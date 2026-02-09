@@ -4,53 +4,6 @@ This module implements a small, FlatBuffers-style wire format and a Zig
 build-time generator that emits zero-copy readers and forward-writing
 builders from Zig schema definitions.
 
-## Layout Overview
-
-A message ends with a fixed tail. All table offsets are **relative to the
-payload base** (the start of the payload), so adding the tail does not change
-any internal offsets.
-
-Message tail (16 bytes, at end of buffer):
-
-- `u32 root_off` = offset of root table from payload base
-- `u16 table_id` = unique id for the root table
-- `u16 table_version` = version of the root table schema
-- `u32 reserved` = 0
-- `u32 magic` = `0x4655425A` ("ZBUF")
-
-ASCII layout (payload + tail):
-
-```
-0x0000  [ payload bytes... ]
-...
-0xNNNN  u32 root_off
-0xNNNN  u16 table_id
-0xNNNN  u16 table_version
-0xNNNN  u32 reserved (0)
-0xNNNN  u32 magic (0x4655425A)
-```
-
-Offsets in tables are relative to the start of the payload (0x0000).
-
-## Table Layout
-
-Each table begins with a fixed header:
-
-- `u16 version`
-- `u16 size_bytes` (bytes of the fixed header for this version)
-
-Fields are laid out by **stable field id** in ascending order. New fields
-may only be appended, and readers use `size_bytes` to skip unknown slots.
-
-Supported field encodings:
-
-- Scalars (`u32`, `u64`) stored inline in the fixed header.
-- Bytes (`[]u8`) stored as `{ u32 off, u32 len }`.
-- Arrays of tables (`[]T`) stored as `{ u32 index_off, u32 count }` where
-  `index_off` points to a contiguous `u32[count]` of child offsets.
-
-All offsets are **relative to payload base**.
-
 ## Generator
 
 - Generator entrypoint: `zbuf/gen.zig`
@@ -95,3 +48,158 @@ const view = switch (msg) {
     else => unreachable,
 };
 ```
+
+## Table Layout
+
+Each table begins with a fixed header:
+
+- `u16 version`
+- `u16 size_bytes` (bytes of the fixed header for this version)
+
+### Table and Field IDs
+
+Each table has a **table id** (set in the schema’s `tables` list). It is used
+in the message tail to identify the root table type, but is not stored inside
+the table itself.
+
+Each field has a **stable field id** (the `.id` in the schema). Field names
+may be renamed or reordered in the source without changing the wire layout.
+The generator sorts fields by `id` in ascending order to determine the slot
+order in the fixed header. New fields may only be appended with new ids, and
+readers use `size_bytes` to skip unknown slots.
+
+Supported field encodings:
+
+- Scalars (`u32`, `u64`) stored inline in the fixed header.
+- Bytes (`[]u8`) stored as `{ u32 off, u32 len }`.
+- Arrays of tables (`[]T`) stored as `{ u32 index_off, u32 count }` where
+  `index_off` points to a contiguous `u32[count]` of child offsets.
+- Direct table fields (`T`) stored as `u32 off` pointing at the child table.
+  A null table is encoded as `zbuf.NullOffset` (`0xFFFF_FFFF`).
+
+All offsets are **relative to payload base**.
+
+## Layout Overview
+
+A message consists of a payload and an optional fixed-length tail. All table offsets
+are **relative to the payload base** (the start of the payload), so adding the
+tail does not change any internal offsets. The tail is optional; it is only
+needed when the receiver does not already know the root table type and root
+offset.
+
+Message tail (optional, 16 bytes at end of buffer):
+
+- `u32 root_off` = offset of root table from payload base
+- `u16 table_id` = unique id for the root table
+- `u16 table_version` = version of the root table schema
+- `u32 reserved` = 0
+- `u32 magic` = `0x4655425A` ("ZBUF")
+
+Offsets in tables are relative to the start of the payload (0x0000).
+
+### Example (Root) with Concrete Fields
+
+Assume the test schema in `zbuf/buffers.zig` and a payload with:
+
+```zig
+pub const Leaf = schema.Table(.{
+    .{ .id = 1, .name = "tag", .ty = schema.U32 },
+    .{ .id = 2, .name = "data", .ty = schema.Bytes },
+});
+
+pub const Node = schema.Table(.{
+    .{ .id = 1, .name = "name", .ty = schema.Bytes },
+    .{ .id = 2, .name = "value", .ty = schema.U64 },
+    .{ .id = 3, .name = "leaves", .ty = schema.Array(Leaf) },
+    .{ .id = 4, .name = "node_leaf", .ty = Leaf },
+});
+
+pub const Root = schema.Table(.{
+    .{ .id = 1, .name = "nodes", .ty = schema.Array(Node) },
+    .{ .id = 2, .name = "payload", .ty = schema.Bytes },
+    .{ .id = 3, .name = "count", .ty = schema.U32 },
+    .{ .id = 4, .name = "root_node", .ty = Node },
+});
+```
+
+Table header sizes for this schema:
+
+- `Root` fixed header = `28` bytes
+  - 2 bytes for `version`
+	- 2 bytes for `size_bytes`
+	- 4 bytes for `nodes_off`
+	- 4 bytes for `nodes_count`
+	- 4 bytes for `payload_off`
+	- 4 bytes for `payload_len`
+	- 4 bytes for `count`
+	- 4 bytes for `root_node_off`
+- `Node` fixed header = `32` bytes
+	- 2 bytes for `version`
+	- 2 bytes for `size_bytes`
+	- 4 bytes for `name_off`
+	- 4 bytes for `name_len`
+	- 8 bytes for `value`
+	- 4 bytes for `leaves_off`
+	- 4 bytes for `leaves_count`
+	- 4 bytes for `node_leaf_off`
+- `Leaf` fixed header = `16` bytes
+	- 2 bytes for `version`
+	- 2 bytes for `size_bytes`
+	- 4 bytes for `tag`
+	- 4 bytes for `data_off`
+	- 4 bytes for `data_len`
+
+One possible payload layout (offsets from payload base `0x0000`), matching a
+common build order (Leaf -> Node -> Root):
+
+```
+0x0000  Leaf header (0x10 bytes)
+0x0010  Leaf.data bytes "DATA"
+0x0014  Node header (0x20 bytes)
+0x0034  Node.name bytes "NAME"
+0x0038  Node.leaves index table (u32[1] = 0x0000)
+0x003C  Root header (0x1C bytes)
+0x0058  Root.nodes index table (u32[1] = 0x0014)
+0x005C  Root.payload bytes "PAYL"
+```
+
+Concrete header contents (little-endian), showing offsets/lengths:
+
+```
+Leaf @0x0000
+  u16 version      = 1
+  u16 size_bytes   = 0x0010
+  u32 tag          = 7
+  u32 data_off     = 0x0010
+  u32 data_len     = 4
+
+Node @0x0014
+  u16 version      = 1
+  u16 size_bytes   = 0x0020
+  u32 name_off     = 0x0034
+  u32 name_len     = 4
+  u64 value        = 42
+  u32 leaves_off   = 0x0038
+  u32 leaves_count = 1
+  u32 node_leaf_off= 0x0000
+
+Root @0x003C
+  u16 version      = 1
+  u16 size_bytes   = 0x001C
+  u32 nodes_off    = 0x0058
+  u32 nodes_count  = 1
+  u32 payload_off  = 0x005C
+  u32 payload_len  = 4
+  u32 count        = 1
+  u32 root_node_off= 0x0014
+```
+
+If you choose to add a tail, it is appended after the payload:
+
+```
+tail (optional, 16 bytes)
+┌────────────────────────────────────────────────────────────┐
+│ root_off = 0x003C | table_id = Root | table_ver = 1 | ZBUF │
+└────────────────────────────────────────────────────────────┘
+```
+

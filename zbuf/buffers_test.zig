@@ -1,7 +1,7 @@
 const std = @import("std");
 const gen = @import("buffers_gen");
 
-fn buildRoot(alloc: std.mem.Allocator, set_root_leaf: bool) !std.ArrayList(u8) {
+fn buildRoot(alloc: std.mem.Allocator, set_root_node: bool) !std.ArrayList(u8) {
     var buf: std.ArrayList(u8) = .{};
 
     var l1 = try gen.LeafBuilder.start(alloc, &buf);
@@ -19,6 +19,7 @@ fn buildRoot(alloc: std.mem.Allocator, set_root_leaf: bool) !std.ArrayList(u8) {
     try n1.setValue(1000);
     const leaves = [_]u32{ l1_off, l2_off };
     try n1.setLeaves(&leaves);
+    try n1.setNodeLeaf(l1_off);
     const n1_off = n1.finish();
 
     var n2 = try gen.NodeBuilder.start(alloc, &buf);
@@ -26,6 +27,7 @@ fn buildRoot(alloc: std.mem.Allocator, set_root_leaf: bool) !std.ArrayList(u8) {
     try n2.setValue(2000);
     const no_leaves = [_]u32{};
     try n2.setLeaves(&no_leaves);
+    try n2.setNodeLeaf(@import("zbuf").zbuf.NullOffset);
     const n2_off = n2.finish();
 
     var root = try gen.RootBuilder.start(alloc, &buf);
@@ -33,10 +35,10 @@ fn buildRoot(alloc: std.mem.Allocator, set_root_leaf: bool) !std.ArrayList(u8) {
     try root.setNodes(&nodes);
     try root.setPayload("payload");
     try root.setCount(2);
-    if (set_root_leaf) {
-        try root.setRootLeaf(l1_off);
+    if (set_root_node) {
+        try root.setRootNode(n1_off);
     } else {
-        try root.setRootLeaf(@import("zbuf").zbuf.NullOffset);
+        try root.setRootNode(@import("zbuf").zbuf.NullOffset);
     }
     const root_off = root.finish();
     try gen.addTail(alloc, &buf, gen.RootView, root_off);
@@ -56,9 +58,12 @@ test "zbuf format roundtrip" {
     try std.testing.expectEqual(@as(u32, 2), root.nodesLen());
     try std.testing.expectEqual(@as(u32, 2), root.count());
     try std.testing.expectEqualSlices(u8, "payload", root.payload());
-    const root_leaf = root.rootLeaf() orelse return error.Invalid;
-    try std.testing.expectEqual(@as(u32, 1), root_leaf.tag());
-    try std.testing.expectEqualSlices(u8, "l1", root_leaf.data());
+    const root_node = root.rootNode() orelse return error.Invalid;
+    try std.testing.expectEqualSlices(u8, "n1", root_node.name());
+    try std.testing.expectEqual(@as(u64, 1000), root_node.value());
+    const node_leaf = root_node.nodeLeaf() orelse return error.Invalid;
+    try std.testing.expectEqual(@as(u32, 1), node_leaf.tag());
+    try std.testing.expectEqualSlices(u8, "l1", node_leaf.data());
 
     const n0 = try root.nodesAt(0);
     try std.testing.expectEqualSlices(u8, "n1", n0.name());
@@ -89,7 +94,7 @@ test "direct table null" {
         .Root => |v| v,
         else => return error.Invalid,
     };
-    try std.testing.expect(root.rootLeaf() == null);
+    try std.testing.expect(root.rootNode() == null);
 }
 
 // Simulate a V2 append-only field by increasing size_bytes.
