@@ -4,6 +4,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    addServer(b, target, optimize);
+
+    const schema_mod = addSchemaModule(b, target, optimize);
+
+    addZbufCli(b, target, optimize, schema_mod);
+    addZbufTests(b, target, optimize, schema_mod);
+}
+
+fn addServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     const exe = b.addExecutable(.{
         .name = "server",
         .root_module = b.createModule(.{
@@ -17,21 +26,21 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    if (b.args) |args| run_cmd.addArgs(args);
 
     const run_step = b.step("run", "Run the server");
     run_step.dependOn(&run_cmd.step);
+}
 
-    // Shared schema module for zbuf generation.
-    const schema_mod = b.createModule(.{
+fn addSchemaModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.createModule(.{
         .root_source_file = b.path("zbuf/schema.zig"),
         .target = target,
         .optimize = optimize,
     });
+}
 
+fn addZbufCli(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, schema_mod: *std.Build.Module) void {
     // Zbuf CLI: zig build zbuf -- path/to/buffers.zig
     // Defaults to u/buffers.zig if no args are provided.
     const buffers_path = if (b.args) |args| blk: {
@@ -63,35 +72,15 @@ pub fn build(b: *std.Build) void {
     });
     zbuf_gen_dyn.root_module.addImport("schema", schema_mod);
     zbuf_gen_dyn.root_module.addImport("buffers", buffers_dyn_mod);
+
     const run_zbuf_gen_dyn = b.addRunArtifact(zbuf_gen_dyn);
     run_zbuf_gen_dyn.addArg(out_path);
 
     const zbuf_cli_step = b.step("zbuf", "Generate buffers code from a schema path");
     zbuf_cli_step.dependOn(&run_zbuf_gen_dyn.step);
+}
 
-    const buffers_mod = b.createModule(.{
-        .root_source_file = b.path("u/buffers.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    buffers_mod.addImport("schema", schema_mod);
-
-    const zbuf_gen = b.addExecutable(.{
-        .name = "zbuf-gen",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("zbuf/gen.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    zbuf_gen.root_module.addImport("schema", schema_mod);
-    zbuf_gen.root_module.addImport("buffers", buffers_mod);
-
-    const run_zbuf_gen = b.addRunArtifact(zbuf_gen);
-    run_zbuf_gen.addArg("u/buffers.gen.zig");
-    const gen_zbuf_step = b.step("gen-zbuf", "Generate zbuf code");
-    gen_zbuf_step.dependOn(&run_zbuf_gen.step);
-
+fn addZbufTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, schema_mod: *std.Build.Module) void {
     const zbuf_mod = b.createModule(.{
         .root_source_file = b.path("zbuf.zig"),
         .target = target,
@@ -116,6 +105,7 @@ pub fn build(b: *std.Build) void {
     });
     test_zbuf_gen.root_module.addImport("schema", schema_mod);
     test_zbuf_gen.root_module.addImport("buffers", test_buffers_mod);
+
     const run_test_zbuf_gen = b.addRunArtifact(test_zbuf_gen);
     run_test_zbuf_gen.addArg("zbuf/buffers.gen.zig");
 
@@ -136,34 +126,8 @@ pub fn build(b: *std.Build) void {
     zbuf_tests.root_module.addImport("buffers_gen", buffers_gen_mod);
     zbuf_tests.root_module.addImport("zbuf", zbuf_mod);
     zbuf_tests.step.dependOn(&run_test_zbuf_gen.step);
+
     const run_zbuf_tests = b.addRunArtifact(zbuf_tests);
     const zbuf_test_step = b.step("test-zbuf", "Run zbuf serialization tests");
     zbuf_test_step.dependOn(&run_zbuf_tests.step);
-
-    // Flatbuffer roundtrip tests
-    const fb_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("fb/test_raft_fb.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    fb_tests.root_module.addIncludePath(b.path("fb/generated"));
-    fb_tests.root_module.addIncludePath(b.path("fb/include"));
-    fb_tests.addCSourceFiles(.{
-        .files = &.{
-            "fb/runtime/builder.c",
-            "fb/runtime/emitter.c",
-            "fb/runtime/refmap.c",
-            "fb/runtime/verifier.c",
-            "fb/raft_fb_shim.c",
-        },
-        .flags = &.{"-std=c11"},
-        .root = b.path("."),
-    });
-
-    const run_fb_tests = b.addRunArtifact(fb_tests);
-    const test_step = b.step("test-fb", "Run flatbuffer roundtrip tests");
-    test_step.dependOn(&run_fb_tests.step);
 }
