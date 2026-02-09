@@ -278,11 +278,11 @@ fn emitArrayLenGetter(w: anytype, offset: u16) !void {
     try w.writeAll("        const header_end = @as(u32, self.base) + self.size_bytes;\n");
     try w.writeAll("        if (slot_end > header_end) return 0;\n");
     try w.print("        const index_off = wire.readU32(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{offset});
-    try w.print("        const count = wire.readU32(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{offset + 4});
-    try w.writeAll("        if (count == 0) return 0;\n");
-    try w.writeAll("        const end = @as(usize, index_off) + @as(usize, count) * 4;\n");
+    try w.print("        const elem_count = wire.readU32(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{offset + 4});
+    try w.writeAll("        if (elem_count == 0) return 0;\n");
+    try w.writeAll("        const end = @as(usize, index_off) + @as(usize, elem_count) * 4;\n");
     try w.writeAll("        if (end > self.buf.len) return 0;\n");
-    try w.writeAll("        return count;\n");
+    try w.writeAll("        return elem_count;\n");
 }
 
 fn emitArrayAtGetter(w: anytype, offset: u16, child_name: []const u8) !void {
@@ -290,10 +290,10 @@ fn emitArrayAtGetter(w: anytype, offset: u16, child_name: []const u8) !void {
     try w.writeAll("        const header_end = @as(u32, self.base) + self.size_bytes;\n");
     try w.writeAll("        if (slot_end > header_end) return wire.Error.OutOfBounds;\n");
     try w.print("        const index_off = try wire.readU32(self.buf, @as(usize, self.base + {d}));\n", .{offset});
-    try w.print("        const count = try wire.readU32(self.buf, @as(usize, self.base + {d}));\n", .{offset + 4});
-    try w.writeAll("        if (i >= count) return wire.Error.OutOfBounds;\n");
-    try w.writeAll("        if (count == 0) return wire.Error.OutOfBounds;\n");
-    try w.writeAll("        const index_end = @as(usize, index_off) + @as(usize, count) * 4;\n");
+    try w.print("        const elem_count = try wire.readU32(self.buf, @as(usize, self.base + {d}));\n", .{offset + 4});
+    try w.writeAll("        if (i >= elem_count) return wire.Error.OutOfBounds;\n");
+    try w.writeAll("        if (elem_count == 0) return wire.Error.OutOfBounds;\n");
+    try w.writeAll("        const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;\n");
     try w.writeAll("        if (index_end > self.buf.len) return wire.Error.OutOfBounds;\n");
     try w.writeAll("        const entry_off = @as(usize, index_off) + @as(usize, i) * 4;\n");
     try w.writeAll("        const child_off = try wire.readU32(self.buf, entry_off);\n");

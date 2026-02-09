@@ -97,8 +97,29 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Test schema and generated code live under wire/.
+    const test_buffers_mod = b.createModule(.{
+        .root_source_file = b.path("wire/buffers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_buffers_mod.addImport("schema", schema_mod);
+
+    const test_wire_gen = b.addExecutable(.{
+        .name = "wire-gen-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("wire/gen.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_wire_gen.root_module.addImport("schema", schema_mod);
+    test_wire_gen.root_module.addImport("buffers", test_buffers_mod);
+    const run_test_wire_gen = b.addRunArtifact(test_wire_gen);
+    run_test_wire_gen.addArg("wire/buffers.gen.zig");
+
     const buffers_gen_mod = b.createModule(.{
-        .root_source_file = b.path("u/buffers.gen.zig"),
+        .root_source_file = b.path("wire/buffers.gen.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -106,13 +127,13 @@ pub fn build(b: *std.Build) void {
 
     const wire_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("wire/test_wire.zig"),
+            .root_source_file = b.path("wire/buffers_test.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
     wire_tests.root_module.addImport("buffers_gen", buffers_gen_mod);
-    wire_tests.step.dependOn(&run_wire_gen.step);
+    wire_tests.step.dependOn(&run_test_wire_gen.step);
     const run_wire_tests = b.addRunArtifact(wire_tests);
     const wire_test_step = b.step("test-wire", "Run wire serialization tests");
     wire_test_step.dependOn(&run_wire_tests.step);
