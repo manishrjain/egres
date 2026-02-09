@@ -1,7 +1,7 @@
 const std = @import("std");
 const gen = @import("buffers_gen");
 
-fn buildRoot(alloc: std.mem.Allocator) !struct { buf: std.ArrayList(u8), root_off: u32 } {
+fn buildRoot(alloc: std.mem.Allocator) !std.ArrayList(u8) {
     var buf: std.ArrayList(u8) = .{};
 
     var l1 = try gen.LeafBuilder.start(alloc, &buf);
@@ -34,15 +34,20 @@ fn buildRoot(alloc: std.mem.Allocator) !struct { buf: std.ArrayList(u8), root_of
     try root.setPayload("payload");
     try root.setCount(2);
     const root_off = root.finish();
+    try gen.addTail(alloc, &buf, gen.RootView, root_off);
 
-    return .{ .buf = buf, .root_off = root_off };
+    return buf;
 }
 
 test "wire format roundtrip" {
-    var built = try buildRoot(std.testing.allocator);
-    defer built.buf.deinit(std.testing.allocator);
+    var buf = try buildRoot(std.testing.allocator);
+    defer buf.deinit(std.testing.allocator);
 
-    const root = try gen.RootView.init(built.buf.items, built.root_off);
+    const msg = try gen.parseMessageFromTail(buf.items);
+    const root = switch (msg) {
+        .Root => |v| v,
+        else => return error.Invalid,
+    };
     try std.testing.expectEqual(@as(u32, 2), root.nodesLen());
     try std.testing.expectEqual(@as(u32, 2), root.count());
     try std.testing.expectEqualSlices(u8, "payload", root.payload());
@@ -69,17 +74,22 @@ test "wire format roundtrip" {
 
 // Simulate a V2 append-only field by increasing size_bytes.
 test "size_bytes compatibility" {
-    var built = try buildRoot(std.testing.allocator);
-    defer built.buf.deinit(std.testing.allocator);
+    var buf = try buildRoot(std.testing.allocator);
+    defer buf.deinit(std.testing.allocator);
 
-    const base = built.root_off;
+    const tail = try @import("wire").wire.readMessageTail(buf.items);
+    const base = tail.root_off;
     const v1_size: u16 = gen.RootView.SIZE_BYTES;
     const v2_size: u16 = v1_size + 4;
 
-    const slice = built.buf.items[base + 2 .. base + 4];
+    const slice = buf.items[base + 2 .. base + 4];
     const ptr = @as(*[2]u8, @ptrCast(slice.ptr));
     std.mem.writeInt(u16, ptr, v2_size, .little);
 
-    const view = try gen.RootView.init(built.buf.items, built.root_off);
+    const msg2 = try gen.parseMessageFromTail(buf.items);
+    const view = switch (msg2) {
+        .Root => |v| v,
+        else => return error.Invalid,
+    };
     try std.testing.expectEqual(@as(u32, 2), view.nodesLen());
 }

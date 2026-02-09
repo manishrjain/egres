@@ -35,8 +35,12 @@ pub fn main() !void {
     try w.writeAll("const wire = @import(\"wire\").wire;\n\n");
 
     // Emit code for each table declared in u/buffers.zig.
+    // Emit tail helpers and message parser for this generated module.
+    try emitTailHelpers(w);
+    try emitMessageParser(w);
+
     inline for (defs.tables) |entry| {
-        try emitTable(alloc, entry.name, entry.ty, w);
+        try emitTable(alloc, entry.name, entry.ty, entry.id, w);
     }
     try w.flush();
 
@@ -77,7 +81,7 @@ fn tableNameForType(comptime T: type) []const u8 {
     @compileError("unknown table type");
 }
 
-fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime T: type, w: anytype) !void {
+fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime T: type, comptime table_id: u16, w: anytype) !void {
     // Compile-time layout calculation: field order, slot offsets, and header size.
     const layout = comptime blk: {
         const fields = schema.sortFieldsById(T.fields);
@@ -102,10 +106,14 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     try w.writeAll("    size_bytes: u16,\n\n");
 
     try w.print("    pub const VERSION: u16 = {d};\n", .{1});
+    try w.print("    pub const TABLE_ID: u16 = {d};\n", .{table_id});
     try w.print("    pub const SIZE_BYTES: u16 = {d};\n\n", .{size_bytes});
 
     try w.writeAll("    pub fn parseRoot(buf: []const u8) !Self {\n");
-    try w.writeAll("        return init(buf, 0);\n");
+    try w.writeAll("        const tail = try wire.readMessageTail(buf);\n");
+    try w.writeAll("        if (tail.table_id != TABLE_ID) return wire.Error.Invalid;\n");
+    try w.writeAll("        const payload_buf = buf[0 .. buf.len - wire.message_tail_size];\n");
+    try w.writeAll("        return init(payload_buf, tail.root_off);\n");
     try w.writeAll("    }\n\n");
 
     // init() validates that header fits in the buffer; field accessors are bounds-checked.
@@ -150,7 +158,7 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
                 try w.writeAll("    }\n\n");
 
                 const child_name = tableNameForType(child);
-                try w.print("    pub fn {s}At(self: Self, i: u32) !{s}View {{\n", .{name_camel_arr, child_name});
+                try w.print("    pub fn {s}At(self: Self, i: u32) !{s}View {{\n", .{ name_camel_arr, child_name });
                 try emitArrayAtGetter(w, info.offset, child_name);
                 try w.writeAll("    }\n\n");
             },
@@ -170,10 +178,10 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
             .array => {
                 const name_camel_arr = try schema.camelName(alloc, info.name);
                 defer alloc.free(name_camel_arr);
-                try w.print("        const count_{s}: u32 = self.{s}Len();\n", .{name_camel_arr, name_camel_arr});
+                try w.print("        const count_{s}: u32 = self.{s}Len();\n", .{ name_camel_arr, name_camel_arr });
                 try w.print("        var i_{s}: u32 = 0;\n", .{name_camel_arr});
-                try w.print("        while (i_{s} < count_{s}) : (i_{s} += 1) {{\n", .{name_camel_arr, name_camel_arr, name_camel_arr});
-                try w.print("            const child_view = try self.{s}At(i_{s});\n", .{name_camel_arr, name_camel_arr});
+                try w.print("        while (i_{s} < count_{s}) : (i_{s} += 1) {{\n", .{ name_camel_arr, name_camel_arr, name_camel_arr });
+                try w.print("            const child_view = try self.{s}At(i_{s});\n", .{ name_camel_arr, name_camel_arr });
                 try w.writeAll("            try child_view.verify();\n");
                 try w.writeAll("        }\n");
             },
@@ -221,27 +229,29 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
                 try w.writeAll("    }\n\n");
             },
             .bytes => {
-                // Append payload and patch (off,len) in the header.
+                // Append payload and patch (off,len) in the header (offsets are payload-relative).
                 try w.print("    pub fn set{s}(self: *Self, data: []const u8) !void {{\n", .{name_camel});
                 try w.writeAll("        if (data.len == 0) {\n");
                 try w.print("            try wire.patchU32(self.buf.items, self.base + {d}, 0);\n", .{info.offset});
                 try w.print("            try wire.patchU32(self.buf.items, self.base + {d}, 0);\n", .{info.offset + 4});
                 try w.writeAll("            return;\n");
                 try w.writeAll("        }\n");
-                try w.writeAll("        const off = try wire.appendBytesAligned(self.buf, self.alloc, data, 4);\n");
+                try w.writeAll("        const abs_off = try wire.appendBytesAligned(self.buf, self.alloc, data, 4);\n");
+                try w.writeAll("        const off = abs_off;\n");
                 try w.print("        try wire.patchU32(self.buf.items, self.base + {d}, off);\n", .{info.offset});
                 try w.print("        try wire.patchU32(self.buf.items, self.base + {d}, @as(u32, @intCast(data.len)));\n", .{info.offset + 4});
                 try w.writeAll("    }\n\n");
             },
             .array => {
-                // Append index table and patch (index_off,count) in the header.
+                // Append index table and patch (index_off,count) in the header (offsets are payload-relative).
                 try w.print("    pub fn set{s}(self: *Self, child_offsets: []const u32) !void {{\n", .{name_camel});
                 try w.writeAll("        if (child_offsets.len == 0) {\n");
                 try w.print("            try wire.patchU32(self.buf.items, self.base + {d}, 0);\n", .{info.offset});
                 try w.print("            try wire.patchU32(self.buf.items, self.base + {d}, 0);\n", .{info.offset + 4});
                 try w.writeAll("            return;\n");
                 try w.writeAll("        }\n");
-                try w.writeAll("        const index_off = try wire.appendU32SliceAligned(self.buf, self.alloc, child_offsets, 4);\n");
+                try w.writeAll("        const abs_index_off = try wire.appendU32SliceAligned(self.buf, self.alloc, child_offsets, 4);\n");
+                try w.writeAll("        const index_off = abs_index_off;\n");
                 try w.print("        try wire.patchU32(self.buf.items, self.base + {d}, index_off);\n", .{info.offset});
                 try w.print("        try wire.patchU32(self.buf.items, self.base + {d}, @as(u32, @intCast(child_offsets.len)));\n", .{info.offset + 4});
                 try w.writeAll("    }\n\n");
@@ -260,7 +270,7 @@ fn emitScalarGetter(w: anytype, offset: u16, size: u16, comptime read_fn: []cons
     try w.print("        const slot_end = @as(u32, self.base) + {d};\n", .{offset + size});
     try w.writeAll("        const header_end = @as(u32, self.base) + self.size_bytes;\n");
     try w.writeAll("        if (slot_end > header_end) return 0;\n");
-    try w.print("        return wire.{s}(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{read_fn, offset});
+    try w.print("        return wire.{s}(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{ read_fn, offset });
 }
 
 fn emitBytesGetter(w: anytype, offset: u16) !void {
@@ -301,7 +311,7 @@ fn emitArrayAtGetter(w: anytype, offset: u16, child_name: []const u8) !void {
 }
 
 fn emitBytesVerify(w: anytype, offset: u16) !void {
-    try w.print("        const slot_end_{d} = @as(u32, self.base) + {d};\n", .{offset, offset + 8});
+    try w.print("        const slot_end_{d} = @as(u32, self.base) + {d};\n", .{ offset, offset + 8 });
     try w.print("        if (slot_end_{d} <= header_end) {{\n", .{offset});
     try w.print("            const off = try wire.readU32(self.buf, @as(usize, self.base + {d}));\n", .{offset});
     try w.print("            const data_len = try wire.readU32(self.buf, @as(usize, self.base + {d}));\n", .{offset + 4});
@@ -309,4 +319,36 @@ fn emitBytesVerify(w: anytype, offset: u16) !void {
     try w.writeAll("                _ = try wire.sliceAt(self.buf, off, data_len);\n");
     try w.writeAll("            }\n");
     try w.writeAll("        }\n");
+}
+
+fn emitTailHelpers(w: anytype) !void {
+    try w.writeAll("pub fn addTail(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), comptime T: type, root_off: u32) !void {\n");
+    try w.writeAll("    try wire.appendMessageTail(buf, alloc, T.TABLE_ID, T.VERSION, root_off);\n");
+    try w.writeAll("}\n\n");
+    try w.writeAll("pub fn parseTail(buf: []const u8) !wire.MessageTail {\n");
+    try w.writeAll("    return wire.readMessageTail(buf);\n");
+    try w.writeAll("}\n\n");
+    try w.writeAll("pub fn tailSize(buf: []const u8) !u16 {\n");
+    try w.writeAll("    if (buf.len < 4) return wire.Error.OutOfBounds;\n");
+    try w.writeAll("    return wire.readU16(buf, buf.len - 2);\n");
+    try w.writeAll("}\n\n");
+    try w.writeAll("pub fn parseMessageFromTail(buf: []const u8) !MessageView {\n");
+    try w.writeAll("    const tail = try wire.readMessageTail(buf);\n");
+    try w.writeAll("    const tail_size = try tailSize(buf);\n");
+    try w.writeAll("    const payload_buf = buf[0 .. buf.len - tail_size];\n");
+    try w.writeAll("    return switch (tail.table_id) {\n");
+    inline for (defs.tables) |entry| {
+        try w.print("        {s}View.TABLE_ID => .{{ .{s} = try {s}View.init(payload_buf, tail.root_off) }},\n", .{ entry.name, entry.name, entry.name });
+    }
+    try w.writeAll("        else => wire.Error.Invalid,\n");
+    try w.writeAll("    };\n");
+    try w.writeAll("}\n\n");
+}
+
+fn emitMessageParser(w: anytype) !void {
+    try w.writeAll("pub const MessageView = union(enum) {\n");
+    inline for (defs.tables) |entry| {
+        try w.print("    {s}: {s}View,\n", .{ entry.name, entry.name });
+    }
+    try w.writeAll("};\n\n");
 }

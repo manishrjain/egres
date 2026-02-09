@@ -18,7 +18,7 @@ pub const Root = schema.Table(.{
 });
 
 pub const tables = .{
-    .{ .name = "Leaf", .ty = Leaf },
-    .{ .name = "Node", .ty = Node },
-    .{ .name = "Root", .ty = Root },
+    .{ .name = "Leaf", .ty = Leaf, .id = 1 },
+    .{ .name = "Node", .ty = Node, .id = 2 },
+    .{ .name = "Root", .ty = Root, .id = 3 },
 };

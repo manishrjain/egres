@@ -17,6 +17,6 @@ pub const TableIndex = schema.Table(.{
 });
 
 pub const tables = .{
-    .{ .name = "BlockOffset", .ty = BlockOffset },
-    .{ .name = "TableIndex", .ty = TableIndex },
+    .{ .name = "BlockOffset", .ty = BlockOffset, .id = 1 },
+    .{ .name = "TableIndex", .ty = TableIndex, .id = 2 },
 };

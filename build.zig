@@ -133,6 +133,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     wire_tests.root_module.addImport("buffers_gen", buffers_gen_mod);
+    wire_tests.root_module.addImport("wire", wire_mod);
     wire_tests.step.dependOn(&run_test_wire_gen.step);
     const run_wire_tests = b.addRunArtifact(wire_tests);
     const wire_test_step = b.step("test-wire", "Run wire serialization tests");
