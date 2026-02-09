@@ -5,14 +5,16 @@ pub const Error = error{
     Invalid,
 };
 
+pub const NullOffset: u32 = 0xFFFF_FFFF;
+
 pub const MessageTail = struct {
     table_id: u16,
     table_version: u16,
     root_off: u32, // offset from payload base
 };
 
-pub const message_magic: u16 = 0x4957; // "WI" little-endian
-pub const message_tail_size: u16 = 12;
+pub const message_magic: u32 = 0x4655425A; // "ZBUF" little-endian
+pub const message_tail_size: u16 = 16;
 
 pub fn appendMessageTail(list: *std.ArrayList(u8), alloc: std.mem.Allocator, table_id: u16, table_version: u16, root_off: u32) !void {
     const start = list.items.len;
@@ -20,18 +22,15 @@ pub fn appendMessageTail(list: *std.ArrayList(u8), alloc: std.mem.Allocator, tab
     try writeU32At(list.items, start + 0, root_off);
     try writeU16At(list.items, start + 4, table_id);
     try writeU16At(list.items, start + 6, table_version);
-    try writeU16At(list.items, start + 8, message_magic);
-    try writeU16At(list.items, start + 10, message_tail_size);
+    try writeU32At(list.items, start + 8, 0);
+    try writeU32At(list.items, start + 12, message_magic);
 }
 
 pub fn readMessageTail(buf: []const u8) !MessageTail {
-    if (buf.len < 4) return Error.OutOfBounds;
-    const tail_size = try readU16(buf, buf.len - 2);
-    const magic = try readU16(buf, buf.len - 4);
+    if (buf.len < message_tail_size) return Error.OutOfBounds;
+    const start = buf.len - message_tail_size;
+    const magic = try readU32(buf, start + 12);
     if (magic != message_magic) return Error.Invalid;
-    if (tail_size < message_tail_size) return Error.Invalid;
-    if (buf.len < tail_size) return Error.OutOfBounds;
-    const start = buf.len - tail_size;
     const root_off = try readU32(buf, start + 0);
     const table_id = try readU16(buf, start + 4);
     const table_version = try readU16(buf, start + 6);

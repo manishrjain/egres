@@ -15,6 +15,7 @@ pub const Root = schema.Table(.{
     .{ .id = 1, .name = "nodes", .ty = schema.Array(Node) },
     .{ .id = 2, .name = "payload", .ty = schema.Bytes },
     .{ .id = 3, .name = "count", .ty = schema.U32 },
+    .{ .id = 4, .name = "root_leaf", .ty = Leaf },
 });
 
 pub const tables = .{

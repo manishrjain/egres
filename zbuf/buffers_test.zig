@@ -1,7 +1,7 @@
 const std = @import("std");
 const gen = @import("buffers_gen");
 
-fn buildRoot(alloc: std.mem.Allocator) !std.ArrayList(u8) {
+fn buildRoot(alloc: std.mem.Allocator, set_root_leaf: bool) !std.ArrayList(u8) {
     var buf: std.ArrayList(u8) = .{};
 
     var l1 = try gen.LeafBuilder.start(alloc, &buf);
@@ -33,14 +33,19 @@ fn buildRoot(alloc: std.mem.Allocator) !std.ArrayList(u8) {
     try root.setNodes(&nodes);
     try root.setPayload("payload");
     try root.setCount(2);
+    if (set_root_leaf) {
+        try root.setRootLeaf(l1_off);
+    } else {
+        try root.setRootLeaf(@import("zbuf").zbuf.NullOffset);
+    }
     const root_off = root.finish();
     try gen.addTail(alloc, &buf, gen.RootView, root_off);
 
     return buf;
 }
 
-test "wire format roundtrip" {
-    var buf = try buildRoot(std.testing.allocator);
+test "zbuf format roundtrip" {
+    var buf = try buildRoot(std.testing.allocator, true);
     defer buf.deinit(std.testing.allocator);
 
     const msg = try gen.parseMessageFromTail(buf.items);
@@ -51,6 +56,9 @@ test "wire format roundtrip" {
     try std.testing.expectEqual(@as(u32, 2), root.nodesLen());
     try std.testing.expectEqual(@as(u32, 2), root.count());
     try std.testing.expectEqualSlices(u8, "payload", root.payload());
+    const root_leaf = root.rootLeaf() orelse return error.Invalid;
+    try std.testing.expectEqual(@as(u32, 1), root_leaf.tag());
+    try std.testing.expectEqualSlices(u8, "l1", root_leaf.data());
 
     const n0 = try root.nodesAt(0);
     try std.testing.expectEqualSlices(u8, "n1", n0.name());
@@ -72,12 +80,24 @@ test "wire format roundtrip" {
     try root.verify();
 }
 
-// Simulate a V2 append-only field by increasing size_bytes.
-test "size_bytes compatibility" {
-    var buf = try buildRoot(std.testing.allocator);
+test "direct table null" {
+    var buf = try buildRoot(std.testing.allocator, false);
     defer buf.deinit(std.testing.allocator);
 
-    const tail = try @import("wire").wire.readMessageTail(buf.items);
+    const msg = try gen.parseMessageFromTail(buf.items);
+    const root = switch (msg) {
+        .Root => |v| v,
+        else => return error.Invalid,
+    };
+    try std.testing.expect(root.rootLeaf() == null);
+}
+
+// Simulate a V2 append-only field by increasing size_bytes.
+test "size_bytes compatibility" {
+    var buf = try buildRoot(std.testing.allocator, true);
+    defer buf.deinit(std.testing.allocator);
+
+    const tail = try @import("zbuf").zbuf.readMessageTail(buf.items);
     const base = tail.root_off;
     const v1_size: u16 = gen.RootView.SIZE_BYTES;
     const v2_size: u16 = v1_size + 4;

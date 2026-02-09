@@ -82,7 +82,7 @@ pub fn slotSize(comptime T: type) u16 {
         .u64 => 8,
         .bytes => 8,
         .array => 8,
-        .table => @compileError("table not allowed as direct field"),
+        .table => 4,
     };
 }
 

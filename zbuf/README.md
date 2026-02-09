@@ -1,4 +1,4 @@
-# Wire Module
+# Zbuf Module
 
 This module implements a small, FlatBuffers-style wire format and a Zig
 build-time generator that emits zero-copy readers and forward-writing
@@ -10,13 +10,27 @@ A message ends with a fixed tail. All table offsets are **relative to the
 payload base** (the start of the payload), so adding the tail does not change
 any internal offsets.
 
-Message tail (12 bytes, at end of buffer):
+Message tail (16 bytes, at end of buffer):
 
 - `u32 root_off` = offset of root table from payload base
 - `u16 table_id` = unique id for the root table
 - `u16 table_version` = version of the root table schema
-- `u16 magic` = `0x4957` ("WI")
-- `u16 tail_size` = 12
+- `u32 reserved` = 0
+- `u32 magic` = `0x4655425A` ("ZBUF")
+
+ASCII layout (payload + tail):
+
+```
+0x0000  [ payload bytes... ]
+...
+0xNNNN  u32 root_off
+0xNNNN  u16 table_id
+0xNNNN  u16 table_version
+0xNNNN  u32 reserved (0)
+0xNNNN  u32 magic (0x4655425A)
+```
+
+Offsets in tables are relative to the start of the payload (0x0000).
 
 ## Table Layout
 
@@ -39,9 +53,9 @@ All offsets are **relative to payload base**.
 
 ## Generator
 
-- Generator entrypoint: `wire/gen.zig`
-- Schema DSL: `wire/schema.zig`
-- Example test schema: `wire/buffers.zig`
+- Generator entrypoint: `zbuf/gen.zig`
+- Schema DSL: `zbuf/schema.zig`
+- Example test schema: `zbuf/buffers.zig`
 
 Generated code includes:
 
@@ -55,15 +69,15 @@ Generated code includes:
 Generate code for a schema file:
 
 ```
-zig build wire -- path/to/buffers.zig
+zig build zbuf -- path/to/buffers.zig
 ```
 
 This writes `path/to/buffers.gen.zig` and prints the generated path.
 
-Run wire tests:
+Run zbuf tests:
 
 ```
-zig build test-wire
+zig build test-zbuf
 ```
 
 ## Example Flow

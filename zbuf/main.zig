@@ -6,7 +6,7 @@ pub fn main() !void {
     const alloc = gpa.allocator();
 
     var args = std.process.args();
-    const prog = args.next() orelse "wire";
+    const prog = args.next() orelse "zbuf";
     const input_path = args.next() orelse {
         std.debug.print("usage: {s} <path/to/buffers.zig>\n", .{prog});
         return error.Invalid;
@@ -17,13 +17,13 @@ pub fn main() !void {
 
     const buffers_arg = try std.fmt.allocPrint(alloc, "-Mroot:buffers={s}", .{input_path});
     defer alloc.free(buffers_arg);
-    const buffers_schema_arg = try std.fmt.allocPrint(alloc, "-Mroot:buffers:schema=wire/schema.zig", .{});
+    const buffers_schema_arg = try std.fmt.allocPrint(alloc, "-Mroot:buffers:schema=zbuf/schema.zig", .{});
     defer alloc.free(buffers_schema_arg);
 
     const argv = [_][]const u8{
         "zig",
         "run",
-        "-Mroot=wire/gen.zig",
+        "-Mroot=zbuf/gen.zig",
         buffers_arg,
         buffers_schema_arg,
         "--",
