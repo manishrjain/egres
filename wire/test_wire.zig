@@ -1,5 +1,5 @@
 const std = @import("std");
-const gen = @import("generated.gen.zig");
+const gen = @import("buffers_gen");
 
 fn buildTableIndex(alloc: std.mem.Allocator) !struct { buf: std.ArrayList(u8), root_off: u32 } {
     var buf: std.ArrayList(u8) = .{};

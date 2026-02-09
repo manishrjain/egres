@@ -1,1 +1,1 @@
-pub usingnamespace @import("wire/wire.zig");
+pub const wire = @import("wire/wire.zig");

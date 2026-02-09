@@ -1,4 +1,4 @@
-const schema = @import("schema.zig");
+const schema = @import("schema");
 
 pub const BlockOffset = schema.Table(.{
     .{ .id = 1, .name = "key", .ty = schema.Bytes },

@@ -97,17 +97,21 @@ pub fn sortFieldsById(comptime fields: anytype) [fields.len]Field {
         out[i] = .{ .id = f.id, .name = f.name, .ty = f.ty };
     }
 
-    var i: usize = 1;
-    while (i < count) : (i += 1) {
-        var j = i;
-        while (j > 0 and out[j - 1].id > out[j].id) : (j -= 1) {
-            const tmp = out[j];
-            out[j] = out[j - 1];
-            out[j - 1] = tmp;
+    std.mem.sort(Field, out[0..], {}, fieldLessThan);
+
+    if (count > 1) {
+        var i: usize = 1;
+        while (i < count) : (i += 1) {
+            if (out[i - 1].id == out[i].id) {
+                @compileError("duplicate field id in schema");
+            }
         }
     }
-
     return out;
+}
+
+fn fieldLessThan(_: void, a: Field, b: Field) bool {
+    return a.id < b.id;
 }
 
 pub fn camelName(alloc: std.mem.Allocator, name: []const u8) ![]const u8 {
