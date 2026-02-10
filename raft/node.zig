@@ -60,7 +60,7 @@ pub const Node = struct {
     allocator: std.mem.Allocator,
 
     outbox: std.ArrayList(Outbound),
-    prng: std.rand.DefaultPrng,
+    prng: std.Random.DefaultPrng,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -72,7 +72,7 @@ pub const Node = struct {
     ) !Node {
         try config.validate();
         const seed = @as(u64, @intCast(std.time.nanoTimestamp()));
-        const prng = std.rand.DefaultPrng.init(seed ^ id);
+        const prng = std.Random.DefaultPrng.init(seed ^ id);
         var node = Node{
             .id = id,
             .peers = peers,
@@ -86,13 +86,13 @@ pub const Node = struct {
             .votes_received = std.AutoHashMap(NodeId, void).init(allocator),
             .peer_states = std.AutoHashMap(NodeId, PeerState).init(allocator),
             .elapsed_ticks = 0,
-            .election_timeout = config.election_timeout_min,
-            .election_timeout_min = config.election_timeout_min,
-            .election_timeout_max = config.election_timeout_max,
-            .heartbeat_interval = config.heartbeat_interval,
+            .election_timeout = config.election_timeout_min_ticks,
+            .election_timeout_min = config.election_timeout_min_ticks,
+            .election_timeout_max = config.election_timeout_max_ticks,
+            .heartbeat_interval = config.heartbeat_ticks,
             .wal = wal,
             .allocator = allocator,
-            .outbox = std.ArrayList(Outbound).init(allocator),
+            .outbox = std.ArrayList(Outbound).empty,
             .prng = prng,
         };
         if (is_spectator) {
@@ -106,7 +106,7 @@ pub const Node = struct {
         self.log.deinit();
         self.votes_received.deinit();
         self.peer_states.deinit();
-        self.outbox.deinit();
+        self.outbox.deinit(self.allocator);
     }
 
     pub fn tick(self: *Node) RaftError!void {
@@ -239,7 +239,7 @@ pub const Node = struct {
 
     pub fn handleRequestVoteReply(self: *Node, rvr: RequestVoteReply) RaftError!void {
         if (self.state != .candidate) return;
-        if (rvr.term < self.current_term) return;
+        if (rvr.term < self.current_term) return; // candidate should have +1 term.
         if (!rvr.vote_granted) return;
 
         _ = try self.votes_received.put(rvr.from, {});
@@ -373,7 +373,7 @@ pub const Node = struct {
     }
 
     pub fn send(self: *Node, to: NodeId, message: Message) void {
-        _ = self.outbox.append(.{ .to = to, .msg = message }) catch {
+        _ = self.outbox.append(self.allocator, .{ .to = to, .msg = message }) catch {
             @panic("raft: outbox append failed");
         };
     }

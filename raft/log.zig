@@ -4,14 +4,15 @@ const msg = @import("message.zig");
 pub const LogEntry = msg.LogEntry;
 
 pub const Log = struct {
+    allocator: std.mem.Allocator,
     entries: std.ArrayList(LogEntry),
 
     pub fn init(allocator: std.mem.Allocator) Log {
-        return .{ .entries = std.ArrayList(LogEntry).init(allocator) };
+        return .{ .allocator = allocator, .entries = std.ArrayList(LogEntry).empty };
     }
 
     pub fn deinit(self: *Log) void {
-        self.entries.deinit();
+        self.entries.deinit(self.allocator);
     }
 
     pub fn lastIndex(self: *const Log) u64 {
@@ -34,11 +35,11 @@ pub const Log = struct {
     }
 
     pub fn append(self: *Log, entry: LogEntry) !void {
-        try self.entries.append(entry);
+        try self.entries.append(self.allocator, entry);
     }
 
     pub fn appendSlice(self: *Log, entries: []const LogEntry) !void {
-        try self.entries.appendSlice(entries);
+        try self.entries.appendSlice(self.allocator, entries);
     }
 
     pub fn truncateFrom(self: *Log, from_index: u64) void {
@@ -83,6 +84,6 @@ pub const Log = struct {
 
     pub fn rebuild(self: *Log, entries: []const LogEntry) !void {
         self.entries.shrinkRetainingCapacity(0);
-        try self.entries.appendSlice(entries);
+        try self.entries.appendSlice(self.allocator, entries);
     }
 };

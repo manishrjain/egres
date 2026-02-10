@@ -1,11 +1,10 @@
 const std = @import("std");
-const wal_mod = @import("../wal.zig");
-const msg = @import("../message.zig");
+const raft = @import("raft");
 
-pub const WalError = wal_mod.WalError;
-pub const HardState = wal_mod.HardState;
-pub const NodeId = msg.NodeId;
-pub const LogEntry = msg.LogEntry;
+pub const WalError = raft.WalError;
+pub const HardState = raft.HardState;
+pub const NodeId = raft.NodeId;
+pub const LogEntry = raft.LogEntry;
 
 pub const MemWal = struct {
     allocator: std.mem.Allocator,
@@ -16,15 +15,15 @@ pub const MemWal = struct {
         return .{
             .allocator = allocator,
             .hard_state = .{ .current_term = 0, .voted_for = null },
-            .entries = std.ArrayList(LogEntry).init(allocator),
+            .entries = std.ArrayList(LogEntry).empty,
         };
     }
 
     pub fn deinit(self: *MemWal) void {
-        self.entries.deinit();
+        self.entries.deinit(self.allocator);
     }
 
-    pub fn asWal(self: *MemWal) wal_mod.Wal {
+    pub fn asWal(self: *MemWal) raft.Wal {
         return .{ .ctx = self, .vtable = &vtable };
     }
 
@@ -36,7 +35,7 @@ pub const MemWal = struct {
 
     fn appendEntries(ctx: *anyopaque, entries: []const LogEntry) WalError!void {
         const self: *MemWal = @ptrCast(@alignCast(ctx));
-        try self.entries.appendSlice(entries);
+        try self.entries.appendSlice(self.allocator, entries);
     }
 
     fn truncateFrom(ctx: *anyopaque, from_index: u64) WalError!void {
@@ -62,7 +61,7 @@ pub const MemWal = struct {
         return .{ self.hard_state, dup };
     }
 
-    const vtable = wal_mod.Wal.VTable{
+    const vtable = raft.Wal.VTable{
         .writeHardState = writeHardState,
         .appendEntries = appendEntries,
         .truncateFrom = truncateFrom,

@@ -5,3 +5,6 @@ pub const LogEntry = @import("message.zig").LogEntry;
 pub const State = @import("message.zig").State;
 pub const NodeId = @import("message.zig").NodeId;
 pub const RaftError = @import("node.zig").RaftError;
+pub const Wal = @import("wal.zig").Wal;
+pub const WalError = @import("wal.zig").WalError;
+pub const HardState = @import("wal.zig").HardState;

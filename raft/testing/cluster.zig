@@ -1,5 +1,5 @@
 const std = @import("std");
-const raft = @import("../raft.zig");
+const raft = @import("raft");
 const mem_wal = @import("mem_wal.zig");
 
 pub const Node = raft.Node;
@@ -29,7 +29,7 @@ pub const TestCluster = struct {
 
         for (ids) |id| {
             var wal = mem_wal.MemWal.init(allocator);
-            const inbox = std.ArrayList(Message).init(allocator);
+            const inbox = std.ArrayList(Message).empty;
             const peers = try buildPeers(allocator, ids, id);
             const is_spectator = containsNode(spectators, id);
 
@@ -61,7 +61,7 @@ pub const TestCluster = struct {
         while (it.next()) |entry| {
             entry.node.deinit();
             entry.wal.deinit();
-            entry.inbox.deinit();
+            entry.inbox.deinit(self.allocator);
             self.allocator.free(entry.peers);
         }
         self.nodes.deinit();
@@ -84,7 +84,7 @@ pub const TestCluster = struct {
                 // Can't use this because we're not using outbox. Only inbox.
                 // entry.node.send(msg.to, msg.msg);
                 if (self.nodes.getPtr(msg.to)) |dest| {
-                    _ = dest.inbox.append(msg.msg) catch {
+                    _ = dest.inbox.append(self.allocator, msg.msg) catch {
                         @panic("raft: inbox append failed");
                     };
                 }
@@ -119,12 +119,12 @@ pub const TestCluster = struct {
     }
 
     fn buildPeers(allocator: std.mem.Allocator, ids: []const NodeId, self_id: NodeId) ![]const NodeId {
-        var peers = std.ArrayList(NodeId).init(allocator);
+        var peers = std.ArrayList(NodeId).empty;
         for (ids) |id| {
             if (id == self_id) continue;
-            try peers.append(id);
+            try peers.append(allocator, id);
         }
-        return peers.toOwnedSlice();
+        return peers.toOwnedSlice(allocator);
     }
 
     fn containsNode(list: []const NodeId, id: NodeId) bool {

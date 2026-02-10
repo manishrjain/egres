@@ -10,6 +10,7 @@ pub fn build(b: *std.Build) void {
 
     addZbufCli(b, target, optimize, schema_mod);
     addZbufTests(b, target, optimize, schema_mod);
+    addRaftTests(b, target, optimize);
 }
 
 fn addServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
@@ -130,4 +131,25 @@ fn addZbufTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
     const run_zbuf_tests = b.addRunArtifact(zbuf_tests);
     const zbuf_test_step = b.step("test-zbuf", "Run zbuf serialization tests");
     zbuf_test_step.dependOn(&run_zbuf_tests.step);
+}
+
+fn addRaftTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const raft_mod = b.createModule(.{
+        .root_source_file = b.path("raft/raft.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const raft_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("raft/testing/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    raft_tests.root_module.addImport("raft", raft_mod);
+
+    const run_raft_tests = b.addRunArtifact(raft_tests);
+    const raft_test_step = b.step("test-raft", "Run raft tests");
+    raft_test_step.dependOn(&run_raft_tests.step);
 }
