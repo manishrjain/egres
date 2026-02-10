@@ -189,14 +189,14 @@ test "log replication" {
     defer expected.deinit(alloc);
 
     var i: usize = 0;
-    while (i < 5) : (i += 1) {
+    while (i < 10) : (i += 1) {
         const len = rand.intRangeAtMost(u8, 1, 16);
         const buf = try alloc.alloc(u8, len);
         rand.bytes(buf);
         const dup = try alloc.dupe(u8, buf);
         try expected.append(alloc, dup);
         _ = try leader_node.propose(buf);
-        try cluster.runTicks(5);
+        try cluster.runTicks(1);
     }
 
     var it = cluster.nodes.valueIterator();
