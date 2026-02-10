@@ -8,6 +8,8 @@ pub const Message = msg.Message;
 pub const MessageType = msg.MessageType;
 pub const RequestVote = msg.RequestVote;
 pub const RequestVoteReply = msg.RequestVoteReply;
+pub const PreVote = msg.PreVote;
+pub const PreVoteReply = msg.PreVoteReply;
 pub const AppendEntries = msg.AppendEntries;
 pub const AppendEntriesReply = msg.AppendEntriesReply;
 pub const LogEntry = msg.LogEntry;
@@ -46,6 +48,7 @@ pub const Node = struct {
     leader_id: ?NodeId,
 
     votes_received: std.AutoHashMap(NodeId, void),
+    prevotes_received: std.AutoHashMap(NodeId, void),
     peer_states: std.AutoHashMap(NodeId, PeerState),
 
     elapsed_ticks: u32,
@@ -79,6 +82,7 @@ pub const Node = struct {
             .last_applied = 0,
             .leader_id = null,
             .votes_received = std.AutoHashMap(NodeId, void).init(allocator),
+            .prevotes_received = std.AutoHashMap(NodeId, void).init(allocator),
             .peer_states = std.AutoHashMap(NodeId, PeerState).init(allocator),
             .elapsed_ticks = 0,
             .election_timeout = config.election_timeout_min_ticks,
@@ -96,6 +100,7 @@ pub const Node = struct {
 
     pub fn deinit(self: *Node) void {
         self.votes_received.deinit();
+        self.prevotes_received.deinit();
         self.peer_states.deinit();
         self.outbox.deinit(self.allocator);
     }
@@ -108,7 +113,11 @@ pub const Node = struct {
                 try self.broadcastHeartbeat();
             },
             .follower, .candidate => if (self.elapsed_ticks >= self.election_timeout) {
-                try self.startElection();
+                if (self.config.enable_prevote) {
+                    try self.startPreVote();
+                } else {
+                    try self.startElection();
+                }
             },
             .spectator => {},
         }
@@ -125,6 +134,28 @@ pub const Node = struct {
             .request_vote_reply => |rvr| try self.handleRequestVoteReply(rvr),
             .append_entries => |ae| try self.handleAppendEntries(ae),
             .append_entries_reply => |aer| try self.handleAppendEntriesReply(aer),
+            .pre_vote => |pv| try self.handlePreVote(pv),
+            .pre_vote_reply => |pvr| try self.handlePreVoteReply(pvr),
+        }
+    }
+
+    pub fn startPreVote(self: *Node) RaftError!void {
+        if (self.state == .spectator) return;
+        self.elapsed_ticks = 0;
+        self.resetElectionTimeout();
+
+        self.prevotes_received.clearRetainingCapacity();
+        try self.prevotes_received.put(self.id, {});
+
+        const pv = PreVote{
+            .term = self.current_term,
+            .candidate_id = self.id,
+            .last_log_index = self.log.lastIndex(),
+            .last_log_term = self.log.lastTerm(),
+        };
+
+        for (self.peers) |peer| {
+            self.send(peer, Message{ .pre_vote = pv });
         }
     }
 
@@ -233,6 +264,43 @@ pub const Node = struct {
             .vote_granted = granted,
             .from = self.id,
         } });
+    }
+
+    pub fn handlePreVote(self: *Node, pv: PreVote) RaftError!void {
+        if (self.state == .spectator) {
+            self.send(pv.candidate_id, Message{ .pre_vote_reply = .{
+                .term = self.current_term,
+                .vote_granted = false,
+                .from = self.id,
+            } });
+            return;
+        }
+        if (pv.term < self.current_term) {
+            self.send(pv.candidate_id, Message{ .pre_vote_reply = .{
+                .term = self.current_term,
+                .vote_granted = false,
+                .from = self.id,
+            } });
+            return;
+        }
+
+        const up_to_date = self.isLogUpToDate(pv.last_log_term, pv.last_log_index);
+        self.send(pv.candidate_id, Message{ .pre_vote_reply = .{
+            .term = self.current_term,
+            .vote_granted = up_to_date,
+            .from = self.id,
+        } });
+    }
+
+    pub fn handlePreVoteReply(self: *Node, pvr: PreVoteReply) RaftError!void {
+        if (self.state == .spectator) return;
+        if (pvr.term < self.current_term) return;
+        if (!pvr.vote_granted) return;
+
+        _ = try self.prevotes_received.put(pvr.from, {});
+        if (self.prevotes_received.count() >= self.quorumSize()) {
+            try self.startElection();
+        }
     }
 
     pub fn handleRequestVoteReply(self: *Node, rvr: RequestVoteReply) RaftError!void {

@@ -12,6 +12,8 @@ pub const MessageType = enum {
     request_vote_reply,
     append_entries,
     append_entries_reply,
+    pre_vote,
+    pre_vote_reply,
 };
 
 pub const LogEntry = struct {
@@ -27,7 +29,20 @@ pub const RequestVote = struct {
     last_log_term: u64,
 };
 
+pub const PreVote = struct {
+    term: u64,
+    candidate_id: NodeId,
+    last_log_index: u64,
+    last_log_term: u64,
+};
+
 pub const RequestVoteReply = struct {
+    term: u64,
+    vote_granted: bool,
+    from: NodeId,
+};
+
+pub const PreVoteReply = struct {
     term: u64,
     vote_granted: bool,
     from: NodeId,
@@ -56,6 +71,8 @@ pub const Message = union(MessageType) {
     request_vote_reply: RequestVoteReply,
     append_entries: AppendEntries,
     append_entries_reply: AppendEntriesReply,
+    pre_vote: PreVote,
+    pre_vote_reply: PreVoteReply,
 
     pub fn msgType(self: Message) MessageType {
         return @as(MessageType, self);
@@ -67,6 +84,8 @@ pub const Message = union(MessageType) {
             .request_vote_reply => |m| m.term,
             .append_entries => |m| m.term,
             .append_entries_reply => |m| m.term,
+            .pre_vote => |m| m.term,
+            .pre_vote_reply => |m| m.term,
         };
     }
 };

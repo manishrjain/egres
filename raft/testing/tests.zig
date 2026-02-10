@@ -105,6 +105,38 @@ test "spectator never votes or becomes leader" {
     }
 }
 
+test "pre-vote avoids term bump without quorum" {
+    var ids = [_]NodeId{ 1, 2, 3 };
+
+    var cfg_pre = defaultConfig();
+    cfg_pre.enable_prevote = true;
+    var cluster_pre = try TestCluster.init(std.testing.allocator, &ids, &[_]NodeId{}, cfg_pre);
+    defer cluster_pre.deinit();
+
+    var cfg_no = defaultConfig();
+    cfg_no.enable_prevote = false;
+    var cluster_no = try TestCluster.init(std.testing.allocator, &ids, &[_]NodeId{}, cfg_no);
+    defer cluster_no.deinit();
+
+    // Drop all outbound messages so no quorum can be reached.
+    inline for ([_]NodeId{ 1, 2, 3 }) |id| {
+        cluster_pre.setDropFrom(id, true);
+        cluster_no.setDropFrom(id, true);
+    }
+
+    const node1_pre = cluster_pre.getNode(1) orelse return error.MissingNode;
+    const node1_no = cluster_no.getNode(1) orelse return error.MissingNode;
+    const term_before = node1_pre.current_term;
+
+    try cluster_pre.runTicks(30);
+    try cluster_no.runTicks(30);
+
+    // With pre-vote enabled, isolated node should not bump term.
+    try std.testing.expectEqual(term_before, node1_pre.current_term);
+    // Without pre-vote, the node will start elections and bump term.
+    try std.testing.expect(node1_no.current_term > term_before);
+}
+
 test "candidate steps down on higher term" {
     const cfg = defaultConfig();
     var ids = [_]NodeId{ 1, 2, 3 };
