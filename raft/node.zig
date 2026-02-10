@@ -1,7 +1,6 @@
 const std = @import("std");
 const msg = @import("message.zig");
-const log_mod = @import("log.zig");
-const wal_mod = @import("wal.zig");
+const raftlog_mod = @import("raftlog.zig");
 const config_mod = @import("config.zig");
 
 pub const NodeId = msg.NodeId;
@@ -15,14 +14,13 @@ pub const LogEntry = msg.LogEntry;
 pub const State = msg.State;
 
 pub const Config = config_mod.Config;
-pub const Log = log_mod.Log;
-pub const Wal = wal_mod.Wal;
-pub const WalError = wal_mod.WalError;
+pub const RaftLog = raftlog_mod.RaftLog;
+pub const RaftLogError = raftlog_mod.RaftLogError;
 
 pub const RaftError = error{
     NotLeader,
     InvalidMessage,
-} || WalError;
+} || RaftLogError;
 
 pub const PeerState = struct {
     next_index: u64,
@@ -40,7 +38,7 @@ pub const Node = struct {
 
     current_term: u64,
     voted_for: ?NodeId,
-    log: Log,
+    log: RaftLog,
 
     state: State,
     commit_index: u64,
@@ -52,11 +50,8 @@ pub const Node = struct {
 
     elapsed_ticks: u32,
     election_timeout: u32,
-    election_timeout_min: u32,
-    election_timeout_max: u32,
-    heartbeat_interval: u32,
+    config: Config,
 
-    wal: Wal,
     allocator: std.mem.Allocator,
 
     outbox: std.ArrayList(Outbound),
@@ -66,7 +61,7 @@ pub const Node = struct {
         allocator: std.mem.Allocator,
         id: NodeId,
         peers: []const NodeId,
-        wal: Wal,
+        log: RaftLog,
         config: Config,
         is_spectator: bool,
     ) !Node {
@@ -78,7 +73,7 @@ pub const Node = struct {
             .peers = peers,
             .current_term = 0,
             .voted_for = null,
-            .log = Log.init(allocator),
+            .log = log,
             .state = .follower,
             .commit_index = 0,
             .last_applied = 0,
@@ -87,10 +82,7 @@ pub const Node = struct {
             .peer_states = std.AutoHashMap(NodeId, PeerState).init(allocator),
             .elapsed_ticks = 0,
             .election_timeout = config.election_timeout_min_ticks,
-            .election_timeout_min = config.election_timeout_min_ticks,
-            .election_timeout_max = config.election_timeout_max_ticks,
-            .heartbeat_interval = config.heartbeat_ticks,
-            .wal = wal,
+            .config = config,
             .allocator = allocator,
             .outbox = std.ArrayList(Outbound).empty,
             .prng = prng,
@@ -103,7 +95,6 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
-        self.log.deinit();
         self.votes_received.deinit();
         self.peer_states.deinit();
         self.outbox.deinit(self.allocator);
@@ -112,7 +103,7 @@ pub const Node = struct {
     pub fn tick(self: *Node) RaftError!void {
         self.elapsed_ticks += 1;
         switch (self.state) {
-            .leader => if (self.elapsed_ticks >= self.heartbeat_interval) {
+            .leader => if (self.elapsed_ticks >= self.config.heartbeat_ticks) {
                 self.elapsed_ticks = 0;
                 try self.broadcastHeartbeat();
             },
@@ -170,9 +161,8 @@ pub const Node = struct {
         self.elapsed_ticks = 0;
 
         self.peer_states.clearRetainingCapacity();
-        const next_index = self.log.lastIndex() + 1;
         for (self.peers) |peer| {
-            try self.peer_states.put(peer, .{ .next_index = next_index, .match_index = 0 });
+            try self.peer_states.put(peer, .{ .next_index = 1, .match_index = 0 });
         }
 
         try self.broadcastHeartbeat();
@@ -185,9 +175,17 @@ pub const Node = struct {
     }
 
     pub fn sendAppendEntries(self: *Node, peer: NodeId) RaftError!void {
-        const prev_index = self.log.lastIndex();
-        const prev_term = self.log.lastTerm();
-        const entries = &[_]LogEntry{};
+        if (self.state != .leader) return;
+        const state = self.peer_states.getPtr(peer) orelse return;
+        const next_index = state.next_index;
+        const prev_index = if (next_index == 0) 0 else next_index - 1;
+        var prev_term: u64 = 0;
+        if (prev_index != 0) {
+            if (self.log.entry(prev_index)) |log_entry| {
+                prev_term = log_entry.term;
+            }
+        }
+        const entries = self.log.entriesFrom(next_index, self.config.max_entries_per_msg);
         const ae = AppendEntries{
             .term = self.current_term,
             .leader_id = self.id,
@@ -269,7 +267,7 @@ pub const Node = struct {
         self.resetElectionTimeout();
 
         if (ae.prev_log_index > 0) {
-            const prev = self.log.getEntry(ae.prev_log_index);
+            const prev = self.log.entry(ae.prev_log_index);
             if (prev == null or prev.?.term != ae.prev_log_term) {
                 self.send(ae.leader_id, Message{ .append_entries_reply = .{
                     .term = self.current_term,
@@ -284,14 +282,25 @@ pub const Node = struct {
         }
 
         if (ae.entries.len > 0) {
-            const first_new_index = ae.prev_log_index + 1;
-            if (self.log.getEntry(first_new_index)) |existing| {
-                if (existing.term != ae.entries[0].term) {
-                    self.log.truncateFrom(first_new_index);
+            var append_from: ?usize = null;
+            for (ae.entries, 0..) |log_entry, i| {
+                if (self.log.entry(log_entry.index)) |existing| {
+                    if (existing.term != log_entry.term) {
+                        self.log.truncateFrom(log_entry.index);
+                        append_from = i;
+                        break;
+                    }
+                } else {
+                    append_from = i;
+                    break;
                 }
             }
-            try self.log.appendSlice(ae.entries);
-            try self.persistLog(ae.entries);
+
+            if (append_from) |start| {
+                const slice = ae.entries[start..];
+                try self.log.append(slice);
+                try self.log.sync();
+            }
         }
 
         if (ae.leader_commit > self.commit_index) {
@@ -333,10 +342,11 @@ pub const Node = struct {
 
     pub fn propose(self: *Node, data: []const u8) RaftError!u64 {
         if (self.state != .leader) return RaftError.NotLeader;
+
         const new_index = self.log.lastIndex() + 1;
         const entry = LogEntry{ .index = new_index, .term = self.current_term, .data = data };
-        try self.log.append(entry);
-        try self.persistLog(&[_]LogEntry{entry});
+        try self.log.append(&[_]LogEntry{entry});
+        try self.log.sync();
         for (self.peers) |peer| {
             try self.sendAppendEntries(peer);
         }
@@ -356,13 +366,13 @@ pub const Node = struct {
     }
 
     pub fn persistHardState(self: *Node) RaftError!void {
-        try self.wal.writeHardState(self.current_term, self.voted_for);
-        try self.wal.sync();
+        try self.log.setHardState(.{ .current_term = self.current_term, .voted_for = self.voted_for });
+        try self.log.sync();
     }
 
     pub fn persistLog(self: *Node, entries: []const LogEntry) RaftError!void {
-        try self.wal.appendEntries(entries);
-        try self.wal.sync();
+        try self.log.append(entries);
+        try self.log.sync();
     }
 
     pub fn isLogUpToDate(self: *const Node, candidate_term: u64, candidate_index: u64) bool {
@@ -393,7 +403,11 @@ pub const Node = struct {
 
     fn resetElectionTimeout(self: *Node) void {
         const rand = self.prng.random();
-        self.election_timeout = rand.intRangeAtMost(u32, self.election_timeout_min, self.election_timeout_max);
+        self.election_timeout = rand.intRangeAtMost(
+            u32,
+            self.config.election_timeout_min_ticks,
+            self.config.election_timeout_max_ticks,
+        );
     }
 
     fn stepDown(self: *Node, new_term: u64) RaftError!void {

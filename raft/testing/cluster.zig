@@ -1,7 +1,5 @@
 const std = @import("std");
 const raft = @import("raft");
-const mem_wal = @import("mem_wal.zig");
-
 pub const Node = raft.Node;
 pub const NodeId = raft.NodeId;
 pub const Message = raft.Message;
@@ -9,11 +7,12 @@ pub const Config = raft.Config;
 
 pub const TestCluster = struct {
     allocator: std.mem.Allocator,
-    nodes: std.AutoHashMap(NodeId, MetaNode),
+    nodes: std.AutoHashMap(NodeId, *MetaNode),
+    drop_from: std.AutoHashMap(NodeId, void),
 
     pub const MetaNode = struct {
         node: Node,
-        wal: mem_wal.MemWal,
+        log: raft.MemRaftLog,
         inbox: std.ArrayList(Message),
         peers: []const NodeId,
     };
@@ -24,66 +23,74 @@ pub const TestCluster = struct {
         spectators: []const NodeId,
         config: Config,
     ) !TestCluster {
-        var nodes = std.AutoHashMap(NodeId, MetaNode).init(allocator);
+        var nodes = std.AutoHashMap(NodeId, *MetaNode).init(allocator);
+        const drop_from = std.AutoHashMap(NodeId, void).init(allocator);
         try nodes.ensureTotalCapacity(@intCast(ids.len));
 
         for (ids) |id| {
-            var wal = mem_wal.MemWal.init(allocator);
-            const inbox = std.ArrayList(Message).empty;
             const peers = try buildPeers(allocator, ids, id);
             const is_spectator = containsNode(spectators, id);
 
-            const node = try Node.init(
+            var entry = try allocator.create(MetaNode);
+            entry.* = .{
+                .node = undefined,
+                .log = raft.MemRaftLog.init(allocator),
+                .inbox = std.ArrayList(Message).empty,
+                .peers = peers,
+            };
+            entry.node = try Node.init(
                 allocator,
                 id,
                 peers,
-                wal.asWal(),
+                entry.log.asRaftLog(),
                 config,
                 is_spectator,
             );
 
-            try nodes.put(id, .{
-                .node = node,
-                .wal = wal,
-                .inbox = inbox,
-                .peers = peers,
-            });
+            try nodes.put(id, entry);
         }
 
         return .{
             .allocator = allocator,
             .nodes = nodes,
+            .drop_from = drop_from,
         };
     }
 
     pub fn deinit(self: *TestCluster) void {
         var it = self.nodes.valueIterator();
-        while (it.next()) |entry| {
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
             entry.node.deinit();
-            entry.wal.deinit();
+            entry.log.deinit();
             entry.inbox.deinit(self.allocator);
             self.allocator.free(entry.peers);
+            self.allocator.destroy(entry);
         }
         self.nodes.deinit();
+        self.drop_from.deinit();
     }
 
     pub fn tickAll(self: *TestCluster) !void {
         var it = self.nodes.valueIterator();
-        while (it.next()) |entry| {
-            try entry.node.tick();
+        while (it.next()) |entry_ptr| {
+            try entry_ptr.*.node.tick();
         }
         self.deliverOutbox();
     }
 
     pub fn deliverOutbox(self: *TestCluster) void {
         var it = self.nodes.valueIterator();
-        while (it.next()) |entry| {
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (self.drop_from.contains(entry.node.id)) {
+                entry.node.clearOutbox();
+                continue;
+            }
             const outbox = entry.node.takeOutbox();
             if (outbox.len == 0) continue;
             for (outbox) |msg| {
-                // Can't use this because we're not using outbox. Only inbox.
-                // entry.node.send(msg.to, msg.msg);
-                if (self.nodes.getPtr(msg.to)) |dest| {
+                if (self.nodes.get(msg.to)) |dest| {
                     _ = dest.inbox.append(self.allocator, msg.msg) catch {
                         @panic("raft: inbox append failed");
                     };
@@ -95,7 +102,8 @@ pub const TestCluster = struct {
 
     pub fn deliverInbox(self: *TestCluster) !void {
         var it = self.nodes.valueIterator();
-        while (it.next()) |entry| {
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
             if (entry.inbox.items.len == 0) continue;
             for (entry.inbox.items) |msg| {
                 try entry.node.handleMessage(msg);
@@ -114,8 +122,18 @@ pub const TestCluster = struct {
     }
 
     pub fn getNode(self: *TestCluster, id: NodeId) ?*Node {
-        const entry = self.nodes.getPtr(id) orelse return null;
+        const entry = self.nodes.get(id) orelse return null;
         return &entry.node;
+    }
+
+    pub fn setDropFrom(self: *TestCluster, id: NodeId, drop: bool) void {
+        if (drop) {
+            _ = self.drop_from.put(id, {}) catch {
+                @panic("raft: drop_from insert failed");
+            };
+        } else {
+            _ = self.drop_from.remove(id);
+        }
     }
 
     fn buildPeers(allocator: std.mem.Allocator, ids: []const NodeId, self_id: NodeId) ![]const NodeId {

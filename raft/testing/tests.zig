@@ -20,7 +20,8 @@ fn defaultConfig() Config {
 fn findLeader(cluster: *TestCluster) ?NodeId {
     var it = cluster.nodes.valueIterator();
     while (it.next()) |entry| {
-        if (entry.node.isLeader()) return entry.node.id;
+        const node = entry.*.node;
+        if (node.isLeader()) return node.id;
     }
     return null;
 }
@@ -29,7 +30,8 @@ fn countLeaders(cluster: *TestCluster) usize {
     var count: usize = 0;
     var it = cluster.nodes.valueIterator();
     while (it.next()) |entry| {
-        if (entry.node.isLeader()) count += 1;
+        const node = entry.*.node;
+        if (node.isLeader()) count += 1;
     }
     return count;
 }
@@ -64,6 +66,24 @@ test "heartbeats keep followers stable" {
     try std.testing.expectEqual(@as(usize, 1), countLeaders(&cluster));
 }
 
+test "leader re-election after isolation" {
+    const cfg = defaultConfig();
+    var ids = [_]NodeId{ 1, 2, 3 };
+
+    var cluster = try TestCluster.init(std.testing.allocator, &ids, &[_]NodeId{}, cfg);
+    defer cluster.deinit();
+
+    try cluster.runTicks(20);
+    const leader1 = findLeader(&cluster) orelse return error.NoLeader;
+
+    cluster.setDropFrom(leader1, true);
+    try cluster.runTicks(30);
+
+    const leader2 = findLeader(&cluster) orelse return error.NoLeader;
+    try std.testing.expect(leader2 != leader1);
+    try std.testing.expectEqual(@as(usize, 1), countLeaders(&cluster));
+}
+
 test "spectator never votes or becomes leader" {
     const cfg = defaultConfig();
     var ids = [_]NodeId{ 1, 2, 3, 4 };
@@ -92,7 +112,7 @@ test "candidate steps down on higher term" {
     var cluster = try TestCluster.init(std.testing.allocator, &ids, &[_]NodeId{}, cfg);
     defer cluster.deinit();
 
-    try cluster.runTicks(10);
+    try cluster.runTicks(20);
 
     const leader = findLeader(&cluster) orelse return error.NoLeader;
     const follower_id: NodeId = if (leader == 1) 2 else 1;
@@ -114,4 +134,47 @@ test "candidate steps down on higher term" {
 
     try std.testing.expect(!leader_node.isLeader());
     try std.testing.expect(leader_node.current_term == higher_term);
+}
+
+test "log replication" {
+    const cfg = defaultConfig();
+    var ids = [_]NodeId{ 1, 2, 3 };
+
+    var cluster = try TestCluster.init(std.testing.allocator, &ids, &[_]NodeId{}, cfg);
+    defer cluster.deinit();
+
+    try cluster.runTicks(20);
+    const leader = findLeader(&cluster) orelse return error.NoLeader;
+    const leader_node = cluster.getNode(leader) orelse return error.MissingNode;
+
+    var prng = std.Random.DefaultPrng.init(1234567);
+    const rand = prng.random();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var expected = std.ArrayList([]const u8).empty;
+    defer expected.deinit(alloc);
+
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        const len = rand.intRangeAtMost(u8, 1, 16);
+        const buf = try alloc.alloc(u8, len);
+        rand.bytes(buf);
+        const dup = try alloc.dupe(u8, buf);
+        try expected.append(alloc, dup);
+        _ = try leader_node.propose(buf);
+        try cluster.runTicks(5);
+    }
+
+    var it = cluster.nodes.valueIterator();
+    while (it.next()) |entry| {
+        const node = entry.*.node;
+        if (node.id == leader) continue;
+        try std.testing.expectEqual(@as(u64, @intCast(expected.items.len)), node.log.lastIndex());
+        for (expected.items, 0..) |data, idx| {
+            const entry_log = node.log.entry(@intCast(idx + 1)) orelse return error.MissingEntry;
+            try std.testing.expectEqualSlices(u8, data, entry_log.data);
+        }
+    }
 }
