@@ -9,8 +9,12 @@ pub fn build(b: *std.Build) void {
     const schema_mod = addSchemaModule(b, target, optimize);
 
     addZbufCli(b, target, optimize, schema_mod);
-    addZbufTests(b, target, optimize, schema_mod);
-    addRaftTests(b, target, optimize);
+    const zbuf_test_step = addZbufTests(b, target, optimize, schema_mod);
+    const raft_test_step = addRaftTests(b, target, optimize);
+
+    const all_test_step = b.step("test", "Run all tests");
+    all_test_step.dependOn(zbuf_test_step);
+    all_test_step.dependOn(raft_test_step);
 }
 
 fn addServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
@@ -81,7 +85,7 @@ fn addZbufCli(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     zbuf_cli_step.dependOn(&run_zbuf_gen_dyn.step);
 }
 
-fn addZbufTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, schema_mod: *std.Build.Module) void {
+fn addZbufTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, schema_mod: *std.Build.Module) *std.Build.Step {
     const zbuf_mod = b.createModule(.{
         .root_source_file = b.path("zbuf.zig"),
         .target = target,
@@ -142,9 +146,10 @@ fn addZbufTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
     const zbuf_test_step = b.step("test-zbuf", "Run zbuf serialization tests");
     zbuf_test_step.dependOn(&run_zbuf_tests.step);
     zbuf_test_step.dependOn(&run_zbuf_negative_tests.step);
+    return zbuf_test_step;
 }
 
-fn addRaftTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+fn addRaftTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step {
     const raft_mod = b.createModule(.{
         .root_source_file = b.path("raft/raft.zig"),
         .target = target,
@@ -163,4 +168,5 @@ fn addRaftTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
 
     const raft_test_step = b.step("test-raft", "Run raft tests");
     raft_test_step.dependOn(&run_raft_tests.step);
+    return raft_test_step;
 }
