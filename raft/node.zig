@@ -14,6 +14,14 @@ pub const AppendEntries = msg.AppendEntries;
 pub const AppendEntriesReply = msg.AppendEntriesReply;
 pub const LogEntry = msg.LogEntry;
 pub const State = msg.State;
+pub const EntryType = msg.EntryType;
+pub const ConfChange = msg.ConfChange;
+pub const ConfChangeType = msg.ConfChangeType;
+
+pub const PeerRole = enum {
+    voter,
+    learner,
+};
 
 pub const Config = config_mod.Config;
 pub const RaftLog = raftlog_mod.RaftLog;
@@ -22,11 +30,14 @@ pub const RaftLogError = raftlog_mod.RaftLogError;
 pub const RaftError = error{
     NotLeader,
     InvalidMessage,
+    ConfChangeInProgress,
 } || RaftLogError;
 
-pub const PeerState = struct {
+pub const Peer = struct {
     next_index: u64,
+    // Highest log index known to be replicated on this peer (leader view).
     match_index: u64,
+    role: PeerRole,
 };
 
 pub const Outbound = struct {
@@ -36,7 +47,7 @@ pub const Outbound = struct {
 
 pub const Node = struct {
     id: NodeId,
-    peers: []const NodeId,
+    peers: std.AutoHashMap(NodeId, Peer),
 
     current_term: u64,
     voted_for: ?NodeId,
@@ -46,10 +57,12 @@ pub const Node = struct {
     commit_index: u64,
     last_applied: u64,
     leader_id: ?NodeId,
+    pending_conf_change: bool,
+    quorum_size: usize,
 
     votes_received: std.AutoHashMap(NodeId, void),
     prevotes_received: std.AutoHashMap(NodeId, void),
-    peer_states: std.AutoHashMap(NodeId, PeerState),
+    // peers map stores both membership role and replication state.
 
     elapsed_ticks: u32,
     election_timeout: u32,
@@ -66,14 +79,14 @@ pub const Node = struct {
         peers: []const NodeId,
         log: RaftLog,
         config: Config,
-        is_spectator: bool,
+        is_learner: bool,
     ) !Node {
         try config.validate();
         const seed = @as(u64, @intCast(std.time.nanoTimestamp()));
         const prng = std.Random.DefaultPrng.init(seed ^ id);
         var node = Node{
             .id = id,
-            .peers = peers,
+            .peers = std.AutoHashMap(NodeId, Peer).init(allocator),
             .current_term = 0,
             .voted_for = null,
             .log = log,
@@ -81,9 +94,10 @@ pub const Node = struct {
             .commit_index = 0,
             .last_applied = 0,
             .leader_id = null,
+            .pending_conf_change = false,
+            .quorum_size = 1,
             .votes_received = std.AutoHashMap(NodeId, void).init(allocator),
             .prevotes_received = std.AutoHashMap(NodeId, void).init(allocator),
-            .peer_states = std.AutoHashMap(NodeId, PeerState).init(allocator),
             .elapsed_ticks = 0,
             .election_timeout = config.election_timeout_min_ticks,
             .config = config,
@@ -91,9 +105,13 @@ pub const Node = struct {
             .outbox = std.ArrayList(Outbound).empty,
             .prng = prng,
         };
-        if (is_spectator) {
-            node.state = .spectator;
+        for (peers) |peer_id| {
+            try node.peers.put(peer_id, .{ .next_index = 1, .match_index = 0, .role = .voter });
         }
+        if (is_learner) {
+            node.state = .learner;
+        }
+        node.recomputeQuorum();
         node.resetElectionTimeout();
         return node;
     }
@@ -101,7 +119,7 @@ pub const Node = struct {
     pub fn deinit(self: *Node) void {
         self.votes_received.deinit();
         self.prevotes_received.deinit();
-        self.peer_states.deinit();
+        self.peers.deinit();
         self.outbox.deinit(self.allocator);
     }
 
@@ -119,7 +137,7 @@ pub const Node = struct {
                     try self.startElection();
                 }
             },
-            .spectator => {},
+            .learner => {},
         }
     }
 
@@ -140,7 +158,7 @@ pub const Node = struct {
     }
 
     pub fn startPreVote(self: *Node) RaftError!void {
-        if (self.state == .spectator) return;
+        if (self.state == .learner) return;
         self.elapsed_ticks = 0;
         self.resetElectionTimeout();
 
@@ -154,13 +172,14 @@ pub const Node = struct {
             .last_log_term = self.log.lastTerm(),
         };
 
-        for (self.peers) |peer| {
-            self.send(peer, Message{ .pre_vote = pv });
+        var it = self.peers.iterator();
+        while (it.next()) |kv| {
+            self.send(kv.key_ptr.*, Message{ .pre_vote = pv });
         }
     }
 
     pub fn startElection(self: *Node) RaftError!void {
-        if (self.state == .spectator) return;
+        if (self.state == .learner) return;
         self.state = .candidate;
         self.current_term += 1;
         self.voted_for = self.id;
@@ -180,34 +199,37 @@ pub const Node = struct {
             .last_log_term = self.log.lastTerm(),
         };
 
-        for (self.peers) |peer| {
-            self.send(peer, Message{ .request_vote = rv });
+        var it = self.peers.iterator();
+        while (it.next()) |kv| {
+            self.send(kv.key_ptr.*, Message{ .request_vote = rv });
         }
     }
 
     pub fn becomeLeader(self: *Node) RaftError!void {
-        if (self.state == .spectator) return;
+        if (self.state == .learner) return;
         self.state = .leader;
         self.leader_id = self.id;
         self.elapsed_ticks = 0;
 
-        self.peer_states.clearRetainingCapacity();
-        for (self.peers) |peer| {
-            try self.peer_states.put(peer, .{ .next_index = 1, .match_index = 0 });
+        var it = self.peers.iterator();
+        while (it.next()) |kv| {
+            kv.value_ptr.next_index = 1;
+            kv.value_ptr.match_index = 0;
         }
 
         try self.broadcastHeartbeat();
     }
 
     pub fn broadcastHeartbeat(self: *Node) RaftError!void {
-        for (self.peers) |peer| {
-            try self.sendAppendEntries(peer);
+        var it = self.peers.iterator();
+        while (it.next()) |kv| {
+            try self.sendAppendEntries(kv.key_ptr.*);
         }
     }
 
     pub fn sendAppendEntries(self: *Node, peer: NodeId) RaftError!void {
         if (self.state != .leader) return;
-        const state = self.peer_states.getPtr(peer) orelse return;
+        const state = self.peers.getPtr(peer) orelse return;
         const next_index = state.next_index;
         const prev_index = if (next_index == 0) 0 else next_index - 1;
         var prev_term: u64 = 0;
@@ -238,7 +260,7 @@ pub const Node = struct {
             return;
         }
 
-        if (self.state == .spectator) {
+        if (self.state == .learner) {
             self.send(rv.candidate_id, Message{ .request_vote_reply = .{
                 .term = self.current_term,
                 .vote_granted = false,
@@ -267,7 +289,7 @@ pub const Node = struct {
     }
 
     pub fn handlePreVote(self: *Node, pv: PreVote) RaftError!void {
-        if (self.state == .spectator) {
+        if (self.state == .learner) {
             self.send(pv.candidate_id, Message{ .pre_vote_reply = .{
                 .term = self.current_term,
                 .vote_granted = false,
@@ -293,7 +315,7 @@ pub const Node = struct {
     }
 
     pub fn handlePreVoteReply(self: *Node, pvr: PreVoteReply) RaftError!void {
-        if (self.state == .spectator) return;
+        if (self.state == .learner) return;
         if (pvr.term < self.current_term) return;
         if (!pvr.vote_granted) return;
 
@@ -327,7 +349,7 @@ pub const Node = struct {
             return;
         }
 
-        if (self.state != .follower and self.state != .spectator) {
+        if (self.state != .follower and self.state != .learner) {
             self.state = .follower;
         }
         self.leader_id = ae.leader_id;
@@ -375,6 +397,7 @@ pub const Node = struct {
             const last_index = self.log.lastIndex();
             self.commit_index = if (ae.leader_commit < last_index) ae.leader_commit else last_index;
         }
+        self.applyCommitted();
 
         self.send(ae.leader_id, Message{ .append_entries_reply = .{
             .term = self.current_term,
@@ -391,7 +414,7 @@ pub const Node = struct {
         if (aer.term < self.current_term) return;
 
         if (!aer.success) {
-            if (self.peer_states.getPtr(aer.from)) |state| {
+            if (self.peers.getPtr(aer.from)) |state| {
                 if (aer.conflict_index > 0) {
                     state.next_index = aer.conflict_index;
                 } else if (state.next_index > 1) {
@@ -401,11 +424,12 @@ pub const Node = struct {
             return;
         }
 
-        if (self.peer_states.getPtr(aer.from)) |state| {
+        if (self.peers.getPtr(aer.from)) |state| {
             state.match_index = aer.match_index;
             state.next_index = aer.match_index + 1;
         }
         self.advanceCommitIndex();
+        self.applyCommitted();
     }
 
     pub fn propose(self: *Node, data: []const u8) RaftError!u64 {
@@ -415,8 +439,31 @@ pub const Node = struct {
         const entry = LogEntry{ .index = new_index, .term = self.current_term, .data = data };
         try self.log.append(&[_]LogEntry{entry});
         try self.log.sync();
-        for (self.peers) |peer| {
-            try self.sendAppendEntries(peer);
+        var it = self.peers.iterator();
+        while (it.next()) |kv| {
+            try self.sendAppendEntries(kv.key_ptr.*);
+        }
+        return new_index;
+    }
+
+    pub fn proposeConfChange(self: *Node, cc: ConfChange) RaftError!u64 {
+        if (self.state != .leader) return RaftError.NotLeader;
+        if (self.pending_conf_change) return RaftError.ConfChangeInProgress;
+
+        self.pending_conf_change = true;
+        const new_index = self.log.lastIndex() + 1;
+        const entry = LogEntry{
+            .index = new_index,
+            .term = self.current_term,
+            .ty = .conf_change,
+            .conf_change = cc,
+            .data = &[_]u8{},
+        };
+        try self.log.append(&[_]LogEntry{entry});
+        try self.log.sync();
+        var it = self.peers.iterator();
+        while (it.next()) |kv| {
+            try self.sendAppendEntries(kv.key_ptr.*);
         }
         return new_index;
     }
@@ -430,7 +477,7 @@ pub const Node = struct {
     }
 
     pub fn clusterSize(self: *const Node) u32 {
-        return @intCast(self.peers.len + 1);
+        return @intCast(self.peers.count() + 1);
     }
 
     pub fn persistHardState(self: *Node) RaftError!void {
@@ -465,8 +512,78 @@ pub const Node = struct {
     }
 
     pub fn quorumSize(self: *const Node) usize {
-        const size: usize = self.peers.len + 1;
-        return (size / 2) + 1;
+        return self.quorum_size;
+    }
+
+    pub fn applyCommitted(self: *Node) void {
+        while (self.last_applied < self.commit_index) {
+            self.last_applied += 1;
+            const entry = self.log.entry(self.last_applied) orelse continue;
+            if (entry.ty == .conf_change and entry.conf_change != null) {
+                self.applyConfChange(entry.conf_change.?);
+                self.pending_conf_change = false;
+            } else {
+                // normal entry -> apply to state machine (not yet wired)
+            }
+        }
+    }
+
+    fn applyConfChange(self: *Node, cc: ConfChange) void {
+        switch (cc.change_type) {
+            .add_voter => self.addPeer(cc.node_id, .voter),
+            .add_learner => self.addPeer(cc.node_id, .learner),
+            .to_voter => self.setPeerRole(cc.node_id, .voter),
+            .to_learner => self.setPeerRole(cc.node_id, .learner),
+            .remove_node => self.removePeer(cc.node_id),
+        }
+    }
+
+    fn hasPeer(self: *Node, id: NodeId) bool {
+        return self.peers.contains(id);
+    }
+
+    fn addPeer(self: *Node, id: NodeId, role: PeerRole) void {
+        if (self.hasPeer(id)) return;
+        _ = self.peers.put(id, .{ .next_index = self.log.lastIndex() + 1, .match_index = 0, .role = role }) catch {
+            @panic("raft: addPeer out of memory");
+        };
+        self.recomputeQuorum();
+    }
+
+    fn removePeer(self: *Node, id: NodeId) void {
+        _ = self.peers.remove(id);
+        self.recomputeQuorum();
+        if (id == self.id) {
+            self.state = .learner;
+        }
+    }
+
+    fn setPeerRole(self: *Node, id: NodeId, role: PeerRole) void {
+        if (self.peers.getPtr(id)) |peer| {
+            peer.role = role;
+            self.recomputeQuorum();
+        } else {
+            // If it's not a peer, treat as add with desired role.
+            self.addPeer(id, role);
+            return;
+        }
+        if (id == self.id) {
+            if (role == .learner) {
+                self.state = .learner;
+            } else if (self.state == .learner) {
+                self.state = .follower;
+            }
+        }
+    }
+
+    fn recomputeQuorum(self: *Node) void {
+        var voters: usize = 0;
+        if (self.state != .learner) voters += 1;
+        var it = self.peers.valueIterator();
+        while (it.next()) |peer| {
+            if (peer.role == .voter) voters += 1;
+        }
+        self.quorum_size = (voters / 2) + 1;
     }
 
     fn resetElectionTimeout(self: *Node) void {
@@ -479,8 +596,8 @@ pub const Node = struct {
     }
 
     fn stepDown(self: *Node, new_term: u64) RaftError!void {
-        if (self.state == .spectator) {
-            self.state = .spectator;
+        if (self.state == .learner) {
+            self.state = .learner;
         } else {
             self.state = .follower;
         }

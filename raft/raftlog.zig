@@ -280,6 +280,8 @@ pub const MemRaftLog = struct {
                 .index = log_entry.index,
                 .term = log_entry.term,
                 .data = data_copy,
+                .ty = log_entry.ty,
+                .conf_change = log_entry.conf_change,
             });
         }
     }

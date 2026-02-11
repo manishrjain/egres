@@ -20,7 +20,7 @@ pub const TestCluster = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         ids: []const NodeId,
-        spectators: []const NodeId,
+        learners: []const NodeId,
         config: Config,
     ) !TestCluster {
         var nodes = std.AutoHashMap(NodeId, *MetaNode).init(allocator);
@@ -29,7 +29,7 @@ pub const TestCluster = struct {
 
         for (ids) |id| {
             const peers = try buildPeers(allocator, ids, id);
-            const is_spectator = containsNode(spectators, id);
+            const is_learner = containsNode(learners, id);
 
             var entry = try allocator.create(MetaNode);
             entry.* = .{
@@ -44,7 +44,7 @@ pub const TestCluster = struct {
                 peers,
                 entry.log.asRaftLog(),
                 config,
-                is_spectator,
+                is_learner,
             );
 
             try nodes.put(id, entry);

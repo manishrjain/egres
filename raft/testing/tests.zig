@@ -84,12 +84,12 @@ test "leader re-election after isolation" {
     try std.testing.expectEqual(@as(usize, 1), countLeaders(&cluster));
 }
 
-test "spectator never votes or becomes leader" {
+test "learner never votes or becomes leader" {
     const cfg = defaultConfig();
     var ids = [_]NodeId{ 1, 2, 3, 4 };
-    var spectators = [_]NodeId{4};
+    var learners = [_]NodeId{4};
 
-    var cluster = try TestCluster.init(std.testing.allocator, &ids, &spectators, cfg);
+    var cluster = try TestCluster.init(std.testing.allocator, &ids, &learners, cfg);
     defer cluster.deinit();
 
     try cluster.runTicks(30);
@@ -99,7 +99,7 @@ test "spectator never votes or becomes leader" {
 
     if (cluster.getNode(4)) |node| {
         try std.testing.expect(!node.isLeader());
-        try std.testing.expect(node.state == .spectator);
+        try std.testing.expect(node.state == .learner);
     } else {
         return error.MissingNode;
     }
@@ -135,6 +135,36 @@ test "pre-vote avoids term bump without quorum" {
     try std.testing.expectEqual(term_before, node1_pre.current_term);
     // Without pre-vote, the node will start elections and bump term.
     try std.testing.expect(node1_no.current_term > term_before);
+}
+
+test "convert to voter and learner adjust quorum" {
+    var cfg = defaultConfig();
+    cfg.enable_prevote = false;
+    var ids = [_]NodeId{ 1, 2, 3 };
+
+    var cluster = try TestCluster.init(std.testing.allocator, &ids, &[_]NodeId{}, cfg);
+    defer cluster.deinit();
+
+    try cluster.runTicks(20);
+    const leader_id = findLeader(&cluster) orelse return error.NoLeader;
+    const leader = cluster.getNode(leader_id) orelse return error.MissingNode;
+
+    const quorum_before = leader.quorum_size;
+
+    _ = try leader.proposeConfChange(.{ .change_type = .add_learner, .node_id = 4 });
+    leader.commit_index = leader.log.lastIndex();
+    leader.applyCommitted();
+    try std.testing.expectEqual(quorum_before, leader.quorum_size);
+
+    _ = try leader.proposeConfChange(.{ .change_type = .to_voter, .node_id = 4 });
+    leader.commit_index = leader.log.lastIndex();
+    leader.applyCommitted();
+    try std.testing.expect(leader.quorum_size > quorum_before);
+
+    _ = try leader.proposeConfChange(.{ .change_type = .to_learner, .node_id = 4 });
+    leader.commit_index = leader.log.lastIndex();
+    leader.applyCommitted();
+    try std.testing.expectEqual(quorum_before, leader.quorum_size);
 }
 
 test "candidate steps down on higher term" {

@@ -4,7 +4,7 @@ pub const State = enum {
     follower,
     candidate,
     leader,
-    spectator,
+    learner,
 };
 
 pub const MessageType = enum {
@@ -16,10 +16,30 @@ pub const MessageType = enum {
     pre_vote_reply,
 };
 
+pub const EntryType = enum(u8) {
+    normal,
+    conf_change,
+};
+
+pub const ConfChangeType = enum(u8) {
+    add_voter,
+    add_learner,
+    to_voter,
+    to_learner,
+    remove_node,
+};
+
+pub const ConfChange = struct {
+    change_type: ConfChangeType,
+    node_id: NodeId,
+};
+
 pub const LogEntry = struct {
     index: u64,
     term: u64,
     data: []const u8,
+    ty: EntryType = .normal,
+    conf_change: ?ConfChange = null,
 };
 
 pub const RequestVote = struct {
