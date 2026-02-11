@@ -35,7 +35,7 @@ pub const LeafView = struct {
 
     pub const VERSION: u16 = 1;
     pub const TABLE_ID: u16 = 1;
-    pub const SIZE_BYTES: u16 = 16;
+    pub const SIZE_BYTES: u16 = 24;
 
     pub fn parseRoot(buf: []const u8) !Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -49,6 +49,15 @@ pub const LeafView = struct {
         const size_bytes = try zbuf.readU16(buf, @as(usize, base + 2));
         if (@as(usize, base) + @as(usize, size_bytes) > buf.len) return zbuf.Error.OutOfBounds;
         return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
+    }
+
+    pub fn leafHot(self: Self) bool {
+        const slot_end = @as(u32, self.base) + 24;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return false;
+        const word = zbuf.readU64(self.buf, @as(usize, self.base + 16)) catch 0;
+        const bit = @as(u6, @intCast(0));
+        return ((word >> bit) & 1) == 1;
     }
 
     pub fn tag(self: Self) u32 {
@@ -66,6 +75,20 @@ pub const LeafView = struct {
         const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 12)) catch 0;
         if (data_len == 0) return &[_]u8{};
         return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
+    }
+
+    pub fn leafFlags(self: Self) u64 {
+        const slot_end = @as(u32, self.base) + 24;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 16)) catch 0;
+    }
+
+    pub fn leafFlagsHasBit(self: Self, bit_index: u32) bool {
+        if (bit_index >= 64) return false;
+        const bit = @as(u6, @intCast(bit_index % 64));
+        const word = zbuf.readU64(self.buf, @as(usize, self.base + 16)) catch 0;
+        return ((word >> bit) & 1) == 1;
     }
 
     pub fn verify(self: Self) !void {
@@ -89,13 +112,25 @@ pub const LeafBuilder = struct {
     base: u32,
 
     pub const VERSION: u16 = 1;
-    pub const SIZE_BYTES: u16 = 16;
+    pub const SIZE_BYTES: u16 = 24;
 
     pub fn start(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) !Self {
         const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);
         try zbuf.writeU16At(buf.items, @as(usize, base), VERSION);
         try zbuf.writeU16At(buf.items, @as(usize, base + 2), SIZE_BYTES);
         return .{ .buf = buf, .alloc = alloc, .base = base };
+    }
+
+    pub fn setLeafHot(self: *Self, v: bool) !void {
+        const word_off = self.base + 16;
+        var word = try zbuf.readU64(self.buf.items, @as(usize, word_off));
+        const bit = @as(u6, @intCast(0));
+        if (v) {
+            word |= (@as(u64, 1) << bit);
+        } else {
+            word &= ~(@as(u64, 1) << bit);
+        }
+        try zbuf.patchU64(self.buf.items, word_off, word);
     }
 
     pub fn setTag(self: *Self, v: u32) !void {
@@ -114,6 +149,36 @@ pub const LeafBuilder = struct {
         try zbuf.patchU32(self.buf.items, self.base + 12, @as(u32, @intCast(data.len)));
     }
 
+    pub fn leafFlagsSet(self: *Self, v: u64) !void {
+        try zbuf.patchU64(self.buf.items, self.base + 16, v);
+    }
+
+    pub fn leafFlagsSetBit(self: *Self, bit_index: u32) !void {
+        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
+        const bit = @as(u6, @intCast(bit_index % 64));
+        const word_off = self.base + 16;
+        var word = try zbuf.readU64(self.buf.items, @as(usize, word_off));
+        word |= (@as(u64, 1) << bit);
+        try zbuf.patchU64(self.buf.items, word_off, word);
+    }
+
+    pub fn leafFlagsClearBit(self: *Self, bit_index: u32) !void {
+        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
+        const bit = @as(u6, @intCast(bit_index % 64));
+        const word_off = self.base + 16;
+        var word = try zbuf.readU64(self.buf.items, @as(usize, word_off));
+        word &= ~(@as(u64, 1) << bit);
+        try zbuf.patchU64(self.buf.items, word_off, word);
+    }
+
+    pub fn leafFlagsHasBit(self: *Self, bit_index: u32) !bool {
+        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
+        const bit = @as(u6, @intCast(bit_index % 64));
+        const word_off = self.base + 16;
+        const word = try zbuf.readU64(self.buf.items, @as(usize, word_off));
+        return ((word >> bit) & 1) == 1;
+    }
+
     pub fn finish(self: *Self) u32 {
         return self.base;
     }
@@ -127,7 +192,7 @@ pub const NodeView = struct {
 
     pub const VERSION: u16 = 1;
     pub const TABLE_ID: u16 = 2;
-    pub const SIZE_BYTES: u16 = 32;
+    pub const SIZE_BYTES: u16 = 48;
 
     pub fn parseRoot(buf: []const u8) !Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -141,6 +206,42 @@ pub const NodeView = struct {
         const size_bytes = try zbuf.readU16(buf, @as(usize, base + 2));
         if (@as(usize, base) + @as(usize, size_bytes) > buf.len) return zbuf.Error.OutOfBounds;
         return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
+    }
+
+    pub fn isActive(self: Self) bool {
+        const slot_end = @as(u32, self.base) + 40;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return false;
+        const word = zbuf.readU64(self.buf, @as(usize, self.base + 32)) catch 0;
+        const bit = @as(u6, @intCast(0));
+        return ((word >> bit) & 1) == 1;
+    }
+
+    pub fn isDraining(self: Self) bool {
+        const slot_end = @as(u32, self.base) + 40;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return false;
+        const word = zbuf.readU64(self.buf, @as(usize, self.base + 32)) catch 0;
+        const bit = @as(u6, @intCast(33));
+        return ((word >> bit) & 1) == 1;
+    }
+
+    pub fn isBootstrapping(self: Self) bool {
+        const slot_end = @as(u32, self.base) + 48;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return false;
+        const word = zbuf.readU64(self.buf, @as(usize, self.base + 40)) catch 0;
+        const bit = @as(u6, @intCast(1));
+        return ((word >> bit) & 1) == 1;
+    }
+
+    pub fn isRetiring(self: Self) bool {
+        const slot_end = @as(u32, self.base) + 48;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return false;
+        const word = zbuf.readU64(self.buf, @as(usize, self.base + 40)) catch 0;
+        const bit = @as(u6, @intCast(41));
+        return ((word >> bit) & 1) == 1;
     }
 
     pub fn name(self: Self) []const u8 {
@@ -196,6 +297,34 @@ pub const NodeView = struct {
         return LeafView.init(self.buf, off) catch null;
     }
 
+    pub fn status(self: Self) u64 {
+        const slot_end = @as(u32, self.base) + 40;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 32)) catch 0;
+    }
+
+    pub fn statusHasBit(self: Self, bit_index: u32) bool {
+        if (bit_index >= 64) return false;
+        const bit = @as(u6, @intCast(bit_index % 64));
+        const word = zbuf.readU64(self.buf, @as(usize, self.base + 32)) catch 0;
+        return ((word >> bit) & 1) == 1;
+    }
+
+    pub fn lifecycle(self: Self) u64 {
+        const slot_end = @as(u32, self.base) + 48;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 40)) catch 0;
+    }
+
+    pub fn lifecycleHasBit(self: Self, bit_index: u32) bool {
+        if (bit_index >= 64) return false;
+        const bit = @as(u6, @intCast(bit_index % 64));
+        const word = zbuf.readU64(self.buf, @as(usize, self.base + 40)) catch 0;
+        return ((word >> bit) & 1) == 1;
+    }
+
     pub fn verify(self: Self) !void {
         if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
         const header_end = @as(u32, self.base) + self.size_bytes;
@@ -226,7 +355,7 @@ pub const NodeBuilder = struct {
     base: u32,
 
     pub const VERSION: u16 = 1;
-    pub const SIZE_BYTES: u16 = 32;
+    pub const SIZE_BYTES: u16 = 48;
 
     pub fn start(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) !Self {
         const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);
@@ -234,6 +363,54 @@ pub const NodeBuilder = struct {
         try zbuf.writeU16At(buf.items, @as(usize, base + 2), SIZE_BYTES);
         try zbuf.patchU32(buf.items, base + 28, zbuf.NullOffset);
         return .{ .buf = buf, .alloc = alloc, .base = base };
+    }
+
+    pub fn setIsActive(self: *Self, v: bool) !void {
+        const word_off = self.base + 32;
+        var word = try zbuf.readU64(self.buf.items, @as(usize, word_off));
+        const bit = @as(u6, @intCast(0));
+        if (v) {
+            word |= (@as(u64, 1) << bit);
+        } else {
+            word &= ~(@as(u64, 1) << bit);
+        }
+        try zbuf.patchU64(self.buf.items, word_off, word);
+    }
+
+    pub fn setIsDraining(self: *Self, v: bool) !void {
+        const word_off = self.base + 32;
+        var word = try zbuf.readU64(self.buf.items, @as(usize, word_off));
+        const bit = @as(u6, @intCast(33));
+        if (v) {
+            word |= (@as(u64, 1) << bit);
+        } else {
+            word &= ~(@as(u64, 1) << bit);
+        }
+        try zbuf.patchU64(self.buf.items, word_off, word);
+    }
+
+    pub fn setIsBootstrapping(self: *Self, v: bool) !void {
+        const word_off = self.base + 40;
+        var word = try zbuf.readU64(self.buf.items, @as(usize, word_off));
+        const bit = @as(u6, @intCast(1));
+        if (v) {
+            word |= (@as(u64, 1) << bit);
+        } else {
+            word &= ~(@as(u64, 1) << bit);
+        }
+        try zbuf.patchU64(self.buf.items, word_off, word);
+    }
+
+    pub fn setIsRetiring(self: *Self, v: bool) !void {
+        const word_off = self.base + 40;
+        var word = try zbuf.readU64(self.buf.items, @as(usize, word_off));
+        const bit = @as(u6, @intCast(41));
+        if (v) {
+            word |= (@as(u64, 1) << bit);
+        } else {
+            word &= ~(@as(u64, 1) << bit);
+        }
+        try zbuf.patchU64(self.buf.items, word_off, word);
     }
 
     pub fn setName(self: *Self, data: []const u8) !void {
@@ -266,6 +443,66 @@ pub const NodeBuilder = struct {
 
     pub fn setNodeLeaf(self: *Self, child_off: u32) !void {
         try zbuf.patchU32(self.buf.items, self.base + 28, child_off);
+    }
+
+    pub fn statusSet(self: *Self, v: u64) !void {
+        try zbuf.patchU64(self.buf.items, self.base + 32, v);
+    }
+
+    pub fn statusSetBit(self: *Self, bit_index: u32) !void {
+        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
+        const bit = @as(u6, @intCast(bit_index % 64));
+        const word_off = self.base + 32;
+        var word = try zbuf.readU64(self.buf.items, @as(usize, word_off));
+        word |= (@as(u64, 1) << bit);
+        try zbuf.patchU64(self.buf.items, word_off, word);
+    }
+
+    pub fn statusClearBit(self: *Self, bit_index: u32) !void {
+        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
+        const bit = @as(u6, @intCast(bit_index % 64));
+        const word_off = self.base + 32;
+        var word = try zbuf.readU64(self.buf.items, @as(usize, word_off));
+        word &= ~(@as(u64, 1) << bit);
+        try zbuf.patchU64(self.buf.items, word_off, word);
+    }
+
+    pub fn statusHasBit(self: *Self, bit_index: u32) !bool {
+        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
+        const bit = @as(u6, @intCast(bit_index % 64));
+        const word_off = self.base + 32;
+        const word = try zbuf.readU64(self.buf.items, @as(usize, word_off));
+        return ((word >> bit) & 1) == 1;
+    }
+
+    pub fn lifecycleSet(self: *Self, v: u64) !void {
+        try zbuf.patchU64(self.buf.items, self.base + 40, v);
+    }
+
+    pub fn lifecycleSetBit(self: *Self, bit_index: u32) !void {
+        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
+        const bit = @as(u6, @intCast(bit_index % 64));
+        const word_off = self.base + 40;
+        var word = try zbuf.readU64(self.buf.items, @as(usize, word_off));
+        word |= (@as(u64, 1) << bit);
+        try zbuf.patchU64(self.buf.items, word_off, word);
+    }
+
+    pub fn lifecycleClearBit(self: *Self, bit_index: u32) !void {
+        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
+        const bit = @as(u6, @intCast(bit_index % 64));
+        const word_off = self.base + 40;
+        var word = try zbuf.readU64(self.buf.items, @as(usize, word_off));
+        word &= ~(@as(u64, 1) << bit);
+        try zbuf.patchU64(self.buf.items, word_off, word);
+    }
+
+    pub fn lifecycleHasBit(self: *Self, bit_index: u32) !bool {
+        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
+        const bit = @as(u6, @intCast(bit_index % 64));
+        const word_off = self.base + 40;
+        const word = try zbuf.readU64(self.buf.items, @as(usize, word_off));
+        return ((word >> bit) & 1) == 1;
     }
 
     pub fn finish(self: *Self) u32 {

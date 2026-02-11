@@ -129,8 +129,19 @@ fn addZbufTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
     zbuf_tests.step.dependOn(&run_test_zbuf_gen.step);
 
     const run_zbuf_tests = b.addRunArtifact(zbuf_tests);
+
+    const zbuf_negative_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zbuf/negative_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_zbuf_negative_tests = b.addRunArtifact(zbuf_negative_tests);
+
     const zbuf_test_step = b.step("test-zbuf", "Run zbuf serialization tests");
     zbuf_test_step.dependOn(&run_zbuf_tests.step);
+    zbuf_test_step.dependOn(&run_zbuf_negative_tests.step);
 }
 
 fn addRaftTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {

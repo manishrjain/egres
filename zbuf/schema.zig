@@ -1,9 +1,10 @@
 const std = @import("std");
 
-pub const Kind = enum { u32, u64, bytes, array, table };
+pub const Kind = enum { u32, u64, bytes, array, table, b64, bool };
 
 pub const Field = struct {
     id: u32,
+    has_wire_id: bool,
     name: []const u8,
     ty: type,
 };
@@ -15,6 +16,18 @@ pub const U32 = struct {
 pub const U64 = struct {
     pub const schema_kind: Kind = .u64;
 };
+
+pub const B64 = struct {
+    pub const schema_kind: Kind = .b64;
+};
+
+pub fn Bool(comptime cfg: struct { field_id: u32, bit: u16 }) type {
+    return struct {
+        pub const schema_kind: Kind = .bool;
+        pub const bits_field_id: u32 = cfg.field_id;
+        pub const bit_index: u16 = cfg.bit;
+    };
+}
 
 pub const Bytes = struct {
     pub const schema_kind: Kind = .bytes;
@@ -54,7 +67,7 @@ pub fn requireKind(comptime T: type, comptime want: Kind) void {
 
 pub fn isScalar(comptime T: type) bool {
     return switch (kindOf(T)) {
-        .u32, .u64 => true,
+        .u32, .u64, .b64 => true,
         else => false,
     };
 }
@@ -80,10 +93,22 @@ pub fn slotSize(comptime T: type) u16 {
     return switch (kindOf(T)) {
         .u32 => 4,
         .u64 => 8,
+        .b64 => 8,
         .bytes => 8,
         .array => 8,
         .table => 4,
+        .bool => 0,
     };
+}
+
+pub fn boolFieldId(comptime T: type) u32 {
+    if (@hasDecl(T, "bits_field_id")) return T.bits_field_id;
+    return 0;
+}
+
+pub fn boolBitIndex(comptime T: type) u16 {
+    if (@hasDecl(T, "bit_index")) return T.bit_index;
+    return 0;
 }
 
 pub fn typeName(comptime T: type) []const u8 {
@@ -93,18 +118,34 @@ pub fn typeName(comptime T: type) []const u8 {
 pub fn sortFieldsById(comptime fields: anytype) [fields.len]Field {
     const count = fields.len;
     var out: [count]Field = undefined;
+
     inline for (fields, 0..) |f, i| {
-        out[i] = .{ .id = f.id, .name = f.name, .ty = f.ty };
+        const f_ty = @TypeOf(f);
+        var id: usize = 0;
+        if (kindOf(f.ty) == .bool) {
+            if (@hasField(f_ty, "id")) {
+                @compileError("Bool field must not declare .id");
+            }
+        } else {
+            if (!@hasField(f_ty, "id")) {
+                @compileError("non-Bool field missing required .id");
+            }
+            id = f.id;
+        }
+        out[i] = .{
+            .id = id,
+            .has_wire_id = (id == 0),
+            .name = f.name,
+            .ty = f.ty,
+        };
     }
 
     std.mem.sort(Field, out[0..], {}, fieldLessThan);
 
-    if (count > 1) {
-        var i: usize = 1;
-        while (i < count) : (i += 1) {
-            if (out[i - 1].id == out[i].id) {
-                @compileError("duplicate field id in schema");
-            }
+    var i: usize = 1;
+    while (i < out.len) : (i += 1) {
+        if (out[i - 1].id > 0 and out[i].id > 0 and out[i - 1].id == out[i].id) {
+            @compileError("duplicate field id in schema");
         }
     }
     return out;
