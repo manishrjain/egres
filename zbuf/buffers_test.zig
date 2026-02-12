@@ -1,14 +1,16 @@
 const std = @import("std");
 const gen = @import("buffers_gen");
 
-fn buildTable(alloc: std.mem.Allocator, set_root_node: bool) !std.ArrayList(u8) {
+fn buildTable(alloc: std.mem.Allocator, set_root_node: bool) !gen.TableBuffer {
     var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(alloc);
 
     var l1 = try gen.CellWriter.initWithBuf(alloc, &buf);
     try l1.setTag(1);
     try l1.setData("l1");
     try l1.setCellHot(true);
     const l1_res = try l1.finish();
+    try std.testing.expect(!l1_res.has_tail);
     const l1_off = l1_res.offset;
 
     var l2 = try gen.CellWriter.initWithBuf(alloc, &buf);
@@ -39,7 +41,7 @@ fn buildTable(alloc: std.mem.Allocator, set_root_node: bool) !std.ArrayList(u8) 
     try n2.setValue(2000);
     const no_leaves = [_]u32{};
     try n2.setCells(&no_leaves);
-    try n2.setRowCell(@import("zbuf").zbuf.NullOffset);
+    try n2.setRowCell(gen.NullOffset);
     try n2.statusSet(0x8);
     try n2.statusClearBit(3);
     try n2.setIsDraining(true);
@@ -55,20 +57,19 @@ fn buildTable(alloc: std.mem.Allocator, set_root_node: bool) !std.ArrayList(u8) 
     if (set_root_node) {
         try root.setTableRow(n1_off);
     } else {
-        try root.setTableRow(@import("zbuf").zbuf.NullOffset);
+        try root.setTableRow(gen.NullOffset);
     }
-    const root_res = try root.finish();
-    const root_off = root_res.offset;
-    try gen.addTail(alloc, &buf, gen.TableReader, root_off);
-
-    return buf;
+    var root_res = try root.finishWithTail();
+    root_res.bytes = try buf.toOwnedSlice(alloc); // Own the bytes.
+    return root_res;
 }
 
 test "zbuf format roundtrip" {
     var buf = try buildTable(std.testing.allocator, true);
-    defer buf.deinit(std.testing.allocator);
+    defer buf.deinit();
+    const bytes = buf.bytes orelse return error.Invalid;
 
-    const msg = try gen.parseMessageFromTail(buf.items);
+    const msg = try gen.parseMessageWithTail(bytes);
     const root = switch (msg) {
         .Table => |v| v,
         else => return error.Invalid,
@@ -139,7 +140,7 @@ test "bitset direct operations" {
     try payload.appendSlice(std.testing.allocator, buf.items);
     try gen.addTail(std.testing.allocator, &payload, gen.RowReader, off);
 
-    const msg = try gen.parseMessageFromTail(payload.items);
+    const msg = try gen.parseMessageWithTail(payload.items);
     const view = switch (msg) {
         .Row => |v| v,
         else => return error.Invalid,
@@ -169,7 +170,7 @@ test "multiple b64 backing fields stay independent" {
     try payload.appendSlice(std.testing.allocator, buf.items);
     try gen.addTail(std.testing.allocator, &payload, gen.RowReader, off);
 
-    const msg = try gen.parseMessageFromTail(payload.items);
+    const msg = try gen.parseMessageWithTail(payload.items);
     const view = switch (msg) {
         .Row => |v| v,
         else => return error.Invalid,
@@ -183,31 +184,28 @@ test "multiple b64 backing fields stay independent" {
 
 test "direct table null" {
     var buf = try buildTable(std.testing.allocator, false);
-    defer buf.deinit(std.testing.allocator);
+    defer buf.deinit();
 
-    const msg = try gen.parseMessageFromTail(buf.items);
-    const root = switch (msg) {
-        .Table => |v| v,
-        else => return error.Invalid,
-    };
+    const root = try buf.initReader();
     try std.testing.expect(root.tableRow() == null);
 }
 
 // Simulate a V2 append-only field by increasing size_bytes.
 test "size_bytes compatibility" {
     var buf = try buildTable(std.testing.allocator, true);
-    defer buf.deinit(std.testing.allocator);
+    defer buf.deinit();
+    const bytes = buf.bytes orelse return error.Invalid;
 
-    const tail = try @import("zbuf").zbuf.readMessageTail(buf.items);
+    const tail = try @import("zbuf").zbuf.readMessageTail(bytes);
     const base = tail.offset;
     const v1_size: u16 = gen.TableReader.SIZE_BYTES;
     const v2_size: u16 = v1_size + 4;
 
-    const slice = buf.items[base + 2 .. base + 4];
+    const slice = bytes[base + 2 .. base + 4];
     const ptr = @as(*[2]u8, @ptrCast(slice.ptr));
     std.mem.writeInt(u16, ptr, v2_size, .little);
 
-    const msg2 = try gen.parseMessageFromTail(buf.items);
+    const msg2 = try gen.parseMessageWithTail(bytes);
     const view = switch (msg2) {
         .Table => |v| v,
         else => return error.Invalid,
@@ -224,12 +222,27 @@ test "owned writer buffer can init reader" {
         .data = "xyz",
         .cell_hot = true,
     });
-    const out = try writer.finish();
-    const bytes = out.bytes orelse return error.Invalid;
-    defer std.testing.allocator.free(bytes);
+    var out = try writer.finish();
+    defer out.deinit();
+    try std.testing.expect(!out.has_tail);
+    _ = out.bytes orelse return error.Invalid;
 
     const reader = try out.initReader();
     try std.testing.expectEqual(@as(u32, 9), reader.tag());
     try std.testing.expectEqualSlices(u8, "xyz", reader.data());
     try std.testing.expect(reader.cellHot());
+}
+
+test "finishWithTail returns tail-wrapped owned bytes" {
+    var writer = try gen.TableWriter.init(std.testing.allocator);
+    defer writer.deinit();
+
+    try writer.setCount(7);
+    var out = try writer.finishWithTail();
+    defer out.deinit();
+    try std.testing.expect(out.has_tail);
+    _ = out.bytes orelse return error.Invalid;
+
+    const table = try out.initReader();
+    try std.testing.expectEqual(@as(u32, 7), table.count());
 }

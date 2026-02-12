@@ -2,6 +2,8 @@
 const std = @import("std");
 const zbuf = @import("zbuf").zbuf;
 
+pub const NullOffset: u32 = zbuf.NullOffset;
+
 pub fn addTail(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), comptime T: type, offset: u32) !void {
     try zbuf.appendMessageTail(buf, alloc, T.TABLE_ID, T.VERSION, offset);
 }
@@ -10,7 +12,7 @@ pub fn parseTail(buf: []const u8) !zbuf.MessageTail {
     return zbuf.readMessageTail(buf);
 }
 
-pub fn parseMessageFromTail(buf: []const u8) !MessageReader {
+pub fn parseMessageWithTail(buf: []const u8) !MessageReader {
     const tail = try zbuf.readMessageTail(buf);
     const payload_buf = buf[0 .. buf.len - zbuf.message_tail_size];
     return switch (tail.table_id) {
@@ -106,11 +108,19 @@ pub const CellReader = struct {
 };
 
 pub const CellBuffer = struct {
+    alloc: std.mem.Allocator,
     offset: u32,
     bytes: ?[]u8,
+    has_tail: bool,
     pub fn initReader(self: @This()) !CellReader {
         const payload = self.bytes orelse return zbuf.Error.Invalid;
         return CellReader.init(payload, self.offset);
+    }
+    pub fn deinit(self: *@This()) void {
+        if (self.bytes) |bytes| {
+            self.alloc.free(bytes);
+            self.bytes = null;
+        }
     }
 };
 
@@ -122,6 +132,7 @@ pub const CellWriter = struct {
     base: u32,
 
     pub const VERSION: u16 = 1;
+    pub const TABLE_ID: u16 = 1;
     pub const SIZE_BYTES: u16 = 24;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
@@ -227,9 +238,17 @@ pub const CellWriter = struct {
             const bytes = try owned.toOwnedSlice(self.alloc);
             self.alloc.destroy(owned);
             self.buf = null;
-            return .{ .offset = self.base, .bytes = bytes };
+            return .{ .alloc = self.alloc, .offset = self.base, .bytes = bytes, .has_tail = false };
         }
-        return .{ .offset = self.base, .bytes = null };
+        return .{ .alloc = self.alloc, .offset = self.base, .bytes = null, .has_tail = false };
+    }
+
+    pub fn finishWithTail(self: *Self) !CellBuffer {
+        const out = self.bufMut();
+        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, VERSION, self.base);
+        var result = try self.finish();
+        result.has_tail = true;
+        return result;
     }
 
     pub fn deinit(self: *Self) void {
@@ -409,11 +428,19 @@ pub const RowReader = struct {
 };
 
 pub const RowBuffer = struct {
+    alloc: std.mem.Allocator,
     offset: u32,
     bytes: ?[]u8,
+    has_tail: bool,
     pub fn initReader(self: @This()) !RowReader {
         const payload = self.bytes orelse return zbuf.Error.Invalid;
         return RowReader.init(payload, self.offset);
+    }
+    pub fn deinit(self: *@This()) void {
+        if (self.bytes) |bytes| {
+            self.alloc.free(bytes);
+            self.bytes = null;
+        }
     }
 };
 
@@ -425,6 +452,7 @@ pub const RowWriter = struct {
     base: u32,
 
     pub const VERSION: u16 = 1;
+    pub const TABLE_ID: u16 = 2;
     pub const SIZE_BYTES: u16 = 48;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
@@ -629,9 +657,17 @@ pub const RowWriter = struct {
             const bytes = try owned.toOwnedSlice(self.alloc);
             self.alloc.destroy(owned);
             self.buf = null;
-            return .{ .offset = self.base, .bytes = bytes };
+            return .{ .alloc = self.alloc, .offset = self.base, .bytes = bytes, .has_tail = false };
         }
-        return .{ .offset = self.base, .bytes = null };
+        return .{ .alloc = self.alloc, .offset = self.base, .bytes = null, .has_tail = false };
+    }
+
+    pub fn finishWithTail(self: *Self) !RowBuffer {
+        const out = self.bufMut();
+        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, VERSION, self.base);
+        var result = try self.finish();
+        result.has_tail = true;
+        return result;
     }
 
     pub fn deinit(self: *Self) void {
@@ -747,11 +783,19 @@ pub const TableReader = struct {
 };
 
 pub const TableBuffer = struct {
+    alloc: std.mem.Allocator,
     offset: u32,
     bytes: ?[]u8,
+    has_tail: bool,
     pub fn initReader(self: @This()) !TableReader {
         const payload = self.bytes orelse return zbuf.Error.Invalid;
         return TableReader.init(payload, self.offset);
+    }
+    pub fn deinit(self: *@This()) void {
+        if (self.bytes) |bytes| {
+            self.alloc.free(bytes);
+            self.bytes = null;
+        }
     }
 };
 
@@ -763,6 +807,7 @@ pub const TableWriter = struct {
     base: u32,
 
     pub const VERSION: u16 = 1;
+    pub const TABLE_ID: u16 = 3;
     pub const SIZE_BYTES: u16 = 28;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
@@ -841,9 +886,17 @@ pub const TableWriter = struct {
             const bytes = try owned.toOwnedSlice(self.alloc);
             self.alloc.destroy(owned);
             self.buf = null;
-            return .{ .offset = self.base, .bytes = bytes };
+            return .{ .alloc = self.alloc, .offset = self.base, .bytes = bytes, .has_tail = false };
         }
-        return .{ .offset = self.base, .bytes = null };
+        return .{ .alloc = self.alloc, .offset = self.base, .bytes = null, .has_tail = false };
+    }
+
+    pub fn finishWithTail(self: *Self) !TableBuffer {
+        const out = self.bufMut();
+        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, VERSION, self.base);
+        var result = try self.finish();
+        result.has_tail = true;
+        return result;
     }
 
     pub fn deinit(self: *Self) void {

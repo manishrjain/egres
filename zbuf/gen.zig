@@ -33,6 +33,7 @@ pub fn main() !void {
     // try w.print("// Generated at: {s}\n", .{ts_line});
     try w.writeAll("const std = @import(\"std\");\n");
     try w.writeAll("const zbuf = @import(\"zbuf\").zbuf;\n\n");
+    try w.writeAll("pub const NullOffset: u32 = zbuf.NullOffset;\n\n");
 
     // Emit code for each table declared in u/buffers.zig.
     // Emit tail helpers and message parser for this generated module.
@@ -282,11 +283,19 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     // Writer type
     // -------------------------
     try w.print("pub const {s}Buffer = struct {{\n", .{table_name});
+    try w.writeAll("    alloc: std.mem.Allocator,\n");
     try w.writeAll("    offset: u32,\n");
     try w.writeAll("    bytes: ?[]u8,\n");
+    try w.writeAll("    has_tail: bool,\n");
     try w.print("    pub fn initReader(self: @This()) !{s}Reader {{\n", .{table_name});
     try w.writeAll("        const payload = self.bytes orelse return zbuf.Error.Invalid;\n");
     try w.print("        return {s}Reader.init(payload, self.offset);\n", .{table_name});
+    try w.writeAll("    }\n");
+    try w.writeAll("    pub fn deinit(self: *@This()) void {\n");
+    try w.writeAll("        if (self.bytes) |bytes| {\n");
+    try w.writeAll("            self.alloc.free(bytes);\n");
+    try w.writeAll("            self.bytes = null;\n");
+    try w.writeAll("        }\n");
     try w.writeAll("    }\n");
     try w.writeAll("};\n\n");
 
@@ -297,6 +306,7 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     try w.writeAll("    alloc: std.mem.Allocator,\n");
     try w.writeAll("    base: u32,\n\n");
     try w.print("    pub const VERSION: u16 = {d};\n", .{1});
+    try w.print("    pub const TABLE_ID: u16 = {d};\n", .{table_id});
     try w.print("    pub const SIZE_BYTES: u16 = {d};\n\n", .{size_bytes});
 
     try w.writeAll("    fn bufMut(self: *Self) *std.ArrayList(u8) {\n");
@@ -449,9 +459,17 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     try w.writeAll("            const bytes = try owned.toOwnedSlice(self.alloc);\n");
     try w.writeAll("            self.alloc.destroy(owned);\n");
     try w.writeAll("            self.buf = null;\n");
-    try w.writeAll("            return .{ .offset = self.base, .bytes = bytes };\n");
+    try w.writeAll("            return .{ .alloc = self.alloc, .offset = self.base, .bytes = bytes, .has_tail = false };\n");
     try w.writeAll("        }\n");
-    try w.writeAll("        return .{ .offset = self.base, .bytes = null };\n");
+    try w.writeAll("        return .{ .alloc = self.alloc, .offset = self.base, .bytes = null, .has_tail = false };\n");
+    try w.writeAll("    }\n");
+    try w.writeAll("\n");
+    try w.print("    pub fn finishWithTail(self: *Self) !{s}Buffer {{\n", .{table_name});
+    try w.writeAll("        const out = self.bufMut();\n");
+    try w.writeAll("        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, VERSION, self.base);\n");
+    try w.writeAll("        var result = try self.finish();\n");
+    try w.writeAll("        result.has_tail = true;\n");
+    try w.writeAll("        return result;\n");
     try w.writeAll("    }\n");
     try w.writeAll("\n");
     try w.writeAll("    pub fn deinit(self: *Self) void {\n");
@@ -612,7 +630,7 @@ fn emitTailHelpers(w: anytype) !void {
     try w.writeAll("pub fn parseTail(buf: []const u8) !zbuf.MessageTail {\n");
     try w.writeAll("    return zbuf.readMessageTail(buf);\n");
     try w.writeAll("}\n\n");
-    try w.writeAll("pub fn parseMessageFromTail(buf: []const u8) !MessageReader {\n");
+    try w.writeAll("pub fn parseMessageWithTail(buf: []const u8) !MessageReader {\n");
     try w.writeAll("    const tail = try zbuf.readMessageTail(buf);\n");
     try w.writeAll("    const payload_buf = buf[0 .. buf.len - zbuf.message_tail_size];\n");
     try w.writeAll("    return switch (tail.table_id) {\n");
