@@ -206,6 +206,17 @@ pub const LeafWriter = struct {
         return ((word >> bit) & 1) == 1;
     }
 
+    pub fn set(self: *Self, values: anytype) !void {
+        const Values = @TypeOf(values);
+        if (@typeInfo(Values) != .@"struct") {
+            @compileError("set() expects a struct literal like .{ .field = value }");
+        }
+        if (@hasField(Values, "leaf_hot")) try self.setLeafHot(@field(values, "leaf_hot"));
+        if (@hasField(Values, "tag")) try self.setTag(@field(values, "tag"));
+        if (@hasField(Values, "data")) try self.setData(@field(values, "data"));
+        if (@hasField(Values, "leaf_flags")) try self.leafFlagsSet(@field(values, "leaf_flags"));
+    }
+
     pub fn finish(self: *Self) !LeafBuffer {
         if (self.owns_buf) {
             const owned = self.buf orelse return zbuf.Error.Invalid;
@@ -587,6 +598,23 @@ pub const NodeWriter = struct {
         return ((word >> bit) & 1) == 1;
     }
 
+    pub fn set(self: *Self, values: anytype) !void {
+        const Values = @TypeOf(values);
+        if (@typeInfo(Values) != .@"struct") {
+            @compileError("set() expects a struct literal like .{ .field = value }");
+        }
+        if (@hasField(Values, "is_active")) try self.setIsActive(@field(values, "is_active"));
+        if (@hasField(Values, "is_draining")) try self.setIsDraining(@field(values, "is_draining"));
+        if (@hasField(Values, "is_bootstrapping")) try self.setIsBootstrapping(@field(values, "is_bootstrapping"));
+        if (@hasField(Values, "is_retiring")) try self.setIsRetiring(@field(values, "is_retiring"));
+        if (@hasField(Values, "name")) try self.setName(@field(values, "name"));
+        if (@hasField(Values, "value")) try self.setValue(@field(values, "value"));
+        if (@hasField(Values, "leaves")) try self.setLeaves(@field(values, "leaves"));
+        if (@hasField(Values, "node_leaf")) try self.setNodeLeaf(@field(values, "node_leaf"));
+        if (@hasField(Values, "status")) try self.statusSet(@field(values, "status"));
+        if (@hasField(Values, "lifecycle")) try self.lifecycleSet(@field(values, "lifecycle"));
+    }
+
     pub fn finish(self: *Self) !NodeBuffer {
         if (self.owns_buf) {
             const owned = self.buf orelse return zbuf.Error.Invalid;
@@ -784,6 +812,17 @@ pub const RootWriter = struct {
         try zbuf.patchU32(out.items, self.base + 24, child_off);
     }
 
+    pub fn set(self: *Self, values: anytype) !void {
+        const Values = @TypeOf(values);
+        if (@typeInfo(Values) != .@"struct") {
+            @compileError("set() expects a struct literal like .{ .field = value }");
+        }
+        if (@hasField(Values, "nodes")) try self.setNodes(@field(values, "nodes"));
+        if (@hasField(Values, "payload")) try self.setPayload(@field(values, "payload"));
+        if (@hasField(Values, "count")) try self.setCount(@field(values, "count"));
+        if (@hasField(Values, "root_node")) try self.setRootNode(@field(values, "root_node"));
+    }
+
     pub fn finish(self: *Self) !RootBuffer {
         if (self.owns_buf) {
             const owned = self.buf orelse return zbuf.Error.Invalid;
@@ -806,3 +845,4 @@ pub const RootWriter = struct {
         }
     }
 };
+

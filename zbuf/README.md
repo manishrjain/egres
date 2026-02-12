@@ -40,7 +40,7 @@ var buf: std.ArrayList(u8) = .{};
 var root = try gen.RootWriter.initWithBuf(alloc, &buf);
 // set fields and finish
 const root_finish = try root.finish();
-const root_off = root_finish.root_off;
+const root_off = root_finish.offset;
 try gen.addTail(alloc, &buf, gen.RootView, root_off);
 
 const msg = try gen.parseMessageFromTail(buf.items);

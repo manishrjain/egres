@@ -9,27 +9,30 @@ fn buildRoot(alloc: std.mem.Allocator, set_root_node: bool) !std.ArrayList(u8) {
     try l1.setData("l1");
     try l1.setLeafHot(true);
     const l1_res = try l1.finish();
-    const l1_off = l1_res.root_off;
+    const l1_off = l1_res.offset;
 
     var l2 = try gen.LeafWriter.initWithBuf(alloc, &buf);
-    try l2.setTag(2);
-    try l2.setData("l2");
+    try l2.set(.{
+        .tag = 2,
+        .data = "l2",
+    });
     try l2.leafFlagsSetBit(3);
     try l2.leafFlagsClearBit(3);
     const l2_res = try l2.finish();
-    const l2_off = l2_res.root_off;
 
     var n1 = try gen.NodeWriter.initWithBuf(alloc, &buf);
     try n1.setName("n1");
-    try n1.setValue(1000);
-    const leaves = [_]u32{ l1_off, l2_off };
+    try n1.set(.{
+        .value = 1000,
+        .is_active = true,
+        .is_bootstrapping = true,
+    });
+    const leaves = [_]u32{ l1_off, l2_res.offset };
     try n1.setLeaves(&leaves);
     try n1.setNodeLeaf(l1_off);
-    try n1.setIsActive(true);
     try n1.statusSetBit(33);
-    try n1.setIsBootstrapping(true);
     const n1_res = try n1.finish();
-    const n1_off = n1_res.root_off;
+    const n1_off = n1_res.offset;
 
     var n2 = try gen.NodeWriter.initWithBuf(alloc, &buf);
     try n2.setName("n2");
@@ -42,7 +45,7 @@ fn buildRoot(alloc: std.mem.Allocator, set_root_node: bool) !std.ArrayList(u8) {
     try n2.setIsDraining(true);
     try n2.lifecycleSetBit(41);
     const n2_res = try n2.finish();
-    const n2_off = n2_res.root_off;
+    const n2_off = n2_res.offset;
 
     var root = try gen.RootWriter.initWithBuf(alloc, &buf);
     const nodes = [_]u32{ n1_off, n2_off };
@@ -55,7 +58,7 @@ fn buildRoot(alloc: std.mem.Allocator, set_root_node: bool) !std.ArrayList(u8) {
         try root.setRootNode(@import("zbuf").zbuf.NullOffset);
     }
     const root_res = try root.finish();
-    const root_off = root_res.root_off;
+    const root_off = root_res.offset;
     try gen.addTail(alloc, &buf, gen.RootView, root_off);
 
     return buf;
@@ -130,7 +133,7 @@ test "bitset direct operations" {
     try node.statusSet(0);
 
     const off_res = try node.finish();
-    const off = off_res.root_off;
+    const off = off_res.offset;
     var payload: std.ArrayList(u8) = .{};
     defer payload.deinit(std.testing.allocator);
     try payload.appendSlice(std.testing.allocator, buf.items);
@@ -160,7 +163,7 @@ test "multiple b64 backing fields stay independent" {
     try std.testing.expect(try node.lifecycleHasBit(41));
 
     const off_res = try node.finish();
-    const off = off_res.root_off;
+    const off = off_res.offset;
     var payload: std.ArrayList(u8) = .{};
     defer payload.deinit(std.testing.allocator);
     try payload.appendSlice(std.testing.allocator, buf.items);
@@ -196,7 +199,7 @@ test "size_bytes compatibility" {
     defer buf.deinit(std.testing.allocator);
 
     const tail = try @import("zbuf").zbuf.readMessageTail(buf.items);
-    const base = tail.root_off;
+    const base = tail.offset;
     const v1_size: u16 = gen.RootView.SIZE_BYTES;
     const v2_size: u16 = v1_size + 4;
 

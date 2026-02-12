@@ -417,6 +417,28 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
         }
     }
 
+    // set() applies multiple fields from a struct literal in one call.
+    try w.writeAll("    pub fn set(self: *Self, values: anytype) !void {\n");
+    try w.writeAll("        const Values = @TypeOf(values);\n");
+    try w.writeAll("        if (@typeInfo(Values) != .@\"struct\") {\n");
+    try w.writeAll("            @compileError(\"set() expects a struct literal like .{ .field = value }\");\n");
+    try w.writeAll("        }\n");
+    inline for (infos) |info| {
+        const name_camel = try schema.camelNameCapitalized(alloc, info.name);
+        defer alloc.free(name_camel);
+        const name_lower = try schema.camelName(alloc, info.name);
+        defer alloc.free(name_lower);
+        switch (comptime schema.kindOf(info.ty)) {
+            .b64 => {
+                try w.print("        if (@hasField(Values, \"{s}\")) try self.{s}Set(@field(values, \"{s}\"));\n", .{ info.name, name_lower, info.name });
+            },
+            else => {
+                try w.print("        if (@hasField(Values, \"{s}\")) try self.set{s}(@field(values, \"{s}\"));\n", .{ info.name, name_camel, info.name });
+            },
+        }
+    }
+    try w.writeAll("    }\n\n");
+
     try w.print("    pub fn finish(self: *Self) !{s}Buffer {{\n", .{table_name});
     try w.writeAll("        if (self.owns_buf) {\n");
     try w.writeAll("            const owned = self.buf orelse return zbuf.Error.Invalid;\n");
