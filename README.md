@@ -17,3 +17,4 @@ To generate for a specific schema file (and write `<input>.gen.zig` next to it),
 ```bash
 zig build zbuf -- path/to/buffers.zig
 ```
+testing
