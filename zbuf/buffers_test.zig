@@ -6,11 +6,14 @@ fn buildTable(alloc: std.mem.Allocator, set_root_node: bool) !gen.TableBuffer {
     defer buf.deinit(alloc);
 
     var l1 = try gen.CellWriter.initWithBuf(alloc, &buf);
-    try l1.setTag(1);
-    try l1.setData("l1");
-    try l1.setCellHot(true);
+    try l1.set(.{
+        .tag = 1,
+        .data = "l1",
+        .cell_hot = true,
+    });
     const l1_res = try l1.finish();
     try std.testing.expect(!l1_res.has_tail);
+    try std.testing.expect(l1_res.bytes == null);
     const l1_off = l1_res.offset;
 
     var l2 = try gen.CellWriter.initWithBuf(alloc, &buf);
