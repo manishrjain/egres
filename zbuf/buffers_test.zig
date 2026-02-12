@@ -4,20 +4,22 @@ const gen = @import("buffers_gen");
 fn buildRoot(alloc: std.mem.Allocator, set_root_node: bool) !std.ArrayList(u8) {
     var buf: std.ArrayList(u8) = .{};
 
-    var l1 = try gen.LeafBuilder.start(alloc, &buf);
+    var l1 = try gen.LeafWriter.initWithBuf(alloc, &buf);
     try l1.setTag(1);
     try l1.setData("l1");
     try l1.setLeafHot(true);
-    const l1_off = l1.finish();
+    const l1_res = try l1.finish();
+    const l1_off = l1_res.root_off;
 
-    var l2 = try gen.LeafBuilder.start(alloc, &buf);
+    var l2 = try gen.LeafWriter.initWithBuf(alloc, &buf);
     try l2.setTag(2);
     try l2.setData("l2");
     try l2.leafFlagsSetBit(3);
     try l2.leafFlagsClearBit(3);
-    const l2_off = l2.finish();
+    const l2_res = try l2.finish();
+    const l2_off = l2_res.root_off;
 
-    var n1 = try gen.NodeBuilder.start(alloc, &buf);
+    var n1 = try gen.NodeWriter.initWithBuf(alloc, &buf);
     try n1.setName("n1");
     try n1.setValue(1000);
     const leaves = [_]u32{ l1_off, l2_off };
@@ -26,9 +28,10 @@ fn buildRoot(alloc: std.mem.Allocator, set_root_node: bool) !std.ArrayList(u8) {
     try n1.setIsActive(true);
     try n1.statusSetBit(33);
     try n1.setIsBootstrapping(true);
-    const n1_off = n1.finish();
+    const n1_res = try n1.finish();
+    const n1_off = n1_res.root_off;
 
-    var n2 = try gen.NodeBuilder.start(alloc, &buf);
+    var n2 = try gen.NodeWriter.initWithBuf(alloc, &buf);
     try n2.setName("n2");
     try n2.setValue(2000);
     const no_leaves = [_]u32{};
@@ -38,9 +41,10 @@ fn buildRoot(alloc: std.mem.Allocator, set_root_node: bool) !std.ArrayList(u8) {
     try n2.statusClearBit(3);
     try n2.setIsDraining(true);
     try n2.lifecycleSetBit(41);
-    const n2_off = n2.finish();
+    const n2_res = try n2.finish();
+    const n2_off = n2_res.root_off;
 
-    var root = try gen.RootBuilder.start(alloc, &buf);
+    var root = try gen.RootWriter.initWithBuf(alloc, &buf);
     const nodes = [_]u32{ n1_off, n2_off };
     try root.setNodes(&nodes);
     try root.setPayload("payload");
@@ -50,7 +54,8 @@ fn buildRoot(alloc: std.mem.Allocator, set_root_node: bool) !std.ArrayList(u8) {
     } else {
         try root.setRootNode(@import("zbuf").zbuf.NullOffset);
     }
-    const root_off = root.finish();
+    const root_res = try root.finish();
+    const root_off = root_res.root_off;
     try gen.addTail(alloc, &buf, gen.RootView, root_off);
 
     return buf;
@@ -115,7 +120,7 @@ test "bitset direct operations" {
     var buf: std.ArrayList(u8) = .{};
     defer buf.deinit(std.testing.allocator);
 
-    var node = try gen.NodeBuilder.start(std.testing.allocator, &buf);
+    var node = try gen.NodeWriter.initWithBuf(std.testing.allocator, &buf);
     try node.statusSetBit(0);
     try node.statusSetBit(63);
     try std.testing.expect(try node.statusHasBit(0));
@@ -124,7 +129,8 @@ test "bitset direct operations" {
     try std.testing.expect(!(try node.statusHasBit(0)));
     try node.statusSet(0);
 
-    const off = node.finish();
+    const off_res = try node.finish();
+    const off = off_res.root_off;
     var payload: std.ArrayList(u8) = .{};
     defer payload.deinit(std.testing.allocator);
     try payload.appendSlice(std.testing.allocator, buf.items);
@@ -143,7 +149,7 @@ test "multiple b64 backing fields stay independent" {
     var buf: std.ArrayList(u8) = .{};
     defer buf.deinit(std.testing.allocator);
 
-    var node = try gen.NodeBuilder.start(std.testing.allocator, &buf);
+    var node = try gen.NodeWriter.initWithBuf(std.testing.allocator, &buf);
     try node.statusSetBit(10);
     try node.lifecycleSetBit(10);
     try node.lifecycleSetBit(41);
@@ -153,7 +159,8 @@ test "multiple b64 backing fields stay independent" {
     try std.testing.expect(try node.lifecycleHasBit(10));
     try std.testing.expect(try node.lifecycleHasBit(41));
 
-    const off = node.finish();
+    const off_res = try node.finish();
+    const off = off_res.root_off;
     var payload: std.ArrayList(u8) = .{};
     defer payload.deinit(std.testing.allocator);
     try payload.appendSlice(std.testing.allocator, buf.items);

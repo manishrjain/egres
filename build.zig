@@ -10,7 +10,7 @@ pub fn build(b: *std.Build) void {
 
     addZbufCli(b, target, optimize, schema_mod);
     const zbuf_test_step = addZbufTests(b, target, optimize, schema_mod);
-    const raft_test_step = addRaftTests(b, target, optimize);
+    const raft_test_step = addRaftTests(b, target, optimize, schema_mod);
 
     const all_test_step = b.step("test", "Run all tests");
     all_test_step.dependOn(zbuf_test_step);
@@ -149,12 +149,50 @@ fn addZbufTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
     return zbuf_test_step;
 }
 
-fn addRaftTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step {
+fn addRaftTests(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    schema_mod: *std.Build.Module,
+) *std.Build.Step {
+    const zbuf_mod = b.createModule(.{
+        .root_source_file = b.path("zbuf.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const raft_buffers_mod = b.createModule(.{
+        .root_source_file = b.path("raft/buffers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    raft_buffers_mod.addImport("schema", schema_mod);
+    const raft_gen = b.addExecutable(.{
+        .name = "zbuf-gen-raft",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zbuf/gen.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    raft_gen.root_module.addImport("schema", schema_mod);
+    raft_gen.root_module.addImport("buffers", raft_buffers_mod);
+    const run_raft_gen = b.addRunArtifact(raft_gen);
+    run_raft_gen.addArg("raft/buffers.gen.zig");
+
+    const raft_buffers_gen_mod = b.createModule(.{
+        .root_source_file = b.path("raft/buffers.gen.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    raft_buffers_gen_mod.addImport("zbuf", zbuf_mod);
+
     const raft_mod = b.createModule(.{
         .root_source_file = b.path("raft/raft.zig"),
         .target = target,
         .optimize = optimize,
     });
+    raft_mod.addImport("buffers_gen", raft_buffers_gen_mod);
+    raft_mod.addImport("zbuf", zbuf_mod);
 
     const raft_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -164,6 +202,7 @@ fn addRaftTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
         }),
     });
     raft_tests.root_module.addImport("raft", raft_mod);
+    raft_tests.step.dependOn(&run_raft_gen.step);
     const run_raft_tests = b.addRunArtifact(raft_tests);
     const run_raft_tests_trace = b.addRunArtifact(raft_tests);
     run_raft_tests_trace.stdio = .inherit;

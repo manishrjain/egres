@@ -2,7 +2,7 @@
 
 This module implements a small, FlatBuffers-style wire format and a Zig
 build-time generator that emits zero-copy readers and forward-writing
-builders from Zig schema definitions.
+writers from Zig schema definitions.
 
 ## Generator
 
@@ -13,9 +13,9 @@ builders from Zig schema definitions.
 Generated code includes:
 
 - `XView` (reader)
-- `XBuilder` (writer)
+- `XWriter` (writer)
 - `addTail()` / `parseTail()` helpers
-- `parseMessage()` which returns the correct root view based on the tail
+- `parseMessageFromTail()` which returns the correct root view based on the tail
 
 ## Build Commands
 
@@ -37,12 +37,13 @@ zig build test-zbuf
 
 ```
 var buf: std.ArrayList(u8) = .{};
-var root = try gen.RootBuilder.start(alloc, &buf);
+var root = try gen.RootWriter.initWithBuf(alloc, &buf);
 // set fields and finish
-const root_off = root.finish();
+const root_finish = try root.finish();
+const root_off = root_finish.root_off;
 try gen.addTail(alloc, &buf, gen.RootView, root_off);
 
-const msg = try gen.parseMessage(buf.items);
+const msg = try gen.parseMessageFromTail(buf.items);
 const view = switch (msg) {
     .Root => |v| v,
     else => unreachable,
@@ -202,4 +203,3 @@ tail (optional, 16 bytes)
 │ root_off = 0x003C | table_id = Root | table_ver = 1 | ZBUF │
 └────────────────────────────────────────────────────────────┘
 ```
-
