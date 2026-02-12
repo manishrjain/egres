@@ -12,10 +12,10 @@ writers from Zig schema definitions.
 
 Generated code includes:
 
-- `XView` (reader)
+- `XReader` (reader)
 - `XWriter` (writer)
 - `addTail()` / `parseTail()` helpers
-- `parseMessageFromTail()` which returns the correct root view based on the tail
+- `parseMessageFromTail()` which returns the correct root reader based on the tail
 
 ## Build Commands
 
@@ -37,15 +37,15 @@ zig build test-zbuf
 
 ```
 var buf: std.ArrayList(u8) = .{};
-var root = try gen.RootWriter.initWithBuf(alloc, &buf);
+var root = try gen.TableWriter.initWithBuf(alloc, &buf);
 // set fields and finish
-const root_finish = try root.finish();
-const root_off = root_finish.offset;
-try gen.addTail(alloc, &buf, gen.RootView, root_off);
+const table_finish = try root.finish();
+const table_off = table_finish.offset;
+try gen.addTail(alloc, &buf, gen.TableReader, table_off);
 
 const msg = try gen.parseMessageFromTail(buf.items);
 const view = switch (msg) {
-    .Root => |v| v,
+    .Table => |v| v,
     else => unreachable,
 };
 ```
@@ -90,7 +90,7 @@ offset.
 
 Message tail (optional, 16 bytes at end of buffer):
 
-- `u32 root_off` = offset of root table from payload base
+- `u32 table_off` = offset of root table from payload base
 - `u16 table_id` = unique id for the root table
 - `u16 table_version` = version of the root table schema
 - `u32 reserved` = 0
@@ -98,52 +98,52 @@ Message tail (optional, 16 bytes at end of buffer):
 
 Offsets in tables are relative to the start of the payload (0x0000).
 
-### Example (Root) with Concrete Fields
+### Example (Table) with Concrete Fields
 
 Assume the test schema in `zbuf/buffers.zig` and a payload with:
 
 ```zig
-pub const Leaf = schema.Table(.{
+pub const Cell = schema.Table(.{
     .{ .id = 1, .name = "tag", .ty = schema.U32 },
     .{ .id = 2, .name = "data", .ty = schema.Bytes },
 });
 
-pub const Node = schema.Table(.{
+pub const Row = schema.Table(.{
     .{ .id = 1, .name = "name", .ty = schema.Bytes },
     .{ .id = 2, .name = "value", .ty = schema.U64 },
-    .{ .id = 3, .name = "leaves", .ty = schema.Array(Leaf) },
-    .{ .id = 4, .name = "node_leaf", .ty = Leaf },
+    .{ .id = 3, .name = "cells", .ty = schema.Array(Cell) },
+    .{ .id = 4, .name = "row_cell", .ty = Cell },
 });
 
-pub const Root = schema.Table(.{
-    .{ .id = 1, .name = "nodes", .ty = schema.Array(Node) },
+pub const Table = schema.Table(.{
+    .{ .id = 1, .name = "rows", .ty = schema.Array(Row) },
     .{ .id = 2, .name = "payload", .ty = schema.Bytes },
     .{ .id = 3, .name = "count", .ty = schema.U32 },
-    .{ .id = 4, .name = "root_node", .ty = Node },
+    .{ .id = 4, .name = "table_row", .ty = Row },
 });
 ```
 
 Table header sizes for this schema:
 
-- `Root` fixed header = `28` bytes
+- `Table` fixed header = `28` bytes
   - 2 bytes for `version`
 	- 2 bytes for `size_bytes`
-	- 4 bytes for `nodes_off`
-	- 4 bytes for `nodes_count`
+	- 4 bytes for `rows_off`
+	- 4 bytes for `rows_count`
 	- 4 bytes for `payload_off`
 	- 4 bytes for `payload_len`
 	- 4 bytes for `count`
-	- 4 bytes for `root_node_off`
-- `Node` fixed header = `32` bytes
+	- 4 bytes for `table_row_off`
+- `Row` fixed header = `32` bytes
 	- 2 bytes for `version`
 	- 2 bytes for `size_bytes`
 	- 4 bytes for `name_off`
 	- 4 bytes for `name_len`
 	- 8 bytes for `value`
-	- 4 bytes for `leaves_off`
-	- 4 bytes for `leaves_count`
-	- 4 bytes for `node_leaf_off`
-- `Leaf` fixed header = `16` bytes
+	- 4 bytes for `cells_off`
+	- 4 bytes for `cells_count`
+	- 4 bytes for `row_cell_off`
+- `Cell` fixed header = `16` bytes
 	- 2 bytes for `version`
 	- 2 bytes for `size_bytes`
 	- 4 bytes for `tag`
@@ -151,48 +151,48 @@ Table header sizes for this schema:
 	- 4 bytes for `data_len`
 
 One possible payload layout (offsets from payload base `0x0000`), matching a
-common build order (Leaf -> Node -> Root):
+common build order (Cell -> Row -> Table):
 
 ```
-0x0000  Leaf header (0x10 bytes)
-0x0010  Leaf.data bytes "DATA"
-0x0014  Node header (0x20 bytes)
-0x0034  Node.name bytes "NAME"
-0x0038  Node.leaves index table (u32[1] = 0x0000)
-0x003C  Root header (0x1C bytes)
-0x0058  Root.nodes index table (u32[1] = 0x0014)
-0x005C  Root.payload bytes "PAYL"
+0x0000  Cell header (0x10 bytes)
+0x0010  Cell.data bytes "DATA"
+0x0014  Row header (0x20 bytes)
+0x0034  Row.name bytes "NAME"
+0x0038  Row.cells index table (u32[1] = 0x0000)
+0x003C  Table header (0x1C bytes)
+0x0058  Table.rows index table (u32[1] = 0x0014)
+0x005C  Table.payload bytes "PAYL"
 ```
 
 Concrete header contents (little-endian), showing offsets/lengths:
 
 ```
-Leaf @0x0000
+Cell @0x0000
   u16 version      = 1
   u16 size_bytes   = 0x0010
   u32 tag          = 7
   u32 data_off     = 0x0010
   u32 data_len     = 4
 
-Node @0x0014
+Row @0x0014
   u16 version      = 1
   u16 size_bytes   = 0x0020
   u32 name_off     = 0x0034
   u32 name_len     = 4
   u64 value        = 42
-  u32 leaves_off   = 0x0038
-  u32 leaves_count = 1
-  u32 node_leaf_off= 0x0000
+  u32 cells_off   = 0x0038
+  u32 cells_count = 1
+  u32 row_cell_off= 0x0000
 
-Root @0x003C
+Table @0x003C
   u16 version      = 1
   u16 size_bytes   = 0x001C
-  u32 nodes_off    = 0x0058
-  u32 nodes_count  = 1
+  u32 rows_off    = 0x0058
+  u32 rows_count  = 1
   u32 payload_off  = 0x005C
   u32 payload_len  = 4
   u32 count        = 1
-  u32 root_node_off= 0x0014
+  u32 table_row_off= 0x0014
 ```
 
 If you choose to add a tail, it is appended after the payload:
@@ -200,6 +200,6 @@ If you choose to add a tail, it is appended after the payload:
 ```
 tail (optional, 16 bytes)
 ┌────────────────────────────────────────────────────────────┐
-│ root_off = 0x003C | table_id = Root | table_ver = 1 | ZBUF │
+│ table_off = 0x003C | table_id = Table | table_ver = 1 | ZBUF │
 └────────────────────────────────────────────────────────────┘
 ```

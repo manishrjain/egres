@@ -1,17 +1,17 @@
 const schema = @import("schema");
 
-pub const Leaf = schema.Table(.{
+pub const Cell = schema.Table(.{
     .{ .id = 1, .name = "tag", .ty = schema.U32 },
     .{ .id = 2, .name = "data", .ty = schema.Bytes },
-    .{ .id = 3, .name = "leaf_flags", .ty = schema.B64 },
-    .{ .name = "leaf_hot", .ty = schema.Bool(.{ .field_id = 3, .bit = 0 }) },
+    .{ .id = 3, .name = "cell_flags", .ty = schema.B64 },
+    .{ .name = "cell_hot", .ty = schema.Bool(.{ .field_id = 3, .bit = 0 }) },
 });
 
-pub const Node = schema.Table(.{
+pub const Row = schema.Table(.{
     .{ .id = 1, .name = "name", .ty = schema.Bytes },
     .{ .id = 2, .name = "value", .ty = schema.U64 },
-    .{ .id = 3, .name = "leaves", .ty = schema.Array(Leaf) },
-    .{ .id = 4, .name = "node_leaf", .ty = Leaf },
+    .{ .id = 3, .name = "cells", .ty = schema.Array(Cell) },
+    .{ .id = 4, .name = "row_cell", .ty = Cell },
     .{ .id = 5, .name = "status", .ty = schema.B64 },
     .{ .id = 6, .name = "lifecycle", .ty = schema.B64 },
     .{ .name = "is_active", .ty = schema.Bool(.{ .field_id = 5, .bit = 0 }) },
@@ -20,15 +20,15 @@ pub const Node = schema.Table(.{
     .{ .name = "is_retiring", .ty = schema.Bool(.{ .field_id = 6, .bit = 41 }) },
 });
 
-pub const Root = schema.Table(.{
-    .{ .id = 1, .name = "nodes", .ty = schema.Array(Node) },
+pub const Table = schema.Table(.{
+    .{ .id = 1, .name = "rows", .ty = schema.Array(Row) },
     .{ .id = 2, .name = "payload", .ty = schema.Bytes },
     .{ .id = 3, .name = "count", .ty = schema.U32 },
-    .{ .id = 4, .name = "root_node", .ty = Node },
+    .{ .id = 4, .name = "table_row", .ty = Row },
 });
 
 pub const tables = .{
-    .{ .name = "Leaf", .ty = Leaf, .id = 1 },
-    .{ .name = "Node", .ty = Node, .id = 2 },
-    .{ .name = "Root", .ty = Root, .id = 3 },
+    .{ .name = "Cell", .ty = Cell, .id = 1 },
+    .{ .name = "Row", .ty = Row, .id = 2 },
+    .{ .name = "Table", .ty = Table, .id = 3 },
 };

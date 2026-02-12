@@ -10,24 +10,24 @@ pub fn parseTail(buf: []const u8) !zbuf.MessageTail {
     return zbuf.readMessageTail(buf);
 }
 
-pub fn parseMessageFromTail(buf: []const u8) !MessageView {
+pub fn parseMessageFromTail(buf: []const u8) !MessageReader {
     const tail = try zbuf.readMessageTail(buf);
     const payload_buf = buf[0 .. buf.len - zbuf.message_tail_size];
     return switch (tail.table_id) {
-        LeafView.TABLE_ID => .{ .Leaf = try LeafView.init(payload_buf, tail.offset) },
-        NodeView.TABLE_ID => .{ .Node = try NodeView.init(payload_buf, tail.offset) },
-        RootView.TABLE_ID => .{ .Root = try RootView.init(payload_buf, tail.offset) },
+        CellReader.TABLE_ID => .{ .Cell = try CellReader.init(payload_buf, tail.offset) },
+        RowReader.TABLE_ID => .{ .Row = try RowReader.init(payload_buf, tail.offset) },
+        TableReader.TABLE_ID => .{ .Table = try TableReader.init(payload_buf, tail.offset) },
         else => zbuf.Error.Invalid,
     };
 }
 
-pub const MessageView = union(enum) {
-    Leaf: LeafView,
-    Node: NodeView,
-    Root: RootView,
+pub const MessageReader = union(enum) {
+    Cell: CellReader,
+    Row: RowReader,
+    Table: TableReader,
 };
 
-pub const LeafView = struct {
+pub const CellReader = struct {
     const Self = @This();
     buf: []const u8,
     base: u32,
@@ -51,7 +51,7 @@ pub const LeafView = struct {
         return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
     }
 
-    pub fn leafHot(self: Self) bool {
+    pub fn cellHot(self: Self) bool {
         const slot_end = @as(u32, self.base) + 24;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return false;
@@ -77,14 +77,14 @@ pub const LeafView = struct {
         return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
     }
 
-    pub fn leafFlags(self: Self) u64 {
+    pub fn cellFlags(self: Self) u64 {
         const slot_end = @as(u32, self.base) + 24;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
         return zbuf.readU64(self.buf, @as(usize, self.base + 16)) catch 0;
     }
 
-    pub fn leafFlagsHasBit(self: Self, bit_index: u32) bool {
+    pub fn cellFlagsHasBit(self: Self, bit_index: u32) bool {
         if (bit_index >= 64) return false;
         const bit = @as(u6, @intCast(bit_index % 64));
         const word = zbuf.readU64(self.buf, @as(usize, self.base + 16)) catch 0;
@@ -105,12 +105,16 @@ pub const LeafView = struct {
     }
 };
 
-pub const LeafBuffer = struct {
+pub const CellBuffer = struct {
     offset: u32,
     bytes: ?[]u8,
+    pub fn initReader(self: @This()) !CellReader {
+        const payload = self.bytes orelse return zbuf.Error.Invalid;
+        return CellReader.init(payload, self.offset);
+    }
 };
 
-pub const LeafWriter = struct {
+pub const CellWriter = struct {
     const Self = @This();
     buf: ?*std.ArrayList(u8),
     owns_buf: bool,
@@ -141,7 +145,7 @@ pub const LeafWriter = struct {
         return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
     }
 
-    pub fn setLeafHot(self: *Self, v: bool) !void {
+    pub fn setCellHot(self: *Self, v: bool) !void {
         const out = self.bufMut();
         const word_off = self.base + 16;
         var word = try zbuf.readU64(out.items, @as(usize, word_off));
@@ -172,12 +176,12 @@ pub const LeafWriter = struct {
         try zbuf.patchU32(out.items, self.base + 12, @as(u32, @intCast(data.len)));
     }
 
-    pub fn leafFlagsSet(self: *Self, v: u64) !void {
+    pub fn cellFlagsSet(self: *Self, v: u64) !void {
         const out = self.bufMut();
         try zbuf.patchU64(out.items, self.base + 16, v);
     }
 
-    pub fn leafFlagsSetBit(self: *Self, bit_index: u32) !void {
+    pub fn cellFlagsSetBit(self: *Self, bit_index: u32) !void {
         const out = self.bufMut();
         if (bit_index >= 64) return zbuf.Error.OutOfBounds;
         const bit = @as(u6, @intCast(bit_index % 64));
@@ -187,7 +191,7 @@ pub const LeafWriter = struct {
         try zbuf.patchU64(out.items, word_off, word);
     }
 
-    pub fn leafFlagsClearBit(self: *Self, bit_index: u32) !void {
+    pub fn cellFlagsClearBit(self: *Self, bit_index: u32) !void {
         const out = self.bufMut();
         if (bit_index >= 64) return zbuf.Error.OutOfBounds;
         const bit = @as(u6, @intCast(bit_index % 64));
@@ -197,7 +201,7 @@ pub const LeafWriter = struct {
         try zbuf.patchU64(out.items, word_off, word);
     }
 
-    pub fn leafFlagsHasBit(self: *Self, bit_index: u32) !bool {
+    pub fn cellFlagsHasBit(self: *Self, bit_index: u32) !bool {
         const out = self.bufMut();
         if (bit_index >= 64) return zbuf.Error.OutOfBounds;
         const bit = @as(u6, @intCast(bit_index % 64));
@@ -211,13 +215,13 @@ pub const LeafWriter = struct {
         if (@typeInfo(Values) != .@"struct") {
             @compileError("set() expects a struct literal like .{ .field = value }");
         }
-        if (@hasField(Values, "leaf_hot")) try self.setLeafHot(@field(values, "leaf_hot"));
+        if (@hasField(Values, "cell_hot")) try self.setCellHot(@field(values, "cell_hot"));
         if (@hasField(Values, "tag")) try self.setTag(@field(values, "tag"));
         if (@hasField(Values, "data")) try self.setData(@field(values, "data"));
-        if (@hasField(Values, "leaf_flags")) try self.leafFlagsSet(@field(values, "leaf_flags"));
+        if (@hasField(Values, "cell_flags")) try self.cellFlagsSet(@field(values, "cell_flags"));
     }
 
-    pub fn finish(self: *Self) !LeafBuffer {
+    pub fn finish(self: *Self) !CellBuffer {
         if (self.owns_buf) {
             const owned = self.buf orelse return zbuf.Error.Invalid;
             const bytes = try owned.toOwnedSlice(self.alloc);
@@ -240,7 +244,7 @@ pub const LeafWriter = struct {
     }
 };
 
-pub const NodeView = struct {
+pub const RowReader = struct {
     const Self = @This();
     buf: []const u8,
     base: u32,
@@ -317,7 +321,7 @@ pub const NodeView = struct {
         return zbuf.readU64(self.buf, @as(usize, self.base + 12)) catch 0;
     }
 
-    pub fn leavesLen(self: Self) u32 {
+    pub fn cellsLen(self: Self) u32 {
         const slot_end = @as(u32, self.base) + 28;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
@@ -329,7 +333,7 @@ pub const NodeView = struct {
         return elem_count;
     }
 
-    pub fn leavesAt(self: Self, i: u32) !LeafView {
+    pub fn cellsAt(self: Self, i: u32) !CellReader {
         const slot_end = @as(u32, self.base) + 28;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return zbuf.Error.OutOfBounds;
@@ -341,16 +345,16 @@ pub const NodeView = struct {
         if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
         const entry_off = @as(usize, index_off) + @as(usize, i) * 4;
         const child_off = try zbuf.readU32(self.buf, entry_off);
-        return LeafView.init(self.buf, child_off);
+        return CellReader.init(self.buf, child_off);
     }
 
-    pub fn nodeLeaf(self: Self) ?LeafView {
+    pub fn rowCell(self: Self) ?CellReader {
         const slot_end = @as(u32, self.base) + 32;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return null;
         const off = zbuf.readU32(self.buf, @as(usize, self.base + 28)) catch 0;
         if (off == zbuf.NullOffset) return null;
-        return LeafView.init(self.buf, off) catch null;
+        return CellReader.init(self.buf, off) catch null;
     }
 
     pub fn status(self: Self) u64 {
@@ -392,24 +396,28 @@ pub const NodeView = struct {
                 _ = try zbuf.sliceAt(self.buf, off, data_len);
             }
         }
-        const count_leaves: u32 = self.leavesLen();
-        var i_leaves: u32 = 0;
-        while (i_leaves < count_leaves) : (i_leaves += 1) {
-            const child_view = try self.leavesAt(i_leaves);
+        const count_cells: u32 = self.cellsLen();
+        var i_cells: u32 = 0;
+        while (i_cells < count_cells) : (i_cells += 1) {
+            const child_view = try self.cellsAt(i_cells);
             try child_view.verify();
         }
-        if (self.nodeLeaf()) |child_view| {
+        if (self.rowCell()) |child_view| {
             try child_view.verify();
         }
     }
 };
 
-pub const NodeBuffer = struct {
+pub const RowBuffer = struct {
     offset: u32,
     bytes: ?[]u8,
+    pub fn initReader(self: @This()) !RowReader {
+        const payload = self.bytes orelse return zbuf.Error.Invalid;
+        return RowReader.init(payload, self.offset);
+    }
 };
 
-pub const NodeWriter = struct {
+pub const RowWriter = struct {
     const Self = @This();
     buf: ?*std.ArrayList(u8),
     owns_buf: bool,
@@ -512,7 +520,7 @@ pub const NodeWriter = struct {
         try zbuf.patchU64(out.items, self.base + 12, v);
     }
 
-    pub fn setLeaves(self: *Self, child_offsets: []const u32) !void {
+    pub fn setCells(self: *Self, child_offsets: []const u32) !void {
         const out = self.bufMut();
         if (child_offsets.len == 0) {
             try zbuf.patchU32(out.items, self.base + 20, 0);
@@ -525,7 +533,7 @@ pub const NodeWriter = struct {
         try zbuf.patchU32(out.items, self.base + 24, @as(u32, @intCast(child_offsets.len)));
     }
 
-    pub fn setNodeLeaf(self: *Self, child_off: u32) !void {
+    pub fn setRowCell(self: *Self, child_off: u32) !void {
         const out = self.bufMut();
         try zbuf.patchU32(out.items, self.base + 28, child_off);
     }
@@ -609,13 +617,13 @@ pub const NodeWriter = struct {
         if (@hasField(Values, "is_retiring")) try self.setIsRetiring(@field(values, "is_retiring"));
         if (@hasField(Values, "name")) try self.setName(@field(values, "name"));
         if (@hasField(Values, "value")) try self.setValue(@field(values, "value"));
-        if (@hasField(Values, "leaves")) try self.setLeaves(@field(values, "leaves"));
-        if (@hasField(Values, "node_leaf")) try self.setNodeLeaf(@field(values, "node_leaf"));
+        if (@hasField(Values, "cells")) try self.setCells(@field(values, "cells"));
+        if (@hasField(Values, "row_cell")) try self.setRowCell(@field(values, "row_cell"));
         if (@hasField(Values, "status")) try self.statusSet(@field(values, "status"));
         if (@hasField(Values, "lifecycle")) try self.lifecycleSet(@field(values, "lifecycle"));
     }
 
-    pub fn finish(self: *Self) !NodeBuffer {
+    pub fn finish(self: *Self) !RowBuffer {
         if (self.owns_buf) {
             const owned = self.buf orelse return zbuf.Error.Invalid;
             const bytes = try owned.toOwnedSlice(self.alloc);
@@ -638,7 +646,7 @@ pub const NodeWriter = struct {
     }
 };
 
-pub const RootView = struct {
+pub const TableReader = struct {
     const Self = @This();
     buf: []const u8,
     base: u32,
@@ -662,7 +670,7 @@ pub const RootView = struct {
         return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
     }
 
-    pub fn nodesLen(self: Self) u32 {
+    pub fn rowsLen(self: Self) u32 {
         const slot_end = @as(u32, self.base) + 12;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
@@ -674,7 +682,7 @@ pub const RootView = struct {
         return elem_count;
     }
 
-    pub fn nodesAt(self: Self, i: u32) !NodeView {
+    pub fn rowsAt(self: Self, i: u32) !RowReader {
         const slot_end = @as(u32, self.base) + 12;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return zbuf.Error.OutOfBounds;
@@ -686,7 +694,7 @@ pub const RootView = struct {
         if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
         const entry_off = @as(usize, index_off) + @as(usize, i) * 4;
         const child_off = try zbuf.readU32(self.buf, entry_off);
-        return NodeView.init(self.buf, child_off);
+        return RowReader.init(self.buf, child_off);
     }
 
     pub fn payload(self: Self) []const u8 {
@@ -706,22 +714,22 @@ pub const RootView = struct {
         return zbuf.readU32(self.buf, @as(usize, self.base + 20)) catch 0;
     }
 
-    pub fn rootNode(self: Self) ?NodeView {
+    pub fn tableRow(self: Self) ?RowReader {
         const slot_end = @as(u32, self.base) + 28;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return null;
         const off = zbuf.readU32(self.buf, @as(usize, self.base + 24)) catch 0;
         if (off == zbuf.NullOffset) return null;
-        return NodeView.init(self.buf, off) catch null;
+        return RowReader.init(self.buf, off) catch null;
     }
 
     pub fn verify(self: Self) !void {
         if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        const count_nodes: u32 = self.nodesLen();
-        var i_nodes: u32 = 0;
-        while (i_nodes < count_nodes) : (i_nodes += 1) {
-            const child_view = try self.nodesAt(i_nodes);
+        const count_rows: u32 = self.rowsLen();
+        var i_rows: u32 = 0;
+        while (i_rows < count_rows) : (i_rows += 1) {
+            const child_view = try self.rowsAt(i_rows);
             try child_view.verify();
         }
         const slot_end_12 = @as(u32, self.base) + 20;
@@ -732,18 +740,22 @@ pub const RootView = struct {
                 _ = try zbuf.sliceAt(self.buf, off, data_len);
             }
         }
-        if (self.rootNode()) |child_view| {
+        if (self.tableRow()) |child_view| {
             try child_view.verify();
         }
     }
 };
 
-pub const RootBuffer = struct {
+pub const TableBuffer = struct {
     offset: u32,
     bytes: ?[]u8,
+    pub fn initReader(self: @This()) !TableReader {
+        const payload = self.bytes orelse return zbuf.Error.Invalid;
+        return TableReader.init(payload, self.offset);
+    }
 };
 
-pub const RootWriter = struct {
+pub const TableWriter = struct {
     const Self = @This();
     buf: ?*std.ArrayList(u8),
     owns_buf: bool,
@@ -776,7 +788,7 @@ pub const RootWriter = struct {
         return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
     }
 
-    pub fn setNodes(self: *Self, child_offsets: []const u32) !void {
+    pub fn setRows(self: *Self, child_offsets: []const u32) !void {
         const out = self.bufMut();
         if (child_offsets.len == 0) {
             try zbuf.patchU32(out.items, self.base + 4, 0);
@@ -807,7 +819,7 @@ pub const RootWriter = struct {
         try zbuf.patchU32(out.items, self.base + 20, v);
     }
 
-    pub fn setRootNode(self: *Self, child_off: u32) !void {
+    pub fn setTableRow(self: *Self, child_off: u32) !void {
         const out = self.bufMut();
         try zbuf.patchU32(out.items, self.base + 24, child_off);
     }
@@ -817,13 +829,13 @@ pub const RootWriter = struct {
         if (@typeInfo(Values) != .@"struct") {
             @compileError("set() expects a struct literal like .{ .field = value }");
         }
-        if (@hasField(Values, "nodes")) try self.setNodes(@field(values, "nodes"));
+        if (@hasField(Values, "rows")) try self.setRows(@field(values, "rows"));
         if (@hasField(Values, "payload")) try self.setPayload(@field(values, "payload"));
         if (@hasField(Values, "count")) try self.setCount(@field(values, "count"));
-        if (@hasField(Values, "root_node")) try self.setRootNode(@field(values, "root_node"));
+        if (@hasField(Values, "table_row")) try self.setTableRow(@field(values, "table_row"));
     }
 
-    pub fn finish(self: *Self) !RootBuffer {
+    pub fn finish(self: *Self) !TableBuffer {
         if (self.owns_buf) {
             const owned = self.buf orelse return zbuf.Error.Invalid;
             const bytes = try owned.toOwnedSlice(self.alloc);

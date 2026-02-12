@@ -142,9 +142,9 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     comptime requireBoolLayoutValid(infos);
 
     // -------------------------
-    // View (reader) type
+    // Reader type
     // -------------------------
-    try w.print("pub const {s}View = struct {{\n", .{table_name});
+    try w.print("pub const {s}Reader = struct {{\n", .{table_name});
     try w.writeAll("    const Self = @This();\n");
     try w.writeAll("    buf: []const u8,\n");
     try w.writeAll("    base: u32,\n");
@@ -210,13 +210,13 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
                 try w.writeAll("    }\n\n");
 
                 const child_name = tableNameForType(child);
-                try w.print("    pub fn {s}At(self: Self, i: u32) !{s}View {{\n", .{ name_camel_arr, child_name });
+                try w.print("    pub fn {s}At(self: Self, i: u32) !{s}Reader {{\n", .{ name_camel_arr, child_name });
                 try emitArrayAtGetter(w, info.offset, child_name);
                 try w.writeAll("    }\n\n");
             },
             .table => {
                 const child_name = tableNameForType(info.ty);
-                try w.print("    pub fn {s}(self: Self) ?{s}View {{\n", .{ name_camel, child_name });
+                try w.print("    pub fn {s}(self: Self) ?{s}Reader {{\n", .{ name_camel, child_name });
                 try emitTableGetter(w, info.offset, child_name);
                 try w.writeAll("    }\n\n");
             },
@@ -284,6 +284,10 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     try w.print("pub const {s}Buffer = struct {{\n", .{table_name});
     try w.writeAll("    offset: u32,\n");
     try w.writeAll("    bytes: ?[]u8,\n");
+    try w.print("    pub fn initReader(self: @This()) !{s}Reader {{\n", .{table_name});
+    try w.writeAll("        const payload = self.bytes orelse return zbuf.Error.Invalid;\n");
+    try w.print("        return {s}Reader.init(payload, self.offset);\n", .{table_name});
+    try w.writeAll("    }\n");
     try w.writeAll("};\n\n");
 
     try w.print("pub const {s}Writer = struct {{\n", .{table_name});
@@ -578,7 +582,7 @@ fn emitArrayAtGetter(w: anytype, offset: u16, child_name: []const u8) !void {
     try w.writeAll("        if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;\n");
     try w.writeAll("        const entry_off = @as(usize, index_off) + @as(usize, i) * 4;\n");
     try w.writeAll("        const child_off = try zbuf.readU32(self.buf, entry_off);\n");
-    try w.print("        return {s}View.init(self.buf, child_off);\n", .{child_name});
+    try w.print("        return {s}Reader.init(self.buf, child_off);\n", .{child_name});
 }
 
 fn emitTableGetter(w: anytype, offset: u16, child_name: []const u8) !void {
@@ -587,7 +591,7 @@ fn emitTableGetter(w: anytype, offset: u16, child_name: []const u8) !void {
     try w.writeAll("        if (slot_end > header_end) return null;\n");
     try w.print("        const off = zbuf.readU32(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{offset});
     try w.writeAll("        if (off == zbuf.NullOffset) return null;\n");
-    try w.print("        return {s}View.init(self.buf, off) catch null;\n", .{child_name});
+    try w.print("        return {s}Reader.init(self.buf, off) catch null;\n", .{child_name});
 }
 
 fn emitBytesVerify(w: anytype, offset: u16) !void {
@@ -608,12 +612,12 @@ fn emitTailHelpers(w: anytype) !void {
     try w.writeAll("pub fn parseTail(buf: []const u8) !zbuf.MessageTail {\n");
     try w.writeAll("    return zbuf.readMessageTail(buf);\n");
     try w.writeAll("}\n\n");
-    try w.writeAll("pub fn parseMessageFromTail(buf: []const u8) !MessageView {\n");
+    try w.writeAll("pub fn parseMessageFromTail(buf: []const u8) !MessageReader {\n");
     try w.writeAll("    const tail = try zbuf.readMessageTail(buf);\n");
     try w.writeAll("    const payload_buf = buf[0 .. buf.len - zbuf.message_tail_size];\n");
     try w.writeAll("    return switch (tail.table_id) {\n");
     inline for (defs.tables) |entry| {
-        try w.print("        {s}View.TABLE_ID => .{{ .{s} = try {s}View.init(payload_buf, tail.offset) }},\n", .{ entry.name, entry.name, entry.name });
+        try w.print("        {s}Reader.TABLE_ID => .{{ .{s} = try {s}Reader.init(payload_buf, tail.offset) }},\n", .{ entry.name, entry.name, entry.name });
     }
     try w.writeAll("        else => zbuf.Error.Invalid,\n");
     try w.writeAll("    };\n");
@@ -621,9 +625,9 @@ fn emitTailHelpers(w: anytype) !void {
 }
 
 fn emitMessageParser(w: anytype) !void {
-    try w.writeAll("pub const MessageView = union(enum) {\n");
+    try w.writeAll("pub const MessageReader = union(enum) {\n");
     inline for (defs.tables) |entry| {
-        try w.print("    {s}: {s}View,\n", .{ entry.name, entry.name });
+        try w.print("    {s}: {s}Reader,\n", .{ entry.name, entry.name });
     }
     try w.writeAll("};\n\n");
 }
