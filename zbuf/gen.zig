@@ -232,9 +232,24 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     }
 
     // verify() provides optional bounds checking of nested data.
+    const verify_needs_header_end = comptime blk: {
+        var needed = false;
+        for (infos) |info| {
+            switch (schema.kindOf(info.ty)) {
+                .bytes, .array, .table => {
+                    needed = true;
+                    break;
+                },
+                else => {},
+            }
+        }
+        break :blk needed;
+    };
     try w.writeAll("    pub fn verify(self: Self) !void {\n");
     try w.writeAll("        if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;\n");
-    try w.writeAll("        const header_end = @as(u32, self.base) + self.size_bytes;\n");
+    if (verify_needs_header_end) {
+        try w.writeAll("        const header_end = @as(u32, self.base) + self.size_bytes;\n");
+    }
     inline for (infos) |info| {
         switch (comptime schema.kindOf(info.ty)) {
             .bytes => {
