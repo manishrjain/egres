@@ -314,11 +314,22 @@ pub const Forest = struct {
         return self.memtables.memoryUsage() >= self.opts.memtable_size;
     }
 
-    /// Freeze the current memtable and create a new one.
-    /// Called when the memtable freeze is committed via Raft.
-    pub fn freezeMemtable(self: *Forest) !void {
-        const new_id = self.next_file_id.fetchAdd(1, .monotonic);
+    /// Create a new memtable, freezing the current one.
+    /// Called when the newMemtable entry is committed via Raft.
+    /// The new_id is assigned by the leader and included in the proposal
+    /// so all nodes use the same ID.
+    pub fn newMemtable(self: *Forest, new_id: u64) !void {
         try self.memtables.swapCurrentOut(new_id);
+    }
+
+    /// Ensure next_file_id is past the given id, so a follower that
+    /// becomes leader won't reuse IDs assigned by the old leader.
+    pub fn advanceFileId(self: *Forest, id: u64) void {
+        while (true) {
+            const cur = self.next_file_id.load(.monotonic);
+            if (cur > id) return;
+            if (self.next_file_id.cmpxchgWeak(cur, id + 1, .monotonic, .monotonic) == null) return;
+        }
     }
 
     /// buildFlush is Phase A of the memtable flush: iterates the oldest frozen

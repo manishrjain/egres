@@ -177,6 +177,9 @@ pub const Table = struct {
         std.debug.assert(prev > 0);
         if (prev == 1) {
             if (self.claimPath()) |p| {
+                // TODO: We should be deleting this file only after we are sure that the Raft WAL
+                // snapshot no longer needs this file to be present for a replay. Because, now the
+                // LSM tree manifest is also essentially an extension of the Raft Snapshot.
                 std.fs.deleteFileAbsolute(p) catch {};
                 self.allocator.free(p);
             }

@@ -72,35 +72,34 @@ pub const StorageImpl = struct {
 
     fn applyManifestChange(self: *StorageImpl, index: u64, mc: zdb_bufs.ManifestChangeReader) void {
         _ = index;
-        const cmd = mc.cmd();
-        switch (cmd) {
-            4 => { // freeze
-                self.forest.freezeMemtable() catch |err| {
-                    log.err("freezeMemtable failed: {s}", .{@errorName(err)});
+        const mcs = zdb_bufs.ManifestChangeStruct.fromReader(self.allocator, mc) catch |err| {
+            log.err("ManifestChange decode failed: {s}", .{@errorName(err)});
+            return;
+        };
+        defer {
+            mcs.deinit(self.allocator);
+            self.allocator.destroy(mcs);
+        }
+
+        // Advance file ID counter so a follower that becomes leader
+        // won't reuse IDs assigned by the old leader.
+        self.forest.advanceFileId(mcs.memtable_id);
+        for (mcs.table_changes) |tc| {
+            self.forest.advanceFileId(tc.table_id);
+        }
+
+        switch (mcs.cmd) {
+            4 => { // new memtable
+                self.forest.newMemtable(mcs.memtable_id) catch |err| {
+                    log.err("newMemtable failed: {s}", .{@errorName(err)});
                 };
             },
             1 => { // flush
-                const mcs = zdb_bufs.ManifestChangeStruct.fromReader(self.allocator, mc) catch |err| {
-                    log.err("ManifestChange decode failed: {s}", .{@errorName(err)});
-                    return;
-                };
-                defer {
-                    mcs.deinit(self.allocator);
-                    self.allocator.destroy(mcs);
-                }
                 self.forest.applyFlush(mcs.table_changes, mcs.memtable_id) catch |err| {
                     log.err("applyFlush failed: {s}", .{@errorName(err)});
                 };
             },
             2 => { // compaction
-                const mcs = zdb_bufs.ManifestChangeStruct.fromReader(self.allocator, mc) catch |err| {
-                    log.err("ManifestChange decode failed: {s}", .{@errorName(err)});
-                    return;
-                };
-                defer {
-                    mcs.deinit(self.allocator);
-                    self.allocator.destroy(mcs);
-                }
                 if (mcs.table_changes.len > 0) {
                     const tree_id = mcs.table_changes[0].tree_id;
                     if (self.forest.trees.get(tree_id)) |tree| {
@@ -111,20 +110,12 @@ pub const StorageImpl = struct {
                 }
             },
             3 => { // tree split
-                const mcs = zdb_bufs.ManifestChangeStruct.fromReader(self.allocator, mc) catch |err| {
-                    log.err("ManifestChange decode failed: {s}", .{@errorName(err)});
-                    return;
-                };
-                defer {
-                    mcs.deinit(self.allocator);
-                    self.allocator.destroy(mcs);
-                }
                 self.forest.applySplit(mcs.*) catch |err| {
                     log.err("applySplit failed: {s}", .{@errorName(err)});
                 };
             },
             else => {
-                log.err("unknown ManifestChange cmd={d}", .{cmd});
+                log.err("unknown ManifestChange cmd={d}", .{mcs.cmd});
             },
         }
     }
@@ -267,26 +258,54 @@ pub const ZdbServer = struct {
     }
 
     pub fn runCompactionLoop(self: *ZdbServer) void {
-        log.info("compaction loop started", .{});
+        log.info("compaction loops started", .{});
+        var group = zio.group();
+        group.spawn(runMemtableLoop, .{self}) catch return;
+        group.spawn(runFlushLoop, .{self}) catch return;
+        group.spawn(runCompactLoop, .{self}) catch return;
+        group.wait() catch {};
+        log.info("compaction loops exiting (shutdown)", .{});
+    }
+
+    fn runMemtableLoop(self: *ZdbServer) void {
+        const interval = zio.Duration.fromMilliseconds(100);
+        while (!self.node.isShuttingDown()) {
+            if (!self.node.isLeader() or !self.forest.shouldFreeze()) {
+                zio.sleep(interval) catch return;
+                continue;
+            }
+            self.proposeNewMemtable() catch |err| {
+                log.err("proposeNewMemtable failed: {s}", .{@errorName(err)});
+            };
+        }
+    }
+
+    fn runFlushLoop(self: *ZdbServer) void {
+        const interval = zio.Duration.fromMilliseconds(200);
+        while (!self.node.isShuttingDown()) {
+            if (!self.node.isLeader() or !self.forest.hasFrozenMemtables()) {
+                zio.sleep(interval) catch return;
+                continue;
+            }
+            self.proposeFlush() catch |err| {
+                log.err("proposeFlush failed: {s}", .{@errorName(err)});
+            };
+        }
+    }
+
+    // TODO: This work can be done by a follower instead of the leader. Leader
+    // should figure out the candidates and hand them over to anyone who's caught up.
+    // Given that we're only doing one compaction per tree, no one else is working on
+    // that tree, so the follower's results would be valid. The leader would check
+    // results before proposing, so we should be fine.
+    // For now, leader is the one doing the compaction.
+    fn runCompactLoop(self: *ZdbServer) void {
         const interval = zio.Duration.fromMilliseconds(500);
         while (!self.node.isShuttingDown()) {
             if (!self.node.isLeader()) {
                 zio.sleep(interval) catch return;
                 continue;
             }
-
-            if (self.forest.shouldFreeze()) {
-                self.proposeFreeze() catch |err| {
-                    log.err("proposeFreeze failed: {s}", .{@errorName(err)});
-                };
-            }
-
-            if (self.forest.hasFrozenMemtables()) {
-                self.proposeFlush() catch |err| {
-                    log.err("proposeFlush failed: {s}", .{@errorName(err)});
-                };
-            }
-
             if (self.forest.bestCompactionCandidate()) |target| {
                 self.proposeCompaction(target) catch |err| {
                     log.err("proposeCompaction failed: {s}", .{@errorName(err)});
@@ -295,11 +314,11 @@ pub const ZdbServer = struct {
                 zio.sleep(interval) catch return;
             }
         }
-        log.info("compaction loop exiting (shutdown)", .{});
     }
 
-    fn proposeFreeze(self: *ZdbServer) !void {
-        const payload = try encodeManifestChange(self.allocator, 4, &.{}, &.{}, 0);
+    fn proposeNewMemtable(self: *ZdbServer) !void {
+        const new_id = self.forest.next_file_id.fetchAdd(1, .monotonic);
+        const payload = try encodeManifestChange(self.allocator, 4, &.{}, &.{}, new_id);
         defer self.allocator.free(payload);
         try self.proposeAndWait(payload);
     }
@@ -538,7 +557,6 @@ fn onCommit(ctx_raw: *anyopaque, _entry: raft.ProposalEntry, status: raft.Commit
     ctx.status = status;
     ctx.wg.done();
 }
-
 
 /// Encode a ManifestChange into a zbuf-serialized payload for proposeDataChange.
 fn encodeManifestChange(

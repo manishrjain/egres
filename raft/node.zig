@@ -120,22 +120,22 @@ pub const Node = struct {
     pub const Storage = struct {
         ctx: *anyopaque,
         applyFn: *const fn (*anyopaque, u64, u64, []const u8) void,
-        writeFileFn: *const fn (*anyopaque, u64, []const u8) void,
-        readFileFn: *const fn (*anyopaque, std.mem.Allocator, u64) ?[]const u8,
-        hasFileFn: *const fn (*anyopaque, u64) bool,
+        writeFileFn: ?*const fn (*anyopaque, u64, []const u8) void = null,
+        readFileFn: ?*const fn (*anyopaque, std.mem.Allocator, u64) ?[]const u8 = null,
+        hasFileFn: ?*const fn (*anyopaque, u64) bool = null,
         preAppendFn: ?*const fn (*anyopaque, *Node, []const zen.LogEntryBuffer) void = null,
 
         pub fn apply(self: *Storage, index: u64, term: u64, data: []const u8) void {
             self.applyFn(self.ctx, index, term, data);
         }
         pub fn writeFile(self: *Storage, file_id: u64, data: []const u8) void {
-            self.writeFileFn(self.ctx, file_id, data);
+            (self.writeFileFn orelse @panic("Storage.writeFile not implemented"))(self.ctx, file_id, data);
         }
         pub fn readFile(self: *Storage, allocator: std.mem.Allocator, file_id: u64) ?[]const u8 {
-            return self.readFileFn(self.ctx, allocator, file_id);
+            return (self.readFileFn orelse @panic("Storage.readFile not implemented"))(self.ctx, allocator, file_id);
         }
         pub fn hasFile(self: *Storage, file_id: u64) bool {
-            return self.hasFileFn(self.ctx, file_id);
+            return (self.hasFileFn orelse @panic("Storage.hasFile not implemented"))(self.ctx, file_id);
         }
         pub fn preAppend(self: *Storage, node: *Node, entries: []const zen.LogEntryBuffer) void {
             if (self.preAppendFn) |f| f(self.ctx, node, entries);
@@ -488,7 +488,9 @@ pub const Node = struct {
                     raft_log.err("file_push crc mismatch for file {d}", .{file_id});
                     return;
                 }
-                if (self.storage) |s| s.writeFile(file_id, data);
+                if (self.storage) |s| {
+                    if (!s.hasFile(file_id)) s.writeFile(file_id, data);
+                }
                 // Signal any pending file request (follower pull).
                 {
                     self.file_req_mu.lock();

@@ -589,16 +589,18 @@ pub const Tree = struct {
         // Flush any remaining data.
         try self.flushBuilderOutput(&bld, &flush_handles, next_file_id);
 
+        // Start dir sync while we're waiting for file syncs to be done. We can do dir sync here
+        // because files have already been created and written. So, dir should have everything it
+        // needs.
+        var dir_sync = try zio.spawn(vfs.VFS.syncDir, .{self.opts.dir});
+        defer dir_sync.join();
+
         // Join all sync fibers and collect output file IDs.
         for (flush_handles.items) |*h| {
             const result = h.join() orelse return error.FlushFailed;
             try output_file_ids.append(self.allocator, result.file_id);
         }
         flush_handles.clearAndFree(self.allocator);
-
-        // Best-effort directory sync in a zio fiber, overlapping with manifest build.
-        var dir_sync = try zio.spawn(vfs.VFS.syncDir, .{self.opts.dir});
-        defer dir_sync.join();
 
         // --- build manifest changes ---
         var changes = try std.ArrayList(manifest.TableChange).initCapacity(
@@ -641,6 +643,8 @@ pub const Tree = struct {
                     .{ self.opts.dir, c.table_id },
                 );
                 defer self.allocator.free(path);
+                // TODO: We should open the table if possible upfront, so this part of the code
+                // executes faster.
                 const t = try Table.open(self.allocator, path, .p0);
                 errdefer t.decrRef();
                 try self.cache.own(c.table_id, t);
