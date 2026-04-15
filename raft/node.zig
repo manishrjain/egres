@@ -192,7 +192,6 @@ pub const Node = struct {
 
     const PendingFileAck = struct {
         acks: std.AutoHashMap(u64, void),
-        wg: utils.WaitGroup,
     };
 
     pub const ProposalType = enum { data, conf };
@@ -541,10 +540,7 @@ pub const Node = struct {
         const pending = try self.allocator.create(PendingFileAck);
         pending.* = .{
             .acks = std.AutoHashMap(u64, void).init(self.allocator),
-            .wg = .{},
         };
-        pending.wg.init();
-        pending.wg.add(1);
         self.file_acks.put(file_id, pending) catch {
             self.allocator.destroy(pending);
             return error.OutOfMemory;
@@ -579,7 +575,7 @@ pub const Node = struct {
             const p = pending orelse continue;
             while (true) {
                 if (!self.isLeader()) return error.NotLeader;
-                if (p.wg.isDone()) break;
+                if (p.acks.count() + 1 >= self.quorum_size) break;
                 zio.sleep(zio.Duration.fromMilliseconds(10)) catch return error.Cancelled;
             }
         }
@@ -637,9 +633,6 @@ pub const Node = struct {
     fn onFileAck(self: *Node, file_id: u64, node_id: u64) void {
         const pending = self.file_acks.get(file_id) orelse return;
         pending.acks.put(node_id, {}) catch return;
-        if (pending.acks.count() + 1 >= self.quorum_size) {
-            pending.wg.done();
-        }
     }
 
     /// Restore hard state (term, voted_for) from WAL on restart.
