@@ -163,12 +163,47 @@ pub const StorageImpl = struct {
         return self.forest.hasFile(file_id);
     }
 
+    /// Ensure all SST files referenced by ManifestChange entries are on disk
+    /// before the WAL append. Fetches missing files from the leader.
     fn preAppend(ctx: *anyopaque, node: *raft.Node, entries: []const raft.buffers.LogEntryBuffer) void {
         const self: *StorageImpl = @ptrCast(@alignCast(ctx));
-        _ = self;
-        _ = node;
-        _ = entries;
-        // TODO: parse entries for ManifestChange, check hasFile, requestFiles for missing.
+
+        // Collect missing file IDs across all entries.
+        var missing = std.ArrayList(u64).empty;
+        defer missing.deinit(self.allocator);
+
+        for (entries) |entry| {
+            const reader = entry.initReader() catch continue;
+            if (!reader.isNormal()) continue;
+            const data = reader.data();
+            if (data.len == 0) continue;
+
+            // Try parsing as ManifestChange.
+            const parsed = zdb_bufs.parseMessageWithTail(data) catch continue;
+            switch (parsed) {
+                .ManifestChange => |mc| {
+                    const cmd = mc.cmd();
+                    if (cmd < 1 or cmd > 3) continue; // only flush/compact/split have files
+                    const tc_len = mc.tableChangesLen();
+                    for (0..tc_len) |i| {
+                        const tc = mc.tableChangesAt(@intCast(i)) catch continue;
+                        if (tc.op() == 0 and !self.forest.hasFile(tc.tableId())) {
+                            missing.append(self.allocator, tc.tableId()) catch continue;
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        if (missing.items.len == 0) return;
+
+        log.info("preAppend: fetching {d} missing files from leader", .{missing.items.len});
+        node.requestFiles(missing.items) catch |err| {
+            log.err("preAppend: requestFiles failed: {s}", .{@errorName(err)});
+            return;
+        };
+        log.info("preAppend: received {d} files from leader", .{missing.items.len});
     }
 };
 
