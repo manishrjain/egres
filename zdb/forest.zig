@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = std.log.scoped(.forest);
 const zio = @import("zio");
 const utils = @import("utils");
 const options = @import("options.zig");
@@ -342,7 +343,6 @@ pub const Forest = struct {
 
     pub fn buildFlush(self: *Forest) !?FlushResult {
         const mt = self.memtables.peekOldest() orelse return null;
-        const memtable_id = mt.id;
         var iter = mt.iterator();
         defer iter.deinit();
 
@@ -386,6 +386,7 @@ pub const Forest = struct {
         // Flush all builders to SST files. writeAndSyncTable handles the full
         // write path (finish → create file → write → sync → close) and returns
         // the manifest TableChange directly.
+        var flush_err: utils.ThreadSafeError = .{};
         var handles: std.ArrayList(zio.JoinHandle(?manifest.TableChange)) = .{};
         defer {
             for (handles.items) |*h| _ = h.join();
@@ -411,18 +412,18 @@ pub const Forest = struct {
             );
 
             try handles.append(self.allocator, try zio.spawn(writeAndSyncTable, .{
-                self.allocator, tb, path, file_id, tree_id,
+                self.allocator, tb, path, file_id, tree_id, &flush_err,
             }));
         }
 
         // Join fibers and collect manifest changes.
         var changes: std.ArrayList(manifest.TableChange) = .{};
         for (handles.items) |*h| {
-            // TODO: We should be handling errors here, not ignoring them.
             const tc = h.join() orelse continue;
             try changes.append(self.allocator, tc);
         }
         handles.clearAndFree(self.allocator);
+        if (flush_err.get()) |err| return err;
 
         // Best-effort directory sync.
         if (self.opts.dir.len > 0) {
@@ -430,7 +431,7 @@ pub const Forest = struct {
             defer dir_sync.join();
         }
 
-        return .{ .changes = changes, .memtable_id = memtable_id };
+        return .{ .changes = changes, .memtable_id = mt.id };
     }
 
     /// Writes table bytes to a new SST file, syncs, and closes.
@@ -441,14 +442,24 @@ pub const Forest = struct {
         path: []const u8,
         file_id: u64,
         tree_id: u64,
+        err_out: *utils.ThreadSafeError,
     ) ?manifest.TableChange {
         defer allocator.free(path);
         var mtb = tb;
         defer mtb.deinit();
 
-        const wh = vfs.g().createFile(path, .{ .mode = .direct }) catch return null;
-        wh.write(mtb.bytes, 0, .p0) catch return null;
-        wh.sync() catch return null;
+        const wh = vfs.g().createFile(path, .{ .mode = .direct }) catch |err| {
+            err_out.set(err);
+            return null;
+        };
+        wh.write(mtb.bytes, 0, .p0) catch |err| {
+            err_out.set(err);
+            return null;
+        };
+        wh.sync() catch |err| {
+            err_out.set(err);
+            return null;
+        };
         wh.close();
         return manifest.createTableChange(file_id, tree_id, 0);
     }
