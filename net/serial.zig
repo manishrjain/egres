@@ -10,6 +10,9 @@ pub const msg_type_raft: u16 = 1;
 pub const msg_type_join_request: u16 = 2;
 pub const msg_type_ping: u16 = 3;
 pub const msg_type_pong: u16 = 4;
+pub const msg_type_file_push: u16 = 5; // [8B file_id][4B crc32][file data...]
+pub const msg_type_file_ack: u16 = 6; // [8B file_id][8B node_id]
+pub const msg_type_file_request: u16 = 7; // [N * 8B file_ids]
 
 pub const OutboundMsg = struct {
     message_type: u16,

@@ -165,9 +165,14 @@ pub fn main() !void {
     var applier = zdb.applier.StorageApplier.init(allocator, forest);
     defer deinitWithLog("applier", &applier);
 
-    // Register state machine apply callback so both leader and followers apply committed entries.
-    node.on_apply = &zdb_server.applyEntryToStorage;
-    node.on_apply_ctx = @ptrCast(&applier);
+    // Storage interface bridges raft commits to forest.
+    var storage_impl = zdb_server.StorageImpl{
+        .applier = &applier,
+        .forest = forest,
+        .allocator = allocator,
+    };
+    var storage = storage_impl.asStorage();
+    node.storage = &storage;
 
     // zio runtime must be created before raft_rt so its defer (deinit) runs last,
     // after all coroutines are cleaned up.

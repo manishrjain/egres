@@ -7,11 +7,170 @@ const zen = @import("buffers_gen");
 const proto = @import("protocol.zig");
 const WaitGroup = @import("raft").utils.WaitGroup;
 
+const zdb_bufs = zdb.buffers;
+const manifest = zdb.manifest;
 const Forest = zdb.forest.Forest;
 const StorageApplier = zdb.applier.StorageApplier;
 const Item = zdb.key.Item;
 const Key = zdb.key.Key;
+const vfs = zdb.vfs;
 const log = std.log.scoped(.zdb_server);
+
+pub const StorageImpl = struct {
+    applier: *StorageApplier,
+    forest: *Forest,
+    allocator: std.mem.Allocator,
+
+    pub fn asStorage(self: *StorageImpl) raft.Node.Storage {
+        return .{
+            .ctx = @ptrCast(self),
+            .applyFn = &applyEntry,
+            .writeFileFn = &writeFile,
+            .readFileFn = &readFile,
+            .hasFileFn = &hasFile,
+            .preAppendFn = &preAppend,
+        };
+    }
+
+    fn applyEntry(ctx: *anyopaque, index: u64, _term: u64, data: []const u8) void {
+        _ = _term;
+        const self: *StorageImpl = @ptrCast(@alignCast(ctx));
+
+        // Try Mutation (zdb-server schema).
+        if (zen.parseMessageWithTail(data)) |parsed| {
+            switch (parsed) {
+                .Mutation => |mutation| {
+                    const items = [_]Item{.{
+                        .key = .{
+                            .namespace = mutation.namespace(),
+                            .primary = mutation.key(),
+                            .timestamp = mutation.timestamp(),
+                        },
+                        .value = mutation.value(),
+                    }};
+                    _ = self.applier.applyMutations(index, &items) catch |err| {
+                        log.err("on_apply: applyMutations failed at index={d}: {s}", .{ index, @errorName(err) });
+                    };
+                    return;
+                },
+            }
+        } else |_| {}
+
+        // Try ManifestChange (zdb schema).
+        if (zdb_bufs.parseMessageWithTail(data)) |parsed| {
+            switch (parsed) {
+                .ManifestChange => |mc| {
+                    self.applyManifestChange(index, mc);
+                    return;
+                },
+                else => {},
+            }
+        } else |_| {}
+
+        log.err("on_apply: unknown entry type at index={d}", .{index});
+    }
+
+    fn applyManifestChange(self: *StorageImpl, index: u64, mc: zdb_bufs.ManifestChangeReader) void {
+        _ = index;
+        const cmd = mc.cmd();
+        switch (cmd) {
+            4 => { // freeze
+                self.forest.freezeMemtable() catch |err| {
+                    log.err("freezeMemtable failed: {s}", .{@errorName(err)});
+                };
+            },
+            1 => { // flush
+                const mcs = zdb_bufs.ManifestChangeStruct.fromReader(self.allocator, mc) catch |err| {
+                    log.err("ManifestChange decode failed: {s}", .{@errorName(err)});
+                    return;
+                };
+                defer {
+                    mcs.deinit(self.allocator);
+                    self.allocator.destroy(mcs);
+                }
+                self.forest.applyFlush(mcs.table_changes, mcs.memtable_id) catch |err| {
+                    log.err("applyFlush failed: {s}", .{@errorName(err)});
+                };
+            },
+            2 => { // compaction
+                const mcs = zdb_bufs.ManifestChangeStruct.fromReader(self.allocator, mc) catch |err| {
+                    log.err("ManifestChange decode failed: {s}", .{@errorName(err)});
+                    return;
+                };
+                defer {
+                    mcs.deinit(self.allocator);
+                    self.allocator.destroy(mcs);
+                }
+                if (mcs.table_changes.len > 0) {
+                    const tree_id = mcs.table_changes[0].tree_id;
+                    if (self.forest.trees.get(tree_id)) |tree| {
+                        tree.applyCompaction(mcs.table_changes) catch |err| {
+                            log.err("applyCompaction failed: {s}", .{@errorName(err)});
+                        };
+                    }
+                }
+            },
+            3 => { // tree split
+                const mcs = zdb_bufs.ManifestChangeStruct.fromReader(self.allocator, mc) catch |err| {
+                    log.err("ManifestChange decode failed: {s}", .{@errorName(err)});
+                    return;
+                };
+                defer {
+                    mcs.deinit(self.allocator);
+                    self.allocator.destroy(mcs);
+                }
+                self.forest.applySplit(mcs.*) catch |err| {
+                    log.err("applySplit failed: {s}", .{@errorName(err)});
+                };
+            },
+            else => {
+                log.err("unknown ManifestChange cmd={d}", .{cmd});
+            },
+        }
+    }
+
+    fn writeFile(ctx: *anyopaque, file_id: u64, data: []const u8) void {
+        const self: *StorageImpl = @ptrCast(@alignCast(ctx));
+        const path = std.fmt.allocPrint(self.allocator, "{s}/{d:0>6}.sst", .{ self.forest.opts.dir, file_id }) catch return;
+        defer self.allocator.free(path);
+        const fh = vfs.g().createFile(path, .{ .mode = .direct }) catch |err| {
+            log.err("writeFile: createFile failed for {d}: {s}", .{ file_id, @errorName(err) });
+            return;
+        };
+        fh.write(data, 0, .p1) catch |err| {
+            log.err("writeFile: write failed for {d}: {s}", .{ file_id, @errorName(err) });
+            fh.close();
+            return;
+        };
+        fh.sync() catch {};
+        fh.close();
+    }
+
+    fn readFile(ctx: *anyopaque, allocator: std.mem.Allocator, file_id: u64) ?[]const u8 {
+        const self: *StorageImpl = @ptrCast(@alignCast(ctx));
+        const path = std.fmt.allocPrint(self.allocator, "{s}/{d:0>6}.sst", .{ self.forest.opts.dir, file_id }) catch return null;
+        defer self.allocator.free(path);
+        const handle = vfs.g().openFile(allocator, path, .{}) catch return null;
+        defer handle.close();
+        const result = handle.readAligned(allocator, 0, @intCast(handle.file_size), .p1) catch return null;
+        // Caller frees. readAligned returns a ReadResult — we need to extract owned data.
+        // ReadResult.data is a slice into buf. Return buf so caller can free it.
+        return result.data;
+    }
+
+    fn hasFile(ctx: *anyopaque, file_id: u64) bool {
+        const self: *StorageImpl = @ptrCast(@alignCast(ctx));
+        return self.forest.hasFile(file_id);
+    }
+
+    fn preAppend(ctx: *anyopaque, node: *raft.Node, entries: []const raft.buffers.LogEntryBuffer) void {
+        const self: *StorageImpl = @ptrCast(@alignCast(ctx));
+        _ = self;
+        _ = node;
+        _ = entries;
+        // TODO: parse entries for ManifestChange, check hasFile, requestFiles for missing.
+    }
+};
 
 pub const ZdbServer = struct {
     allocator: std.mem.Allocator,
@@ -76,15 +235,97 @@ pub const ZdbServer = struct {
         log.info("compaction loop started", .{});
         const interval = zio.Duration.fromMilliseconds(500);
         while (!self.node.isShuttingDown()) {
-            const did_compact = self.forest.compact() catch false;
-            if (did_compact) {
-                log.debug("compaction completed a round", .{});
+            if (!self.node.isLeader()) {
+                zio.sleep(interval) catch return;
+                continue;
             }
-            if (!did_compact) {
+
+            if (self.forest.shouldFreeze()) {
+                self.proposeFreeze() catch |err| {
+                    log.err("proposeFreeze failed: {s}", .{@errorName(err)});
+                };
+            }
+
+            if (self.forest.hasFrozenMemtables()) {
+                self.proposeFlush() catch |err| {
+                    log.err("proposeFlush failed: {s}", .{@errorName(err)});
+                };
+            }
+
+            if (self.forest.bestCompactionCandidate()) |target| {
+                self.proposeCompaction(target) catch |err| {
+                    log.err("proposeCompaction failed: {s}", .{@errorName(err)});
+                };
+            } else {
                 zio.sleep(interval) catch return;
             }
         }
         log.info("compaction loop exiting (shutdown)", .{});
+    }
+
+    fn proposeFreeze(self: *ZdbServer) !void {
+        const payload = try encodeManifestChange(self.allocator, 4, &.{}, &.{}, 0);
+        defer self.allocator.free(payload);
+        try self.proposeAndWait(payload);
+    }
+
+    fn proposeFlush(self: *ZdbServer) !void {
+        const result = try self.forest.buildFlush() orelse return;
+        var changes = result.changes;
+        defer changes.deinit(self.allocator);
+        if (changes.items.len == 0) return;
+
+        try self.distributeNewFiles(changes.items);
+
+        const payload = try encodeManifestChange(self.allocator, 1, changes.items, &.{}, result.memtable_id);
+        defer self.allocator.free(payload);
+        try self.proposeAndWait(payload);
+    }
+
+    fn proposeCompaction(self: *ZdbServer, target: Forest.CompactionTarget) !void {
+        var changes = try target.tree.buildCompaction(target.candidate.level, &self.forest.next_file_id);
+        defer changes.deinit(self.allocator);
+        if (changes.items.len == 0) return;
+
+        try self.distributeNewFiles(changes.items);
+
+        const payload = try encodeManifestChange(self.allocator, 2, changes.items, &.{}, 0);
+        defer self.allocator.free(payload);
+        try self.proposeAndWait(payload);
+    }
+
+    /// Read and send each new SST file to peers, then wait for quorum on all.
+    fn distributeNewFiles(self: *ZdbServer, changes: []const manifest.TableChange) !void {
+        // Collect CREATE file IDs.
+        var file_ids = std.ArrayList(u64).empty;
+        defer file_ids.deinit(self.allocator);
+        for (changes) |c| {
+            if (c.op == 0) try file_ids.append(self.allocator, c.table_id);
+        }
+        if (file_ids.items.len == 0) return;
+
+        // Read each file and send to peers one at a time.
+        for (file_ids.items) |file_id| {
+            const path = try std.fmt.allocPrint(self.allocator, "{s}/{d:0>6}.sst", .{ self.forest.opts.dir, file_id });
+            defer self.allocator.free(path);
+            const handle = try vfs.g().openFile(self.allocator, path, .{});
+            defer handle.close();
+            const result = try handle.readAligned(self.allocator, 0, @intCast(handle.file_size), .p1);
+            defer result.free();
+            try self.node.sendFile(file_id, result.data);
+        }
+
+        // Wait for quorum on all files.
+        try self.node.waitForFileQuorum(file_ids.items);
+    }
+
+    fn proposeAndWait(self: *ZdbServer, payload: []const u8) !void {
+        var ctx = CommitCtx{ .status = .committed };
+        ctx.wg.init();
+        ctx.wg.add(1);
+        try self.node.proposeDataChange(payload, &onCommit, @ptrCast(&ctx));
+        ctx.wg.wait() catch return error.CommitFailed;
+        if (ctx.status != .committed) return error.NotCommitted;
     }
 
     fn handleClient(self: *ZdbServer, stream: zio.net.Stream) void {
@@ -263,28 +504,50 @@ fn onCommit(ctx_raw: *anyopaque, _entry: raft.ProposalEntry, status: raft.Commit
     ctx.wg.done();
 }
 
-/// Called by raft node's applyCommits for each committed normal entry.
-/// Decodes the mutation and applies it to the storage engine.
-pub fn applyEntryToStorage(ctx_raw: *anyopaque, index: u64, _term: u64, data: []const u8) void {
-    _ = _term;
-    const applier: *StorageApplier = @ptrCast(@alignCast(ctx_raw));
-    const parsed = zen.parseMessageWithTail(data) catch |err| {
-        log.err("on_apply: failed to parse entry at index={d}: {s}", .{ index, @errorName(err) });
-        return;
-    };
-    switch (parsed) {
-        .Mutation => |mutation| {
-            const items = [_]Item{.{
-                .key = .{
-                    .namespace = mutation.namespace(),
-                    .primary = mutation.key(),
-                    .timestamp = mutation.timestamp(),
-                },
-                .value = mutation.value(),
-            }};
-            _ = applier.applyMutations(index, &items) catch |err| {
-                log.err("on_apply: applyMutations failed at index={d}: {s}", .{ index, @errorName(err) });
-            };
-        },
+
+/// Encode a ManifestChange into a zbuf-serialized payload for proposeDataChange.
+fn encodeManifestChange(
+    allocator: std.mem.Allocator,
+    cmd: u32,
+    table_changes: []const manifest.TableChange,
+    tree_changes: []const manifest.TreeChange,
+    memtable_id: u64,
+) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    var mw = try zdb_bufs.ManifestChangeWriter.initWithBuf(allocator, &buf);
+
+    if (table_changes.len > 0) {
+        const offsets = try allocator.alloc(u32, table_changes.len);
+        defer allocator.free(offsets);
+        for (table_changes, 0..) |tc, i| {
+            var tw = try zdb_bufs.TableChangeWriter.initWithBuf(allocator, &buf);
+            try tw.set(.{ .op = tc.op, .level = tc.level, .table_id = tc.table_id, .tree_id = tc.tree_id });
+            offsets[i] = (try tw.finish()).offset;
+        }
+        try mw.setTableChanges(offsets);
     }
+
+    if (tree_changes.len > 0) {
+        const offsets = try allocator.alloc(u32, tree_changes.len);
+        defer allocator.free(offsets);
+        for (tree_changes, 0..) |tc, i| {
+            var tw = try zdb_bufs.TreeChangeWriter.initWithBuf(allocator, &buf);
+            try tw.set(.{
+                .op = tc.op,
+                .tree_id = tc.tree_id,
+                .namespace_id = tc.namespace_id,
+                .left_key = tc.left_key,
+                .right_key = tc.right_key,
+            });
+            offsets[i] = (try tw.finish()).offset;
+        }
+        try mw.setTreeChanges(offsets);
+    }
+
+    try mw.setCmd(cmd);
+    if (memtable_id != 0) try mw.setMemtableId(memtable_id);
+    _ = try mw.finishWithTail();
+    return buf.toOwnedSlice(allocator);
 }

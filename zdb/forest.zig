@@ -324,8 +324,14 @@ pub const Forest = struct {
     /// buildFlush is Phase A of the memtable flush: iterates the oldest frozen
     /// memtable, routes each key to its tree, builds one L0 SST per tree,
     /// and returns the manifest changes. The caller proposes these through Raft.
-    pub fn buildFlush(self: *Forest) !std.ArrayList(manifest.TableChange) {
-        const mt = self.memtables.peekOldest() orelse return .{};
+    pub const FlushResult = struct {
+        changes: std.ArrayList(manifest.TableChange),
+        memtable_id: u64,
+    };
+
+    pub fn buildFlush(self: *Forest) !?FlushResult {
+        const mt = self.memtables.peekOldest() orelse return null;
+        const memtable_id = mt.id;
         var iter = mt.iterator();
         defer iter.deinit();
 
@@ -401,6 +407,7 @@ pub const Forest = struct {
         // Join fibers and collect manifest changes.
         var changes: std.ArrayList(manifest.TableChange) = .{};
         for (handles.items) |*h| {
+            // TODO: We should be handling errors here, not ignoring them.
             const tc = h.join() orelse continue;
             try changes.append(self.allocator, tc);
         }
@@ -412,7 +419,7 @@ pub const Forest = struct {
             defer dir_sync.join();
         }
 
-        return changes;
+        return .{ .changes = changes, .memtable_id = memtable_id };
     }
 
     /// Writes table bytes to a new SST file, syncs, and closes.
@@ -540,25 +547,49 @@ pub const Forest = struct {
     /// Compact finds the tree with the highest compaction score and runs one
     /// compaction on it. Returns true if a compaction was executed, false if
     /// no tree needs compaction.
-    pub fn compact(self: *Forest) !bool {
-        const Best = struct { tree: *Tree, tree_id: u64, candidate: tree_mod.CompactCandidate };
-        var best: ?Best = null;
+    pub const CompactionTarget = struct {
+        tree: *Tree,
+        tree_id: u64,
+        candidate: tree_mod.CompactCandidate,
+    };
 
-        {
-            self.mu.lockShared();
-            defer self.mu.unlockShared();
+    /// Find the best tree/level to compact without performing compaction.
+    pub fn bestCompactionCandidate(self: *Forest) ?CompactionTarget {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
 
-            var it = self.trees.iterator();
-            while (it.next()) |kv| {
-                const tree = kv.value_ptr.*;
-                const candidate = tree.compact_candidate orelse continue;
-                if (best == null or candidate.score > best.?.candidate.score) {
-                    best = .{ .tree = tree, .tree_id = kv.key_ptr.*, .candidate = candidate };
-                }
+        var best: ?CompactionTarget = null;
+        var it = self.trees.iterator();
+        while (it.next()) |kv| {
+            const tree = kv.value_ptr.*;
+            const candidate = tree.compact_candidate orelse continue;
+            if (best == null or candidate.score > best.?.candidate.score) {
+                best = .{ .tree = tree, .tree_id = kv.key_ptr.*, .candidate = candidate };
             }
         }
+        return best;
+    }
 
-        const b = best orelse return false;
+    /// Check if the current memtable should be frozen.
+    pub fn shouldFreeze(self: *Forest) bool {
+        return self.memtables.memoryUsage() >= self.opts.memtable_size;
+    }
+
+    /// Check if there are frozen memtables waiting to be flushed.
+    pub fn hasFrozenMemtables(self: *Forest) bool {
+        return self.memtables.peekOldest() != null;
+    }
+
+    /// Check if an SST file exists on disk.
+    pub fn hasFile(self: *Forest, file_id: u64) bool {
+        var buf: [256]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "{s}/{d:0>6}.sst", .{ self.opts.dir, file_id }) catch return false;
+        std.fs.cwd().access(path, .{}) catch return false;
+        return true;
+    }
+
+    pub fn compact(self: *Forest) !bool {
+        const b = self.bestCompactionCandidate() orelse return false;
         try b.tree.doCompact(b.candidate.level, &self.next_file_id);
         self.table_cache.clearStale();
 

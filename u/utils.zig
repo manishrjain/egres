@@ -37,6 +37,10 @@ pub const WaitGroup = struct {
         self.add(-1);
     }
 
+    pub fn isDone(self: *WaitGroup) bool {
+        return self.counter.load(.acquire) == 0;
+    }
+
     pub fn wait(self: *WaitGroup) !void {
         if (self.counter.load(.acquire) == 0) return;
         _ = self.ch.receive() catch return;
