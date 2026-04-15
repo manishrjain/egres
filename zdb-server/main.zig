@@ -171,8 +171,8 @@ pub fn main() !void {
         .forest = forest,
         .allocator = allocator,
     };
-    var storage = storage_impl.asStorage();
-    node.storage = &storage;
+    var sm = storage_impl.asStateMachine();
+    node.state_machine = &sm;
 
     // zio runtime must be created before raft_rt so its defer (deinit) runs last,
     // after all coroutines are cleaned up.

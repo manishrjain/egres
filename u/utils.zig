@@ -204,6 +204,62 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
     };
 }
 
+/// Thread-safe wrapper around std.AutoHashMap. All operations are mutex-protected.
+/// Init with `.init(allocator)`.
+pub fn SafeHashMap(comptime K: type, comptime V: type) type {
+    return struct {
+        const Self = @This();
+        const HashMap = std.AutoHashMap(K, V);
+
+        map: HashMap,
+        mu: std.Thread.Mutex = .{},
+
+        pub fn init(allocator: std.mem.Allocator) Self {
+            return .{ .map = HashMap.init(allocator) };
+        }
+
+        pub fn get(self: *Self, key: K) ?V {
+            self.mu.lock();
+            defer self.mu.unlock();
+            return self.map.get(key);
+        }
+
+        pub fn put(self: *Self, key: K, value: V) !void {
+            self.mu.lock();
+            defer self.mu.unlock();
+            try self.map.put(key, value);
+        }
+
+        pub fn remove(self: *Self, key: K) bool {
+            self.mu.lock();
+            defer self.mu.unlock();
+            return self.map.remove(key);
+        }
+
+        pub fn fetchRemove(self: *Self, key: K) ?HashMap.KV {
+            self.mu.lock();
+            defer self.mu.unlock();
+            return self.map.fetchRemove(key);
+        }
+
+        pub fn contains(self: *Self, key: K) bool {
+            self.mu.lock();
+            defer self.mu.unlock();
+            return self.map.contains(key);
+        }
+
+        pub fn count(self: *Self) u32 {
+            self.mu.lock();
+            defer self.mu.unlock();
+            return self.map.count();
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.map.deinit();
+        }
+    };
+}
+
 /// Run all pub test functions (fn names starting with "test") in a module
 /// inside a zio runtime. Test functions must be `pub fn testXxx() !void`.
 ///

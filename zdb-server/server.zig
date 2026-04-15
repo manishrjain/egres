@@ -21,7 +21,7 @@ pub const StorageImpl = struct {
     forest: *Forest,
     allocator: std.mem.Allocator,
 
-    pub fn asStorage(self: *StorageImpl) raft.Node.Storage {
+    pub fn asStateMachine(self: *StorageImpl) raft.Node.StateMachine {
         return .{
             .ctx = @ptrCast(self),
             .applyFn = &applyEntry,
