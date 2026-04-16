@@ -447,7 +447,7 @@ pub fn testDoCompactL0L1() !void {
     for (l0_data) |d| {
         var tb = try buildTable(alloc, &.{.{ .key = d.key, .ts = 0, .val = d.val }});
         defer tb.deinit();
-        const path = try std.fmt.allocPrint(alloc, "{s}/{d:0>6}.sst", .{ dir_path, d.id });
+        const path = try options_mod.sstPath(alloc, dir_path, d.id);
         defer alloc.free(path);
         const f = try std.fs.createFileAbsolute(path, .{});
         defer f.close();

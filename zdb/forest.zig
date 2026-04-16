@@ -405,11 +405,7 @@ pub const Forest = struct {
             }
 
             const file_id = self.next_file_id.fetchAdd(1, .monotonic);
-            const path = try std.fmt.allocPrint(
-                self.allocator,
-                "{s}/{d:0>6}.sst",
-                .{ self.opts.dir, file_id },
-            );
+            const path = try options.sstPath(self.allocator, self.opts.dir,file_id);
 
             try handles.append(self.allocator, try zio.spawn(writeAndSyncTable, .{
                 self.allocator, tb, path, file_id, tree_id, &flush_err,
@@ -477,11 +473,7 @@ pub const Forest = struct {
             std.debug.assert(c.op == 0); // flush only creates
             const tree = self.trees.get(c.tree_id) orelse continue;
 
-            const path = try std.fmt.allocPrint(
-                self.allocator,
-                "{s}/{d:0>6}.sst",
-                .{ self.opts.dir, c.table_id },
-            );
+            const path = try options.sstPath(self.allocator, self.opts.dir,c.table_id);
             defer self.allocator.free(path);
 
             const t = try Table.open(self.allocator, path, .p0);
@@ -604,10 +596,46 @@ pub const Forest = struct {
 
     /// Check if an SST file exists on disk.
     pub fn hasFile(self: *Forest, file_id: u64) bool {
-        var buf: [256]u8 = undefined;
-        const path = std.fmt.bufPrint(&buf, "{s}/{d:0>6}.sst", .{ self.opts.dir, file_id }) catch return false;
+        const path = options.sstPath(self.allocator, self.opts.dir,file_id) catch return false;
+        defer self.allocator.free(path);
         std.fs.cwd().access(path, .{}) catch return false;
         return true;
+    }
+
+    /// Write an SST file to disk and pre-open it into the table cache.
+    pub fn writeFile(self: *Forest, file_id: u64, data: []const u8) void {
+        const path = options.sstPath(self.allocator, self.opts.dir,file_id) catch return;
+        defer self.allocator.free(path);
+        const fh = vfs.g().createFile(path, .{ .mode = .direct }) catch |err| {
+            log.err("writeFile: createFile failed for {d}: {s}", .{ file_id, @errorName(err) });
+            return;
+        };
+        fh.write(data, 0, .p1) catch |err| {
+            log.err("writeFile: write failed for {d}: {s}", .{ file_id, @errorName(err) });
+            fh.close();
+            return;
+        };
+        fh.sync() catch {};
+        fh.close();
+
+        // Pre-open the table into the cache so it's ready when compaction needs it.
+        const t = Table.open(self.allocator, path, .p1) catch |err| {
+            log.err("writeFile: Table.open failed for {d}: {s}", .{ file_id, @errorName(err) });
+            return;
+        };
+        self.table_cache.own(file_id, t) catch |err| {
+            log.err("writeFile: table_cache.own failed for {d}: {s}", .{ file_id, @errorName(err) });
+        };
+    }
+
+    /// Read an SST file from disk. Caller owns the returned slice.
+    pub fn readFile(self: *Forest, allocator: std.mem.Allocator, file_id: u64) ?[]const u8 {
+        const path = options.sstPath(self.allocator, self.opts.dir,file_id) catch return null;
+        defer self.allocator.free(path);
+        const handle = vfs.g().openFile(allocator, path, .{}) catch return null;
+        defer handle.close();
+        const result = handle.readAligned(allocator, 0, @intCast(handle.file_size), .p1) catch return null;
+        return result.data;
     }
 
     pub fn compact(self: *Forest) !bool {
@@ -694,7 +722,7 @@ pub const Forest = struct {
         return .{
             .table_changes = try table_changes.toOwnedSlice(alloc),
             .tree_changes = tree_changes,
-            .cmd = 3, // tree_split
+            .cmd = 4, // tree_split
         };
     }
 

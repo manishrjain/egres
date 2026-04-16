@@ -174,7 +174,7 @@ pub fn testForestSplitTree() !void {
 
         const table_keys = [_][]const u8{ "aaa", "mmm", "zzz" };
         for (table_keys, 1..) |key, tbl_id| {
-            const path = try std.fmt.allocPrint(alloc, "{s}/{d:0>6}.sst", .{ dir_path, tbl_id });
+            const path = try options_mod.sstPath(alloc, dir_path, tbl_id);
             defer alloc.free(path);
             try buildAndWriteTable(alloc, path, key);
             try ms.commit(&.{manifest.createTableChange(tbl_id, 1, 1)}, &.{});

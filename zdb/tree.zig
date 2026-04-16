@@ -75,15 +75,21 @@ pub const TableCache = struct {
         self.tables.deinit();
     }
 
-    /// own hands ownership of a *Table to the cache. The cache will destroy the
-    /// struct in deinit/clearStale. Caller must not destroy t after this call.
+    /// own hands ownership of a *Table to the cache. The cache incrRef's so
+    /// the table stays alive until explicitly released (e.g. after a snapshot
+    /// confirms no follower needs the backing SST file). Caller must not
+    /// destroy t after this call.
     pub fn own(self: *TableCache, id: u64, t: *Table) !void {
         self.mu.lock();
         defer self.mu.unlock();
         std.debug.assert(!self.tables.contains(id));
+        t.incrRef();
         try self.tables.put(id, t);
     }
 
+    /// Evict tables whose ref has reached zero. Since own() holds a cache ref,
+    /// a table only becomes evictable after its cache ref is explicitly released
+    /// (e.g. after a snapshot confirms no follower needs the SST file).
     pub fn clearStale(self: *TableCache) void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -157,11 +163,7 @@ pub const TableCache = struct {
         // Phase B: open the SST file WITHOUT holding the lock.
         // Table.open may yield the fiber (async I/O); holding the lock here
         // would deadlock cooperative fibers on the same OS thread (EDEADLK).
-        const path = std.fmt.allocPrint(
-            self.allocator,
-            "{s}/{d:0>6}.sst",
-            .{ self.dir, need.id },
-        ) catch |err| {
+        const path = options.sstPath(self.allocator, self.dir, need.id) catch |err| {
             tse.set(err);
             return;
         };
@@ -170,7 +172,7 @@ pub const TableCache = struct {
             tse.set(err);
             return;
         };
-        defer t.decrRef(); // We shouldn't own a ref.
+        defer t.decrRef(); // Drop the open-time ref; own() takes its own.
         errdefer self.allocator.free(t);
 
         // Phase C: re-acquire write lock to insert; handle race with another fiber.
@@ -181,7 +183,8 @@ pub const TableCache = struct {
             levels[need.level].addEntry(need.id, existing) catch |err| tse.set(err);
             return;
         }
-        // Cache holds its own ref (Table.open starts at refcount 1).
+        // Cache takes its own ref; defer above drops the open-time ref.
+        t.incrRef();
         self.tables.put(need.id, t) catch |err| {
             self.mu.unlock();
             tse.set(err);
@@ -637,11 +640,7 @@ pub const Tree = struct {
             if (c.op == 1) { // DELETE
                 self.levels[c.level].deleteEntries(&.{.{ .id = c.table_id, .table = undefined }});
             } else if (c.op == 0) { // CREATE
-                const path = try std.fmt.allocPrint(
-                    self.allocator,
-                    "{s}/{d:0>6}.sst",
-                    .{ self.opts.dir, c.table_id },
-                );
+                const path = try options.sstPath(self.allocator, self.opts.dir, c.table_id);
                 defer self.allocator.free(path);
                 // TODO: We should open the table if possible upfront, so this part of the code
                 // executes faster.
@@ -673,11 +672,7 @@ pub const Tree = struct {
         if (tb.bytes.len == 0) return;
 
         const id = next_file_id.fetchAdd(1, .monotonic);
-        const path = try std.fmt.allocPrint(
-            self.allocator,
-            "{s}/{d:0>6}.sst",
-            .{ self.opts.dir, id },
-        );
+        const path = try options.sstPath(self.allocator, self.opts.dir, id);
         errdefer self.allocator.free(path);
 
         const wh = try vfs.g().createFile(path, .{ .mode = .direct });

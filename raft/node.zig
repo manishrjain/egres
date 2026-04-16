@@ -531,37 +531,12 @@ pub const Node = struct {
         }
     }
 
-    /// Send a file to all peers via P1. Registers a pending ack tracker
-    /// but does NOT wait for quorum. Call waitForFileQuorum after all
-    /// files have been sent.
-    pub fn sendFile(self: *Node, file_id: u64, data: []const u8) !void {
-        const tr = self.transport orelse return error.NoTransport;
-
-        const pending = try self.allocator.create(PendingFileAck);
-        pending.* = .{
-            .acks = std.AutoHashMap(u64, void).init(self.allocator),
-        };
-        self.file_acks.put(file_id, pending) catch {
-            self.allocator.destroy(pending);
-            return error.OutOfMemory;
-        };
-
-        // Build payload: [8B file_id][4B crc32][data]
-        const payload = try self.allocator.alloc(u8, 12 + data.len);
-        defer self.allocator.free(payload);
-        std.mem.writeInt(u64, payload[0..8], file_id, .little);
-        std.mem.writeInt(u32, payload[8..12], std.hash.crc.Crc32Iscsi.hash(data), .little);
-        @memcpy(payload[12..], data);
-
-        var peer_it = self.peers.iterator();
-        while (peer_it.next()) |kv| {
-            tr.sendMsg(kv.key_ptr.*, .p1, serial_mod.msg_type_file_push, payload) catch {};
-        }
-    }
-
-    /// Wait for quorum acks on all given file IDs, polling leadership.
+    /// Read files via state machine, send to all peers, and wait for quorum acks.
     /// Cleans up ack trackers on return (success or error).
-    pub fn waitForFileQuorum(self: *Node, file_ids: []const u64) !void {
+    pub fn sendAndWaitForFileQuorum(self: *Node, file_ids: []const u64) !void {
+        const tr = self.transport orelse return error.NoTransport;
+        const sm = self.state_machine orelse return error.NoStateMachine;
+
         defer {
             for (file_ids) |fid| {
                 if (self.file_acks.fetchRemove(fid)) |kv| {
@@ -570,9 +545,37 @@ pub const Node = struct {
                 }
             }
         }
+
+        // Read each file via state machine, send to all peers.
+        for (file_ids) |file_id| {
+            const data = sm.readFile(self.allocator, file_id) orelse return error.FileNotFound;
+            defer self.allocator.free(data);
+
+            const pending = try self.allocator.create(PendingFileAck);
+            pending.* = .{
+                .acks = std.AutoHashMap(u64, void).init(self.allocator),
+            };
+            self.file_acks.put(file_id, pending) catch {
+                self.allocator.destroy(pending);
+                return error.OutOfMemory;
+            };
+
+            // Build payload: [8B file_id][4B crc32][data]
+            const payload = try self.allocator.alloc(u8, 12 + data.len);
+            defer self.allocator.free(payload);
+            std.mem.writeInt(u64, payload[0..8], file_id, .little);
+            std.mem.writeInt(u32, payload[8..12], std.hash.crc.Crc32Iscsi.hash(data), .little);
+            @memcpy(payload[12..], data);
+
+            var peer_it = self.peers.iterator();
+            while (peer_it.next()) |kv| {
+                tr.sendMsg(kv.key_ptr.*, .p1, serial_mod.msg_type_file_push, payload) catch {};
+            }
+        }
+
+        // Wait for quorum on all files.
         for (file_ids) |fid| {
-            const pending = self.file_acks.get(fid);
-            const p = pending orelse continue;
+            const p = self.file_acks.get(fid) orelse continue;
             while (true) {
                 if (!self.isLeader()) return error.NotLeader;
                 if (p.acks.count() + 1 >= self.quorum_size) break;
@@ -581,9 +584,9 @@ pub const Node = struct {
         }
     }
 
-    /// Request missing files from the leader and block until all arrive via P1.
+    /// Fetch missing files from the leader and block until all arrive via P1.
     /// Caller should only pass file IDs confirmed missing on disk.
-    pub fn requestFiles(self: *Node, file_ids: []const u64) !void {
+    pub fn fetchFiles(self: *Node, file_ids: []const u64) !void {
         if (file_ids.len == 0) return;
         const leader = self.leader_id orelse return error.NotLeader;
         const tr = self.transport orelse return error.NoTransport;

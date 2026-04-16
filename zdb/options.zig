@@ -1,3 +1,4 @@
+const std = @import("std");
 const utils = @import("utils");
 
 pub const Error = error{
@@ -45,3 +46,7 @@ pub const Options = struct {
         if (self.in_memory and self.dir.len != 0) return error.InvalidDirForInMemory;
     }
 };
+
+pub fn sstPath(allocator: std.mem.Allocator, dir: []const u8, file_id: u64) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{d:0>6}.sst", .{ dir, file_id });
+}

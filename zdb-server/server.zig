@@ -89,17 +89,17 @@ pub const StorageImpl = struct {
         }
 
         switch (mcs.cmd) {
-            4 => { // new memtable
+            1 => { // new memtable
                 self.forest.newMemtable(mcs.memtable_id) catch |err| {
                     log.err("newMemtable failed: {s}", .{@errorName(err)});
                 };
             },
-            1 => { // flush
+            2 => { // flush
                 self.forest.applyFlush(mcs.table_changes, mcs.memtable_id) catch |err| {
                     log.err("applyFlush failed: {s}", .{@errorName(err)});
                 };
             },
-            2 => { // compaction
+            3 => { // compaction
                 if (mcs.table_changes.len > 0) {
                     const tree_id = mcs.table_changes[0].tree_id;
                     if (self.forest.trees.get(tree_id)) |tree| {
@@ -109,7 +109,7 @@ pub const StorageImpl = struct {
                     }
                 }
             },
-            3 => { // tree split
+            4 => { // tree split
                 self.forest.applySplit(mcs.*) catch |err| {
                     log.err("applySplit failed: {s}", .{@errorName(err)});
                 };
@@ -122,31 +122,12 @@ pub const StorageImpl = struct {
 
     fn writeFile(ctx: *anyopaque, file_id: u64, data: []const u8) void {
         const self: *StorageImpl = @ptrCast(@alignCast(ctx));
-        const path = std.fmt.allocPrint(self.allocator, "{s}/{d:0>6}.sst", .{ self.forest.opts.dir, file_id }) catch return;
-        defer self.allocator.free(path);
-        const fh = vfs.g().createFile(path, .{ .mode = .direct }) catch |err| {
-            log.err("writeFile: createFile failed for {d}: {s}", .{ file_id, @errorName(err) });
-            return;
-        };
-        fh.write(data, 0, .p1) catch |err| {
-            log.err("writeFile: write failed for {d}: {s}", .{ file_id, @errorName(err) });
-            fh.close();
-            return;
-        };
-        fh.sync() catch {};
-        fh.close();
+        self.forest.writeFile(file_id, data);
     }
 
     fn readFile(ctx: *anyopaque, allocator: std.mem.Allocator, file_id: u64) ?[]const u8 {
         const self: *StorageImpl = @ptrCast(@alignCast(ctx));
-        const path = std.fmt.allocPrint(self.allocator, "{s}/{d:0>6}.sst", .{ self.forest.opts.dir, file_id }) catch return null;
-        defer self.allocator.free(path);
-        const handle = vfs.g().openFile(allocator, path, .{}) catch return null;
-        defer handle.close();
-        const result = handle.readAligned(allocator, 0, @intCast(handle.file_size), .p1) catch return null;
-        // Caller frees. readAligned returns a ReadResult — we need to extract owned data.
-        // ReadResult.data is a slice into buf. Return buf so caller can free it.
-        return result.data;
+        return self.forest.readFile(allocator, file_id);
     }
 
     fn hasFile(ctx: *anyopaque, file_id: u64) bool {
@@ -174,7 +155,7 @@ pub const StorageImpl = struct {
             switch (parsed) {
                 .ManifestChange => |mc| {
                     const cmd = mc.cmd();
-                    if (cmd < 1 or cmd > 3) continue; // only flush/compact/split have files
+                    if (cmd < 2 or cmd > 4) continue; // only flush/compact/split have files
                     const tc_len = mc.tableChangesLen();
                     for (0..tc_len) |i| {
                         const tc = mc.tableChangesAt(@intCast(i)) catch continue;
@@ -190,7 +171,7 @@ pub const StorageImpl = struct {
         if (missing.items.len == 0) return;
 
         log.info("preAppend: fetching {d} missing files from leader", .{missing.items.len});
-        node.requestFiles(missing.items) catch |err| {
+        node.fetchFiles(missing.items) catch |err| {
             log.err("preAppend: requestFiles failed: {s}", .{@errorName(err)});
             return;
         };
@@ -262,7 +243,7 @@ pub const ZdbServer = struct {
         var group = zio.group();
         group.spawn(runMemtableLoop, .{self}) catch return;
         group.spawn(runFlushLoop, .{self}) catch return;
-        group.spawn(runCompactLoop, .{self}) catch return;
+        group.spawn(runLevelsLoop, .{self}) catch return;
         group.wait() catch {};
         log.info("compaction loops exiting (shutdown)", .{});
     }
@@ -299,7 +280,7 @@ pub const ZdbServer = struct {
     // that tree, so the follower's results would be valid. The leader would check
     // results before proposing, so we should be fine.
     // For now, leader is the one doing the compaction.
-    fn runCompactLoop(self: *ZdbServer) void {
+    fn runLevelsLoop(self: *ZdbServer) void {
         const interval = zio.Duration.fromMilliseconds(500);
         while (!self.node.isShuttingDown()) {
             if (!self.node.isLeader()) {
@@ -318,7 +299,7 @@ pub const ZdbServer = struct {
 
     fn proposeNewMemtable(self: *ZdbServer) !void {
         const new_id = self.forest.next_file_id.fetchAdd(1, .monotonic);
-        const payload = try encodeManifestChange(self.allocator, 4, &.{}, &.{}, new_id);
+        const payload = try encodeManifestChange(self.allocator, 1, &.{}, &.{}, new_id);
         defer self.allocator.free(payload);
         try self.proposeAndWait(payload);
     }
@@ -331,7 +312,7 @@ pub const ZdbServer = struct {
 
         try self.distributeNewFiles(changes.items);
 
-        const payload = try encodeManifestChange(self.allocator, 1, changes.items, &.{}, result.memtable_id);
+        const payload = try encodeManifestChange(self.allocator, 2, changes.items, &.{}, result.memtable_id);
         defer self.allocator.free(payload);
         try self.proposeAndWait(payload);
     }
@@ -343,34 +324,20 @@ pub const ZdbServer = struct {
 
         try self.distributeNewFiles(changes.items);
 
-        const payload = try encodeManifestChange(self.allocator, 2, changes.items, &.{}, 0);
+        const payload = try encodeManifestChange(self.allocator, 3, changes.items, &.{}, 0);
         defer self.allocator.free(payload);
         try self.proposeAndWait(payload);
     }
 
-    /// Read and send each new SST file to peers, then wait for quorum on all.
+    /// Send new SST files to peers and wait for quorum acks.
     fn distributeNewFiles(self: *ZdbServer, changes: []const manifest.TableChange) !void {
-        // Collect CREATE file IDs.
         var file_ids = std.ArrayList(u64).empty;
         defer file_ids.deinit(self.allocator);
         for (changes) |c| {
             if (c.op == 0) try file_ids.append(self.allocator, c.table_id);
         }
         if (file_ids.items.len == 0) return;
-
-        // Read each file and send to peers one at a time.
-        for (file_ids.items) |file_id| {
-            const path = try std.fmt.allocPrint(self.allocator, "{s}/{d:0>6}.sst", .{ self.forest.opts.dir, file_id });
-            defer self.allocator.free(path);
-            const handle = try vfs.g().openFile(self.allocator, path, .{});
-            defer handle.close();
-            const result = try handle.readAligned(self.allocator, 0, @intCast(handle.file_size), .p1);
-            defer result.free();
-            try self.node.sendFile(file_id, result.data);
-        }
-
-        // Wait for quorum on all files.
-        try self.node.waitForFileQuorum(file_ids.items);
+        try self.node.sendAndWaitForFileQuorum(file_ids.items);
     }
 
     fn proposeAndWait(self: *ZdbServer, payload: []const u8) !void {
