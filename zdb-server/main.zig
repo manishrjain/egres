@@ -161,13 +161,8 @@ pub fn main() !void {
     }
     log.info("forest opened", .{});
 
-    // Storage applier bridges raft commits to forest.
-    var applier = zdb.applier.StorageApplier.init(allocator, forest);
-    defer deinitWithLog("applier", &applier);
-
     // Storage interface bridges raft commits to forest.
     var storage_impl = zdb_server.StorageImpl{
-        .applier = &applier,
         .forest = forest,
         .allocator = allocator,
     };
@@ -189,7 +184,6 @@ pub fn main() !void {
     var zdb_srv = try zdb_server.ZdbServer.init(
         allocator,
         forest,
-        &applier,
         node,
         args.client_addr,
     );

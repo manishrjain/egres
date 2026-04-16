@@ -45,7 +45,7 @@ const LevelPriority = struct {
 // TableCache
 // ---------------------------------------------------------------------------
 
-pub const TableNeed = struct { id: u64, level: usize };
+pub const TableNeed = struct { id: u64, level: usize, table: ?*Table = null };
 
 /// TableCache is a Forest-owned registry of open *Table objects keyed by table_id.
 /// Tree.open() calls loadTables() instead of opening SST files itself, so a table
@@ -73,6 +73,13 @@ pub const TableCache = struct {
             self.allocator.destroy(table);
         }
         self.tables.deinit();
+    }
+
+    /// contains reports whether a table with this id is currently cached.
+    pub fn contains(self: *TableCache, id: u64) bool {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        return self.tables.contains(id);
     }
 
     /// own hands ownership of a *Table to the cache. The cache incrRef's so
@@ -113,20 +120,22 @@ pub const TableCache = struct {
     }
 
     /// loadTables serves each TableNeed from cache (read lock) or opens it
-    /// concurrently via zio fibers (write lock per miss). Each served table
-    /// is added to levels[need.level] via Level.addEntry (which incrRef's).
-    pub fn loadTables(self: *TableCache, needed: []const TableNeed, levels: []Level) !void {
-        // Phase 1: serve cache hits under read lock.
-        var misses: std.ArrayList(TableNeed) = .{};
+    /// concurrently via zio fibers (write lock per miss). On return, each
+    /// need's .table field points to an open *Table owned by the cache.
+    /// The caller is responsible for installing these tables into levels
+    /// (e.g. via Level.addEntry) — this keeps loadTables free of any
+    /// level-layout assumptions.
+    pub fn loadTables(self: *TableCache, needed: []TableNeed) !void {
+        // Phase 1: serve cache hits under read lock; collect pointers for misses.
+        var misses: std.ArrayList(*TableNeed) = .{};
         defer misses.deinit(self.allocator);
         {
             self.mu.lockShared();
             defer self.mu.unlockShared();
-            for (needed) |n| {
+            for (needed) |*n| {
                 if (self.tables.get(n.id)) |t| {
                     std.debug.assert(t.ref.load(.acquire) > 0);
-                    // addEntry acquires Level.mu; lock order TableCache.mu(R) → Level.mu is safe.
-                    try levels[n.level].addEntry(n.id, t);
+                    n.table = t;
                 } else {
                     try misses.append(self.allocator, n);
                 }
@@ -134,12 +143,12 @@ pub const TableCache = struct {
         }
         if (misses.items.len == 0) return;
 
-        // Phase 2: open misses concurrently.
+        // Phase 2: open misses concurrently. Each fiber writes to need.table.
         var tse: utils.ThreadSafeError = .{};
         var group = zio.group();
         defer group.cancel();
         for (misses.items) |n| {
-            try group.spawn(openFiber, .{ self, n, levels, &tse });
+            try group.spawn(openFiber, .{ self, n, &tse });
         }
         group.wait() catch {};
         if (tse.get()) |err| return err;
@@ -147,15 +156,14 @@ pub const TableCache = struct {
 
     fn openFiber(
         self: *TableCache,
-        need: TableNeed,
-        levels: []Level,
+        need: *TableNeed,
         tse: *utils.ThreadSafeError,
     ) void {
         // Phase A: check under write lock (brief — no I/O).
         self.mu.lock();
         if (self.tables.get(need.id)) |t| {
             self.mu.unlock();
-            levels[need.level].addEntry(need.id, t) catch |err| tse.set(err);
+            need.table = t;
             return;
         }
         self.mu.unlock();
@@ -173,14 +181,13 @@ pub const TableCache = struct {
             return;
         };
         defer t.decrRef(); // Drop the open-time ref; own() takes its own.
-        errdefer self.allocator.free(t);
 
         // Phase C: re-acquire write lock to insert; handle race with another fiber.
         self.mu.lock();
         if (self.tables.get(need.id)) |existing| {
             // Another fiber opened the same table while we were in phase B.
             self.mu.unlock();
-            levels[need.level].addEntry(need.id, existing) catch |err| tse.set(err);
+            need.table = existing;
             return;
         }
         // Cache takes its own ref; defer above drops the open-time ref.
@@ -191,8 +198,7 @@ pub const TableCache = struct {
             return;
         };
         self.mu.unlock();
-        // Level takes its own ref via addEntry.
-        levels[need.level].addEntry(need.id, t) catch |err| tse.set(err);
+        need.table = t;
     }
 };
 
@@ -254,7 +260,10 @@ pub const Tree = struct {
                     try needed.append(allocator, .{ .id = tid.*, .level = level_idx });
                 }
             }
-            try cache.loadTables(needed.items, levels);
+            try cache.loadTables(needed.items);
+            for (needed.items) |n| {
+                try levels[n.level].addEntry(n.id, n.table.?);
+            }
         }
 
         var tree: Tree = .{
@@ -635,22 +644,28 @@ pub const Tree = struct {
         // Commit to manifest (durable) before touching the levels.
         try self.ms.commit(changes, &.{});
 
-        // Apply level changes: delete old entries, add new ones.
+        // Batch-load all CREATE tables via the cache in a single concurrent
+        // pass. writeFile may have pre-opened them (follower path) → hit;
+        // otherwise loadTables opens them.
+        var needed: std.ArrayList(TableNeed) = .{};
+        defer needed.deinit(self.allocator);
+        for (changes) |c| {
+            if (c.op == 0) {
+                try needed.append(self.allocator, .{ .id = c.table_id, .level = c.level });
+            }
+        }
+        try self.cache.loadTables(needed.items);
+
+        // Apply level changes in original order: delete old entries, add new.
+        var need_idx: usize = 0;
         for (changes) |c| {
             if (c.op == 1) { // DELETE
-                self.levels[c.level].deleteEntries(&.{.{ .id = c.table_id, .table = undefined }});
+                self.levels[c.level].deleteEntry(c.table_id);
             } else if (c.op == 0) { // CREATE
-                const path = try options.sstPath(self.allocator, self.opts.dir, c.table_id);
-                defer self.allocator.free(path);
-                // TODO: We should open the table if possible upfront, so this part of the code
-                // executes faster.
-                const t = try Table.open(self.allocator, path, .p0);
-                errdefer t.decrRef();
-                try self.cache.own(c.table_id, t);
-                try self.levels[c.level].addEntry(c.table_id, t);
-                // cache.own takes struct ownership; addEntry incrRef'd.
-                // Drop the open ref so only the level holds a live ref.
-                t.decrRef();
+                const n = needed.items[need_idx];
+                need_idx += 1;
+                std.debug.assert(c.table_id == n.id);
+                try self.levels[c.level].addEntry(n.id, n.table.?);
             }
         }
 

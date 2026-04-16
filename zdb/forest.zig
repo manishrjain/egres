@@ -306,13 +306,12 @@ pub const Forest = struct {
     }
 
     /// Put a batch of key-value pairs into the current memtable.
-    /// Returns true if the memtable size exceeds the threshold and a freeze
-    /// should be proposed via Raft.
-    pub fn put(self: *Forest, items: []const Item) !bool {
+    /// Callers can use shouldFreeze() afterward to decide whether to propose
+    /// a memtable freeze through Raft.
+    pub fn put(self: *Forest, items: []const Item) !void {
         for (items) |item| {
             try self.memtables.put(item.key, item.value);
         }
-        return self.memtables.memoryUsage() >= self.opts.memtable_size;
     }
 
     /// Create a new memtable, freezing the current one.
@@ -468,19 +467,23 @@ pub const Forest = struct {
             try self.ms.commit(changes, &.{});
         }
 
-        // Open new L0 tables and add to each tree's level 0.
+        // Load all new L0 tables concurrently via the cache. writeFile may
+        // have pre-opened these (follower path) → cache hit. On the leader,
+        // flush writes bytes directly, so these will typically be misses.
+        var needed: std.ArrayList(tree_mod.TableNeed) = .{};
+        defer needed.deinit(self.allocator);
         for (changes) |c| {
             std.debug.assert(c.op == 0); // flush only creates
+            try needed.append(self.allocator, .{ .id = c.table_id, .level = c.level });
+        }
+        try self.table_cache.loadTables(needed.items);
+
+        // Install each loaded table into its tree's level. We zip changes and
+        // needed in the same order they were built, so indices align.
+        for (changes, needed.items) |c, n| {
+            std.debug.assert(c.table_id == n.id);
             const tree = self.trees.get(c.tree_id) orelse continue;
-
-            const path = try options.sstPath(self.allocator, self.opts.dir,c.table_id);
-            defer self.allocator.free(path);
-
-            const t = try Table.open(self.allocator, path, .p0);
-            errdefer t.decrRef();
-            try self.table_cache.own(c.table_id, t);
-            try tree.levels[c.level].addEntry(c.table_id, t);
-            t.decrRef(); // drop open ref; level holds its own
+            try tree.levels[c.level].addEntry(n.id, n.table.?);
         }
 
         // Remove the oldest flushed memtable.
@@ -603,20 +606,42 @@ pub const Forest = struct {
     }
 
     /// Write an SST file to disk and pre-open it into the table cache.
+    /// Skips the write when the file is already cached, or already on disk with
+    /// a matching size — file_id → content is deterministic in this system, and
+    /// a size match is a strong signal the bytes are correct (no cross-ID
+    /// collisions possible). If a size mismatch is detected, we log and rewrite.
     pub fn writeFile(self: *Forest, file_id: u64, data: []const u8) void {
-        const path = options.sstPath(self.allocator, self.opts.dir,file_id) catch return;
+        if (self.table_cache.contains(file_id)) return;
+
+        const path = options.sstPath(self.allocator, self.opts.dir, file_id) catch return;
         defer self.allocator.free(path);
-        const fh = vfs.g().createFile(path, .{ .mode = .direct }) catch |err| {
-            log.err("writeFile: createFile failed for {d}: {s}", .{ file_id, @errorName(err) });
-            return;
-        };
-        fh.write(data, 0, .p1) catch |err| {
-            log.err("writeFile: write failed for {d}: {s}", .{ file_id, @errorName(err) });
+
+        // Probe existence + size via vfs (no allocation, just open + getEndPos).
+        const existing_size: ?u64 = if (vfs.g().openFile(self.allocator, path, .{})) |fh| blk: {
+            defer fh.close();
+            break :blk fh.file_size;
+        } else |_| null;
+
+        const size_matches = existing_size != null and existing_size.? == data.len;
+        if (existing_size != null and !size_matches) {
+            log.warn("writeFile: size mismatch for {d} ({d} on disk vs {d}), rewriting", .{
+                file_id, existing_size.?, data.len,
+            });
+        }
+
+        if (!size_matches) {
+            const fh = vfs.g().createFile(path, .{ .mode = .direct, .flags = .{ .truncate = true } }) catch |err| {
+                log.err("writeFile: createFile failed for {d}: {s}", .{ file_id, @errorName(err) });
+                return;
+            };
+            fh.write(data, 0, .p1) catch |err| {
+                log.err("writeFile: write failed for {d}: {s}", .{ file_id, @errorName(err) });
+                fh.close();
+                return;
+            };
+            fh.sync() catch {};
             fh.close();
-            return;
-        };
-        fh.sync() catch {};
-        fh.close();
+        }
 
         // Pre-open the table into the cache so it's ready when compaction needs it.
         const t = Table.open(self.allocator, path, .p1) catch |err| {
@@ -765,7 +790,7 @@ pub const Forest = struct {
         // Remove migrated tables from old tree.
         for (mc.table_changes) |c| {
             if (c.op == 1 and c.tree_id == old_tree_id) { // DELETE from old tree
-                left_tree.levels[c.level].deleteEntries(&.{.{ .id = c.table_id, .table = undefined }});
+                left_tree.levels[c.level].deleteEntry(c.table_id);
             }
         }
 

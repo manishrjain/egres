@@ -136,12 +136,12 @@ pub const Level = struct {
         self.sortEntries();
     }
 
-    /// deleteEntries removes entries by id and decrements each removed table's ref.
-    pub fn deleteEntries(self: *Level, to_del: []const TableEntry) void {
+    /// deleteEntry removes a single entry by id and decrements the removed table's ref.
+    pub fn deleteEntry(self: *Level, id: u64) void {
         self.mu.lock();
         defer self.mu.unlock();
 
-        return self.deleteEntriesLocked(to_del);
+        return self.deleteEntriesLocked(&.{.{ .id = id, .table = undefined }});
     }
 
     fn deleteEntriesLocked(self: *Level, to_del: []const TableEntry) void {

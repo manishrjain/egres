@@ -3,21 +3,18 @@ const zio = @import("zio");
 const raft = @import("raft");
 const zdb = @import("zdb");
 const runtime = @import("runtime");
-const zen = @import("buffers_gen");
 const proto = @import("protocol.zig");
 const WaitGroup = @import("raft").utils.WaitGroup;
 
 const zdb_bufs = zdb.buffers;
 const manifest = zdb.manifest;
 const Forest = zdb.forest.Forest;
-const StorageApplier = zdb.applier.StorageApplier;
 const Item = zdb.key.Item;
 const Key = zdb.key.Key;
 const vfs = zdb.vfs;
 const log = std.log.scoped(.zdb_server);
 
 pub const StorageImpl = struct {
-    applier: *StorageApplier,
     forest: *Forest,
     allocator: std.mem.Allocator,
 
@@ -35,47 +32,45 @@ pub const StorageImpl = struct {
     fn applyEntry(ctx: *anyopaque, index: u64, _term: u64, data: []const u8) void {
         _ = _term;
         const self: *StorageImpl = @ptrCast(@alignCast(ctx));
-
-        // Try Mutation (zdb-server schema).
-        if (zen.parseMessageWithTail(data)) |parsed| {
-            switch (parsed) {
-                .Mutation => |mutation| {
-                    const items = [_]Item{.{
-                        .key = .{
-                            .namespace = mutation.namespace(),
-                            .primary = mutation.key(),
-                            .timestamp = mutation.timestamp(),
-                        },
-                        .value = mutation.value(),
-                    }};
-                    _ = self.applier.applyMutations(index, &items) catch |err| {
-                        log.err("on_apply: applyMutations failed at index={d}: {s}", .{ index, @errorName(err) });
-                    };
-                    return;
-                },
-            }
-        } else |_| {}
-
-        // Try ManifestChange (zdb schema).
-        if (zdb_bufs.parseMessageWithTail(data)) |parsed| {
-            switch (parsed) {
-                .ManifestChange => |mc| {
-                    self.applyManifestChange(index, mc);
-                    return;
-                },
-                else => {},
-            }
-        } else |_| {}
-
-        log.err("on_apply: unknown entry type at index={d}", .{index});
+        while (true) {
+            self.applyEntryInner(index, data) catch |err| {
+                log.err("on_apply: failed at index={d}: {s}, retrying", .{ index, @errorName(err) });
+                zio.sleep(zio.Duration.fromMilliseconds(100)) catch return;
+                continue;
+            };
+            return;
+        }
     }
 
-    fn applyManifestChange(self: *StorageImpl, index: u64, mc: zdb_bufs.ManifestChangeReader) void {
-        _ = index;
-        const mcs = zdb_bufs.ManifestChangeStruct.fromReader(self.allocator, mc) catch |err| {
-            log.err("ManifestChange decode failed: {s}", .{@errorName(err)});
+    fn applyEntryInner(self: *StorageImpl, index: u64, data: []const u8) !void {
+        const parsed = zdb_bufs.parseMessageWithTail(data) catch {
+            log.err("on_apply: unknown entry type at index={d}", .{index});
             return;
         };
+        switch (parsed) {
+            .Mutation => |mutation| {
+                const items = [_]Item{.{
+                    .key = .{
+                        .namespace = mutation.namespace(),
+                        .primary = mutation.key(),
+                        .timestamp = mutation.timestamp(),
+                    },
+                    .value = mutation.value(),
+                }};
+                try self.forest.put(&items);
+            },
+            .ManifestChange => |mc| {
+                try self.applyManifestChange(index, mc);
+            },
+            else => {
+                log.err("on_apply: unhandled message type at index={d}", .{index});
+            },
+        }
+    }
+
+    fn applyManifestChange(self: *StorageImpl, index: u64, mc: zdb_bufs.ManifestChangeReader) !void {
+        _ = index;
+        const mcs = try zdb_bufs.ManifestChangeStruct.fromReader(self.allocator, mc);
         defer {
             mcs.deinit(self.allocator);
             self.allocator.destroy(mcs);
@@ -89,34 +84,18 @@ pub const StorageImpl = struct {
         }
 
         switch (mcs.cmd) {
-            1 => { // new memtable
-                self.forest.newMemtable(mcs.memtable_id) catch |err| {
-                    log.err("newMemtable failed: {s}", .{@errorName(err)});
-                };
-            },
-            2 => { // flush
-                self.forest.applyFlush(mcs.table_changes, mcs.memtable_id) catch |err| {
-                    log.err("applyFlush failed: {s}", .{@errorName(err)});
-                };
-            },
-            3 => { // compaction
+            1 => try self.forest.newMemtable(mcs.memtable_id),
+            2 => try self.forest.applyFlush(mcs.table_changes, mcs.memtable_id),
+            3 => {
                 if (mcs.table_changes.len > 0) {
                     const tree_id = mcs.table_changes[0].tree_id;
                     if (self.forest.trees.get(tree_id)) |tree| {
-                        tree.applyCompaction(mcs.table_changes) catch |err| {
-                            log.err("applyCompaction failed: {s}", .{@errorName(err)});
-                        };
+                        try tree.applyCompaction(mcs.table_changes);
                     }
                 }
             },
-            4 => { // tree split
-                self.forest.applySplit(mcs.*) catch |err| {
-                    log.err("applySplit failed: {s}", .{@errorName(err)});
-                };
-            },
-            else => {
-                log.err("unknown ManifestChange cmd={d}", .{mcs.cmd});
-            },
+            4 => try self.forest.applySplit(mcs.*),
+            else => log.err("unknown ManifestChange cmd={d}", .{mcs.cmd}),
         }
     }
 
@@ -154,8 +133,6 @@ pub const StorageImpl = struct {
             const parsed = zdb_bufs.parseMessageWithTail(data) catch continue;
             switch (parsed) {
                 .ManifestChange => |mc| {
-                    const cmd = mc.cmd();
-                    if (cmd < 2 or cmd > 4) continue; // only flush/compact/split have files
                     const tc_len = mc.tableChangesLen();
                     for (0..tc_len) |i| {
                         const tc = mc.tableChangesAt(@intCast(i)) catch continue;
@@ -171,10 +148,14 @@ pub const StorageImpl = struct {
         if (missing.items.len == 0) return;
 
         log.info("preAppend: fetching {d} missing files from leader", .{missing.items.len});
-        node.fetchFiles(missing.items) catch |err| {
-            log.err("preAppend: requestFiles failed: {s}", .{@errorName(err)});
-            return;
-        };
+        while (true) {
+            node.fetchFiles(missing.items) catch |err| {
+                log.err("preAppend: fetchFiles failed: {s}, retrying", .{@errorName(err)});
+                zio.sleep(zio.Duration.fromMilliseconds(100)) catch return;
+                continue;
+            };
+            break;
+        }
         log.info("preAppend: received {d} files from leader", .{missing.items.len});
     }
 };
@@ -182,14 +163,12 @@ pub const StorageImpl = struct {
 pub const ZdbServer = struct {
     allocator: std.mem.Allocator,
     forest: *Forest,
-    applier: *StorageApplier,
     node: *raft.Node,
     listen_addr: zio.net.IpAddress,
 
     pub fn init(
         allocator: std.mem.Allocator,
         forest: *Forest,
-        applier: *StorageApplier,
         node: *raft.Node,
         client_addr: []const u8,
     ) !ZdbServer {
@@ -197,7 +176,6 @@ pub const ZdbServer = struct {
         return .{
             .allocator = allocator,
             .forest = forest,
-            .applier = applier,
             .node = node,
             .listen_addr = addr,
         };
@@ -391,7 +369,7 @@ pub const ZdbServer = struct {
 
     fn handleSet(self: *ZdbServer, stream: zio.net.Stream, req: proto.SetCmd) !void {
         // Encode mutation as zbuf for the raft proposal.
-        var mutation_writer = try zen.MutationWriter.init(self.allocator);
+        var mutation_writer = try zdb_bufs.MutationWriter.init(self.allocator);
         defer mutation_writer.deinit();
         try mutation_writer.set(.{
             .namespace = req.ns,

@@ -499,15 +499,11 @@ fn addZdbServer(
     zdb_mod.addImport("zio", zio_mod);
     zdb_mod.addImport("vfs", vfs_mod);
 
-    const zdb_srv_buffers_gen_mod = makeModule(b, target, optimize, "zdb-server/buffers.gen.zig");
-    zdb_srv_buffers_gen_mod.addImport("zbuf", zbuf_mod);
-
     const zdb_server_mod = makeModule(b, target, optimize, "zdb-server/server.zig");
     zdb_server_mod.addImport("zio", zio_mod);
     zdb_server_mod.addImport("raft", raft_mod);
     zdb_server_mod.addImport("zdb", zdb_mod);
     zdb_server_mod.addImport("runtime", runtime_mod);
-    zdb_server_mod.addImport("buffers_gen", zdb_srv_buffers_gen_mod);
 
     const exe = b.addExecutable(.{
         .name = "zdb-server",

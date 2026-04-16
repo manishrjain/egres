@@ -63,6 +63,14 @@ pub const ManifestChange = schema.Table(.{
     .{ .id = 4, .name = "memtable_id", .ty = schema.U64 }, // for flush: which memtable was flushed
 });
 
+/// A single key-value mutation proposed through raft.
+pub const Mutation = schema.Table(.{
+    .{ .id = 1, .name = "namespace", .ty = schema.U32 },
+    .{ .id = 2, .name = "key", .ty = schema.Bytes },
+    .{ .id = 3, .name = "value", .ty = schema.Bytes },
+    .{ .id = 4, .name = "timestamp", .ty = schema.U64 },
+});
+
 // zbuf tail stores table_id as u16, so use a module namespace in high bits and
 // OR local ids into low bits.
 const ZDB_TABLE_NS: u16 = 0xB600;
@@ -79,4 +87,5 @@ pub const tables = .{
     .{ .name = "TreeChange", .ty = TreeChange, .id = tableId(4) },
     .{ .name = "TableChange", .ty = TableChange, .id = tableId(5) },
     .{ .name = "ManifestChange", .ty = ManifestChange, .id = tableId(6) },
+    .{ .name = "Mutation", .ty = Mutation, .id = tableId(7) },
 };
