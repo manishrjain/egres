@@ -12,6 +12,7 @@ const Forest = zdb.forest.Forest;
 const Item = zdb.key.Item;
 const Key = zdb.key.Key;
 const vfs = zdb.vfs;
+const metrics = zdb.metrics;
 const log = std.log.scoped(.zdb_server);
 
 pub const StorageImpl = struct {
@@ -58,6 +59,10 @@ pub const StorageImpl = struct {
                     .value = mutation.value(),
                 }};
                 try self.forest.put(&items);
+                try metrics.g().bytes_written.incrBy(.{
+                    .source = "user",
+                    .namespace_id = mutation.namespace(),
+                }, mutation.value().len);
             },
             .ManifestChange => |mc| {
                 try self.applyManifestChange(index, mc);
@@ -95,6 +100,7 @@ pub const StorageImpl = struct {
                 }
             },
             4 => try self.forest.applySplit(mcs.*),
+            5 => try self.forest.applyNamespaceCreate(mcs.*),
             else => log.err("unknown ManifestChange cmd={d}", .{mcs.cmd}),
         }
     }
@@ -362,6 +368,10 @@ pub const ZdbServer = struct {
                     log.info("CONF {s} node={d}", .{ @tagName(req.action), req.node_id });
                     self.handleConf(stream, req) catch return;
                 },
+                .ns_create => |req| {
+                    log.info("NS CREATE ns={d}", .{req.ns});
+                    self.handleNsCreate(stream, req) catch return;
+                },
             }
         }
         log.info("client handler exiting after {d} ops (shutdown)", .{ops});
@@ -488,6 +498,44 @@ pub const ZdbServer = struct {
             },
             else => try proto.writeErr(stream, @tagName(ctx.status)),
         }
+    }
+
+    fn handleNsCreate(self: *ZdbServer, stream: zio.net.Stream, req: proto.NsCreateCmd) !void {
+        if (!self.node.isLeader()) {
+            const leader = self.node.getLeaderId() orelse 0;
+            try proto.writeNotLeader(stream, leader);
+            return;
+        }
+
+        // Build the ManifestChange on a temporary arena so we don't track each
+        // inner allocation; the proposal is serialized before the arena drops.
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const mc = self.forest.buildNamespaceCreate(arena.allocator(), req.ns) catch |err| {
+            log.err("buildNamespaceCreate failed: {s}", .{@errorName(err)});
+            try proto.writeErr(stream, @errorName(err));
+            return;
+        };
+
+        const payload = encodeManifestChange(
+            self.allocator,
+            mc.cmd,
+            mc.table_changes,
+            mc.tree_changes,
+            mc.memtable_id,
+        ) catch |err| {
+            log.err("encodeManifestChange failed: {s}", .{@errorName(err)});
+            try proto.writeErr(stream, @errorName(err));
+            return;
+        };
+        defer self.allocator.free(payload);
+
+        self.proposeAndWait(payload) catch |err| {
+            log.err("ns create propose failed: {s}", .{@errorName(err)});
+            try proto.writeErr(stream, @errorName(err));
+            return;
+        };
+        try proto.writeOk(stream);
     }
 };
 

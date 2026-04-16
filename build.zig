@@ -303,6 +303,12 @@ fn addZdbTests(
     });
     const zio_mod = zio_dep.module("zio");
 
+    const metrics_dep = b.dependency("metrics", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const metrics_mod = metrics_dep.module("metrics");
+
     const utils_mod = makeModule(b, target, optimize, "u/utils.zig");
     utils_mod.addIncludePath(b.path("."));
     utils_mod.addIncludePath(b.path("third_party/lz4/lib"));
@@ -317,6 +323,7 @@ fn addZdbTests(
     zdb_mod.addImport("utils", utils_mod);
     zdb_mod.addImport("zio", zio_mod);
     zdb_mod.addImport("vfs", vfs_mod);
+    zdb_mod.addImport("metrics", metrics_mod);
 
     const zdb_core_tests = b.addTest(.{
         .root_module = makeModule(b, target, optimize, "zdb/core_test.zig"),
@@ -494,17 +501,25 @@ fn addZdbServer(
 
     const vfs_mod = raft_mod.import_table.get("vfs").?;
 
+    const metrics_dep = b.dependency("metrics", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const metrics_mod = metrics_dep.module("metrics");
+
     const zdb_mod = makeModule(b, target, optimize, "zdb.zig");
     zdb_mod.addImport("zbuf", zbuf_mod);
     zdb_mod.addImport("utils", utils_mod);
     zdb_mod.addImport("zio", zio_mod);
     zdb_mod.addImport("vfs", vfs_mod);
+    zdb_mod.addImport("metrics", metrics_mod);
 
     const zdb_server_mod = makeModule(b, target, optimize, "zdb-server/server.zig");
     zdb_server_mod.addImport("zio", zio_mod);
     zdb_server_mod.addImport("raft", raft_mod);
     zdb_server_mod.addImport("zdb", zdb_mod);
     zdb_server_mod.addImport("runtime", runtime_mod);
+    zdb_server_mod.addImport("metrics", metrics_mod);
 
     const exe = b.addExecutable(.{
         .name = "zdb-server",
@@ -516,6 +531,7 @@ fn addZdbServer(
     exe.root_module.addImport("zdb", zdb_mod);
     exe.root_module.addImport("runtime", runtime_mod);
     exe.root_module.addImport("zdb_server", zdb_server_mod);
+    exe.root_module.addImport("metrics", metrics_mod);
     exe.step.dependOn(regen_buffers_step);
     b.installArtifact(exe);
 

@@ -123,6 +123,10 @@ pub fn main() !void {
     // Initialize VFS with 500 MB/s bandwidth limit.
     zdb.vfs.VFS.initGlobal(.{ .bytes_per_sec = 500 * 1024 * 1024 });
 
+    // Initialize global metrics before anything that might increment them.
+    try zdb.metrics.initGlobal(allocator);
+    defer zdb.metrics.deinitGlobal();
+
     // Runtime pool singleton — created first so all runtimes are available.
     const pool = try runtime.Pool.init(allocator, .{});
     defer deinitWithLog("pool", pool);

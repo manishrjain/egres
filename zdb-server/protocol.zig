@@ -5,6 +5,11 @@ pub const Command = union(enum) {
     set: SetCmd,
     get: GetCmd,
     conf: ConfCmd,
+    ns_create: NsCreateCmd,
+};
+
+pub const NsCreateCmd = struct {
+    ns: u32,
 };
 
 pub const SetCmd = struct {
@@ -114,6 +119,14 @@ fn parseLine(line: []const u8) !Command {
             .node_id = node_id,
             .addr = addr,
         } };
+    } else if (std.mem.eql(u8, cmd, "ns")) {
+        // ns create <ns_id>
+        const sub = it.next() orelse return error.MissingSubcommand;
+        if (!std.mem.eql(u8, sub, "create")) return error.UnknownCommand;
+        const ns_str = it.next() orelse return error.MissingNamespace;
+        const ns = std.fmt.parseInt(u32, ns_str, 10) catch return error.InvalidNamespace;
+        if (ns == 0) return error.InvalidNamespace; // 0 is a sentinel
+        return .{ .ns_create = .{ .ns = ns } };
     } else {
         return error.UnknownCommand;
     }

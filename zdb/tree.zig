@@ -6,6 +6,7 @@ const manifest = @import("manifest.zig");
 const level_handler = @import("level.zig");
 const table_mod = @import("table.zig");
 const vfs = @import("vfs");
+const metrics = @import("metrics.zig");
 
 const Table = table_mod.Table;
 const TableIterator = table_mod.TableIterator;
@@ -657,7 +658,10 @@ pub const Tree = struct {
         try self.cache.loadTables(needed.items);
 
         // Apply level changes in original order: delete old entries, add new.
+        // Track total bytes created and the destination level for metrics.
         var need_idx: usize = 0;
+        var bytes_out: u64 = 0;
+        var dest_level: ?u8 = null;
         for (changes) |c| {
             if (c.op == 1) { // DELETE
                 self.levels[c.level].deleteEntry(c.table_id);
@@ -666,7 +670,25 @@ pub const Tree = struct {
                 need_idx += 1;
                 std.debug.assert(c.table_id == n.id);
                 try self.levels[c.level].addEntry(n.id, n.table.?);
+                bytes_out += n.table.?.fileSize();
+                dest_level = @intCast(c.level);
             }
+        }
+
+        // Metrics: one compaction run, plus bytes written to the dest level.
+        const ns_id: u32 = if (self.ms.trees.get(self.tree_id)) |ts| ts.namespace_id else 0;
+        if (dest_level) |lvl| {
+            try metrics.g().compactions.incr(.{
+                .namespace_id = ns_id,
+                .tree_id = self.tree_id,
+                .level = lvl,
+            });
+            try metrics.g().bytes_written.incrBy(.{
+                .source = "compact",
+                .namespace_id = ns_id,
+                .tree_id = self.tree_id,
+                .level = lvl,
+            }, bytes_out);
         }
 
         try self.updateCompactCandidate();

@@ -9,6 +9,7 @@ const table_mod = @import("table.zig");
 const vfs = @import("vfs");
 const tree_mod = @import("tree.zig");
 const skl = @import("skl/skiplist.zig");
+const metrics = @import("metrics.zig");
 
 const Key = @import("key.zig").Key;
 const KeyRange = level.KeyRange;
@@ -332,6 +333,16 @@ pub const Forest = struct {
         }
     }
 
+    /// Same as advanceFileId but for tree IDs. A follower that becomes leader
+    /// must not reuse tree IDs assigned by the previous leader.
+    pub fn advanceTreeId(self: *Forest, id: u64) void {
+        while (true) {
+            const cur = self.next_tree_id.load(.monotonic);
+            if (cur > id) return;
+            if (self.next_tree_id.cmpxchgWeak(cur, id + 1, .monotonic, .monotonic) == null) return;
+        }
+    }
+
     /// buildFlush is Phase A of the memtable flush: iterates the oldest frozen
     /// memtable, routes each key to its tree, builds one L0 SST per tree,
     /// and returns the manifest changes. The caller proposes these through Raft.
@@ -484,6 +495,16 @@ pub const Forest = struct {
             std.debug.assert(c.table_id == n.id);
             const tree = self.trees.get(c.tree_id) orelse continue;
             try tree.levels[c.level].addEntry(n.id, n.table.?);
+
+            // Metrics: one per-tree flush output + bytes written to L0.
+            const ns_id: u32 = if (self.ms.trees.get(c.tree_id)) |ts| ts.namespace_id else 0;
+            try metrics.g().flushes.incr(.{ .namespace_id = ns_id, .tree_id = c.tree_id });
+            try metrics.g().bytes_written.incrBy(.{
+                .source = "flush",
+                .namespace_id = ns_id,
+                .tree_id = c.tree_id,
+                .level = @intCast(c.level),
+            }, n.table.?.fileSize());
         }
 
         // Remove the oldest flushed memtable.
@@ -522,36 +543,74 @@ pub const Forest = struct {
         return tree.get(search_key, priority);
     }
 
+    /// installTree opens an empty in-memory Tree for the given id and registers
+    /// the namespace route. Caller must have already committed the TreeChange to
+    /// manifest and must hold the forest write lock.
+    fn installTree(self: *Forest, tree_id: u64, namespace_id: u32, range: KeyRange) !void {
+        var tree = try Tree.open(self.allocator, self.opts, tree_id, &self.ms, &self.table_cache);
+        errdefer tree.close();
+
+        const tree_ptr = try self.allocator.create(Tree);
+        errdefer self.allocator.destroy(tree_ptr);
+        tree_ptr.* = tree;
+        try self.trees.put(tree_id, tree_ptr);
+
+        const rt = try self.getOrCreateRouteTable(namespace_id);
+        try rt.addRoute(tree_id, range);
+    }
+
     /// Create a new tree for the given namespace and key range.
-    /// Returns the new tree_id.
+    /// Single-node path (no Raft) — used by tests. Returns the new tree_id.
     pub fn createTree(self: *Forest, namespace_id: u32, range: KeyRange) !u64 {
         self.mu.lock();
         defer self.mu.unlock();
 
         const tree_id = self.next_tree_id.fetchAdd(1, .monotonic);
 
-        // Commit tree creation to manifest.
         const left_raw = try range.left.marshal(self.allocator);
         defer self.allocator.free(left_raw);
-
         const right_raw = try range.right.marshal(self.allocator);
         defer self.allocator.free(right_raw);
 
         try self.ms.commit(&.{}, &.{manifest.createTreeChange(tree_id, namespace_id, left_raw, right_raw)});
-
-        // Create in-memory tree (empty — no tables yet).
-        var tree = try Tree.open(self.allocator, self.opts, tree_id, &self.ms, &self.table_cache);
-        errdefer tree.close();
-
-        const tree_ptr = try self.allocator.create(Tree);
-        tree_ptr.* = tree;
-        try self.trees.put(tree_id, tree_ptr);
-
-        // Set up namespace routing.
-        const rt = try self.getOrCreateRouteTable(namespace_id);
-        try rt.addRoute(tree_id, range);
-
+        try self.installTree(tree_id, namespace_id, range);
         return tree_id;
+    }
+
+    /// buildNamespaceCreate is Phase A of the Raft-replicated namespace create:
+    /// allocates a new tree_id and returns a ManifestChange with one TreeChange
+    /// carrying an infinite range (empty left+right). No state mutates beyond
+    /// next_tree_id, so a failed propose only burns one id. Caller owns the
+    /// returned slice.
+    pub fn buildNamespaceCreate(self: *Forest, alloc: std.mem.Allocator, namespace_id: u32) !manifest.ManifestChange {
+        std.debug.assert(namespace_id > 0);
+        const tree_id = self.next_tree_id.fetchAdd(1, .monotonic);
+
+        const tree_changes = try alloc.alloc(manifest.TreeChange, 1);
+        tree_changes[0] = manifest.createTreeChange(tree_id, namespace_id, "", "");
+
+        return .{
+            .tree_changes = tree_changes,
+            .table_changes = &.{},
+            .cmd = 5, // ns_create
+            .memtable_id = 0,
+        };
+    }
+
+    /// applyNamespaceCreate is Phase B: commits each TreeChange to the manifest
+    /// and installs the in-memory Tree + namespace route. Called on all nodes
+    /// after Raft commit (cmd=5).
+    pub fn applyNamespaceCreate(self: *Forest, mc: manifest.ManifestChange) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        for (mc.tree_changes) |tc| {
+            if (tc.op != 0) continue; // only CREATE for ns_create
+            self.advanceTreeId(tc.tree_id);
+            try self.ms.commit(&.{}, &.{tc});
+            // Empty left/right encodes the infinite range.
+            try self.installTree(tc.tree_id, tc.namespace_id, .{ .inf = true });
+        }
     }
 
     /// Get a tree by its id.
