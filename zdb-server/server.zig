@@ -4,6 +4,7 @@ const raft = @import("raft");
 const zdb = @import("zdb");
 const runtime = @import("runtime");
 const proto = @import("protocol.zig");
+const m = @import("metrics");
 const WaitGroup = @import("raft").utils.WaitGroup;
 
 const zdb_bufs = zdb.buffers;
@@ -30,12 +31,15 @@ pub const StorageImpl = struct {
         };
     }
 
-    fn applyEntry(ctx: *anyopaque, index: u64, _term: u64, data: []const u8) void {
-        _ = _term;
+    fn applyEntry(ctx: *anyopaque, entry: raft.Entry, data: []const u8) void {
+        // Empty-data entries (clock ticks) have no state machine work — the
+        // raft node still advances `apply_ts` after we return, so the tick's
+        // timestamp becomes visible to blocked readers.
+        if (data.len == 0) return;
         const self: *StorageImpl = @ptrCast(@alignCast(ctx));
         while (true) {
-            self.applyEntryInner(index, data) catch |err| {
-                log.err("on_apply: failed at index={d}: {s}, retrying", .{ index, @errorName(err) });
+            self.applyEntryInner(entry, data) catch |err| {
+                log.err("on_apply: failed at index={d}: {s}, retrying", .{ entry.index, @errorName(err) });
                 zio.sleep(zio.Duration.fromMilliseconds(100)) catch return;
                 continue;
             };
@@ -43,9 +47,9 @@ pub const StorageImpl = struct {
         }
     }
 
-    fn applyEntryInner(self: *StorageImpl, index: u64, data: []const u8) !void {
+    fn applyEntryInner(self: *StorageImpl, entry: raft.Entry, data: []const u8) !void {
         const parsed = zdb_bufs.parseMessageWithTail(data) catch {
-            log.err("on_apply: unknown entry type at index={d}", .{index});
+            log.err("on_apply: unknown entry type at index={d}", .{entry.index});
             return;
         };
         switch (parsed) {
@@ -54,7 +58,9 @@ pub const StorageImpl = struct {
                     .key = .{
                         .namespace = mutation.namespace(),
                         .primary = mutation.key(),
-                        .timestamp = mutation.timestamp(),
+                        // Timestamp comes from the raft Entry (assigned by leader
+                        // under the propose lock), not from the Mutation itself.
+                        .timestamp = entry.timestamp,
                     },
                     .value = mutation.value(),
                 }};
@@ -65,10 +71,10 @@ pub const StorageImpl = struct {
                 }, mutation.value().len);
             },
             .ManifestChange => |mc| {
-                try self.applyManifestChange(index, mc);
+                try self.applyManifestChange(entry.index, mc);
             },
             else => {
-                log.err("on_apply: unhandled message type at index={d}", .{index});
+                log.err("on_apply: unhandled message type at index={d}", .{entry.index});
             },
         }
     }
@@ -228,8 +234,29 @@ pub const ZdbServer = struct {
         group.spawn(runMemtableLoop, .{self}) catch return;
         group.spawn(runFlushLoop, .{self}) catch return;
         group.spawn(runLevelsLoop, .{self}) catch return;
+        group.spawn(runClockTickLoop, .{self}) catch return;
         group.wait() catch {};
         log.info("compaction loops exiting (shutdown)", .{});
+    }
+
+    /// Adaptive clock tick fiber. Wakes every 400ms; if the wall-clock second
+    /// has moved past the last log entry's second on this leader, propose an
+    /// empty-data LogEntry so apply_ts advances even during write-quiet
+    /// periods. During active writes each Mutation naturally advances the
+    /// last log entry's second so no tick is emitted.
+    fn runClockTickLoop(self: *ZdbServer) void {
+        const poll = zio.Duration.fromMilliseconds(400);
+        while (!self.node.isShuttingDown()) {
+            zio.sleep(poll) catch return;
+            if (!self.node.isLeader()) continue;
+            const last_ts = raft.utils.hlc.HLC.fromU64(self.node.lastLogTimestamp());
+            const wall_sec: u32 = @intCast(std.time.timestamp());
+            if (wall_sec > last_ts.seconds) {
+                self.proposeAndWait(&.{}) catch |err| {
+                    log.warn("clock tick propose failed: {s}", .{@errorName(err)});
+                };
+            }
+        }
     }
 
     fn runMemtableLoop(self: *ZdbServer) void {
@@ -355,13 +382,13 @@ pub const ZdbServer = struct {
             ops += 1;
             switch (cmd) {
                 .set => |req| {
-                    log.debug("SET ns={d} key={s} ts={d} value_len={d}", .{
-                        req.ns, req.key, req.ts, req.value.len,
+                    log.debug("SET ns={d} key={s} value_len={d}", .{
+                        req.ns, req.key, req.value.len,
                     });
                     self.handleSet(stream, req) catch return;
                 },
                 .get => |req| {
-                    log.debug("GET ns={d} key={s} ts={d}", .{ req.ns, req.key, req.ts });
+                    log.debug("GET ns={d} key={s} read_ts={d}", .{ req.ns, req.key, req.read_ts });
                     self.handleGet(stream, req) catch return;
                 },
                 .conf => |req| {
@@ -371,6 +398,9 @@ pub const ZdbServer = struct {
                 .ns_create => |req| {
                     log.info("NS CREATE ns={d}", .{req.ns});
                     self.handleNsCreate(stream, req) catch return;
+                },
+                .stats => |_| {
+                    self.handleStats(stream) catch return;
                 },
             }
         }
@@ -385,7 +415,6 @@ pub const ZdbServer = struct {
             .namespace = req.ns,
             .key = req.key,
             .value = req.value,
-            .timestamp = req.ts,
         });
         var mutation_buf = try mutation_writer.finishWithTail();
         defer mutation_buf.deinit();
@@ -434,10 +463,20 @@ pub const ZdbServer = struct {
     }
 
     fn handleGet(self: *ZdbServer, stream: zio.net.Stream, req: proto.GetCmd) !void {
+        // If the client sent a read_ts, wait for this node's apply_ts to reach
+        // it (5s timeout). No read_ts → serve local applied state immediately.
+        if (req.read_ts > 0) {
+            self.node.waitUntilApplied(req.read_ts, zio.Duration.fromSeconds(5)) catch {
+                try proto.writeErr(stream, "read_stale");
+                return;
+            };
+        }
+        // MVCC lookup at the requested timestamp. 0 → latest (maxInt).
+        const search_ts: u64 = if (req.read_ts == 0) std.math.maxInt(u64) else req.read_ts;
         const search_key = Key{
             .namespace = req.ns,
             .primary = req.key,
-            .timestamp = req.ts,
+            .timestamp = search_ts,
         };
         const result = self.forest.get(self.allocator, search_key, .p0) catch |err| {
             log.err("forest.get failed: {s}", .{@errorName(err)});
@@ -500,6 +539,17 @@ pub const ZdbServer = struct {
         }
     }
 
+    fn handleStats(self: *ZdbServer, stream: zio.net.Stream) !void {
+        // Snapshot into a buffer so we write in a single syscall. The metrics
+        // lib emits each metric terminated by '\n'; we append one extra '\n'
+        // so the response ends in a blank line — clients read until \n\n.
+        var body: std.Io.Writer.Allocating = .init(self.allocator);
+        defer body.deinit();
+        try m.write(zdb.metrics.g(), &body.writer);
+        try body.writer.writeByte('\n');
+        try stream.writeAll(body.writer.buffered(), .none);
+    }
+
     fn handleNsCreate(self: *ZdbServer, stream: zio.net.Stream, req: proto.NsCreateCmd) !void {
         if (!self.node.isLeader()) {
             const leader = self.node.getLeaderId() orelse 0;
@@ -542,12 +592,14 @@ pub const ZdbServer = struct {
 const CommitCtx = struct {
     wg: WaitGroup = .{},
     status: raft.CommitStatus,
+    /// Timestamp the leader assigned to the committed entry (0 on failure).
+    commit_ts: u64 = 0,
 };
 
-fn onCommit(ctx_raw: *anyopaque, _entry: raft.ProposalEntry, status: raft.CommitStatus) void {
-    _ = _entry;
+fn onCommit(ctx_raw: *anyopaque, entry: raft.Entry, status: raft.CommitStatus) void {
     const ctx: *CommitCtx = @ptrCast(@alignCast(ctx_raw));
     ctx.status = status;
+    ctx.commit_ts = entry.timestamp;
     ctx.wg.done();
 }
 

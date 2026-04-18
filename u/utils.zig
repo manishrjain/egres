@@ -2,6 +2,7 @@ const std = @import("std");
 const zio = @import("zio");
 const builtin = @import("builtin");
 pub const compression = @import("compress.zig");
+pub const hlc = @import("hlc.zig");
 
 /// WaitGroup provides Go-style Add/Done/Wait synchronization for zio coroutines.
 ///

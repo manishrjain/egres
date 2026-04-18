@@ -2243,12 +2243,10 @@ pub const MutationStruct = struct {
     namespace: u32 = 0,
     key: []const u8 = &.{},
     value: []const u8 = &.{},
-    timestamp: u64 = 0,
 
     fn fromReaderValue(alloc: std.mem.Allocator, r: MutationReader) Error!MutationStruct {
         var s = MutationStruct{
             .namespace = r.namespace(),
-            .timestamp = r.timestamp(),
         };
         errdefer s.deinit(alloc);
         s.key = try alloc.dupe(u8, r.key());
@@ -2278,7 +2276,6 @@ pub const MutationStruct = struct {
     fn cloneValue(self: MutationStruct, alloc: std.mem.Allocator) Error!MutationStruct {
         var s = MutationStruct{
             .namespace = self.namespace,
-            .timestamp = self.timestamp,
         };
         errdefer s.deinit(alloc);
         s.key = try alloc.dupe(u8, self.key);
@@ -2298,7 +2295,6 @@ pub const MutationStruct = struct {
         try writer.setNamespace(self.namespace);
         try writer.setKey(self.key);
         try writer.setValue(self.value);
-        try writer.setTimestamp(self.timestamp);
         const result = try writer.finish();
         return result.offset;
     }
@@ -2312,7 +2308,7 @@ pub const MutationReader = struct {
 
     pub const VERSION: u16 = 1;
     pub const TABLE_ID: u16 = 46599;
-    pub const SIZE_BYTES: u16 = 32;
+    pub const SIZE_BYTES: u16 = 24;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -2353,13 +2349,6 @@ pub const MutationReader = struct {
         const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 20)) catch 0;
         if (data_len == 0) return &[_]u8{};
         return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
-    }
-
-    pub fn timestamp(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 32;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 24)) catch 0;
     }
 
     pub fn verify(self: Self) Error!void {
@@ -2409,7 +2398,6 @@ pub const MutationBuffer = struct {
         try writer.setNamespace(reader.namespace());
         try writer.setKey(reader.key());
         try writer.setValue(reader.value());
-        try writer.setTimestamp(reader.timestamp());
         const result = try writer.finish();
         return result.offset;
     }
@@ -2431,7 +2419,7 @@ pub const MutationWriter = struct {
 
     pub const VERSION: u16 = 1;
     pub const TABLE_ID: u16 = 46599;
-    pub const SIZE_BYTES: u16 = 32;
+    pub const SIZE_BYTES: u16 = 24;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -2485,11 +2473,6 @@ pub const MutationWriter = struct {
         try zbuf.patchU32(out.items, self.base + 20, @as(u32, @intCast(data.len)));
     }
 
-    pub fn setTimestamp(self: *Self, v: u64) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 24, v);
-    }
-
     pub fn set(self: *Self, values: anytype) Error!void {
         const Values = @TypeOf(values);
         if (@typeInfo(Values) != .@"struct") {
@@ -2498,7 +2481,6 @@ pub const MutationWriter = struct {
         if (@hasField(Values, "namespace")) try self.setNamespace(@field(values, "namespace"));
         if (@hasField(Values, "key")) try self.setKey(@field(values, "key"));
         if (@hasField(Values, "value")) try self.setValue(@field(values, "value"));
-        if (@hasField(Values, "timestamp")) try self.setTimestamp(@field(values, "timestamp"));
     }
 
     pub fn finish(self: *Self) Error!MutationBuffer {

@@ -64,11 +64,12 @@ pub const ManifestChange = schema.Table(.{
 });
 
 /// A single key-value mutation proposed through raft.
+/// The timestamp is carried on the enclosing `LogEntry.timestamp`, assigned
+/// by the leader inside the propose critical section — not stored per-Mutation.
 pub const Mutation = schema.Table(.{
     .{ .id = 1, .name = "namespace", .ty = schema.U32 },
     .{ .id = 2, .name = "key", .ty = schema.Bytes },
     .{ .id = 3, .name = "value", .ty = schema.Bytes },
-    .{ .id = 4, .name = "timestamp", .ty = schema.U64 },
 });
 
 // zbuf tail stores table_id as u16, so use a module namespace in high bits and

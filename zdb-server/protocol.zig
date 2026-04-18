@@ -6,23 +6,29 @@ pub const Command = union(enum) {
     get: GetCmd,
     conf: ConfCmd,
     ns_create: NsCreateCmd,
+    stats: StatsCmd,
 };
 
 pub const NsCreateCmd = struct {
     ns: u32,
 };
 
+pub const StatsCmd = struct {};
+
 pub const SetCmd = struct {
     ns: u32,
     key: []const u8,
-    ts: u64,
     value: []const u8,
 };
 
 pub const GetCmd = struct {
     ns: u32,
     key: []const u8,
-    ts: u64,
+    /// Optional read timestamp. 0 means "serve local applied state without
+    /// blocking." If > 0, the server waits until this node's apply_ts has
+    /// reached read_ts (with a timeout) so the returned view includes every
+    /// mutation up to read_ts.
+    read_ts: u64 = 0,
 };
 
 pub const ConfCmd = struct {
@@ -42,7 +48,7 @@ pub const ConfCmd = struct {
 const max_line_len = 64 * 1024;
 
 /// Read one text command from the stream.
-/// Format: "set <ns> <key> <ts> <value>\n" or "get <ns> <key> <ts>\n"
+/// Format: "set <ns> <key> <value>\n" or "get <ns> <key> [<read_ts>]\n"
 /// Returns null on EOF.
 pub fn readCommand(stream: zio.net.Stream, buf: []u8) !?Command {
     const line = try readLine(stream, buf) orelse return null;
@@ -75,25 +81,27 @@ fn parseLine(line: []const u8) !Command {
     if (std.mem.eql(u8, cmd, "set")) {
         const ns_str = it.next() orelse return error.MissingNamespace;
         const key = it.next() orelse return error.MissingKey;
-        const ts_str = it.next() orelse return error.MissingTimestamp;
         const value = it.rest();
         if (value.len == 0) return error.MissingValue;
 
         return .{ .set = .{
             .ns = std.fmt.parseInt(u32, ns_str, 10) catch return error.InvalidNamespace,
             .key = key,
-            .ts = std.fmt.parseInt(u64, ts_str, 10) catch return error.InvalidTimestamp,
             .value = value,
         } };
     } else if (std.mem.eql(u8, cmd, "get")) {
         const ns_str = it.next() orelse return error.MissingNamespace;
         const key = it.next() orelse return error.MissingKey;
-        const ts_str = it.next() orelse return error.MissingTimestamp;
+        // read_ts is optional; if absent, follower serves local applied state.
+        const read_ts: u64 = if (it.next()) |ts_str|
+            (std.fmt.parseInt(u64, ts_str, 10) catch return error.InvalidTimestamp)
+        else
+            0;
 
         return .{ .get = .{
             .ns = std.fmt.parseInt(u32, ns_str, 10) catch return error.InvalidNamespace,
             .key = key,
-            .ts = std.fmt.parseInt(u64, ts_str, 10) catch return error.InvalidTimestamp,
+            .read_ts = read_ts,
         } };
     } else if (std.mem.eql(u8, cmd, "conf")) {
         const action_str = it.next() orelse return error.MissingAction;
@@ -127,14 +135,25 @@ fn parseLine(line: []const u8) !Command {
         const ns = std.fmt.parseInt(u32, ns_str, 10) catch return error.InvalidNamespace;
         if (ns == 0) return error.InvalidNamespace; // 0 is a sentinel
         return .{ .ns_create = .{ .ns = ns } };
+    } else if (std.mem.eql(u8, cmd, "stats")) {
+        return .{ .stats = .{} };
     } else {
         return error.UnknownCommand;
     }
 }
 
-/// Write a successful set response: "OK\n"
+/// Write a successful response: "OK\n". Used for conf/ns_create where there's
+/// no committed timestamp to surface.
 pub fn writeOk(stream: zio.net.Stream) !void {
     try stream.writeAll("OK\n", .none);
+}
+
+/// Write a successful set response carrying the committed HLC timestamp:
+/// "OK <ts>\n". Clients track the max observed commit ts for read-your-writes.
+pub fn writeSetOk(stream: zio.net.Stream, commit_ts: u64) !void {
+    var buf: [32]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "OK {d}\n", .{commit_ts}) catch unreachable;
+    try stream.writeAll(s, .none);
 }
 
 /// Write an error response: "ERR <msg>\n"

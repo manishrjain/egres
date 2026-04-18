@@ -515,6 +515,7 @@ pub const LogEntryStruct = struct {
     is_conf_change: bool = false,
     index: u64 = 0,
     term: u64 = 0,
+    timestamp: u64 = 0,
     data: []const u8 = &.{},
     entry_type: u64 = 0,
     conf_change: ?ConfChangeStruct = null,
@@ -525,6 +526,7 @@ pub const LogEntryStruct = struct {
             .is_conf_change = r.isConfChange(),
             .index = r.index(),
             .term = r.term(),
+            .timestamp = r.timestamp(),
             .entry_type = r.entryType(),
         };
         errdefer s.deinit(alloc);
@@ -560,6 +562,7 @@ pub const LogEntryStruct = struct {
             .is_conf_change = self.is_conf_change,
             .index = self.index,
             .term = self.term,
+            .timestamp = self.timestamp,
             .entry_type = self.entry_type,
         };
         errdefer s.deinit(alloc);
@@ -583,6 +586,7 @@ pub const LogEntryStruct = struct {
         try writer.setIsConfChange(self.is_conf_change);
         try writer.setIndex(self.index);
         try writer.setTerm(self.term);
+        try writer.setTimestamp(self.timestamp);
         try writer.setData(self.data);
         try writer.entryTypeSet(self.entry_type);
         if (self.conf_change) |child| {
@@ -602,7 +606,7 @@ pub const LogEntryReader = struct {
 
     pub const VERSION: u16 = 1;
     pub const TABLE_ID: u16 = 42242;
-    pub const SIZE_BYTES: u16 = 40;
+    pub const SIZE_BYTES: u16 = 48;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -619,19 +623,19 @@ pub const LogEntryReader = struct {
     }
 
     pub fn isNormal(self: Self) bool {
-        const slot_end = @as(u32, self.base) + 36;
+        const slot_end = @as(u32, self.base) + 44;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return false;
-        const word = zbuf.readU64(self.buf, @as(usize, self.base + 28)) catch 0;
+        const word = zbuf.readU64(self.buf, @as(usize, self.base + 36)) catch 0;
         const bit = @as(u6, @intCast(0));
         return ((word >> bit) & 1) == 1;
     }
 
     pub fn isConfChange(self: Self) bool {
-        const slot_end = @as(u32, self.base) + 36;
+        const slot_end = @as(u32, self.base) + 44;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return false;
-        const word = zbuf.readU64(self.buf, @as(usize, self.base + 28)) catch 0;
+        const word = zbuf.readU64(self.buf, @as(usize, self.base + 36)) catch 0;
         const bit = @as(u6, @intCast(1));
         return ((word >> bit) & 1) == 1;
     }
@@ -650,35 +654,42 @@ pub const LogEntryReader = struct {
         return zbuf.readU64(self.buf, @as(usize, self.base + 12)) catch 0;
     }
 
-    pub fn data(self: Self) []const u8 {
+    pub fn timestamp(self: Self) u64 {
         const slot_end = @as(u32, self.base) + 28;
         const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 20)) catch 0;
+    }
+
+    pub fn data(self: Self) []const u8 {
+        const slot_end = @as(u32, self.base) + 36;
+        const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return &[_]u8{};
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 20)) catch 0;
-        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 24)) catch 0;
+        const off = zbuf.readU32(self.buf, @as(usize, self.base + 28)) catch 0;
+        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 32)) catch 0;
         if (data_len == 0) return &[_]u8{};
         return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
     }
 
     pub fn entryType(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 36;
+        const slot_end = @as(u32, self.base) + 44;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 28)) catch 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 36)) catch 0;
     }
 
     pub fn entryTypeHasBit(self: Self, bit_index: u32) bool {
         if (bit_index >= 64) return false;
         const bit = @as(u6, @intCast(bit_index % 64));
-        const word = zbuf.readU64(self.buf, @as(usize, self.base + 28)) catch 0;
+        const word = zbuf.readU64(self.buf, @as(usize, self.base + 36)) catch 0;
         return ((word >> bit) & 1) == 1;
     }
 
     pub fn confChange(self: Self) ?ConfChangeReader {
-        const slot_end = @as(u32, self.base) + 40;
+        const slot_end = @as(u32, self.base) + 48;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return null;
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 36)) catch 0;
+        const off = zbuf.readU32(self.buf, @as(usize, self.base + 44)) catch 0;
         if (off == zbuf.NullOffset) return null;
         return ConfChangeReader.init(self.buf, off) catch null;
     }
@@ -686,10 +697,10 @@ pub const LogEntryReader = struct {
     pub fn verify(self: Self) Error!void {
         if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        const slot_end_20 = @as(u32, self.base) + 28;
-        if (slot_end_20 <= header_end) {
-            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 20));
-            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 24));
+        const slot_end_28 = @as(u32, self.base) + 36;
+        if (slot_end_28 <= header_end) {
+            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 28));
+            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 32));
             if (data_len > 0) {
                 _ = try zbuf.sliceAt(self.buf, off, data_len);
             }
@@ -726,6 +737,7 @@ pub const LogEntryBuffer = struct {
         try writer.setIsConfChange(reader.isConfChange());
         try writer.setIndex(reader.index());
         try writer.setTerm(reader.term());
+        try writer.setTimestamp(reader.timestamp());
         try writer.setData(reader.data());
         try writer.entryTypeSet(reader.entryType());
         if (reader.confChange()) |child| {
@@ -754,7 +766,7 @@ pub const LogEntryWriter = struct {
 
     pub const VERSION: u16 = 1;
     pub const TABLE_ID: u16 = 42242;
-    pub const SIZE_BYTES: u16 = 40;
+    pub const SIZE_BYTES: u16 = 48;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -764,7 +776,7 @@ pub const LogEntryWriter = struct {
         const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);
         try zbuf.writeU16At(buf.items, @as(usize, base), VERSION);
         try zbuf.writeU16At(buf.items, @as(usize, base + 2), SIZE_BYTES);
-        try zbuf.patchU32(buf.items, base + 36, zbuf.NullOffset);
+        try zbuf.patchU32(buf.items, base + 44, zbuf.NullOffset);
         return .{ .buf = buf, .owns_buf = false, .alloc = alloc, .base = base };
     }
 
@@ -775,13 +787,13 @@ pub const LogEntryWriter = struct {
         const base = try zbuf.reserveHeader(owned, alloc, SIZE_BYTES);
         try zbuf.writeU16At(owned.items, @as(usize, base), VERSION);
         try zbuf.writeU16At(owned.items, @as(usize, base + 2), SIZE_BYTES);
-        try zbuf.patchU32(owned.items, base + 36, zbuf.NullOffset);
+        try zbuf.patchU32(owned.items, base + 44, zbuf.NullOffset);
         return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
     }
 
     pub fn setIsNormal(self: *Self, v: bool) Error!void {
         const out = self.bufMut();
-        const word_off = self.base + 28;
+        const word_off = self.base + 36;
         var word = try zbuf.readU64(out.items, @as(usize, word_off));
         const bit = @as(u6, @intCast(0));
         if (v) {
@@ -794,7 +806,7 @@ pub const LogEntryWriter = struct {
 
     pub fn setIsConfChange(self: *Self, v: bool) Error!void {
         const out = self.bufMut();
-        const word_off = self.base + 28;
+        const word_off = self.base + 36;
         var word = try zbuf.readU64(out.items, @as(usize, word_off));
         const bit = @as(u6, @intCast(1));
         if (v) {
@@ -815,29 +827,34 @@ pub const LogEntryWriter = struct {
         try zbuf.patchU64(out.items, self.base + 12, v);
     }
 
+    pub fn setTimestamp(self: *Self, v: u64) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU64(out.items, self.base + 20, v);
+    }
+
     pub fn setData(self: *Self, data: []const u8) Error!void {
         const out = self.bufMut();
         if (data.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 20, 0);
-            try zbuf.patchU32(out.items, self.base + 24, 0);
+            try zbuf.patchU32(out.items, self.base + 28, 0);
+            try zbuf.patchU32(out.items, self.base + 32, 0);
             return;
         }
         const abs_off = try zbuf.appendBytes(out, self.alloc, data);
         const off = abs_off;
-        try zbuf.patchU32(out.items, self.base + 20, off);
-        try zbuf.patchU32(out.items, self.base + 24, @as(u32, @intCast(data.len)));
+        try zbuf.patchU32(out.items, self.base + 28, off);
+        try zbuf.patchU32(out.items, self.base + 32, @as(u32, @intCast(data.len)));
     }
 
     pub fn entryTypeSet(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 28, v);
+        try zbuf.patchU64(out.items, self.base + 36, v);
     }
 
     pub fn entryTypeSetBit(self: *Self, bit_index: u32) Error!void {
         const out = self.bufMut();
         if (bit_index >= 64) return zbuf.Error.OutOfBounds;
         const bit = @as(u6, @intCast(bit_index % 64));
-        const word_off = self.base + 28;
+        const word_off = self.base + 36;
         var word = try zbuf.readU64(out.items, @as(usize, word_off));
         word |= (@as(u64, 1) << bit);
         try zbuf.patchU64(out.items, word_off, word);
@@ -847,7 +864,7 @@ pub const LogEntryWriter = struct {
         const out = self.bufMut();
         if (bit_index >= 64) return zbuf.Error.OutOfBounds;
         const bit = @as(u6, @intCast(bit_index % 64));
-        const word_off = self.base + 28;
+        const word_off = self.base + 36;
         var word = try zbuf.readU64(out.items, @as(usize, word_off));
         word &= ~(@as(u64, 1) << bit);
         try zbuf.patchU64(out.items, word_off, word);
@@ -857,14 +874,14 @@ pub const LogEntryWriter = struct {
         const out = self.bufMut();
         if (bit_index >= 64) return zbuf.Error.OutOfBounds;
         const bit = @as(u6, @intCast(bit_index % 64));
-        const word_off = self.base + 28;
+        const word_off = self.base + 36;
         const word = try zbuf.readU64(out.items, @as(usize, word_off));
         return ((word >> bit) & 1) == 1;
     }
 
     pub fn setConfChange(self: *Self, child_off: u32) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 36, child_off);
+        try zbuf.patchU32(out.items, self.base + 44, child_off);
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -876,6 +893,7 @@ pub const LogEntryWriter = struct {
         if (@hasField(Values, "is_conf_change")) try self.setIsConfChange(@field(values, "is_conf_change"));
         if (@hasField(Values, "index")) try self.setIndex(@field(values, "index"));
         if (@hasField(Values, "term")) try self.setTerm(@field(values, "term"));
+        if (@hasField(Values, "timestamp")) try self.setTimestamp(@field(values, "timestamp"));
         if (@hasField(Values, "data")) try self.setData(@field(values, "data"));
         if (@hasField(Values, "entry_type")) try self.entryTypeSet(@field(values, "entry_type"));
         if (@hasField(Values, "conf_change")) try self.setConfChange(@field(values, "conf_change"));

@@ -13,28 +13,46 @@ const Args = struct {
     read_pct: u8 = 50,
     value_size: u32 = 100,
     phase: Phase = .both,
+    /// Number of namespaces to spread traffic across. Each id in [1..=namespaces]
+    /// must already exist (create via `ns create <id>` before loading). A key
+    /// with id k goes to namespace nsFor(k) = (k % namespaces) + 1.
+    namespaces: u32 = 1,
+    verify_clients: u32 = 0, // concurrent verifier fibers during load phase
 
     const Phase = enum { load, run, both };
 };
+
+/// Map a key id to its namespace. Deterministic so writers and verifiers
+/// addressing the same key agree on the target namespace.
+fn nsFor(key_id: u64, namespaces: u32) u32 {
+    return @intCast((key_id % @as(u64, namespaces)) + 1);
+}
 
 fn usage() void {
     std.debug.print(
         \\usage: zdb-client [options]
         \\
-        \\  --addr <ip:port>     server address (default: 127.0.0.1:8001)
-        \\  --clients <n>        concurrent clients (default: 1)
-        \\  --records <n>        records to load (default: 1000)
-        \\  --ops <n>            operations per client in run phase (default: 10000)
-        \\  --read-pct <0-100>   read percentage (default: 50, i.e. workload A)
-        \\  --value-size <n>     value size in bytes (default: 100)
-        \\  --load               load phase only
-        \\  --run                run phase only
+        \\  --addr <ip:port>        server address (default: 127.0.0.1:8001)
+        \\  --clients <n>           concurrent writer clients (default: 1)
+        \\  --records <n>           records to load (default: 1000)
+        \\  --ops <n>               operations per client in run phase (default: 10000)
+        \\  --read-pct <0-100>      read percentage (default: 50, i.e. workload A)
+        \\  --value-size <n>        value size in bytes (default: 100)
+        \\  --namespaces <n>        spread traffic across n namespaces (default: 1).
+        \\                          Each id in [1..=n] must exist (ns create <id>).
+        \\  --verify-clients <n>    concurrent read-verifier fibers during load (default: 0)
+        \\  --load                  load phase only
+        \\  --run                   run phase only
         \\
         \\Workload presets (set via --read-pct):
         \\  50  = YCSB-A (read-heavy update)
         \\  95  = YCSB-B (read-mostly)
         \\  100 = YCSB-C (read-only)
         \\  0   = write-only
+        \\
+        \\Values are deterministic from key id. Reads in the run phase and the
+        \\verifier fibers compare returned bytes to the expected pattern; the
+        \\benchmark exits nonzero if any mismatch is observed.
         \\
     , .{});
 }
@@ -69,6 +87,15 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i >= argv.len) return error.InvalidArgs;
             args.value_size = try std.fmt.parseInt(u32, argv[i], 10);
+        } else if (std.mem.eql(u8, arg, "--namespaces")) {
+            i += 1;
+            if (i >= argv.len) return error.InvalidArgs;
+            args.namespaces = try std.fmt.parseInt(u32, argv[i], 10);
+            if (args.namespaces == 0) return error.InvalidArgs;
+        } else if (std.mem.eql(u8, arg, "--verify-clients")) {
+            i += 1;
+            if (i >= argv.len) return error.InvalidArgs;
+            args.verify_clients = try std.fmt.parseInt(u32, argv[i], 10);
         } else if (std.mem.eql(u8, arg, "--load")) {
             args.phase = .load;
         } else if (std.mem.eql(u8, arg, "--run")) {
@@ -83,9 +110,9 @@ fn parseArgs(argv: []const []const u8) !Args {
 
 // --- Text protocol (client side) ---
 
-fn sendSet(stream: zio.net.Stream, ns: u32, key: []const u8, ts: u64, value: []const u8) !void {
+fn sendSet(stream: zio.net.Stream, ns: u32, key: []const u8, value: []const u8) !void {
     var hdr_buf: [128]u8 = undefined;
-    const hdr = std.fmt.bufPrint(&hdr_buf, "set {d} {s} {d} ", .{ ns, key, ts }) catch unreachable;
+    const hdr = std.fmt.bufPrint(&hdr_buf, "set {d} {s} ", .{ ns, key }) catch unreachable;
     try stream.writeAll(hdr, .none);
     try stream.writeAll(value, .none);
     try stream.writeAll("\n", .none);
@@ -93,6 +120,9 @@ fn sendSet(stream: zio.net.Stream, ns: u32, key: []const u8, ts: u64, value: []c
 
 const SetResult = struct {
     ok: bool,
+    /// HLC timestamp assigned by the leader. Clients track the max seen and
+    /// pass it to subsequent gets as `read_ts` for read-your-writes.
+    commit_ts: u64 = 0,
     not_leader: bool = false,
     leader_id: u64 = 0,
 };
@@ -100,7 +130,11 @@ const SetResult = struct {
 fn recvSetResponse(stream: zio.net.Stream) !SetResult {
     var buf: [256]u8 = undefined;
     const line = try readResponseLine(stream, &buf);
-    if (std.mem.eql(u8, line, "OK")) {
+    if (std.mem.startsWith(u8, line, "OK ")) {
+        const ts_str = line["OK ".len..];
+        const commit_ts = std.fmt.parseInt(u64, ts_str, 10) catch 0;
+        return .{ .ok = true, .commit_ts = commit_ts };
+    } else if (std.mem.eql(u8, line, "OK")) {
         return .{ .ok = true };
     } else if (std.mem.startsWith(u8, line, "NOT_LEADER ")) {
         const id_str = line["NOT_LEADER ".len..];
@@ -111,20 +145,24 @@ fn recvSetResponse(stream: zio.net.Stream) !SetResult {
     }
 }
 
-fn sendGet(stream: zio.net.Stream, ns: u32, key: []const u8, ts: u64) !void {
+fn sendGet(stream: zio.net.Stream, ns: u32, key: []const u8, read_ts: u64) !void {
     var hdr_buf: [128]u8 = undefined;
-    const hdr = std.fmt.bufPrint(&hdr_buf, "get {d} {s} {d}\n", .{ ns, key, ts }) catch unreachable;
+    const hdr = std.fmt.bufPrint(&hdr_buf, "get {d} {s} {d}\n", .{ ns, key, read_ts }) catch unreachable;
     try stream.writeAll(hdr, .none);
 }
 
 const GetResult = struct {
     found: bool,
     ts: u64 = 0,
+    /// The value bytes, sliced into the caller-provided buffer. Empty on miss.
+    value: []const u8 = "",
 };
 
-fn recvGetResponse(stream: zio.net.Stream) !GetResult {
-    var buf: [16 * 1024 * 1024 + 256]u8 = undefined;
-    const line = try readResponseLine(stream, &buf);
+/// Reads the response for a `get` into the caller-provided `buf` (which must
+/// be large enough for the header + value — callers size it for max value_size).
+/// On FOUND, `value` slices into `buf` past the "FOUND <ts> " header.
+fn recvGetResponse(stream: zio.net.Stream, buf: []u8) !GetResult {
+    const line = try readResponseLine(stream, buf);
     if (std.mem.eql(u8, line, "NOT_FOUND")) {
         return .{ .found = false };
     } else if (std.mem.startsWith(u8, line, "FOUND ")) {
@@ -132,7 +170,7 @@ fn recvGetResponse(stream: zio.net.Stream) !GetResult {
         // Parse ts from "FOUND <ts> <value>"
         if (std.mem.indexOfScalar(u8, rest, ' ')) |sep| {
             const ts = std.fmt.parseInt(u64, rest[0..sep], 10) catch 0;
-            return .{ .found = true, .ts = ts };
+            return .{ .found = true, .ts = ts, .value = rest[sep + 1 ..] };
         }
         return .{ .found = true };
     } else {
@@ -155,25 +193,78 @@ fn readResponseLine(stream: zio.net.Stream, buf: []u8) ![]const u8 {
     return error.LineTooLong;
 }
 
-// --- Monotonic timestamp generator ---
-
-var g_ts = std.atomic.Value(u64).init(0);
-
-fn initTimestamp() void {
-    const now = Timestamp.now(.realtime).toNanoseconds();
-    g_ts.store(now, .release);
-}
-
-fn nextTimestamp() u64 {
-    return g_ts.fetchAdd(1, .monotonic);
-}
-
-// --- Key generation (YCSB-style) ---
+// --- Key + value generation ---
 
 fn formatKey(buf: *[24]u8, id: u64) []const u8 {
     const result = std.fmt.bufPrint(buf, "user{d:0>16}", .{id}) catch unreachable;
     return result;
 }
+
+/// fillValue writes a deterministic byte pattern derived from key id into buf.
+/// The pattern is cheap to compute and easy to verify: an LCG seeded by the
+/// id. Any worker that knows the id can recompute the expected bytes for
+/// post-write verification.
+fn fillValue(buf: []u8, id: u64) void {
+    var prng = std.Random.DefaultPrng.init(id);
+    prng.random().bytes(buf);
+}
+
+/// valueMatches returns true iff `got` equals the expected pattern for id.
+fn valueMatches(got: []const u8, id: u64) bool {
+    var expected_buf: [16 * 1024]u8 = undefined;
+    if (got.len > expected_buf.len) return false;
+    const expected = expected_buf[0..got.len];
+    fillValue(expected, id);
+    return std.mem.eql(u8, got, expected);
+}
+
+/// getWithRetry issues a GET and retries on NOT_FOUND with exponential backoff.
+/// The server already blocks until apply_ts reaches read_ts, so NOT_FOUND
+/// after waiting is suspicious (possible data loss or a lagging follower).
+/// We still retry a few times as defense in depth.
+///
+/// Caller provides `buf` for the response (sized to hold header + value) and
+/// `read_ts` (typically `SharedState.max_commit_ts` so followers catch up to
+/// every previously-acked write).
+fn getWithRetry(stream: zio.net.Stream, ns: u32, key: []const u8, read_ts: u64, buf: []u8) !GetResult {
+    const max_retries: u32 = 5;
+    var delay_ms: u64 = 10;
+    var attempt: u32 = 0;
+    while (true) : (attempt += 1) {
+        try sendGet(stream, ns, key, read_ts);
+        const result = try recvGetResponse(stream, buf);
+        if (result.found) return result;
+        if (attempt >= max_retries) return result;
+        zio.sleep(zio.Duration.fromMilliseconds(delay_ms)) catch return result;
+        delay_ms *= 2;
+    }
+}
+
+// --- Shared state ---
+
+/// SharedState is shared across all worker fibers (writers + verifiers).
+/// Atomics are used so verifiers can race-read high_water and loader_done.
+const SharedState = struct {
+    /// Highest key id + 1 that has been successfully written. Verifiers pick
+    /// random j in [0, high_water) to read back.
+    high_water: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Max commit timestamp observed across all workers. Verifiers use this
+    /// as `read_ts` so followers block until apply_ts has caught up to every
+    /// previously-acked write.
+    max_commit_ts: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Number of load workers that have finished. Verifier fibers exit once
+    /// this reaches clients.
+    loaders_done: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Count of read-verify mismatches observed across all workers.
+    /// Nonzero at exit == benchmark failure.
+    mismatches: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Number of verify reads attempted (for reporting).
+    verify_reads: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Number of verify reads that hit NOT_FOUND despite high_water covering
+    /// the key. A brief window is expected (commit ack → apply lag on a
+    /// follower connection); sustained nonzero is a bug.
+    verify_misses: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+};
 
 // --- Per-worker stats ---
 
@@ -211,6 +302,7 @@ const WorkerCtx = struct {
     id: u32,
     args: *const Args,
     server_addr: zio.net.IpAddress,
+    shared: *SharedState,
     stats: WorkerStats = .{},
     load_elapsed_ns: u64 = 0,
     run_elapsed_ns: u64 = 0,
@@ -235,14 +327,17 @@ fn workerImpl(ctx: *WorkerCtx) !void {
     stream.socket.setNoDelay(true) catch {};
     log.info("worker {d}: connected", .{ctx.id});
 
-    // Generate value once.
+    // Deterministic per-key value buffer (reused per write) + read buffer
+    // sized for our max value size plus the "FOUND <ts> " header.
     var value_buf: [16 * 1024]u8 = undefined;
+    var read_buf: [16 * 1024 + 256]u8 = undefined;
     const value_size: usize = @min(args.value_size, value_buf.len);
+    // PRNG only used for run-phase random op selection (read vs write).
     var prng = std.Random.DefaultPrng.init(@as(u64, ctx.id) ^ 0xdeadbeef);
-    prng.random().bytes(value_buf[0..value_size]);
-    const value = value_buf[0..value_size];
 
-    // Load phase: each worker inserts its slice of records.
+    // Load phase: each worker inserts its slice of records. We bump high_water
+    // after each ack'd write so verifier fibers can safely read what's been
+    // committed.
     if (args.phase == .load or args.phase == .both) {
         const total = args.records;
         const n_clients: u64 = args.clients;
@@ -256,10 +351,13 @@ fn workerImpl(ctx: *WorkerCtx) !void {
         while (k < end_key) : (k += 1) {
             var key_buf: [24]u8 = undefined;
             const key = formatKey(&key_buf, k);
-            try sendSet(stream, 0, key, nextTimestamp(), value);
+            fillValue(value_buf[0..value_size], k);
+            try sendSet(stream, nsFor(k, args.namespaces), key, value_buf[0..value_size]);
             const resp = try recvSetResponse(stream);
             if (resp.ok) {
                 ctx.stats.write_ok += 1;
+                _ = ctx.shared.high_water.fetchMax(k + 1, .release);
+                _ = ctx.shared.max_commit_ts.fetchMax(resp.commit_ts, .release);
             } else {
                 ctx.stats.write_err += 1;
                 if (resp.not_leader) {
@@ -275,6 +373,7 @@ fn workerImpl(ctx: *WorkerCtx) !void {
         }
         const t1 = Timestamp.now(.monotonic);
         ctx.load_elapsed_ns = Timestamp.durationTo(t0, t1).toNanoseconds();
+        _ = ctx.shared.loaders_done.fetchAdd(1, .release);
         log.info("worker {d}: load complete — {d} ok, {d} err, {d:.1} ms", .{
             ctx.id,
             ctx.stats.write_ok,
@@ -283,7 +382,8 @@ fn workerImpl(ctx: *WorkerCtx) !void {
         });
     }
 
-    // Run phase: random read/write mix.
+    // Run phase: random read/write mix. Reads retry on NOT_FOUND and verify
+    // the returned value bytes against the expected deterministic pattern.
     if (args.phase == .run or args.phase == .both) {
         log.info("worker {d}: run phase — {d} ops, {d}% reads", .{ ctx.id, args.ops, args.read_pct });
         const t0 = Timestamp.now(.monotonic);
@@ -293,15 +393,12 @@ fn workerImpl(ctx: *WorkerCtx) !void {
             var key_buf: [24]u8 = undefined;
             const key_id = prng.random().intRangeLessThan(u64, 0, args.records);
             const key = formatKey(&key_buf, key_id);
+            const ns = nsFor(key_id, args.namespaces);
 
             if (r < args.read_pct) {
-                // Read
+                const read_ts = ctx.shared.max_commit_ts.load(.acquire);
                 const op_start = Timestamp.now(.monotonic);
-                sendGet(stream, 0, key, std.math.maxInt(u64)) catch {
-                    ctx.stats.read_err += 1;
-                    continue;
-                };
-                const result = recvGetResponse(stream) catch {
+                const result = getWithRetry(stream, ns, key, read_ts, &read_buf) catch {
                     ctx.stats.read_err += 1;
                     continue;
                 };
@@ -310,14 +407,19 @@ fn workerImpl(ctx: *WorkerCtx) !void {
                 ctx.stats.min_read_ns = @min(ctx.stats.min_read_ns, lat);
                 ctx.stats.max_read_ns = @max(ctx.stats.max_read_ns, lat);
                 if (result.found) {
-                    ctx.stats.read_ok += 1;
+                    if (valueMatches(result.value, key_id)) {
+                        ctx.stats.read_ok += 1;
+                    } else {
+                        _ = ctx.shared.mismatches.fetchAdd(1, .monotonic);
+                        log.err("worker {d}: VALUE MISMATCH for key id={d}", .{ ctx.id, key_id });
+                    }
                 } else {
                     ctx.stats.read_miss += 1;
                 }
             } else {
-                // Write
+                fillValue(value_buf[0..value_size], key_id);
                 const op_start = Timestamp.now(.monotonic);
-                sendSet(stream, 0, key, nextTimestamp(), value) catch {
+                sendSet(stream, ns, key, value_buf[0..value_size]) catch {
                     ctx.stats.write_err += 1;
                     continue;
                 };
@@ -331,6 +433,7 @@ fn workerImpl(ctx: *WorkerCtx) !void {
                 ctx.stats.max_write_ns = @max(ctx.stats.max_write_ns, lat);
                 if (resp.ok) {
                     ctx.stats.write_ok += 1;
+                    _ = ctx.shared.max_commit_ts.fetchMax(resp.commit_ts, .release);
                 } else {
                     ctx.stats.write_err += 1;
                 }
@@ -352,9 +455,79 @@ fn workerImpl(ctx: *WorkerCtx) !void {
     }
 }
 
+// --- Verifier worker (runs alongside load; reads random keys and verifies) ---
+
+fn verifyWorkerFn(ctx: *WorkerCtx) void {
+    verifyWorkerImpl(ctx) catch |err| {
+        ctx.err = err;
+    };
+}
+
+fn verifyWorkerImpl(ctx: *WorkerCtx) !void {
+    const args = ctx.args;
+    const stream = ctx.server_addr.connect(.{}) catch |err| {
+        log.err("verifier {d}: connect failed: {s}", .{ ctx.id, @errorName(err) });
+        return err;
+    };
+    defer stream.close();
+    stream.socket.setNoDelay(true) catch {};
+    log.info("verifier {d}: connected", .{ctx.id});
+
+    var read_buf: [16 * 1024 + 256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@as(u64, ctx.id) ^ 0xcafebabe);
+    const wait = zio.Duration.fromMilliseconds(20);
+
+    while (true) {
+        const hw = ctx.shared.high_water.load(.acquire);
+        if (hw == 0) {
+            if (ctx.shared.loaders_done.load(.acquire) >= args.clients) return;
+            zio.sleep(wait) catch return;
+            continue;
+        }
+
+        // Pick a random key that's been written past high_water.
+        const j = prng.random().intRangeLessThan(u64, 0, hw);
+        var key_buf: [24]u8 = undefined;
+        const key = formatKey(&key_buf, j);
+        const ns = nsFor(j, args.namespaces);
+
+        // Pass max_commit_ts as read_ts so the follower's handleGet waits for
+        // its apply_ts to catch up to every previously-acked write before
+        // serving. Without this, a verifier connected to a lagging follower
+        // could see NOT_FOUND for a key the leader already committed.
+        const read_ts = ctx.shared.max_commit_ts.load(.acquire);
+        const result = getWithRetry(stream, ns, key, read_ts, &read_buf) catch {
+            ctx.stats.read_err += 1;
+            continue;
+        };
+        _ = ctx.shared.verify_reads.fetchAdd(1, .monotonic);
+        if (result.found) {
+            if (valueMatches(result.value, j)) {
+                ctx.stats.read_ok += 1;
+            } else {
+                _ = ctx.shared.mismatches.fetchAdd(1, .monotonic);
+                log.err("verifier {d}: VALUE MISMATCH for key id={d}", .{ ctx.id, j });
+            }
+        } else {
+            // Sustained NOT_FOUND past retries — a real data-loss or read-skew
+            // symptom. Log loudly; count for the summary.
+            _ = ctx.shared.verify_misses.fetchAdd(1, .monotonic);
+            ctx.stats.read_miss += 1;
+            log.err("verifier {d}: MISS after retries for key id={d} (hw={d})", .{ ctx.id, j, hw });
+        }
+
+        // Exit condition: all loaders done AND we've seen stable high_water.
+        if (ctx.shared.loaders_done.load(.acquire) >= args.clients and
+            ctx.shared.high_water.load(.acquire) == hw)
+        {
+            return;
+        }
+    }
+}
+
 // --- Printing results ---
 
-fn printResults(args: *const Args, contexts: []WorkerCtx) void {
+fn printResults(args: *const Args, contexts: []WorkerCtx, shared: *const SharedState) void {
     var total = WorkerStats{};
     var load_ns: u64 = 0;
     var run_ns: u64 = 0;
@@ -368,6 +541,17 @@ fn printResults(args: *const Args, contexts: []WorkerCtx) void {
         total.merge(ctx.stats);
         load_ns = @max(load_ns, ctx.load_elapsed_ns);
         run_ns = @max(run_ns, ctx.run_elapsed_ns);
+    }
+
+    // Verification summary (nonzero mismatches → load-test failure).
+    const vr = shared.verify_reads.load(.monotonic);
+    const vm = shared.verify_misses.load(.monotonic);
+    const mm = shared.mismatches.load(.monotonic);
+    if (args.verify_clients > 0 or vr > 0 or mm > 0 or vm > 0) {
+        std.debug.print("--- Verification ---\n", .{});
+        std.debug.print("  verify reads:   {d}\n", .{vr});
+        std.debug.print("  mismatches:     {d}\n", .{mm});
+        std.debug.print("  persistent miss: {d}\n", .{vm});
     }
 
     if (had_error) {
@@ -459,22 +643,30 @@ pub fn main() !void {
     defer rt.deinit();
 
     log.info("runtime initialized with {d} threads, starting benchmark", .{n_threads});
-    runBenchmark(allocator, &args);
+    const mismatches = runBenchmark(allocator, &args);
+    if (mismatches > 0) {
+        std.debug.print("FAIL: {d} value mismatches observed — data integrity failure\n", .{mismatches});
+        std.process.exit(1);
+    }
 }
 
-fn runBenchmark(allocator: std.mem.Allocator, args: *const Args) void {
+fn runBenchmark(allocator: std.mem.Allocator, args: *const Args) u64 {
     log.info("runBenchmark", .{});
-    initTimestamp();
     const server_addr = zio.net.IpAddress.parseIpAndPort(args.addr) catch |err| {
         log.err("invalid address '{s}': {s}", .{ args.addr, @errorName(err) });
-        return;
+        return 0;
     };
     log.info("server_addr done", .{});
 
-    // Allocate worker contexts.
-    const contexts = allocator.alloc(WorkerCtx, args.clients) catch {
+    // Shared state seen by all workers (atomics for lock-free progress).
+    var shared: SharedState = .{};
+
+    // Writer contexts + verifier contexts get a contiguous block so we can
+    // aggregate stats with one pass at the end.
+    const total_workers = args.clients + args.verify_clients;
+    const contexts = allocator.alloc(WorkerCtx, total_workers) catch {
         log.err("out of memory allocating worker contexts", .{});
-        return;
+        return 0;
     };
     defer allocator.free(contexts);
 
@@ -483,25 +675,33 @@ fn runBenchmark(allocator: std.mem.Allocator, args: *const Args) void {
             .id = @intCast(i),
             .args = args,
             .server_addr = server_addr,
+            .shared = &shared,
         };
     }
 
-    log.info("spawning {d} worker(s)", .{args.clients});
+    log.info("spawning {d} writer(s) + {d} verifier(s)", .{ args.clients, args.verify_clients });
 
-    // Spawn all workers.
     var group = zio.group();
     defer group.cancel();
 
-    for (contexts) |*ctx| {
+    // Writers = contexts[0..clients]; verifiers = contexts[clients..]
+    for (contexts[0..args.clients]) |*ctx| {
         group.spawn(workerFn, .{ctx}) catch {
             log.err("failed to spawn worker {d}", .{ctx.id});
-            return;
+            return 0;
+        };
+    }
+    for (contexts[args.clients..]) |*ctx| {
+        group.spawn(verifyWorkerFn, .{ctx}) catch {
+            log.err("failed to spawn verifier {d}", .{ctx.id});
+            return 0;
         };
     }
 
     // Wait for all workers.
-    group.wait() catch return;
+    group.wait() catch return 0;
 
     log.info("all workers finished", .{});
-    printResults(args, contexts);
+    printResults(args, contexts, &shared);
+    return shared.mismatches.load(.monotonic);
 }

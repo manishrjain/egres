@@ -50,12 +50,15 @@ pub const Snapshot = schema.Table(.{
 pub const LogEntry = schema.Table(.{
     .{ .id = 1, .name = "index", .ty = schema.U64 },
     .{ .id = 2, .name = "term", .ty = schema.U64 },
-    .{ .id = 3, .name = "data", .ty = schema.Bytes },
+    // HLC-derived monotonic timestamp, assigned by the leader inside the
+    // propose critical section (so log order == timestamp order).
+    .{ .id = 3, .name = "timestamp", .ty = schema.U64 },
+    .{ .id = 4, .name = "data", .ty = schema.Bytes },
 
-    .{ .id = 4, .name = "entry_type", .ty = schema.B64 },
-    .{ .name = "is_normal", .ty = schema.Bool(.{ .field_id = 4, .bit = 0 }) },
-    .{ .name = "is_conf_change", .ty = schema.Bool(.{ .field_id = 4, .bit = 1 }) },
-    .{ .id = 5, .name = "conf_change", .ty = ConfChange },
+    .{ .id = 5, .name = "entry_type", .ty = schema.B64 },
+    .{ .name = "is_normal", .ty = schema.Bool(.{ .field_id = 5, .bit = 0 }) },
+    .{ .name = "is_conf_change", .ty = schema.Bool(.{ .field_id = 5, .bit = 1 }) },
+    .{ .id = 6, .name = "conf_change", .ty = ConfChange },
 });
 
 pub const RequestVote = schema.Table(.{

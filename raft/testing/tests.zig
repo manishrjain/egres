@@ -13,7 +13,7 @@ test "all" {
     try raft.utils.runTestsInZioRuntime(@This());
 }
 
-fn noopCb(_: *anyopaque, _: raft.ProposalEntry, _: raft.CommitStatus) void {}
+fn noopCb(_: *anyopaque, _: raft.Entry, _: raft.CommitStatus) void {}
 
 fn defaultConfig() Config {
     return .{
@@ -237,11 +237,11 @@ pub fn testProposalCallbackFiresOnCommit() !void {
 
     const Ctx = struct {
         called: bool = false,
-        entry: ?raft.ProposalEntry = null,
+        entry: ?raft.Entry = null,
         status: ?raft.CommitStatus = null,
     };
     const callback = struct {
-        fn run(raw: *anyopaque, entry: raft.ProposalEntry, status: raft.CommitStatus) void {
+        fn run(raw: *anyopaque, entry: raft.Entry, status: raft.CommitStatus) void {
             const ctx: *Ctx = @ptrCast(@alignCast(raw));
             ctx.called = true;
             ctx.entry = entry;
@@ -327,7 +327,7 @@ pub fn testTransportProcessesProposal() !void {
         done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     };
     const callback = struct {
-        fn run(raw: *anyopaque, _: raft.ProposalEntry, _: raft.CommitStatus) void {
+        fn run(raw: *anyopaque, _: raft.Entry, _: raft.CommitStatus) void {
             const ctx: *Ctx = @ptrCast(@alignCast(raw));
             ctx.done.store(true, .seq_cst);
         }
@@ -394,7 +394,7 @@ pub fn testProposeAfterShutdownReturnsQueueClosed() !void {
 
     node.startShutdown();
     const callback = struct {
-        fn run(_: *anyopaque, _: raft.ProposalEntry, _: raft.CommitStatus) void {}
+        fn run(_: *anyopaque, _: raft.Entry, _: raft.CommitStatus) void {}
     };
     try std.testing.expectError(
         raft.RaftError.QueueClosed,

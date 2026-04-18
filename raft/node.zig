@@ -77,9 +77,10 @@ pub const InboundMsg = struct {
 };
 
 pub const Inbound = []const u8;
-pub const ProposalEntry = struct {
+pub const Entry = struct {
     term: u64,
     index: u64,
+    timestamp: u64 = 0,
 };
 
 pub const CommitStatus = enum {
@@ -97,7 +98,7 @@ pub const CommitStatus = enum {
 
 pub const ApplyCallback = *const fn (
     ctx: *anyopaque,
-    entry: ProposalEntry,
+    entry: Entry,
     status: CommitStatus,
 ) void;
 
@@ -119,14 +120,14 @@ pub const Node = struct {
     /// this (e.g. with forest/applier) and sets node.state_machine.
     pub const StateMachine = struct {
         ctx: *anyopaque,
-        applyFn: *const fn (*anyopaque, u64, u64, []const u8) void,
+        applyFn: *const fn (*anyopaque, Entry, []const u8) void,
         writeFileFn: ?*const fn (*anyopaque, u64, []const u8) void = null,
         readFileFn: ?*const fn (*anyopaque, std.mem.Allocator, u64) ?[]const u8 = null,
         hasFileFn: ?*const fn (*anyopaque, u64) bool = null,
         preAppendFn: ?*const fn (*anyopaque, *Node, []const zen.LogEntryBuffer) void = null,
 
-        pub fn apply(self: *StateMachine, index: u64, term: u64, data: []const u8) void {
-            self.applyFn(self.ctx, index, term, data);
+        pub fn apply(self: *StateMachine, entry: Entry, data: []const u8) void {
+            self.applyFn(self.ctx, entry, data);
         }
         pub fn writeFile(self: *StateMachine, file_id: u64, data: []const u8) void {
             (self.writeFileFn orelse @panic("StateMachine.writeFile not implemented"))(self.ctx, file_id, data);
@@ -152,6 +153,13 @@ pub const Node = struct {
     state: State,
     commit_index: std.atomic.Value(u64),
     apply_index: std.atomic.Value(u64),
+    /// HLC timestamp of the most-recently applied entry. Progress marker
+    /// parallel to `apply_index`. Readers bounded by `read_ts` block until
+    /// `apply_ts >= read_ts` via `waitUntilApplied`.
+    apply_ts: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Broadcast signal fired after every `apply_ts` advance. Waiters in
+    /// `waitUntilApplied` are woken and re-check their target.
+    apply_ts_notify: zio.Notify = .init,
     conf_applied_index: u64,
     leader_id: ?NodeId,
     pending_conf_change: bool,
@@ -203,7 +211,7 @@ pub const Node = struct {
         proposal_type: ProposalType = .data,
     };
     const PendingApply = struct {
-        entry: ProposalEntry,
+        entry: Entry,
         cb: ApplyCallback,
         ctx: *anyopaque,
     };
@@ -255,6 +263,10 @@ pub const Node = struct {
         node.recomputeQuorum();
         node.resetElectionTimeout(.init);
 
+        // Seed the HLC clock with the current wall-clock second so peek()
+        // returns a sensible value even before the first `next()` call.
+        utils.hlc.g().seed(.{ .seconds = @intCast(std.time.timestamp()), .logical = 0 });
+
         // Restore persisted state from WAL if present.
         if (node.log.lastIndex() > 0) {
             raft_log.info("node {d}: restoring state from WAL", .{node.id});
@@ -263,6 +275,13 @@ pub const Node = struct {
             raft_log.info("node {d}: state restored, term={d} peers={d} quorum={d}", .{
                 node.id, node.current_term, node.peers.count(), node.quorum_size,
             });
+            // Raise the HLC clock past the most recent log entry's timestamp,
+            // so a newly-elected leader's future `next()` values are strictly
+            // past every previously-committed one.
+            const seed_ts = node.lastLogTimestamp();
+            if (seed_ts != 0) {
+                utils.hlc.g().seed(utils.hlc.HLC.fromU64(seed_ts));
+            }
         }
 
         dbg(
@@ -394,7 +413,7 @@ pub const Node = struct {
         }
     };
 
-    fn onJoinCommit(ctx_raw: *anyopaque, _: ProposalEntry, status: CommitStatus) void {
+    fn onJoinCommit(ctx_raw: *anyopaque, _: Entry, status: CommitStatus) void {
         const ctx: *JoinCtx = @ptrCast(@alignCast(ctx_raw));
         ctx.status = status;
         ctx.done.send(1) catch {};
@@ -845,7 +864,7 @@ pub const Node = struct {
         }
     }
 
-    fn noopCommitCb(_: *anyopaque, _: ProposalEntry, _: CommitStatus) void {}
+    fn noopCommitCb(_: *anyopaque, _: Entry, _: CommitStatus) void {}
 
     pub fn becomeLeader(self: *Node) RaftError!void {
         if (self.state == .learner) return;
@@ -1264,9 +1283,19 @@ pub const Node = struct {
         self.event_ch.trySend(1) catch {};
     }
 
-    fn appendProposalsToLeaderLog(self: *Node, requests: []const ProposalRequest) RaftError!u64 {
+    /// Append the successful subset of `requests` to the leader's log,
+    /// assigning each a fresh HLC timestamp under the propose lock so log
+    /// order equals timestamp order. Each successfully-appended request's
+    /// apply callback is enqueued into `apply_callbacks`; rejected conf
+    /// changes fire their apply_cb inline and are NOT enqueued. If the
+    /// enqueue fails (channel closed during shutdown), the callback fires
+    /// inline with `.shutdown`.
+    fn appendProposalsToLeaderLog(
+        self: *Node,
+        requests: []const ProposalRequest,
+    ) RaftError!void {
         if (self.state != .leader) return RaftError.NotLeader;
-        if (requests.len == 0) return self.log.lastIndex() + 1;
+        if (requests.len == 0) return;
 
         var entries = std.ArrayList(zen.LogEntryBuffer).empty;
         defer {
@@ -1275,8 +1304,7 @@ pub const Node = struct {
         }
         try entries.ensureTotalCapacity(self.allocator, requests.len);
 
-        const first_index = self.log.lastIndex() + 1;
-        var index = first_index;
+        var index = self.log.lastIndex() + 1;
         var has_conf = false;
         for (requests) |req| {
             const is_conf = req.proposal_type == .conf;
@@ -1355,9 +1383,14 @@ pub const Node = struct {
                 cc_offset = try cc_buf.cloneInto(self.allocator, &buf);
             }
 
+            // Assign the HLC inside this critical section so log order matches
+            // timestamp order — the invariant that makes applied_timestamp a
+            // safe bound for consistent follower reads.
+            const ts = utils.hlc.g().next().asU64();
             try writer.set(.{
                 .index = index,
                 .term = self.current_term,
+                .timestamp = ts,
                 .data = if (is_conf) &[_]u8{} else req.data,
                 .is_normal = !is_conf,
                 .is_conf_change = is_conf,
@@ -1370,13 +1403,27 @@ pub const Node = struct {
             errdefer entry.deinit();
 
             try entries.append(self.allocator, entry);
+
+            // Enqueue the pending apply callback. send() blocks on full channel
+            // (backpressure if state-machine apply is lagging) and fails only
+            // on channel closed (shutdown) or fiber cancellation — in either
+            // case we fire the callback inline with .shutdown so the client
+            // isn't left hanging.
+            const pending: PendingApply = .{
+                .entry = .{ .index = index, .term = self.current_term, .timestamp = ts },
+                .cb = req.apply_cb,
+                .ctx = req.ctx,
+            };
+            self.apply_callbacks.send(pending) catch {
+                req.apply_cb(req.ctx, pending.entry, .shutdown);
+            };
+
             index += 1;
         }
 
         try self.log.append(entries.items);
         try self.log.sync();
         if (has_conf) self.pending_conf_change = true;
-        return first_index;
     }
 
     // processProposalRequests is just checking for proposals in proposal_requests queue, and
@@ -1390,6 +1437,7 @@ pub const Node = struct {
             }
             return 0;
         }
+
         var batch = std.ArrayList(ProposalRequest).empty;
         defer batch.deinit(self.allocator);
 
@@ -1402,7 +1450,11 @@ pub const Node = struct {
         defer for (batch.items) |req| self.allocator.free(req.data);
 
         const term = self.current_term;
-        const first_index = self.appendProposalsToLeaderLog(batch.items) catch |err| switch (err) {
+        // appendProposalsToLeaderLog enqueues each successful entry's
+        // PendingApply directly into apply_callbacks with the assigned HLC
+        // timestamp. Rejected conf changes already fired their apply_cb inline
+        // from within the function, so there's no per-request loop here.
+        self.appendProposalsToLeaderLog(batch.items) catch |err| switch (err) {
             error.NotLeader => {
                 for (batch.items) |req| {
                     req.apply_cb(req.ctx, .{ .term = term, .index = 0 }, .not_leader);
@@ -1411,20 +1463,6 @@ pub const Node = struct {
             },
             else => return err,
         };
-
-        for (batch.items, 0..) |req, i| {
-            const entry = ProposalEntry{
-                .term = term,
-                .index = first_index + @as(u64, @intCast(i)),
-            };
-            self.apply_callbacks.trySend(.{
-                .entry = entry,
-                .cb = req.apply_cb,
-                .ctx = req.ctx,
-            }) catch {
-                req.apply_cb(req.ctx, entry, .shutdown);
-            };
-        }
 
         return batch.items.len;
     }
@@ -1468,12 +1506,23 @@ pub const Node = struct {
                 if (reader.isNormal()) {
                     if (self.state_machine) |s| {
                         if (reader.data().len > 0) {
-                            s.apply(entry.index, entry.term, reader.data());
+                            s.apply(.{
+                                .index = entry.index,
+                                .term = entry.term,
+                                .timestamp = reader.timestamp(),
+                            }, reader.data());
                         }
                     }
                 }
                 ai = entry.index;
                 self.apply_index.store(ai, .seq_cst);
+                // Advance apply_ts AFTER the state machine has applied the
+                // entry (or is a no-op for empty-data ticks). Matches the
+                // read contract: "apply_ts >= T implies every entry with
+                // timestamp <= T is visible."
+                _ = self.apply_ts.fetchMax(reader.timestamp(), .release);
+                // Wake any reader blocked in waitUntilApplied.
+                self.apply_ts_notify.broadcast();
 
                 // Fire proposal callback if one exists for this index (leader only).
                 const head = self.apply_callbacks.peek() catch continue;
@@ -1895,6 +1944,37 @@ pub const Node = struct {
         try self.persistHardState();
     }
 
+    /// HLC timestamp of the most-recently applied entry on this node.
+    /// Reads bounded by `read_ts` must wait until `appliedTs() >= read_ts`.
+    pub fn appliedTs(self: *const Node) u64 {
+        return self.apply_ts.load(.acquire);
+    }
+
+    /// Block the caller until this node's `apply_ts >= target_ts` or the
+    /// timeout expires. Returns `error.Timeout` if the deadline passes
+    /// before catch-up. Wake-up is event-driven — each `apply_ts` advance
+    /// in `applyCommits` broadcasts to all waiters, who then recheck.
+    pub fn waitUntilApplied(self: *Node, target_ts: u64, timeout: zio.Duration) !void {
+        const deadline = (zio.Timeout{ .duration = timeout }).toDeadline();
+        while (self.apply_ts.load(.acquire) < target_ts) {
+            try self.apply_ts_notify.timedWait(deadline);
+        }
+    }
+
+    /// Timestamp of the last entry in the WAL (0 if empty). The clock-tick
+    /// fiber reads this to decide whether to propose a tick: if the wall
+    /// clock has ticked past this entry's second, a new tick is needed.
+    /// Source of truth is the WAL — no separate atomic to maintain.
+    pub fn lastLogTimestamp(self: *Node) u64 {
+        const last = self.log.lastIndex();
+        if (last == 0) return 0;
+        var result = self.log.entriesRange(.{ .lo = last, .hi = last + 1, .max_bytes = 4096 }) catch return 0;
+        defer result.deinit();
+        if (result.entries.len == 0) return 0;
+        const reader = zen.LogEntryReader.parseRoot(result.entries[0].bytes) catch return 0;
+        return reader.timestamp();
+    }
+
     fn failAllPendingCallbacks(self: *Node, status: CommitStatus) void {
         while (true) {
             const head = self.apply_callbacks.tryReceive() catch break;
@@ -1913,6 +1993,7 @@ pub const Node = struct {
         try writer.set(.{
             .index = new_index,
             .term = self.current_term,
+            .timestamp = utils.hlc.g().next().asU64(),
             .data = data,
             .is_normal = true,
             .is_conf_change = false,
