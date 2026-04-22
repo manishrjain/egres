@@ -400,7 +400,7 @@ fn addUCompressTests(
     optimize: std.builtin.OptimizeMode,
 ) *std.Build.Step {
     const utils_tests = b.addTest(.{
-        .root_module = makeModule(b, target, optimize, "u/compress_test.zig"),
+        .root_module = makeModule(b, target, optimize, "u/tests.zig"),
     });
     addVendoredCompressionSources(b, utils_tests);
 
