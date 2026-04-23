@@ -1,235 +1,383 @@
 const std = @import("std");
 const flags = @import("flags.zig");
 
-const SuperFlag = flags.SuperFlag;
-const Help = flags.Help;
-const Error = flags.Error;
+const RaftCfg = struct {
+    name: []const u8 = "default",
+    retries: u32 = 3,
+    ratio: f64 = 0.5,
+    tracing: bool = false,
+    tick_interval_ms: u32 = 10,
 
-test "parse happy path and key normalisation" {
+    pub const docs = .{
+        .name = "Human-readable identifier for this raft node.",
+        .retries = "Number of attempts before giving up on a proposal.",
+        .ratio = "Sampling ratio in [0,1].",
+        .tracing = "Emit per-event trace logs (very chatty).",
+        .tick_interval_ms = "Wall-clock tick period for the raft loop.",
+    };
+};
+
+const NetCfg = struct {
+    listen_addr: []const u8 = ":9000",
+    enable_tls: bool = false,
+
+    pub const docs = .{
+        .listen_addr = "Address the server listens on.",
+        .enable_tls = "Whether incoming connections require TLS.",
+    };
+};
+
+// ---------- Live(T) tests ----------
+
+test "init with empty input uses defaults" {
     const alloc = std.testing.allocator;
-    var sf = try SuperFlag.parse(alloc, "Bool_Key=true; int-key=5; name=manish; ;");
-    defer sf.deinit();
-
-    try std.testing.expectEqualStrings("true", sf.getString("bool-key"));
-    try std.testing.expectEqualStrings("true", sf.getString("Bool_Key")); // lookup normalises
-    try std.testing.expectEqualStrings("5", sf.getString("int-key"));
-    try std.testing.expectEqualStrings("manish", sf.getString("name"));
-    try std.testing.expectEqualStrings("", sf.getString("missing"));
-    try std.testing.expect(sf.has("name"));
-    try std.testing.expect(!sf.has("missing"));
+    var live = try flags.Live(RaftCfg).init(alloc, "");
+    defer live.deinit();
+    const c = live.snapshot();
+    try std.testing.expectEqualStrings("default", c.name);
+    try std.testing.expectEqual(@as(u32, 3), c.retries);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), c.ratio, 1e-9);
+    try std.testing.expect(!c.tracing);
+    try std.testing.expectEqual(@as(u32, 10), c.tick_interval_ms);
 }
 
-test "parse empty input" {
+test "init applies partial overrides" {
     const alloc = std.testing.allocator;
-    var sf = try SuperFlag.parse(alloc, "");
-    defer sf.deinit();
-    try std.testing.expectEqualStrings("", sf.getString("anything"));
+    var live = try flags.Live(RaftCfg).init(alloc, "retries=5;");
+    defer live.deinit();
+    const c = live.snapshot();
+    try std.testing.expectEqual(@as(u32, 5), c.retries);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), c.ratio, 1e-9);
 }
 
-test "parse returns MissingValue for segment without =" {
+test "update merges, leaves unspecified fields alone" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(error.MissingValue, SuperFlag.parse(alloc, "key-without-value"));
-    try std.testing.expectError(error.MissingValue, SuperFlag.parse(alloc, "ok=1; bad"));
+    var live = try flags.Live(RaftCfg).init(alloc, "retries=5; ratio=0.9;");
+    defer live.deinit();
+    try live.update("tracing=true;");
+    const c = live.snapshot();
+    try std.testing.expectEqual(@as(u32, 5), c.retries);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.9), c.ratio, 1e-9);
+    try std.testing.expect(c.tracing);
 }
 
-test "parse allows empty value" {
+test "update rejects unknown key, leaves state intact" {
     const alloc = std.testing.allocator;
-    var sf = try SuperFlag.parse(alloc, "key=;");
-    defer sf.deinit();
-    try std.testing.expectEqualStrings("", sf.getString("key"));
-    // has() treats empty as absent (same semantic as Go's SuperFlag.Has)
-    try std.testing.expect(!sf.has("key"));
+    var live = try flags.Live(RaftCfg).init(alloc, "retries=5;");
+    defer live.deinit();
+    const v_before = live.version();
+    try std.testing.expectError(error.UnknownOption, live.update("mystery=1;"));
+    const c = live.snapshot();
+    try std.testing.expectEqual(@as(u32, 5), c.retries);
+    try std.testing.expectEqual(v_before, live.version());
 }
 
-test "mergeDefaults fills missing, preserves user values" {
+test "update rejects malformed value, leaves state intact" {
     const alloc = std.testing.allocator;
-    var sf = try SuperFlag.parse(alloc, "a=1; b=2;");
-    defer sf.deinit();
-    try sf.mergeDefaults("a=0; b=0; c=3;");
-    try std.testing.expectEqualStrings("1", sf.getString("a"));
-    try std.testing.expectEqualStrings("2", sf.getString("b"));
-    try std.testing.expectEqualStrings("3", sf.getString("c"));
+    var live = try flags.Live(RaftCfg).init(alloc, "retries=5;");
+    defer live.deinit();
+    try std.testing.expectError(error.InvalidInt, live.update("retries=abc;"));
+    try std.testing.expectEqual(@as(u32, 5), live.snapshot().retries);
 }
 
-test "mergeDefaults rejects unknown keys" {
+test "string field arena lifetime survives later updates" {
     const alloc = std.testing.allocator;
-    var sf = try SuperFlag.parse(alloc, "a=1; x=oops;");
-    defer sf.deinit();
-    try std.testing.expectError(error.UnknownOption, sf.mergeDefaults("a=0; b=0;"));
+    var live = try flags.Live(RaftCfg).init(alloc, "name=first;");
+    defer live.deinit();
+    const snap1 = live.snapshot();
+    try std.testing.expectEqualStrings("first", snap1.name);
+
+    try live.update("name=second;");
+    try live.update("name=third;");
+    // snap1 still references the original arena slice; it must still equal "first".
+    try std.testing.expectEqualStrings("first", snap1.name);
+    try std.testing.expectEqualStrings("third", live.snapshot().name);
 }
 
-test "mergeDefaults idempotent when called twice with same defaults" {
+test "_ms duration field accepts unit notation" {
     const alloc = std.testing.allocator;
-    var sf = try SuperFlag.parse(alloc, "a=1;");
-    defer sf.deinit();
-    try sf.mergeDefaults("a=0; b=2;");
-    try sf.mergeDefaults("a=0; b=2;");
-    try std.testing.expectEqualStrings("1", sf.getString("a"));
-    try std.testing.expectEqualStrings("2", sf.getString("b"));
+    var live = try flags.Live(RaftCfg).init(alloc, "tick-interval-ms=500ms;");
+    defer live.deinit();
+    try std.testing.expectEqual(@as(u32, 500), live.snapshot().tick_interval_ms);
+
+    try live.update("tick-interval-ms=2s;");
+    try std.testing.expectEqual(@as(u32, 2000), live.snapshot().tick_interval_ms);
+
+    try live.update("tick-interval-ms=1h;");
+    try std.testing.expectEqual(@as(u32, 3_600_000), live.snapshot().tick_interval_ms);
+
+    try live.update("tick-interval-ms=42;");
+    try std.testing.expectEqual(@as(u32, 42), live.snapshot().tick_interval_ms);
 }
 
-test "getBool accepts short and long forms, case-insensitive" {
+test "bool accepts short and long forms (case-insensitive)" {
     const alloc = std.testing.allocator;
-    const trues = [_][]const u8{ "true", "TRUE", "True", "t", "T", "1", "yes", "y", "on", "ON" };
-    const falses = [_][]const u8{ "false", "FALSE", "f", "F", "0", "no", "n", "off", "OFF" };
+    const trues = [_][]const u8{ "true", "TRUE", "t", "T", "1", "yes", "y", "on", "ON" };
+    const falses = [_][]const u8{ "false", "f", "F", "0", "no", "n", "off", "OFF" };
     for (trues) |v| {
-        const opt = try std.fmt.allocPrint(alloc, "k={s};", .{v});
+        const opt = try std.fmt.allocPrint(alloc, "tracing={s};", .{v});
         defer alloc.free(opt);
-        var sf = try SuperFlag.parse(alloc, opt);
-        defer sf.deinit();
-        try std.testing.expect(try sf.getBool("k"));
+        var live = try flags.Live(RaftCfg).init(alloc, opt);
+        defer live.deinit();
+        try std.testing.expect(live.snapshot().tracing);
     }
     for (falses) |v| {
-        const opt = try std.fmt.allocPrint(alloc, "k={s};", .{v});
+        const opt = try std.fmt.allocPrint(alloc, "tracing={s};", .{v});
         defer alloc.free(opt);
-        var sf = try SuperFlag.parse(alloc, opt);
-        defer sf.deinit();
-        try std.testing.expect(!try sf.getBool("k"));
+        var live = try flags.Live(RaftCfg).init(alloc, opt);
+        defer live.deinit();
+        try std.testing.expect(!live.snapshot().tracing);
     }
-
-    var sf = try SuperFlag.parse(alloc, "k=garbage;");
-    defer sf.deinit();
-    try std.testing.expectError(error.InvalidBool, sf.getBool("k"));
-
-    // missing key -> false, no error
-    try std.testing.expect(!try sf.getBool("missing"));
+    var bad = try flags.Live(RaftCfg).init(alloc, "");
+    defer bad.deinit();
+    try std.testing.expectError(error.InvalidBool, bad.update("tracing=garbage;"));
 }
 
-test "getI64 / getU64 handle decimal, hex, octal, binary" {
+test "key name mapping accepts all reasonable variants" {
     const alloc = std.testing.allocator;
-    var sf = try SuperFlag.parse(alloc, "dec=42; hex=0xff; oct=0o17; bin=0b101; neg=-7;");
-    defer sf.deinit();
-    try std.testing.expectEqual(@as(i64, 42), try sf.getI64("dec"));
-    try std.testing.expectEqual(@as(i64, 255), try sf.getI64("hex"));
-    try std.testing.expectEqual(@as(i64, 15), try sf.getI64("oct"));
-    try std.testing.expectEqual(@as(i64, 5), try sf.getI64("bin"));
-    try std.testing.expectEqual(@as(i64, -7), try sf.getI64("neg"));
-    try std.testing.expectEqual(@as(u64, 255), try sf.getU64("hex"));
-    try std.testing.expectEqual(@as(u64, 0), try sf.getU64("missing"));
-}
-
-test "getF64" {
-    const alloc = std.testing.allocator;
-    var sf = try SuperFlag.parse(alloc, "ratio=0.05; neg=-1.5; bad=abc;");
-    defer sf.deinit();
-    try std.testing.expectApproxEqAbs(@as(f64, 0.05), try sf.getF64("ratio"), 1e-9);
-    try std.testing.expectApproxEqAbs(@as(f64, -1.5), try sf.getF64("neg"), 1e-9);
-    try std.testing.expectError(error.InvalidFloat, sf.getF64("bad"));
-    try std.testing.expectEqual(@as(f64, 0), try sf.getF64("missing"));
-}
-
-test "getDurationMs days, standard units, compound, fractional" {
-    const alloc = std.testing.allocator;
-    var sf = try SuperFlag.parse(alloc,
-        \\ms=500ms; s=2s; m=15m; h=12h; d=30d; compound=1h30m; frac=1.5s; neg=-5m; bad=abc;
-    );
-    defer sf.deinit();
-    try std.testing.expectEqual(@as(i64, 500), try sf.getDurationMs("ms"));
-    try std.testing.expectEqual(@as(i64, 2_000), try sf.getDurationMs("s"));
-    try std.testing.expectEqual(@as(i64, 15 * 60 * 1000), try sf.getDurationMs("m"));
-    try std.testing.expectEqual(@as(i64, 12 * 3600 * 1000), try sf.getDurationMs("h"));
-    try std.testing.expectEqual(@as(i64, 30 * 24 * 3600 * 1000), try sf.getDurationMs("d"));
-    try std.testing.expectEqual(@as(i64, (60 + 30) * 60 * 1000), try sf.getDurationMs("compound"));
-    try std.testing.expectEqual(@as(i64, 1500), try sf.getDurationMs("frac"));
-    try std.testing.expectEqual(@as(i64, -5 * 60 * 1000), try sf.getDurationMs("neg"));
-    try std.testing.expectError(error.InvalidDuration, sf.getDurationMs("bad"));
-    try std.testing.expectEqual(@as(i64, 0), try sf.getDurationMs("missing"));
-}
-
-test "getPath expands ~ and resolves relative segments" {
-    const alloc = std.testing.allocator;
-    const home = std.process.getEnvVarOwned(alloc, "HOME") catch return; // skip if HOME unset
-    defer alloc.free(home);
-    const cwd = try std.process.getCwdAlloc(alloc);
-    defer alloc.free(cwd);
-
-    var sf = try SuperFlag.parse(alloc,
-        \\abs=/tmp/file.txt; home=~/file.txt; homedot=~/abc/../file.txt; homeonly=~/; rel=./file; curdir=./; tildelit=~file; empty=;
-    );
-    defer sf.deinit();
-
-    {
-        const p = try sf.getPath(alloc, "abs");
-        defer alloc.free(p);
-        try std.testing.expectEqualStrings("/tmp/file.txt", p);
-    }
-    {
-        const p = try sf.getPath(alloc, "home");
-        defer alloc.free(p);
-        const expected = try std.fs.path.join(alloc, &.{ home, "file.txt" });
-        defer alloc.free(expected);
-        try std.testing.expectEqualStrings(expected, p);
-    }
-    {
-        const p = try sf.getPath(alloc, "homedot");
-        defer alloc.free(p);
-        const expected = try std.fs.path.join(alloc, &.{ home, "file.txt" });
-        defer alloc.free(expected);
-        try std.testing.expectEqualStrings(expected, p);
-    }
-    {
-        const p = try sf.getPath(alloc, "homeonly");
-        defer alloc.free(p);
-        try std.testing.expectEqualStrings(home, p);
-    }
-    {
-        const p = try sf.getPath(alloc, "rel");
-        defer alloc.free(p);
-        const expected = try std.fs.path.join(alloc, &.{ cwd, "file" });
-        defer alloc.free(expected);
-        try std.testing.expectEqualStrings(expected, p);
-    }
-    {
-        const p = try sf.getPath(alloc, "curdir");
-        defer alloc.free(p);
-        try std.testing.expectEqualStrings(cwd, p);
-    }
-    {
-        const p = try sf.getPath(alloc, "tildelit");
-        defer alloc.free(p);
-        const expected = try std.fs.path.join(alloc, &.{ cwd, "~file" });
-        defer alloc.free(expected);
-        try std.testing.expectEqualStrings(expected, p);
-    }
-    {
-        const p = try sf.getPath(alloc, "empty");
-        defer alloc.free(p);
-        try std.testing.expectEqualStrings("", p);
+    const variants = [_][]const u8{
+        "tick-interval-ms=42;",
+        "tick_interval_ms=42;",
+        "Tick-Interval-MS=42;",
+        "TICK_INTERVAL_MS=42;",
+    };
+    for (variants) |v| {
+        var live = try flags.Live(RaftCfg).init(alloc, v);
+        defer live.deinit();
+        try std.testing.expectEqual(@as(u32, 42), live.snapshot().tick_interval_ms);
     }
 }
 
-test "writeTo serialises entries" {
+test "version monotonic on success, unchanged on failure" {
     const alloc = std.testing.allocator;
-    var sf = try SuperFlag.parse(alloc, "a=1; b=2;");
-    defer sf.deinit();
+    var live = try flags.Live(RaftCfg).init(alloc, "");
+    defer live.deinit();
+    try std.testing.expectEqual(@as(u64, 0), live.version());
+    try live.update("retries=1;");
+    try std.testing.expectEqual(@as(u64, 1), live.version());
+    try live.update("retries=2;");
+    try std.testing.expectEqual(@as(u64, 2), live.version());
+    try std.testing.expectError(error.UnknownOption, live.update("nope=1;"));
+    try std.testing.expectEqual(@as(u64, 2), live.version());
+}
+
+const ConcurrentCtx = struct {
+    live: *flags.Live(RaftCfg),
+    stop: *std.atomic.Value(bool),
+    err: *std.atomic.Value(u16),
+};
+
+fn readerLoop(ctx: ConcurrentCtx) void {
+    while (!ctx.stop.load(.acquire)) {
+        const c = ctx.live.snapshot();
+        // Touch every field so any torn state would surface.
+        std.mem.doNotOptimizeAway(c.retries);
+        std.mem.doNotOptimizeAway(c.tracing);
+        std.mem.doNotOptimizeAway(c.tick_interval_ms);
+        std.mem.doNotOptimizeAway(c.ratio);
+        if (c.name.len == 0) {
+            _ = ctx.err.cmpxchgStrong(0, 1, .acq_rel, .monotonic);
+            return;
+        }
+    }
+}
+
+test "concurrent readers do not see torn state" {
+    const alloc = std.testing.allocator;
+    var live = try flags.Live(RaftCfg).init(alloc, "name=initial;");
+    defer live.deinit();
+
+    var stop = std.atomic.Value(bool).init(false);
+    var err_flag = std.atomic.Value(u16).init(0);
+    const ctx = ConcurrentCtx{ .live = &live, .stop = &stop, .err = &err_flag };
+
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, readerLoop, .{ctx});
+
+    // Hammer with updates.
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        const buf = try std.fmt.allocPrint(alloc, "name=v{d}; retries={d}; tracing={s};", .{
+            i, @as(u32, @intCast(i % 10)), if (i % 2 == 0) "true" else "false",
+        });
+        defer alloc.free(buf);
+        try live.update(buf);
+    }
+
+    stop.store(true, .release);
+    for (threads) |t| t.join();
+    try std.testing.expectEqual(@as(u16, 0), err_flag.load(.acquire));
+}
+
+// ---------- Registry tests ----------
+
+test "registry: register returns Live pointer; dispatch routes to it" {
+    const alloc = std.testing.allocator;
+    var reg = flags.Registry.init(alloc);
+    defer reg.deinit();
+    const raft = try reg.register("raft", RaftCfg);
+    const net = try reg.register("net", NetCfg);
+
+    try reg.update("raft", "tracing=true; retries=7;");
+    try reg.update("net", "enable-tls=true;");
+
+    try std.testing.expect(raft.snapshot().tracing);
+    try std.testing.expectEqual(@as(u32, 7), raft.snapshot().retries);
+    try std.testing.expect(net.snapshot().enable_tls);
+    try std.testing.expectEqualStrings(":9000", net.snapshot().listen_addr);
+}
+
+test "registry: duplicate name rejected" {
+    const alloc = std.testing.allocator;
+    var reg = flags.Registry.init(alloc);
+    defer reg.deinit();
+    _ = try reg.register("raft", RaftCfg);
+    try std.testing.expectError(error.DuplicateModule, reg.register("raft", RaftCfg));
+}
+
+test "registry: unknown module returns error" {
+    const alloc = std.testing.allocator;
+    var reg = flags.Registry.init(alloc);
+    defer reg.deinit();
+    const raft = try reg.register("raft", RaftCfg);
+    try std.testing.expectError(error.UnknownModule, reg.update("ghost", "x=1;"));
+    try std.testing.expectEqual(@as(u32, 3), raft.snapshot().retries);
+}
+
+test "registry: module name normalization" {
+    const alloc = std.testing.allocator;
+    var reg = flags.Registry.init(alloc);
+    defer reg.deinit();
+    const raft = try reg.register("My_Module", RaftCfg);
+
+    try reg.update("my-module", "retries=1;");
+    try std.testing.expectEqual(@as(u32, 1), raft.snapshot().retries);
+    try reg.update("MY_MODULE", "retries=2;");
+    try std.testing.expectEqual(@as(u32, 2), raft.snapshot().retries);
+    try reg.update("My-Module", "retries=3;");
+    try std.testing.expectEqual(@as(u32, 3), raft.snapshot().retries);
+}
+
+test "registry: parseArgv happy path" {
+    const alloc = std.testing.allocator;
+    var reg = flags.Registry.init(alloc);
+    defer reg.deinit();
+    const raft = try reg.register("raft", RaftCfg);
+    const net = try reg.register("net", NetCfg);
+
+    var leftover: std.ArrayList([]const u8) = .empty;
+    defer leftover.deinit(alloc);
+    const argv = [_][]const u8{
+        "--raft=retries=7;",
+        "--net",
+        "listen-addr=:8080;",
+        "data.db",
+    };
+    try reg.parseArgv(&argv, &leftover);
+    try std.testing.expectEqual(@as(u32, 7), raft.snapshot().retries);
+    try std.testing.expectEqualStrings(":8080", net.snapshot().listen_addr);
+    try std.testing.expectEqual(@as(usize, 1), leftover.items.len);
+    try std.testing.expectEqualStrings("data.db", leftover.items[0]);
+}
+
+test "registry: parseArgv strips surviving outer quotes from payload" {
+    const alloc = std.testing.allocator;
+    var reg = flags.Registry.init(alloc);
+    defer reg.deinit();
+    const raft = try reg.register("raft", RaftCfg);
+    const net = try reg.register("net", NetCfg);
+
+    var leftover: std.ArrayList([]const u8) = .empty;
+    defer leftover.deinit(alloc);
+    const argv = [_][]const u8{
+        "--raft=\"retries=7; ratio=0.6\"",
+        "--net",
+        "'listen-addr=:8080; enable-tls=true'",
+    };
+    try reg.parseArgv(&argv, &leftover);
+    try std.testing.expectEqual(@as(u32, 7), raft.snapshot().retries);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.6), raft.snapshot().ratio, 1e-9);
+    try std.testing.expectEqualStrings(":8080", net.snapshot().listen_addr);
+    try std.testing.expect(net.snapshot().enable_tls);
+}
+
+test "registry: parseArgv unknown module" {
+    const alloc = std.testing.allocator;
+    var reg = flags.Registry.init(alloc);
+    defer reg.deinit();
+    const raft = try reg.register("raft", RaftCfg);
+
+    var leftover: std.ArrayList([]const u8) = .empty;
+    defer leftover.deinit(alloc);
+    const argv = [_][]const u8{ "--ghost=x=1;", "--raft=retries=2;" };
+    try std.testing.expectError(error.UnknownModule, reg.parseArgv(&argv, &leftover));
+    try std.testing.expectEqual(@as(u32, 3), raft.snapshot().retries);
+}
+
+test "registry: writeHelpAll renders both modules with their docs" {
+    const alloc = std.testing.allocator;
+    var reg = flags.Registry.init(alloc);
+    defer reg.deinit();
+    _ = try reg.register("raft", RaftCfg);
+    _ = try reg.register("net", NetCfg);
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
-    try sf.writeTo(alloc, &out);
+    try reg.writeHelpAll(&out);
 
-    // Key order is undefined, so accept either permutation.
-    const s = out.items;
-    const ok = std.mem.eql(u8, s, "a=1; b=2") or std.mem.eql(u8, s, "b=2; a=1");
-    try std.testing.expect(ok);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "raft\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "net\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "tick-interval-ms=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "listen-addr=") != null);
+    // Doc strings get rendered.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "Wall-clock tick period for the raft loop.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "Whether incoming connections require TLS.") != null);
 }
 
-test "Help.render produces sorted sections with defaults first" {
+test "global registry: initGlobal / g() / deinitGlobal" {
     const alloc = std.testing.allocator;
-    var help = try Help.init(alloc, "enabled=true; path=/tmp;");
-    defer help.deinit();
-    help.setHead("Trace options");
-    try help.addFlag("path", "The path to <something>.");
-    try help.addFlag("enabled", "Turns on <something>.");
-    try help.addFlag("another", "Not in defaults.");
+    flags.initGlobal(alloc);
+    defer flags.deinitGlobal();
 
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(alloc);
-    try help.render(alloc, &out);
+    const raft = try flags.g().register("raft", RaftCfg);
+    try flags.g().update("raft", "retries=42;");
+    try std.testing.expectEqual(@as(u32, 42), raft.snapshot().retries);
+}
 
-    const expected =
-        "Trace options\n" ++
-        "    enabled=true; Turns on <something>.\n" ++
-        "    path=/tmp; The path to <something>.\n" ++
-        "    another=; Not in defaults.\n";
-    try std.testing.expectEqualStrings(expected, out.items);
+const MultiUpdaterCtx = struct {
+    live: *flags.Live(RaftCfg),
+    iters: usize,
+    err: *std.atomic.Value(u16),
+};
+
+fn updaterLoop(ctx: MultiUpdaterCtx) void {
+    var i: usize = 0;
+    while (i < ctx.iters) : (i += 1) {
+        var buf: [64]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "retries={d};", .{i % 100}) catch {
+            _ = ctx.err.cmpxchgStrong(0, 1, .acq_rel, .monotonic);
+            return;
+        };
+        ctx.live.update(s) catch {
+            _ = ctx.err.cmpxchgStrong(0, 2, .acq_rel, .monotonic);
+            return;
+        };
+    }
+}
+
+test "registry: concurrent updates same module are serialised" {
+    const alloc = std.testing.allocator;
+    var reg = flags.Registry.init(alloc);
+    defer reg.deinit();
+    const raft = try reg.register("raft", RaftCfg);
+
+    var err_flag = std.atomic.Value(u16).init(0);
+    const ctx = MultiUpdaterCtx{ .live = raft, .iters = 100, .err = &err_flag };
+
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, updaterLoop, .{ctx});
+    for (threads) |t| t.join();
+
+    try std.testing.expectEqual(@as(u16, 0), err_flag.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 4 * 100), raft.version());
 }
