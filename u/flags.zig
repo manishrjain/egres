@@ -188,10 +188,15 @@ fn validateShape(comptime T: type) void {
                 "' has unsupported type " ++ @typeName(f.type) ++
                 " (allowed: bool, int <=64, f32/f64, []const u8)");
         }
+        if (std.mem.eql(u8, f.name, "self")) {
+            @compileError("flags.Live: field name 'self' conflicts with the " ++
+                "reserved 'docs.self' module-description key on " ++ @typeName(T));
+        }
     }
     // Mandatory `pub const docs = .{ .field = "..." }`. Every field needs an
-    // entry; every entry must name a real field. Both sides checked at comptime
-    // so configs can never ship undocumented or with stale doc keys.
+    // entry; every entry must name a real field. The special key `.self` is
+    // an optional one-liner about the module itself (rendered next to the
+    // module name in writeHelp).
     if (!@hasDecl(T, "docs")) {
         @compileError("flags.Live: '" ++ @typeName(T) ++ "' must declare " ++
             "'pub const docs = .{ .field = \"...\", ... }' covering every field");
@@ -207,6 +212,7 @@ fn validateShape(comptime T: type) void {
         }
     }
     inline for (docs_info.@"struct".fields) |df| {
+        if (std.mem.eql(u8, df.name, "self")) continue; // module-level doc; allowed
         if (!@hasField(T, df.name)) {
             @compileError("flags.Live: '" ++ @typeName(T) ++ ".docs." ++ df.name ++
                 "' has no matching field on " ++ @typeName(T));
@@ -218,6 +224,12 @@ fn validateShape(comptime T: type) void {
 /// guaranteed by validateShape to exist.
 fn docFor(comptime T: type, comptime field_name: []const u8) []const u8 {
     return @field(T.docs, field_name);
+}
+
+/// Optional one-line module description from `T.docs.self`.
+fn selfDocFor(comptime T: type) ?[]const u8 {
+    if (!@hasField(@TypeOf(T.docs), "self")) return null;
+    return @field(T.docs, "self");
 }
 
 // ---------- per-field parser ----------
@@ -332,23 +344,55 @@ pub fn Live(comptime T: type) type {
 
 // ---------- comptime help renderer (per-struct) ----------
 
-pub fn writeHelp(comptime T: type, out: *std.ArrayList(u8), allocator: std.mem.Allocator) Error!void {
+/// Renders a help block for one module, mirroring ristretto/z SuperFlagHelp:
+///
+///   <module> -- <T.docs.self>     (the "-- ..." part is omitted if absent)
+///       <field>=<default>; <field doc>
+///       ...
+pub fn writeHelp(
+    comptime T: type,
+    name: []const u8,
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+) Error!void {
     comptime validateShape(T);
+
+    try out.appendSlice(allocator, "  ");
+    try out.appendSlice(allocator, name);
+    if (comptime selfDocFor(T)) |s| {
+        try out.appendSlice(allocator, " -- ");
+        try out.appendSlice(allocator, s);
+    }
+    try out.append(allocator, '\n');
+
     const fields = @typeInfo(T).@"struct".fields;
     const default_t: T = .{};
     inline for (fields) |f| {
         const canonical = comptime comptimeCanonical(f.name);
-        try out.appendSlice(allocator, "    ");
+        try out.appendSlice(allocator, "      ");
         try out.appendSlice(allocator, &canonical);
         try out.append(allocator, '=');
         try writeDefault(f.type, @field(default_t, f.name), out, allocator);
-        try out.appendSlice(allocator, "  (");
-        try out.appendSlice(allocator, @typeName(f.type));
-        try out.append(allocator, ')');
-        try out.appendSlice(allocator, "  -- ");
+        try out.appendSlice(allocator, " (");
+        try out.appendSlice(allocator, comptime humanType(f.type, f.name));
+        try out.appendSlice(allocator, "); ");
         try out.appendSlice(allocator, comptime docFor(T, f.name));
         try out.append(allocator, '\n');
     }
+}
+
+fn humanType(comptime FT: type, comptime field_name: []const u8) []const u8 {
+    const info = @typeInfo(FT);
+    return switch (info) {
+        .bool => "bool",
+        .int => blk: {
+            if (comptime std.mem.endsWith(u8, field_name, "_ms")) break :blk "duration";
+            break :blk @typeName(FT);
+        },
+        .float => "float",
+        .pointer => "string",
+        else => unreachable,
+    };
 }
 
 fn writeDefault(comptime FT: type, value: FT, out: *std.ArrayList(u8), allocator: std.mem.Allocator) Error!void {
@@ -367,7 +411,7 @@ fn writeDefault(comptime FT: type, value: FT, out: *std.ArrayList(u8), allocator
 const Entry = struct {
     live_ptr: *anyopaque,
     update_fn: *const fn (*anyopaque, []const u8) Error!void,
-    help_fn: *const fn (*anyopaque, *std.ArrayList(u8), std.mem.Allocator) Error!void,
+    help_fn: *const fn (*anyopaque, []const u8, *std.ArrayList(u8), std.mem.Allocator) Error!void,
     deinit_fn: *const fn (*anyopaque, std.mem.Allocator) void,
 };
 
@@ -406,9 +450,9 @@ pub const Registry = struct {
                 const l: *Live(T) = @ptrCast(@alignCast(p));
                 return l.update(input);
             }
-            fn help(p: *anyopaque, out: *std.ArrayList(u8), alloc: std.mem.Allocator) Error!void {
+            fn help(p: *anyopaque, module_name: []const u8, out: *std.ArrayList(u8), alloc: std.mem.Allocator) Error!void {
                 _ = p;
-                return writeHelp(T, out, alloc);
+                return writeHelp(T, module_name, out, alloc);
             }
             fn deinit(p: *anyopaque, alloc: std.mem.Allocator) void {
                 const l: *Live(T) = @ptrCast(@alignCast(p));
@@ -535,10 +579,9 @@ pub const Registry = struct {
         }
         self.mu.unlock();
 
-        for (names.items, entries.items) |n, e| {
-            try out.appendSlice(self.allocator, n);
-            try out.append(self.allocator, '\n');
-            try e.help_fn(e.live_ptr, out, self.allocator);
+        for (names.items, entries.items, 0..) |n, e, idx| {
+            if (idx > 0) try out.append(self.allocator, '\n');
+            try e.help_fn(e.live_ptr, n, out, self.allocator);
         }
     }
 };

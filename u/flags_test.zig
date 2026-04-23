@@ -9,6 +9,7 @@ const RaftCfg = struct {
     tick_interval_ms: u32 = 10,
 
     pub const docs = .{
+        .self = "Raft consensus tunables. Hot-reloadable.",
         .name = "Human-readable identifier for this raft node.",
         .retries = "Number of attempts before giving up on a proposal.",
         .ratio = "Sampling ratio in [0,1].",
@@ -324,12 +325,15 @@ test "registry: writeHelpAll renders both modules with their docs" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
     try reg.writeHelpAll(&out);
+    std.debug.print("{s}\n", .{out.items});
 
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "raft\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "net\n") != null);
+    // raft has a self-doc; rendered next to the module name.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "raft -- Raft consensus tunables. Hot-reloadable.\n") != null);
+    // net has no self-doc; module name appears bare on its own line.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "  net\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "tick-interval-ms=") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "listen-addr=") != null);
-    // Doc strings get rendered.
+    // Field doc strings get rendered.
     try std.testing.expect(std.mem.indexOf(u8, out.items, "Wall-clock tick period for the raft loop.") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "Whether incoming connections require TLS.") != null);
 }
