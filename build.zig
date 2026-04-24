@@ -82,6 +82,7 @@ pub fn build(b: *std.Build) void {
 
     addZdbServer(b, target, optimize, raft_mod, regen_buffers_step);
     addZdbBench(b, target, optimize);
+    addLoadtestDriver(b, target, optimize);
     const zdb_test_step = addZdbTests(b, target, optimize, regen_buffers_step);
     const utils_test_step = addUCompressTests(b, target, optimize);
     const zbuf_test_step = addZbufTests(b, target, optimize, regen_buffers_step);
@@ -560,6 +561,29 @@ fn addZdbBench(
 
     const install = b.addInstallArtifact(exe, .{});
     const step = b.step("zdb-bench", "Build zdb YCSB benchmark client");
+    step.dependOn(&install.step);
+}
+
+fn addLoadtestDriver(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    const zio_dep = b.dependency("zio", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zio_mod = zio_dep.module("zio");
+
+    const exe = b.addExecutable(.{
+        .name = "loadtest",
+        .root_module = makeModule(b, target, optimize, "scripts/loadtest.zig"),
+    });
+    exe.root_module.addImport("zio", zio_mod);
+    b.installArtifact(exe);
+
+    const install = b.addInstallArtifact(exe, .{});
+    const step = b.step("loadtest", "Build the zdb load-test driver");
     step.dependOn(&install.step);
 }
 

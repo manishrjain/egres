@@ -200,13 +200,32 @@ fn formatKey(buf: *[24]u8, id: u64) []const u8 {
     return result;
 }
 
-/// fillValue writes a deterministic byte pattern derived from key id into buf.
-/// The pattern is cheap to compute and easy to verify: an LCG seeded by the
-/// id. Any worker that knows the id can recompute the expected bytes for
-/// post-write verification.
+/// A pool of printable-ASCII bytes used as the source of every value the
+/// benchmark writes. Pre-filled once at startup (see `initValueBuffer`) and
+/// read-only thereafter — no per-value PRNG cost on the hot path.
+const value_buffer_size: usize = 4 * 1024 * 1024;
+var value_buffer: [value_buffer_size]u8 = undefined;
+
+fn initValueBuffer() void {
+    var prng = std.Random.DefaultPrng.init(0xc0ffee);
+    for (&value_buffer) |*b| {
+        b.* = 0x20 + prng.random().intRangeLessThan(u8, 0, 95); // 0x20..0x7E
+    }
+}
+
+/// Writes a deterministic byte pattern for key `id` into `buf`. The bytes are
+/// a window into the shared `value_buffer` starting at offset `id % size`,
+/// wrapping around the end if needed. Adjacent ids produce adjacent windows
+/// — good cache locality for the memcpy, and any reader that knows `id` can
+/// reconstruct the exact bytes for verification.
 fn fillValue(buf: []u8, id: u64) void {
-    var prng = std.Random.DefaultPrng.init(id);
-    prng.random().bytes(buf);
+    std.debug.assert(buf.len <= value_buffer_size);
+    const start: usize = @intCast(id % value_buffer_size);
+    const first = @min(buf.len, value_buffer_size - start);
+    @memcpy(buf[0..first], value_buffer[start .. start + first]);
+    if (first < buf.len) {
+        @memcpy(buf[first..], value_buffer[0 .. buf.len - first]);
+    }
 }
 
 /// valueMatches returns true iff `got` equals the expected pattern for id.
@@ -245,9 +264,18 @@ fn getWithRetry(stream: zio.net.Stream, ns: u32, key: []const u8, read_ts: u64, 
 /// SharedState is shared across all worker fibers (writers + verifiers).
 /// Atomics are used so verifiers can race-read high_water and loader_done.
 const SharedState = struct {
-    /// Highest key id + 1 that has been successfully written. Verifiers pick
-    /// random j in [0, high_water) to read back.
+    /// Highest (any-worker) key id + 1 that has been acked. Loose progress
+    /// signal used by the verifier to decide "has writing started / is it
+    /// still advancing" — NOT used to pick which key to read.
     high_water: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Per-worker count of successfully-written keys within that worker's
+    /// range. Verifiers pick a worker uniformly then pick a random offset
+    /// in [0, per_worker_written[w]) so they only ever read keys that have
+    /// actually been acked by that worker — avoids the off-by-contiguous
+    /// bug where a global high_water doesn't imply every key below it was
+    /// written (workers have disjoint ranges).
+    /// Allocated in runBenchmark to len = args.clients.
+    per_worker_written: []std.atomic.Value(u64) = &.{},
     /// Max commit timestamp observed across all workers. Verifiers use this
     /// as `read_ts` so followers block until apply_ts has caught up to every
     /// previously-acked write.
@@ -358,6 +386,11 @@ fn workerImpl(ctx: *WorkerCtx) !void {
                 ctx.stats.write_ok += 1;
                 _ = ctx.shared.high_water.fetchMax(k + 1, .release);
                 _ = ctx.shared.max_commit_ts.fetchMax(resp.commit_ts, .release);
+                // k - start_key == number of writes completed by this worker
+                // BEFORE this one, so +1 = "count of keys acked so far". Store
+                // instead of fetchAdd so ordering is crash-safe (every ack
+                // gives a strictly greater value).
+                ctx.shared.per_worker_written[ctx.id].store(k - start_key + 1, .release);
             } else {
                 ctx.stats.write_err += 1;
                 if (resp.not_leader) {
@@ -477,6 +510,8 @@ fn verifyWorkerImpl(ctx: *WorkerCtx) !void {
     var prng = std.Random.DefaultPrng.init(@as(u64, ctx.id) ^ 0xcafebabe);
     const wait = zio.Duration.fromMilliseconds(20);
 
+    const per_worker = args.records / args.clients;
+
     while (true) {
         const hw = ctx.shared.high_water.load(.acquire);
         if (hw == 0) {
@@ -485,8 +520,18 @@ fn verifyWorkerImpl(ctx: *WorkerCtx) !void {
             continue;
         }
 
-        // Pick a random key that's been written past high_water.
-        const j = prng.random().intRangeLessThan(u64, 0, hw);
+        // Pick a worker uniformly, then a random offset within that worker's
+        // range of already-acked keys. This guarantees `j` refers to a key
+        // the worker has completed writing — the global high_water doesn't
+        // give that guarantee since workers cover disjoint ranges.
+        const w = prng.random().intRangeLessThan(u32, 0, args.clients);
+        const written = ctx.shared.per_worker_written[w].load(.acquire);
+        if (written == 0) {
+            zio.sleep(wait) catch return;
+            continue;
+        }
+        const offset = prng.random().intRangeLessThan(u64, 0, written);
+        const j = @as(u64, w) * per_worker + offset;
         var key_buf: [24]u8 = undefined;
         const key = formatKey(&key_buf, j);
         const ns = nsFor(j, args.namespaces);
@@ -634,8 +679,6 @@ pub fn main() !void {
         args.addr, args.clients, args.records, args.ops, args.read_pct, args.value_size,
     });
 
-    // Init a zio runtime directly — this makes the main thread a zio executor,
-    // so all zio operations (Group, connect, readAll, etc.) work from here.
     const n_threads: u6 = @intCast(@max(2, args.clients));
     var rt = try zio.Runtime.init(allocator, .{
         .executors = @enumFromInt(n_threads),
@@ -643,7 +686,11 @@ pub fn main() !void {
     defer rt.deinit();
 
     log.info("runtime initialized with {d} threads, starting benchmark", .{n_threads});
-    const mismatches = runBenchmark(allocator, &args);
+    // runBenchmark uses zio.group() / zio.net which require a current executor,
+    // so we spawn it as a root task on the runtime instead of calling from
+    // the main thread (which is never an executor after Runtime.init).
+    var root = try rt.spawn(runBenchmark, .{ allocator, &args });
+    const mismatches = root.join();
     if (mismatches > 0) {
         std.debug.print("FAIL: {d} value mismatches observed — data integrity failure\n", .{mismatches});
         std.process.exit(1);
@@ -652,6 +699,9 @@ pub fn main() !void {
 
 fn runBenchmark(allocator: std.mem.Allocator, args: *const Args) u64 {
     log.info("runBenchmark", .{});
+    // Fill the shared value pool once, before any fibers spawn — workers then
+    // only pay for memcpy, not per-byte PRNG.
+    initValueBuffer();
     const server_addr = zio.net.IpAddress.parseIpAndPort(args.addr) catch |err| {
         log.err("invalid address '{s}': {s}", .{ args.addr, @errorName(err) });
         return 0;
@@ -660,6 +710,13 @@ fn runBenchmark(allocator: std.mem.Allocator, args: *const Args) u64 {
 
     // Shared state seen by all workers (atomics for lock-free progress).
     var shared: SharedState = .{};
+    const pw = allocator.alloc(std.atomic.Value(u64), args.clients) catch {
+        log.err("out of memory allocating per_worker_written", .{});
+        return 0;
+    };
+    defer allocator.free(pw);
+    for (pw) |*slot| slot.* = std.atomic.Value(u64).init(0);
+    shared.per_worker_written = pw;
 
     // Writer contexts + verifier contexts get a contiguous block so we can
     // aggregate stats with one pass at the end.
