@@ -17,6 +17,8 @@ const Config = struct {
     verify_clients: u32 = 8,
     records: u64 = 100_000_000,
     value_size: u32 = 1024,
+    /// Writes per Raft proposal. Amortizes commit cost across N ops.
+    batch_size: u32 = 64,
     raft_port_base: u16 = 9000,
     client_port_base: u16 = 8000,
     monitor_interval_ms: u64 = 10_000,
@@ -378,6 +380,8 @@ fn cmdRun(alloc: std.mem.Allocator, hours: f64) !void {
     defer alloc.free(value_size_str);
     const ns_str = try std.fmt.allocPrint(alloc, "{d}", .{cfg.namespaces});
     defer alloc.free(ns_str);
+    const batch_str = try std.fmt.allocPrint(alloc, "{d}", .{cfg.batch_size});
+    defer alloc.free(batch_str);
 
     var bench = std.process.Child.init(&.{
         bench_bin,
@@ -387,6 +391,7 @@ fn cmdRun(alloc: std.mem.Allocator, hours: f64) !void {
         "--records",        records_str,
         "--value-size",     value_size_str,
         "--namespaces",     ns_str,
+        "--batch-size",     batch_str,
         "--load",
     }, alloc);
     bench.stdout_behavior = .Inherit;

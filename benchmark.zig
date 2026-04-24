@@ -18,6 +18,11 @@ const Args = struct {
     /// with id k goes to namespace nsFor(k) = (k % namespaces) + 1.
     namespaces: u32 = 1,
     verify_clients: u32 = 0, // concurrent verifier fibers during load phase
+    /// Writes per batch. 1 = one write per Raft proposal (original behavior).
+    /// Higher batch_size amortizes Raft commit cost across many writes —
+    /// expect near-linear throughput improvement up to the point where
+    /// batch-encoding CPU or TCP MSS limits kick in.
+    batch_size: u32 = 1,
 
     const Phase = enum { load, run, both };
 };
@@ -41,6 +46,7 @@ fn usage() void {
         \\  --namespaces <n>        spread traffic across n namespaces (default: 1).
         \\                          Each id in [1..=n] must exist (ns create <id>).
         \\  --verify-clients <n>    concurrent read-verifier fibers during load (default: 0)
+        \\  --batch-size <n>        writes per `set_batch` proposal (default: 1 = no batching)
         \\  --load                  load phase only
         \\  --run                   run phase only
         \\
@@ -96,6 +102,11 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i >= argv.len) return error.InvalidArgs;
             args.verify_clients = try std.fmt.parseInt(u32, argv[i], 10);
+        } else if (std.mem.eql(u8, arg, "--batch-size")) {
+            i += 1;
+            if (i >= argv.len) return error.InvalidArgs;
+            args.batch_size = try std.fmt.parseInt(u32, argv[i], 10);
+            if (args.batch_size == 0) return error.InvalidArgs;
         } else if (std.mem.eql(u8, arg, "--load")) {
             args.phase = .load;
         } else if (std.mem.eql(u8, arg, "--run")) {
@@ -116,6 +127,48 @@ fn sendSet(stream: zio.net.Stream, ns: u32, key: []const u8, value: []const u8) 
     try stream.writeAll(hdr, .none);
     try stream.writeAll(value, .none);
     try stream.writeAll("\n", .none);
+}
+
+/// One-shot batch write in the human-friendly text protocol:
+///
+///   set-batch <ns> <count>
+///   <k1> <v1>
+///   <k2> <v2>
+///   ...
+///
+/// Newlines are cosmetic — the server tokenizes on any whitespace. All
+/// key/value bytes are emitted literally (our fillValue avoids whitespace
+/// and leading `0x`, so no hex encoding is needed on the hot path).
+/// Packs everything into one buffer and sends with a single writeAll.
+fn sendSetBatch(
+    allocator: std.mem.Allocator,
+    stream: zio.net.Stream,
+    ns: u32,
+    keys: []const []const u8,
+    values: []const []const u8,
+) !void {
+    std.debug.assert(keys.len == values.len);
+
+    var body_bytes: usize = 0;
+    for (keys, values) |k, v| body_bytes += k.len + v.len + 2; // key + space + val + '\n'
+
+    const hdr_cap: usize = 64;
+    const buf = try allocator.alloc(u8, hdr_cap + body_bytes);
+    defer allocator.free(buf);
+    const hdr = try std.fmt.bufPrint(buf, "set-batch {d} {d}\n", .{ ns, keys.len });
+
+    var off: usize = hdr.len;
+    for (keys, values) |k, v| {
+        @memcpy(buf[off .. off + k.len], k);
+        off += k.len;
+        buf[off] = ' ';
+        off += 1;
+        @memcpy(buf[off .. off + v.len], v);
+        off += v.len;
+        buf[off] = '\n';
+        off += 1;
+    }
+    try stream.writeAll(buf[0..off], .none);
 }
 
 const SetResult = struct {
@@ -195,9 +248,12 @@ fn readResponseLine(stream: zio.net.Stream, buf: []u8) ![]const u8 {
 
 // --- Key + value generation ---
 
-fn formatKey(buf: *[24]u8, id: u64) []const u8 {
-    const result = std.fmt.bufPrint(buf, "user{d:0>16}", .{id}) catch unreachable;
-    return result;
+/// Writes `user{id:016d}` into `buf` and returns the slice of bytes written.
+/// `buf` must be at least 20 bytes. Changed from `*[24]u8` to `[]u8` so the
+/// same function works for stack-fixed buffers and for slices into a larger
+/// pre-allocated batch buffer (both coerce to `[]u8`).
+fn formatKey(buf: []u8, id: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "user{d:0>16}", .{id}) catch unreachable;
 }
 
 /// A pool of printable-ASCII bytes used as the source of every value the
@@ -208,8 +264,12 @@ var value_buffer: [value_buffer_size]u8 = undefined;
 
 fn initValueBuffer() void {
     var prng = std.Random.DefaultPrng.init(0xc0ffee);
+    // 0x31..0x7E — printable ASCII excluding space (0x20), tab/CR/LF (< 0x21),
+    // and the digit '0' (0x30). This lets the batch protocol's whitespace
+    // tokenization work without hex-encoding, and guarantees no value ever
+    // starts with "0x" which would be mistaken for a hex token.
     for (&value_buffer) |*b| {
-        b.* = 0x20 + prng.random().intRangeLessThan(u8, 0, 95); // 0x20..0x7E
+        b.* = 0x31 + prng.random().intRangeLessThan(u8, 0, 0x7E - 0x31 + 1);
     }
 }
 
@@ -355,17 +415,27 @@ fn workerImpl(ctx: *WorkerCtx) !void {
     stream.socket.setNoDelay(true) catch {};
     log.info("worker {d}: connected", .{ctx.id});
 
-    // Deterministic per-key value buffer (reused per write) + read buffer
-    // sized for our max value size plus the "FOUND <ts> " header.
-    var value_buf: [16 * 1024]u8 = undefined;
+    const alloc = std.heap.page_allocator;
     var read_buf: [16 * 1024 + 256]u8 = undefined;
-    const value_size: usize = @min(args.value_size, value_buf.len);
+    const value_size: usize = @min(args.value_size, 16 * 1024);
+    const bs: u32 = @max(args.batch_size, 1);
+    // Pre-alloc batch buffers once per worker (keys + values flat + their
+    // slice-of-slice headers). Reused every batch iteration.
+    const keys_flat = try alloc.alloc(u8, bs * 24);
+    defer alloc.free(keys_flat);
+    const vals_flat = try alloc.alloc(u8, bs * value_size);
+    defer alloc.free(vals_flat);
+    const keys_slices = try alloc.alloc([]const u8, bs);
+    defer alloc.free(keys_slices);
+    const vals_slices = try alloc.alloc([]const u8, bs);
+    defer alloc.free(vals_slices);
     // PRNG only used for run-phase random op selection (read vs write).
     var prng = std.Random.DefaultPrng.init(@as(u64, ctx.id) ^ 0xdeadbeef);
 
-    // Load phase: each worker inserts its slice of records. We bump high_water
-    // after each ack'd write so verifier fibers can safely read what's been
-    // committed.
+    // Load phase: each worker inserts its slice of records as batches of up
+    // to `bs` keys per `set_batch`. Batches break on namespace boundaries
+    // (all kvs in one batch must share a namespace — that's how the server
+    // is structured).
     if (args.phase == .load or args.phase == .both) {
         const total = args.records;
         const n_clients: u64 = args.clients;
@@ -373,34 +443,48 @@ fn workerImpl(ctx: *WorkerCtx) !void {
         const start_key = per_worker * ctx.id;
         const end_key = if (ctx.id == args.clients - 1) total else start_key + per_worker;
 
-        log.info("worker {d}: load phase keys [{d}..{d})", .{ ctx.id, start_key, end_key });
+        log.info("worker {d}: load phase keys [{d}..{d}) batch_size={d}", .{ ctx.id, start_key, end_key, bs });
         const t0 = Timestamp.now(.monotonic);
         var k: u64 = start_key;
-        while (k < end_key) : (k += 1) {
-            var key_buf: [24]u8 = undefined;
-            const key = formatKey(&key_buf, k);
-            fillValue(value_buf[0..value_size], k);
-            try sendSet(stream, nsFor(k, args.namespaces), key, value_buf[0..value_size]);
+        while (k < end_key) {
+            // Fill the next batch — stop early on namespace boundary.
+            var n: u32 = 0;
+            var batch_ns: u32 = 0;
+            while (n < bs and k < end_key) {
+                const this_ns = nsFor(k, args.namespaces);
+                if (n == 0) {
+                    batch_ns = this_ns;
+                } else if (this_ns != batch_ns) {
+                    break;
+                }
+                keys_slices[n] = formatKey(keys_flat[n * 24 .. n * 24 + 24], k);
+                const vslot = vals_flat[n * value_size .. (n + 1) * value_size];
+                fillValue(vslot, k);
+                vals_slices[n] = vslot;
+                n += 1;
+                k += 1;
+            }
+            if (n == 0) break;
+
+            try sendSetBatch(alloc, stream, batch_ns, keys_slices[0..n], vals_slices[0..n]);
             const resp = try recvSetResponse(stream);
             if (resp.ok) {
-                ctx.stats.write_ok += 1;
-                _ = ctx.shared.high_water.fetchMax(k + 1, .release);
+                ctx.stats.write_ok += n;
+                _ = ctx.shared.high_water.fetchMax(k, .release);
                 _ = ctx.shared.max_commit_ts.fetchMax(resp.commit_ts, .release);
-                // k - start_key == number of writes completed by this worker
-                // BEFORE this one, so +1 = "count of keys acked so far". Store
-                // instead of fetchAdd so ordering is crash-safe (every ack
-                // gives a strictly greater value).
-                ctx.shared.per_worker_written[ctx.id].store(k - start_key + 1, .release);
+                // All N writes are durable after this single ack.
+                ctx.shared.per_worker_written[ctx.id].store(k - start_key, .release);
             } else {
-                ctx.stats.write_err += 1;
+                ctx.stats.write_err += n;
                 if (resp.not_leader) {
                     log.warn("worker {d}: not leader (leader_id={d})", .{ ctx.id, resp.leader_id });
                 }
             }
-            // Progress every 1000 records.
-            if ((ctx.stats.write_ok + ctx.stats.write_err) % 1000 == 0) {
+            // Progress every ~1000 records.
+            const done = ctx.stats.write_ok + ctx.stats.write_err;
+            if (done / 1000 != (done - n) / 1000) {
                 log.info("worker {d}: loaded {d}/{d} records", .{
-                    ctx.id, ctx.stats.write_ok + ctx.stats.write_err, end_key - start_key,
+                    ctx.id, done, end_key - start_key,
                 });
             }
         }
@@ -450,9 +534,11 @@ fn workerImpl(ctx: *WorkerCtx) !void {
                     ctx.stats.read_miss += 1;
                 }
             } else {
-                fillValue(value_buf[0..value_size], key_id);
+                // Reuse slot 0 of the batch value buffer for this single write.
+                const vslot = vals_flat[0..value_size];
+                fillValue(vslot, key_id);
                 const op_start = Timestamp.now(.monotonic);
-                sendSet(stream, ns, key, value_buf[0..value_size]) catch {
+                sendSet(stream, ns, key, vslot) catch {
                     ctx.stats.write_err += 1;
                     continue;
                 };

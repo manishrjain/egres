@@ -399,6 +399,10 @@ pub const ZdbServer = struct {
                     });
                     self.handleSet(stream, req) catch return;
                 },
+                .set_batch => |req| {
+                    log.debug("SET_BATCH ns={d} count={d}", .{ req.ns, req.count });
+                    self.handleSetBatch(stream, req) catch return;
+                },
                 .get => |req| {
                     log.debug("GET ns={d} key={s} read_ts={d}", .{ req.ns, req.key, req.read_ts });
                     self.handleGet(stream, req) catch return;
@@ -467,6 +471,55 @@ pub const ZdbServer = struct {
                 log.err("SET failed: status={s}", .{@tagName(ctx.status)});
                 try proto.writeErr(stream, @tagName(ctx.status));
             },
+        }
+    }
+
+    /// Tokenize `count * 2` whitespace-delimited tokens off the stream into
+    /// (key, value) pairs, encode as a single Mutations, propose once.
+    /// Each token is hex-decoded if it starts with `0x`, literal otherwise.
+    fn handleSetBatch(self: *ZdbServer, stream: zio.net.Stream, req: proto.SetBatchCmd) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var kvs: std.ArrayList(KV) = .empty;
+        try kvs.ensureTotalCapacity(a, req.count);
+
+        var i: u32 = 0;
+        while (i < req.count) : (i += 1) {
+            const key = proto.readToken(stream, a) catch {
+                try proto.writeErr(stream, "bad_batch_token");
+                return;
+            };
+            const val = proto.readToken(stream, a) catch {
+                try proto.writeErr(stream, "bad_batch_token");
+                return;
+            };
+            kvs.appendAssumeCapacity(.{ .key = key, .value = val });
+        }
+
+        const proposal_bytes = try encodeMutations(self.allocator, req.ns, kvs.items);
+        defer self.allocator.free(proposal_bytes);
+
+        var ctx = CommitCtx{ .status = .committed };
+        ctx.wg.init();
+        ctx.wg.add(1);
+        self.node.proposeDataChange(proposal_bytes, &onCommit, @ptrCast(&ctx)) catch |err| {
+            log.err("batch propose failed: {s}", .{@errorName(err)});
+            try proto.writeErr(stream, "propose failed");
+            return;
+        };
+        ctx.wg.wait() catch {
+            try proto.writeErr(stream, "commit wait failed");
+            return;
+        };
+        switch (ctx.status) {
+            .committed => try proto.writeOk(stream),
+            .not_leader => {
+                const leader = self.node.getLeaderId() orelse 0;
+                try proto.writeNotLeader(stream, leader);
+            },
+            else => try proto.writeErr(stream, @tagName(ctx.status)),
         }
     }
 

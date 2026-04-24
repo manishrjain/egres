@@ -3,6 +3,7 @@ const zio = @import("zio");
 
 pub const Command = union(enum) {
     set: SetCmd,
+    set_batch: SetBatchCmd,
     get: GetCmd,
     conf: ConfCmd,
     ns_create: NsCreateCmd,
@@ -19,6 +20,16 @@ pub const SetCmd = struct {
     ns: u32,
     key: []const u8,
     value: []const u8,
+};
+
+/// Header for a batched write. The body is `count * 2` whitespace-delimited
+/// tokens (key1, value1, key2, value2, ...). Whitespace is any run of
+/// space / tab / LF / CR — newlines are cosmetic. A token starting with `0x`
+/// is hex-decoded; otherwise taken as literal bytes. To send a literal
+/// starting with `0x` or containing whitespace, hex-encode the whole token.
+pub const SetBatchCmd = struct {
+    ns: u32,
+    count: u32,
 };
 
 pub const GetCmd = struct {
@@ -55,6 +66,48 @@ pub fn readCommand(stream: zio.net.Stream, buf: []u8) !?Command {
     return try parseLine(line);
 }
 
+fn isWs(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+}
+
+/// Read one whitespace-delimited token. Leading whitespace is skipped; the
+/// token ends at the next whitespace byte. If the token starts with `0x`,
+/// the bytes after the prefix are hex-decoded; otherwise the token is
+/// treated as literal bytes. The returned slice is owned by `alloc`.
+pub fn readToken(stream: zio.net.Stream, alloc: std.mem.Allocator) ![]u8 {
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(alloc);
+
+    // Skip whitespace.
+    var b: [1]u8 = undefined;
+    while (true) {
+        try stream.readAll(&b, .none);
+        if (!isWs(b[0])) {
+            try raw.append(alloc, b[0]);
+            break;
+        }
+    }
+    // Collect until next whitespace.
+    while (raw.items.len < max_line_len) {
+        stream.readAll(&b, .none) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (isWs(b[0])) break;
+        try raw.append(alloc, b[0]);
+    }
+
+    const bytes = raw.items;
+    if (bytes.len >= 2 and bytes[0] == '0' and bytes[1] == 'x') {
+        const hex = bytes[2..];
+        if (hex.len % 2 != 0) return error.BadHex;
+        const out = try alloc.alloc(u8, hex.len / 2);
+        _ = try std.fmt.hexToBytes(out, hex);
+        return out;
+    }
+    return try alloc.dupe(u8, bytes);
+}
+
 fn readLine(stream: zio.net.Stream, buf: []u8) !?[]const u8 {
     var pos: usize = 0;
     while (pos < buf.len) {
@@ -88,6 +141,13 @@ fn parseLine(line: []const u8) !Command {
             .ns = std.fmt.parseInt(u32, ns_str, 10) catch return error.InvalidNamespace,
             .key = key,
             .value = value,
+        } };
+    } else if (std.mem.eql(u8, cmd, "set-batch")) {
+        const ns_str = it.next() orelse return error.MissingNamespace;
+        const count_str = it.next() orelse return error.MissingCount;
+        return .{ .set_batch = .{
+            .ns = std.fmt.parseInt(u32, ns_str, 10) catch return error.InvalidNamespace,
+            .count = std.fmt.parseInt(u32, count_str, 10) catch return error.InvalidCount,
         } };
     } else if (std.mem.eql(u8, cmd, "get")) {
         const ns_str = it.next() orelse return error.MissingNamespace;
