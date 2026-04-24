@@ -56,8 +56,6 @@ pub const ConfCmd = struct {
     };
 };
 
-const max_line_len = 64 * 1024;
-
 /// Read one text command from the buffered reader. Returns null on EOF.
 pub fn readCommand(r: *std.Io.Reader, line_buf: []u8) !?Command {
     const line = readLine(r, line_buf) catch |err| switch (err) {
@@ -81,41 +79,69 @@ fn isWs(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\n' or c == '\r';
 }
 
-/// Read one whitespace-delimited token. Leading whitespace is skipped; the
-/// token ends at the next whitespace byte. If the token starts with `0x`,
-/// the bytes after the prefix are hex-decoded; otherwise the token is
-/// treated as literal bytes. The returned slice is owned by `alloc`.
-pub fn readToken(r: *std.Io.Reader, alloc: std.mem.Allocator) ![]u8 {
-    var raw: std.ArrayList(u8) = .empty;
-    defer raw.deinit(alloc);
+/// Hard cap on the bytes of any single whitespace-delimited wire token
+/// (a key OR a value in a `set-batch` body). Also the per-token unused
+/// capacity the caller must reserve on the scratch `ArrayList` — see
+/// `readToken`. Set once here so the caller's reservation and the
+/// parser's rejection threshold can't drift apart.
+pub const max_token_size: usize = 64 * 1024;
 
-    // Skip whitespace.
+/// Read one whitespace-delimited token, appending its bytes onto `buf`.
+/// Leading whitespace is skipped; the token ends at the next whitespace
+/// byte (or EOF). If prefixed with `0x`, the payload is hex-decoded in
+/// place — the decoded output is exactly half the hex input length, and
+/// `buf.items.len` is truncated so only the decoded bytes remain.
+///
+/// Contract with the caller:
+/// - Before calling, caller must `ensureUnusedCapacity(max_token_size)`
+///   on `buf` so `appendAssumeCapacity` is safe for the whole token.
+/// - `readToken` rejects any token that would exceed `max_token_size`
+///   with `error.TokenTooLong` before the overflowing append, so a
+///   malicious oversized token cannot trip the `appendAssumeCapacity`
+///   assertion.
+///
+/// To recover the token's position, snapshot `buf.items.len` before and
+/// after the call — the token lives at `buf.items[before..after]`.
+/// Don't eagerly materialize that slice if more `readToken` calls will
+/// follow with intervening `ensureUnusedCapacity`, since a reallocation
+/// will invalidate it; keep offsets instead and resolve them once the
+/// buffer is stable.
+pub fn readToken(r: *std.Io.Reader, buf: *std.ArrayList(u8)) !void {
+    const start = buf.items.len;
+    // Skip leading whitespace, then keep the first non-ws byte. The
+    // caller's capacity guarantee covers this single-byte append, so
+    // no bounds check needed here (max_token_size is always >= 1).
     while (true) {
         const b = try r.takeByte();
         if (!isWs(b)) {
-            try raw.append(alloc, b);
+            buf.appendAssumeCapacity(b);
             break;
         }
     }
-    // Collect until next whitespace.
-    while (raw.items.len < max_line_len) {
+    // Collect until the next whitespace (or EOF). Check the length BEFORE
+    // each append — so the `max_token_size + 1`-th byte is rejected
+    // instead of overflowing the caller's reservation.
+    while (true) {
         const b = r.takeByte() catch |err| switch (err) {
             error.EndOfStream => break,
             else => return err,
         };
         if (isWs(b)) break;
-        try raw.append(alloc, b);
+        if (buf.items.len - start >= max_token_size) return error.TokenTooLong;
+        buf.appendAssumeCapacity(b);
     }
 
-    const bytes = raw.items;
+    // Hex-encoded token? Decode in place. Write position (start + i)
+    // always trails read position (start + 2 + 2*i), so the overlap is
+    // safe — hexToBytes only touches a source byte before the destination
+    // byte that would overwrite it.
+    const bytes = buf.items[start..];
     if (bytes.len >= 2 and bytes[0] == '0' and bytes[1] == 'x') {
         const hex = bytes[2..];
         if (hex.len % 2 != 0) return error.BadHex;
-        const out = try alloc.alloc(u8, hex.len / 2);
-        _ = try std.fmt.hexToBytes(out, hex);
-        return out;
+        _ = try std.fmt.hexToBytes(bytes[0 .. hex.len / 2], hex);
+        buf.items.len = start + hex.len / 2;
     }
-    return try alloc.dupe(u8, bytes);
 }
 
 fn parseLine(line: []const u8) !Command {

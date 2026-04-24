@@ -493,27 +493,57 @@ pub const ZdbServer = struct {
         r: *std.Io.Reader,
         req: proto.SetBatchCmd,
     ) !void {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const a = arena.allocator();
+        // One ArrayList holds every key/value byte for the whole batch.
+        // Tokens are appended contiguously; we record (start,end) offsets
+        // during the loop and resolve them to slices only once the buffer
+        // is stable. Capturing slices mid-loop would be unsafe because
+        // `ensureUnusedCapacity` between tokens may reallocate and move
+        // the backing storage.
+        var input: std.ArrayList(u8) = .empty;
+        defer input.deinit(self.allocator);
+        try input.ensureTotalCapacity(self.allocator, 16 * 1024);
 
-        var kvs: std.ArrayList(KV) = .empty;
-        try kvs.ensureTotalCapacity(a, req.count);
+        const Range = struct { start: u32, end: u32 };
+        const ranges = try self.allocator.alloc([2]Range, req.count);
+        defer self.allocator.free(ranges);
 
         var i: u32 = 0;
         while (i < req.count) : (i += 1) {
-            const key = proto.readToken(r, a) catch {
-                try proto.writeErr(stream, "bad_batch_token");
+            // Reserve the same budget the parser enforces, so
+            // `appendAssumeCapacity` inside readToken can never overflow
+            // even on maliciously oversized input — a too-long token
+            // surfaces as `error.TokenTooLong` rather than an assertion.
+            try input.ensureUnusedCapacity(self.allocator, proto.max_token_size);
+            const k_start: u32 = @intCast(input.items.len);
+            proto.readToken(r, &input) catch |err| {
+                try proto.writeErr(stream, @errorName(err));
                 return;
             };
-            const val = proto.readToken(r, a) catch {
-                try proto.writeErr(stream, "bad_batch_token");
+            const k_end: u32 = @intCast(input.items.len);
+
+            try input.ensureUnusedCapacity(self.allocator, proto.max_token_size);
+            const v_start: u32 = @intCast(input.items.len);
+            proto.readToken(r, &input) catch |err| {
+                try proto.writeErr(stream, @errorName(err));
                 return;
             };
-            kvs.appendAssumeCapacity(.{ .key = key, .value = val });
+            const v_end: u32 = @intCast(input.items.len);
+
+            ranges[i] = .{
+                .{ .start = k_start, .end = k_end },
+                .{ .start = v_start, .end = v_end },
+            };
         }
 
-        const proposal_bytes = try encodeMutations(self.allocator, req.ns, kvs.items);
+        // Resolve offsets to slices — input is stable now, no more growth.
+        const kvs = try self.allocator.alloc(KV, req.count);
+        defer self.allocator.free(kvs);
+        for (ranges, 0..) |rng, j| kvs[j] = .{
+            .key = input.items[rng[0].start..rng[0].end],
+            .value = input.items[rng[1].start..rng[1].end],
+        };
+
+        const proposal_bytes = try encodeMutations(self.allocator, req.ns, kvs);
         defer self.allocator.free(proposal_bytes);
 
         var ctx = CommitCtx{ .status = .committed };

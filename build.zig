@@ -390,6 +390,11 @@ fn addZdbTests(
     zdb_bw_tests.root_module.addImport("zio", zio_mod);
     zdb_bw_tests.linkLibC();
 
+    const proto_tests = b.addTest(.{
+        .root_module = makeModule(b, target, optimize, "zdb-server/protocol_test.zig"),
+    });
+    proto_tests.root_module.addImport("zio", zio_mod);
+
     const zdb_test_step = b.step("test-zdb", "Run zdb core tests");
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_core_tests).step);
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_skl_tests).step);
@@ -400,6 +405,7 @@ fn addZdbTests(
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_cache_tests).step);
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_vfs_tests).step);
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_bw_tests).step);
+    zdb_test_step.dependOn(&b.addRunArtifact(proto_tests).step);
     return zdb_test_step;
 }
 
