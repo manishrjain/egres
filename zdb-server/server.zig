@@ -375,10 +375,19 @@ pub const ZdbServer = struct {
     fn handleClient(self: *ZdbServer, stream: zio.net.Stream) void {
         defer stream.close();
         var ops: u64 = 0;
-        var buf: [64 * 1024]u8 = undefined;
+        // One buffered reader per connection — protocol reads (command
+        // headers, batch tokens) come from the 256 KiB buffer instead of
+        // hitting io_uring per byte. Buffers heap-allocated because zio
+        // fibers have small stacks.
+        const reader_buf = self.allocator.alloc(u8, 256 * 1024) catch return;
+        defer self.allocator.free(reader_buf);
+        const line_buf = self.allocator.alloc(u8, 64 * 1024) catch return;
+        defer self.allocator.free(line_buf);
+        var reader = stream.reader(reader_buf);
+        const r = &reader.interface;
 
         while (!self.node.isShuttingDown()) {
-            const cmd = proto.readCommand(stream, &buf) catch |err| {
+            const cmd = proto.readCommand(r, line_buf) catch |err| {
                 if (ops > 0) {
                     log.info("client disconnected after {d} ops: {s}", .{ ops, @errorName(err) });
                 } else {
@@ -401,7 +410,7 @@ pub const ZdbServer = struct {
                 },
                 .set_batch => |req| {
                     log.debug("SET_BATCH ns={d} count={d}", .{ req.ns, req.count });
-                    self.handleSetBatch(stream, req) catch return;
+                    self.handleSetBatch(stream, r, req) catch return;
                 },
                 .get => |req| {
                     log.debug("GET ns={d} key={s} read_ts={d}", .{ req.ns, req.key, req.read_ts });
@@ -474,10 +483,16 @@ pub const ZdbServer = struct {
         }
     }
 
-    /// Tokenize `count * 2` whitespace-delimited tokens off the stream into
-    /// (key, value) pairs, encode as a single Mutations, propose once.
-    /// Each token is hex-decoded if it starts with `0x`, literal otherwise.
-    fn handleSetBatch(self: *ZdbServer, stream: zio.net.Stream, req: proto.SetBatchCmd) !void {
+    /// Tokenize `count * 2` whitespace-delimited tokens from the buffered
+    /// reader into (key, value) pairs, encode as a single Mutations,
+    /// propose once. Each token is hex-decoded if prefixed with `0x`,
+    /// literal otherwise.
+    fn handleSetBatch(
+        self: *ZdbServer,
+        stream: zio.net.Stream,
+        r: *std.Io.Reader,
+        req: proto.SetBatchCmd,
+    ) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -487,11 +502,11 @@ pub const ZdbServer = struct {
 
         var i: u32 = 0;
         while (i < req.count) : (i += 1) {
-            const key = proto.readToken(stream, a) catch {
+            const key = proto.readToken(r, a) catch {
                 try proto.writeErr(stream, "bad_batch_token");
                 return;
             };
-            const val = proto.readToken(stream, a) catch {
+            const val = proto.readToken(r, a) catch {
                 try proto.writeErr(stream, "bad_batch_token");
                 return;
             };

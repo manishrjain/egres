@@ -14,11 +14,11 @@ const Config = struct {
     nodes: u32 = 3,
     namespaces: u32 = 1,
     clients: u32 = 16,
-    verify_clients: u32 = 8,
+    verify_clients: u32 = 0, // disabled for raw Raft throughput measurement
     records: u64 = 100_000_000,
     value_size: u32 = 1024,
     /// Writes per Raft proposal. Amortizes commit cost across N ops.
-    batch_size: u32 = 64,
+    batch_size: u32 = 256,
     raft_port_base: u16 = 9000,
     client_port_base: u16 = 8000,
     monitor_interval_ms: u64 = 10_000,

@@ -58,12 +58,23 @@ pub const ConfCmd = struct {
 
 const max_line_len = 64 * 1024;
 
-/// Read one text command from the stream.
-/// Format: "set <ns> <key> <value>\n" or "get <ns> <key> [<read_ts>]\n"
-/// Returns null on EOF.
-pub fn readCommand(stream: zio.net.Stream, buf: []u8) !?Command {
-    const line = try readLine(stream, buf) orelse return null;
+/// Read one text command from the buffered reader. Returns null on EOF.
+pub fn readCommand(r: *std.Io.Reader, line_buf: []u8) !?Command {
+    const line = readLine(r, line_buf) catch |err| switch (err) {
+        error.EndOfStream => return null,
+        else => return err,
+    };
     return try parseLine(line);
+}
+
+fn readLine(r: *std.Io.Reader, buf: []u8) ![]const u8 {
+    // takeDelimiterExclusive returns a slice into the reader's internal
+    // buffer — we copy into `buf` so the line survives subsequent reader use.
+    const line = try r.takeDelimiterExclusive('\n');
+    if (line.len > buf.len) return error.LineTooLong;
+    const end = if (line.len > 0 and line[line.len - 1] == '\r') line.len - 1 else line.len;
+    @memcpy(buf[0..end], line[0..end]);
+    return buf[0..end];
 }
 
 fn isWs(c: u8) bool {
@@ -74,27 +85,26 @@ fn isWs(c: u8) bool {
 /// token ends at the next whitespace byte. If the token starts with `0x`,
 /// the bytes after the prefix are hex-decoded; otherwise the token is
 /// treated as literal bytes. The returned slice is owned by `alloc`.
-pub fn readToken(stream: zio.net.Stream, alloc: std.mem.Allocator) ![]u8 {
+pub fn readToken(r: *std.Io.Reader, alloc: std.mem.Allocator) ![]u8 {
     var raw: std.ArrayList(u8) = .empty;
     defer raw.deinit(alloc);
 
     // Skip whitespace.
-    var b: [1]u8 = undefined;
     while (true) {
-        try stream.readAll(&b, .none);
-        if (!isWs(b[0])) {
-            try raw.append(alloc, b[0]);
+        const b = try r.takeByte();
+        if (!isWs(b)) {
+            try raw.append(alloc, b);
             break;
         }
     }
     // Collect until next whitespace.
     while (raw.items.len < max_line_len) {
-        stream.readAll(&b, .none) catch |err| switch (err) {
+        const b = r.takeByte() catch |err| switch (err) {
             error.EndOfStream => break,
             else => return err,
         };
-        if (isWs(b[0])) break;
-        try raw.append(alloc, b[0]);
+        if (isWs(b)) break;
+        try raw.append(alloc, b);
     }
 
     const bytes = raw.items;
@@ -106,25 +116,6 @@ pub fn readToken(stream: zio.net.Stream, alloc: std.mem.Allocator) ![]u8 {
         return out;
     }
     return try alloc.dupe(u8, bytes);
-}
-
-fn readLine(stream: zio.net.Stream, buf: []u8) !?[]const u8 {
-    var pos: usize = 0;
-    while (pos < buf.len) {
-        var byte: [1]u8 = undefined;
-        stream.readAll(&byte, .none) catch |err| {
-            if (pos == 0) return null; // clean EOF
-            return err;
-        };
-        if (byte[0] == '\n') {
-            // Strip trailing \r if present.
-            const end = if (pos > 0 and buf[pos - 1] == '\r') pos - 1 else pos;
-            return buf[0..end];
-        }
-        buf[pos] = byte[0];
-        pos += 1;
-    }
-    return error.LineTooLong;
 }
 
 fn parseLine(line: []const u8) !Command {

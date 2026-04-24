@@ -310,6 +310,10 @@ pub const Forest = struct {
     /// Callers can use shouldFreeze() afterward to decide whether to propose
     /// a memtable freeze through Raft.
     pub fn put(self: *Forest, items: []const Item) !void {
+        // TEMP: measuring raw Raft throughput — skip the memtable write so
+        // timings isolate WAL + quorum + apply dispatch from storage cost.
+        // Revert this return to re-enable storage apply.
+        if (true) return;
         for (items) |item| {
             try self.memtables.put(item.key, item.value);
         }
