@@ -556,9 +556,10 @@ pub const Registry = struct {
         self: *Registry,
         out: *std.ArrayList(u8),
     ) Error!void {
-        // Snapshot keys under the mutex, then release before writing (writeHelp
-        // calls take the per-Live's lock implicitly only if they read state;
-        // ours is comptime and stateless so this is just hygiene).
+        // Snapshot entries under the lock: a concurrent register() could resize
+        // the hashmap and invalidate the iterator. help_fn is stateless (comptime-
+        // derived from T), so we needn't hold any lock across the per-module render
+        // — and dropping it first keeps the registry responsive during a long write.
         self.mu.lock();
         var names = std.ArrayList([]const u8).empty;
         defer names.deinit(self.allocator);

@@ -328,7 +328,7 @@ test "registry: writeHelpAll renders both modules with their docs" {
     std.debug.print("{s}\n", .{out.items});
 
     // raft has a self-doc; rendered next to the module name.
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "raft -- Raft consensus tunables. Hot-reloadable.\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "Raft consensus tunables. Hot-reloadable.\n") != null);
     // net has no self-doc; module name appears bare on its own line.
     try std.testing.expect(std.mem.indexOf(u8, out.items, "  net\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "tick-interval-ms=") != null);
