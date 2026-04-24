@@ -53,22 +53,34 @@ pub const StorageImpl = struct {
             return;
         };
         switch (parsed) {
-            .Mutation => |mutation| {
-                const items = [_]Item{.{
-                    .key = .{
-                        .namespace = mutation.namespace(),
-                        .primary = mutation.key(),
-                        // Timestamp comes from the raft Entry (assigned by leader
-                        // under the propose lock), not from the Mutation itself.
-                        .timestamp = entry.timestamp,
-                    },
-                    .value = mutation.value(),
-                }};
-                try self.forest.put(&items);
+            .Mutations => |ms| {
+                const ns = ms.namespace();
+                const count = ms.kvsLen();
+
+                var items: std.ArrayList(Item) = .empty;
+                defer items.deinit(self.allocator);
+                try items.ensureTotalCapacity(self.allocator, count);
+
+                var total_bytes: u64 = 0;
+                for (0..count) |i| {
+                    const kv = try ms.kvsAt(@intCast(i));
+                    const val = kv.value();
+                    items.appendAssumeCapacity(.{
+                        .key = .{
+                            .namespace = ns,
+                            .primary = kv.key(),
+                            // Timestamp comes from the raft Entry (one per batch).
+                            .timestamp = entry.timestamp,
+                        },
+                        .value = val,
+                    });
+                    total_bytes += val.len;
+                }
+                try self.forest.put(items.items);
                 try metrics.g().bytes_written.incrBy(.{
                     .source = "user",
-                    .namespace_id = mutation.namespace(),
-                }, mutation.value().len);
+                    .namespace_id = ns,
+                }, total_bytes);
             },
             .ManifestChange => |mc| {
                 try self.applyManifestChange(entry.index, mc);
@@ -408,17 +420,13 @@ pub const ZdbServer = struct {
     }
 
     fn handleSet(self: *ZdbServer, stream: zio.net.Stream, req: proto.SetCmd) !void {
-        // Encode mutation as zbuf for the raft proposal.
-        var mutation_writer = try zdb_bufs.MutationWriter.init(self.allocator);
-        defer mutation_writer.deinit();
-        try mutation_writer.set(.{
-            .namespace = req.ns,
-            .key = req.key,
-            .value = req.value,
+        // Encode as a single-item Mutations batch — the wire format is the
+        // same regardless of batch size, so the apply path doesn't need to
+        // know whether this write came from a `set` or a `set_batch`.
+        const proposal_bytes = try encodeMutations(self.allocator, req.ns, &.{
+            .{ .key = req.key, .value = req.value },
         });
-        var mutation_buf = try mutation_writer.finishWithTail();
-        defer mutation_buf.deinit();
-        const proposal_bytes = mutation_buf.bytes orelse return error.EncodeFailed;
+        defer self.allocator.free(proposal_bytes);
 
         // TODO: Fire callback at commit time (quorum achieved) instead of after apply.
         // Currently the client blocks until both commit + apply are done. To fix:
@@ -646,6 +654,30 @@ fn encodeManifestChange(
 
     try mw.setCmd(cmd);
     if (memtable_id != 0) try mw.setMemtableId(memtable_id);
+    _ = try mw.finishWithTail();
+    return buf.toOwnedSlice(allocator);
+}
+
+pub const KV = struct { key: []const u8, value: []const u8 };
+
+/// Encode one or more key-value writes as a single `Mutations` payload for
+/// proposeDataChange. All kvs in a batch share a namespace (keeps tree
+/// routing + apply simple) and land as one Raft log entry (one commit HLC).
+fn encodeMutations(allocator: std.mem.Allocator, namespace: u32, kvs: []const KV) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    var mw = try zdb_bufs.MutationsWriter.initWithBuf(allocator, &buf);
+
+    const offsets = try allocator.alloc(u32, kvs.len);
+    defer allocator.free(offsets);
+    for (kvs, 0..) |kv, i| {
+        var kvw = try zdb_bufs.KeyValueWriter.initWithBuf(allocator, &buf);
+        try kvw.set(.{ .key = kv.key, .value = kv.value });
+        offsets[i] = (try kvw.finish()).offset;
+    }
+    try mw.setNamespace(namespace);
+    try mw.setKvs(offsets);
     _ = try mw.finishWithTail();
     return buf.toOwnedSlice(allocator);
 }

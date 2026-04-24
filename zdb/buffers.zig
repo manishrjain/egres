@@ -63,13 +63,20 @@ pub const ManifestChange = schema.Table(.{
     .{ .id = 4, .name = "memtable_id", .ty = schema.U64 }, // for flush: which memtable was flushed
 });
 
-/// A single key-value mutation proposed through raft.
-/// The timestamp is carried on the enclosing `LogEntry.timestamp`, assigned
-/// by the leader inside the propose critical section — not stored per-Mutation.
-pub const Mutation = schema.Table(.{
+/// A single key-value tuple. Carried inside `Mutations` which groups them
+/// by namespace — so the per-tuple envelope only holds the bytes themselves.
+pub const KeyValue = schema.Table(.{
+    .{ .id = 1, .name = "key", .ty = schema.Bytes },
+    .{ .id = 2, .name = "value", .ty = schema.Bytes },
+});
+
+/// One or more key-value writes proposed through raft as a single entry.
+/// The enclosing `LogEntry.timestamp` is the commit HLC for the whole batch
+/// (all kvs share it). Namespace is at the Mutations level so every kv in a
+/// proposal lands in the same tree — keeps routing + apply simple.
+pub const Mutations = schema.Table(.{
     .{ .id = 1, .name = "namespace", .ty = schema.U32 },
-    .{ .id = 2, .name = "key", .ty = schema.Bytes },
-    .{ .id = 3, .name = "value", .ty = schema.Bytes },
+    .{ .id = 2, .name = "kvs", .ty = schema.Array(KeyValue) },
 });
 
 // zbuf tail stores table_id as u16, so use a module namespace in high bits and
@@ -88,5 +95,6 @@ pub const tables = .{
     .{ .name = "TreeChange", .ty = TreeChange, .id = tableId(4) },
     .{ .name = "TableChange", .ty = TableChange, .id = tableId(5) },
     .{ .name = "ManifestChange", .ty = ManifestChange, .id = tableId(6) },
-    .{ .name = "Mutation", .ty = Mutation, .id = tableId(7) },
+    .{ .name = "KeyValue", .ty = KeyValue, .id = tableId(7) },
+    .{ .name = "Mutations", .ty = Mutations, .id = tableId(8) },
 };
