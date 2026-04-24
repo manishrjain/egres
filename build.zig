@@ -581,11 +581,16 @@ fn addLoadtestDriver(
     });
     const zio_mod = zio_dep.module("zio");
 
+    // `flags` is its own module — it only depends on std, so no need to
+    // rope it through utils_mod (which would pull in lz4/zstd headers).
+    const flags_mod = makeModule(b, target, optimize, "u/flags.zig");
+
     const exe = b.addExecutable(.{
         .name = "loadtest",
         .root_module = makeModule(b, target, optimize, "scripts/loadtest.zig"),
     });
     exe.root_module.addImport("zio", zio_mod);
+    exe.root_module.addImport("flags", flags_mod);
     b.installArtifact(exe);
 
     const install = b.addInstallArtifact(exe, .{});

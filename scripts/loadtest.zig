@@ -1,16 +1,35 @@
 //! Load-test driver for a local zdb Raft cluster.
 //!
-//! Subcommands:
-//!   run [HOURS=0.1]    Clean → start → bootstrap → monitor → loadgen → stop.
-//!   stats [NODE=1]     One-shot stats dump for a node (Prometheus text).
-//!   clean              Remove loadtest-* directories and metrics file.
+//! Subcommand (positional, defaults to `run` if omitted), then flags:
+//!
+//!   loadtest                                      # run, all defaults
+//!   loadtest run --run nodes=1; duration-ms=30m;  # single-node 30-min run
+//!   loadtest stats --stats node=2;                # one-shot stats dump
+//!   loadtest clean                                # wipe artifacts
+//!   loadtest run --ports raft-port-base=9100;     # shared port override
+//!
+//! Run `loadtest --help` for every flag field with its default and docstring.
 
 const std = @import("std");
 const zio = @import("zio");
+const flags = @import("flags");
 
 // --- config -----------------------------------------------------------------
 
-const Config = struct {
+// Shared address knobs, used by `run` (to spawn servers) and `stats` (to
+// connect). Registered as `--ports ...`.
+const PortsCfg = struct {
+    raft_port_base: u16 = 9000,
+    client_port_base: u16 = 8000,
+    pub const docs = .{
+        .self = "TCP port bases shared by `run` and `stats`.",
+        .raft_port_base = "Node i listens for raft peers on 127.0.0.1:(base+i).",
+        .client_port_base = "Node i listens for clients/stats on 127.0.0.1:(base+i).",
+    };
+};
+
+// Tunables for the main `run` subcommand.
+const RunCfg = struct {
     nodes: u32 = 3,
     namespaces: u32 = 1,
     clients: u32 = 16,
@@ -19,14 +38,43 @@ const Config = struct {
     value_size: u32 = 1024,
     /// Writes per Raft proposal. Amortizes commit cost across N ops.
     batch_size: u32 = 256,
-    raft_port_base: u16 = 9000,
-    client_port_base: u16 = 8000,
+    /// Wall-clock budget for the run. `_ms` suffix → accepts `30s`, `5m`, etc.
+    duration_ms: u64 = 360_000, // 6 minutes
     monitor_interval_ms: u64 = 10_000,
     bootstrap_timeout_ms: u64 = 30_000,
     stop_grace_ms: u64 = 2000,
+
+    pub const docs = .{
+        .self = "Full benchmark run: clean → start cluster → bootstrap → loadgen → stop.",
+        .nodes = "Number of Raft cluster nodes to spawn (set to 1 for leader-only bench).",
+        .namespaces = "How many namespaces the bootstrap step creates.",
+        .clients = "Benchmark writer fiber count.",
+        .verify_clients = "Verifier fiber count (0 disables; non-zero slows writers).",
+        .records = "Total records the benchmark should insert.",
+        .value_size = "Bytes per value in generated load.",
+        .batch_size = "Entries per set-batch proposal (higher = more amortization).",
+        .duration_ms = "Wall-clock budget for the run (accepts 30s / 5m / 2h / bare ms).",
+        .monitor_interval_ms = "Sampling interval for the /stats monitor fiber.",
+        .bootstrap_timeout_ms = "Giveup budget for the namespace-create bootstrap loop.",
+        .stop_grace_ms = "SIGTERM-to-SIGKILL grace window when tearing servers down.",
+    };
 };
 
-const cfg: Config = .{};
+// Tunables for the `stats` subcommand (just which node to query).
+const StatsCfg = struct {
+    node: u32 = 1,
+    pub const docs = .{
+        .self = "Prometheus-format stats dump from a single node.",
+        .node = "Which node to query.",
+    };
+};
+
+// Module globals, populated from `live.snapshot()` in `main()` after CLI
+// parsing. Each helper reads `cfg_<module>.<field>` — this is a single-shot
+// CLI tool so a snapshot-at-startup is sufficient.
+var cfg_ports: PortsCfg = .{};
+var cfg_run: RunCfg = .{};
+var cfg_stats: StatsCfg = .{};
 
 // --- path helpers -----------------------------------------------------------
 
@@ -41,18 +89,18 @@ fn repoRoot(alloc: std.mem.Allocator) ![]u8 {
 }
 
 fn raftAddrStr(alloc: std.mem.Allocator, node: u32) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "127.0.0.1:{d}", .{cfg.raft_port_base + node});
+    return try std.fmt.allocPrint(alloc, "127.0.0.1:{d}", .{cfg_ports.raft_port_base + node});
 }
 
 fn clientAddrStr(alloc: std.mem.Allocator, node: u32) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "127.0.0.1:{d}", .{cfg.client_port_base + node});
+    return try std.fmt.allocPrint(alloc, "127.0.0.1:{d}", .{cfg_ports.client_port_base + node});
 }
 
 // --- TCP protocol helpers (zio) ---------------------------------------------
 
 fn connectNode(node: u32) !zio.net.Stream {
     var buf: [32]u8 = undefined;
-    const addr_str = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{cfg.client_port_base + node});
+    const addr_str = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{cfg_ports.client_port_base + node});
     const addr = try zio.net.IpAddress.parseIpAndPort(addr_str);
     return try addr.connect(.{});
 }
@@ -196,7 +244,7 @@ fn spawnServer(
 
 fn stopServer(sp: *ServerProc) void {
     _ = std.posix.kill(sp.child.id, std.posix.SIG.TERM) catch {};
-    zio.sleep(zio.Duration.fromMilliseconds(cfg.stop_grace_ms)) catch {};
+    zio.sleep(zio.Duration.fromMilliseconds(cfg_run.stop_grace_ms)) catch {};
     _ = sp.child.kill() catch {};
     _ = sp.child.wait() catch {};
     sp.log_file.close();
@@ -206,7 +254,7 @@ fn stopServer(sp: *ServerProc) void {
 
 fn bootstrapNamespaces(alloc: std.mem.Allocator, ns_count: u32) !void {
     var leader_node: u32 = 1;
-    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(cfg.bootstrap_timeout_ms));
+    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(cfg_run.bootstrap_timeout_ms));
 
     var ns: u32 = 1;
     while (ns <= ns_count) : (ns += 1) {
@@ -264,7 +312,7 @@ fn monitorFiber(ctx: *MonitorCtx) void {
     while (!ctx.stop.load(.acquire)) {
         const now_s = std.time.timestamp();
         var node: u32 = 1;
-        while (node <= cfg.nodes) : (node += 1) {
+        while (node <= cfg_run.nodes) : (node += 1) {
             const blob = sendStats(ctx.alloc, node) catch continue;
             defer ctx.alloc.free(blob);
 
@@ -288,7 +336,7 @@ fn monitorFiber(ctx: *MonitorCtx) void {
             }) catch continue;
             _ = metrics_file.write(line) catch {};
         }
-        zio.sleep(zio.Duration.fromMilliseconds(cfg.monitor_interval_ms)) catch break;
+        zio.sleep(zio.Duration.fromMilliseconds(cfg_run.monitor_interval_ms)) catch break;
     }
 }
 
@@ -312,7 +360,7 @@ fn cmdStats(alloc: std.mem.Allocator, node: u32) !void {
     _ = try stdout.write(blob);
 }
 
-fn cmdRun(alloc: std.mem.Allocator, hours: f64) !void {
+fn cmdRun(alloc: std.mem.Allocator) !void {
     const root = try repoRoot(alloc);
     defer alloc.free(root);
     const data_root = try std.fs.path.join(alloc, &.{ root, "loadtest-data" });
@@ -331,7 +379,11 @@ fn cmdRun(alloc: std.mem.Allocator, hours: f64) !void {
     try std.fs.cwd().makePath(log_root);
 
     // --- start N nodes ---
-    var servers: [cfg.nodes]ServerProc = undefined;
+    // Heap-allocated — `cfg_run.nodes` is runtime, set via `--loadtest nodes=N;`,
+    // so a fixed-size array won't do. `started` tracks how many were actually
+    // spawned; the defer tears down exactly that prefix if we bail partway.
+    const servers = try alloc.alloc(ServerProc, cfg_run.nodes);
+    defer alloc.free(servers);
     const seed_raft = try raftAddrStr(alloc, 1);
     defer alloc.free(seed_raft);
 
@@ -342,7 +394,7 @@ fn cmdRun(alloc: std.mem.Allocator, hours: f64) !void {
     }
 
     var i: u32 = 0;
-    while (i < cfg.nodes) : (i += 1) {
+    while (i < cfg_run.nodes) : (i += 1) {
         const node = i + 1;
         const data_dir = try std.fmt.allocPrint(alloc, "{s}/node{d}", .{ data_root, node });
         defer alloc.free(data_dir);
@@ -356,7 +408,7 @@ fn cmdRun(alloc: std.mem.Allocator, hours: f64) !void {
 
     // --- let Raft elect, then bootstrap ---
     try zio.sleep(zio.Duration.fromSeconds(1));
-    try bootstrapNamespaces(alloc, cfg.namespaces);
+    try bootstrapNamespaces(alloc, cfg_run.namespaces);
 
     // --- monitor fiber ---
     var mon_ctx: MonitorCtx = .{
@@ -370,17 +422,17 @@ fn cmdRun(alloc: std.mem.Allocator, hours: f64) !void {
     // --- load generator (child process) ---
     const leader_client_addr = try clientAddrStr(alloc, 1);
     defer alloc.free(leader_client_addr);
-    const clients_str = try std.fmt.allocPrint(alloc, "{d}", .{cfg.clients});
+    const clients_str = try std.fmt.allocPrint(alloc, "{d}", .{cfg_run.clients});
     defer alloc.free(clients_str);
-    const verify_str = try std.fmt.allocPrint(alloc, "{d}", .{cfg.verify_clients});
+    const verify_str = try std.fmt.allocPrint(alloc, "{d}", .{cfg_run.verify_clients});
     defer alloc.free(verify_str);
-    const records_str = try std.fmt.allocPrint(alloc, "{d}", .{cfg.records});
+    const records_str = try std.fmt.allocPrint(alloc, "{d}", .{cfg_run.records});
     defer alloc.free(records_str);
-    const value_size_str = try std.fmt.allocPrint(alloc, "{d}", .{cfg.value_size});
+    const value_size_str = try std.fmt.allocPrint(alloc, "{d}", .{cfg_run.value_size});
     defer alloc.free(value_size_str);
-    const ns_str = try std.fmt.allocPrint(alloc, "{d}", .{cfg.namespaces});
+    const ns_str = try std.fmt.allocPrint(alloc, "{d}", .{cfg_run.namespaces});
     defer alloc.free(ns_str);
-    const batch_str = try std.fmt.allocPrint(alloc, "{d}", .{cfg.batch_size});
+    const batch_str = try std.fmt.allocPrint(alloc, "{d}", .{cfg_run.batch_size});
     defer alloc.free(batch_str);
 
     var bench = std.process.Child.init(&.{
@@ -397,10 +449,10 @@ fn cmdRun(alloc: std.mem.Allocator, hours: f64) !void {
     bench.stdout_behavior = .Inherit;
     bench.stderr_behavior = .Inherit;
     try bench.spawn();
-    std.log.info("benchmark started pid={d}, duration={d:.2}h", .{ bench.id, hours });
+    std.log.info("benchmark started pid={d}, duration_ms={d}", .{ bench.id, cfg_run.duration_ms });
 
     // --- wait for duration OR bench exit ---
-    const duration_ms: u64 = @intFromFloat(hours * 3600.0 * 1000.0);
+    const duration_ms: u64 = cfg_run.duration_ms;
     const start_ms = std.time.milliTimestamp();
     while (true) {
         // Poll for bench exit via waitpid(WNOHANG).
@@ -424,36 +476,47 @@ fn cmdRun(alloc: std.mem.Allocator, hours: f64) !void {
 
 // --- entry ------------------------------------------------------------------
 
-fn usage() void {
+const Mode = enum { run, stats, clean };
+
+fn parseSubcommand(arg: []const u8) ?Mode {
+    if (std.mem.eql(u8, arg, "run")) return .run;
+    if (std.mem.eql(u8, arg, "stats")) return .stats;
+    if (std.mem.eql(u8, arg, "clean")) return .clean;
+    return null;
+}
+
+fn usage(alloc: std.mem.Allocator) void {
     const stderr = std.fs.File.stderr();
     _ = stderr.write(
-        \\usage: loadtest <subcommand> [args]
+        \\usage: loadtest [subcommand] [--<module> k=v; k=v; ...]
         \\
-        \\subcommands:
-        \\  run [HOURS=0.1]    Full end-to-end: clean, start cluster, bootstrap,
-        \\                     monitor, run benchmark, stop.
-        \\  stats [NODE=1]     Dump Prometheus-format stats from a node.
-        \\  clean              Remove loadtest data/logs/metrics.
+        \\subcommands (positional, defaults to `run` if omitted):
+        \\  run        Full end-to-end: clean, start cluster, bootstrap, loadgen, stop.
+        \\  stats      Dump Prometheus-format stats from one node.
+        \\  clean      Remove loadtest data / logs / metrics.
+        \\
+        \\Flag modules (pass as `--<module> <field>=<value>; ...`):
         \\
     ) catch {};
+
+    // Registry-rendered help: module name on one line, then one
+    // `<field>=<default> (<type>); <doc>` line per field.
+    var help: std.ArrayList(u8) = .empty;
+    defer help.deinit(alloc);
+    flags.g().writeHelpAll(&help) catch {};
+    _ = stderr.write(help.items) catch {};
+    _ = stderr.write("\n") catch {};
 }
 
 // Root task — runs inside the zio runtime as a spawned task, so every
 // zio primitive inside the command functions can resolve its executor.
-const TaskArgs = struct {
-    alloc: std.mem.Allocator,
-    mode: enum { run, stats, clean },
-    hours: f64 = 0.1,
-    node: u32 = 1,
-};
-
-fn rootTask(args: TaskArgs) void {
-    const result = switch (args.mode) {
-        .run => cmdRun(args.alloc, args.hours),
-        .stats => cmdStats(args.alloc, args.node),
-        .clean => cmdClean(args.alloc),
+fn rootTask(alloc: std.mem.Allocator, mode: Mode) void {
+    const result = switch (mode) {
+        .run => cmdRun(alloc),
+        .stats => cmdStats(alloc, cfg_stats.node),
+        .clean => cmdClean(alloc),
     };
-    result catch |err| std.log.err("{s} failed: {s}", .{ @tagName(args.mode), @errorName(err) });
+    result catch |err| std.log.err("{s} failed: {s}", .{ @tagName(mode), @errorName(err) });
 }
 
 pub fn main() !void {
@@ -464,31 +527,61 @@ pub fn main() !void {
     const argv = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, argv);
 
-    if (argv.len < 2) {
-        usage();
+    // --- step 1: extract the positional subcommand (argv[1] if present and
+    // doesn't start with `--`). Anything else goes to the flag parser. This
+    // keeps the verb natural (`loadtest run`) without needing flag gymnastics
+    // like `--clean=` for no-arg subcommands.
+    var mode: Mode = .run;
+    var flag_start: usize = 1;
+    if (argv.len >= 2 and !std.mem.startsWith(u8, argv[1], "--")) {
+        mode = parseSubcommand(argv[1]) orelse {
+            std.log.err("unknown subcommand '{s}'", .{argv[1]});
+            // usage() needs the registry populated for writeHelpAll; do it
+            // after registration below. Here we just exit.
+            std.process.exit(1);
+        };
+        flag_start = 2;
+    }
+
+    // --- step 2: register flag modules and parse argv[flag_start..].
+    flags.initGlobal(alloc);
+    defer flags.deinitGlobal();
+    const live_ports = try flags.g().register("ports", PortsCfg);
+    const live_run = try flags.g().register("run", RunCfg);
+    const live_stats = try flags.g().register("stats", StatsCfg);
+
+    // --help is terminal; handle it after registration so the rendered help
+    // includes every module's fields.
+    for (argv[1..]) |a| {
+        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+            usage(alloc);
+            return;
+        }
+    }
+
+    // No positional args beyond the subcommand — any leftover from parseArgv
+    // is a user error.
+    var leftover: std.ArrayList([]const u8) = .empty;
+    defer leftover.deinit(alloc);
+    flags.g().parseArgv(argv[flag_start..], &leftover) catch |err| {
+        std.log.err("flag parse failed: {s}", .{@errorName(err)});
+        usage(alloc);
+        std.process.exit(1);
+    };
+    if (leftover.items.len != 0) {
+        std.log.err("unexpected positional '{s}' — config goes through --<module> flags", .{leftover.items[0]});
+        usage(alloc);
         std.process.exit(1);
     }
 
-    const cmd = argv[1];
-    var task_args: TaskArgs = .{ .alloc = alloc, .mode = .run };
-    if (std.mem.eql(u8, cmd, "run")) {
-        task_args.mode = .run;
-        if (argv.len > 2) task_args.hours = std.fmt.parseFloat(f64, argv[2]) catch 0.1;
-    } else if (std.mem.eql(u8, cmd, "stats")) {
-        task_args.mode = .stats;
-        if (argv.len > 2) task_args.node = std.fmt.parseInt(u32, argv[2], 10) catch 1;
-    } else if (std.mem.eql(u8, cmd, "clean")) {
-        task_args.mode = .clean;
-    } else {
-        usage();
-        std.process.exit(1);
-    }
+    cfg_ports = live_ports.snapshot();
+    cfg_run = live_run.snapshot();
+    cfg_stats = live_stats.snapshot();
 
-    // Start the zio runtime, spawn the root task on it, and block main on
-    // its join handle. This is what gives every zio.* call inside the
-    // command functions a valid executor to dispatch on.
+    // --- step 3: spawn the root task on the zio runtime. Every zio.* call
+    // inside the command functions resolves its executor from here.
     var rt = try zio.Runtime.init(alloc, .{ .executors = .exact(2) });
     defer rt.deinit();
-    var root = try rt.spawn(rootTask, .{task_args});
+    var root = try rt.spawn(rootTask, .{ alloc, mode });
     _ = root.join();
 }
