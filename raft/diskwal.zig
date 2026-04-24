@@ -655,7 +655,7 @@ pub const wal = struct {
                     .current = &opened.items[opened.items.len - 1],
                     .cache = entry_cache,
                     .next_fid = current.fid + 1,
-                    };
+                };
             }
 
             // All files were malformed — start fresh.

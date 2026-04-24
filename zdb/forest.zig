@@ -670,7 +670,11 @@ pub const Forest = struct {
     /// a size match is a strong signal the bytes are correct (no cross-ID
     /// collisions possible). If a size mismatch is detected, we log and rewrite.
     pub fn writeFile(self: *Forest, file_id: u64, data: []const u8) void {
-        if (self.table_cache.contains(file_id)) return;
+        const fe = std.log.scoped(.file_event);
+        if (self.table_cache.contains(file_id)) {
+            fe.info("event=write_file file_id={d} path=cache_hit", .{file_id});
+            return;
+        }
 
         const path = options.sstPath(self.allocator, self.opts.dir, file_id) catch return;
         defer self.allocator.free(path);
@@ -700,6 +704,9 @@ pub const Forest = struct {
             };
             fh.sync() catch {};
             fh.close();
+            fe.info("event=write_file file_id={d} path=wrote bytes={d}", .{ file_id, data.len });
+        } else {
+            fe.info("event=write_file file_id={d} path=disk_hit bytes={d}", .{ file_id, data.len });
         }
 
         // Pre-open the table into the cache so it's ready when compaction needs it.

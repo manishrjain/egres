@@ -504,6 +504,10 @@ pub const Node = struct {
                     raft_log.err("file_push crc mismatch for file {d}", .{file_id});
                     return;
                 }
+                std.log.scoped(.file_event).info(
+                    "node={d} event=p1_recv file_id={d} bytes={d}",
+                    .{ self.id, file_id, data.len },
+                );
                 if (self.state_machine) |s| {
                     if (!s.hasFile(file_id)) s.writeFile(file_id, data);
                 }
@@ -609,6 +613,11 @@ pub const Node = struct {
         if (file_ids.len == 0) return;
         const leader = self.leader_id orelse return error.NotLeader;
         const tr = self.transport orelse return error.NoTransport;
+
+        const fe = std.log.scoped(.file_event);
+        for (file_ids) |fid| {
+            fe.info("node={d} event=fetch_request file_id={d} from_leader={d}", .{ self.id, fid, leader });
+        }
 
         // Register pending wait entries.
         for (file_ids) |fid| {
