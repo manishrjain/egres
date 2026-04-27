@@ -24,4 +24,5 @@ pub const requestJoin = runtime.requestJoin;
 pub const joinCluster = runtime.joinCluster;
 pub const msg_type_raft = @import("node.zig").msg_type_raft;
 pub const utils = @import("utils");
+pub const metrics = @import("metrics.zig");
 pub const meta = @import("meta.zig");

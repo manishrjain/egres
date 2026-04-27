@@ -649,9 +649,12 @@ pub const ZdbServer = struct {
         // Snapshot into a buffer so we write in a single syscall. The metrics
         // lib emits each metric terminated by '\n'; we append one extra '\n'
         // so the response ends in a blank line — clients read until \n\n.
+        // Both metric namespaces (zdb storage + raft propose-phase) are
+        // walked through the same writer so they appear in one /stats blob.
         var body: std.Io.Writer.Allocating = .init(self.allocator);
         defer body.deinit();
         try m.write(zdb.metrics.g(), &body.writer);
+        try m.write(raft.metrics.g(), &body.writer);
         try body.writer.writeByte('\n');
         try stream.writeAll(body.writer.buffered(), .none);
     }

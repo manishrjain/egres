@@ -7,6 +7,7 @@ const transport_mod = @import("transport");
 const Transport = transport_mod.Transport;
 const serial_mod = @import("serial");
 const Serial = serial_mod.Serial;
+const metrics = @import("metrics.zig");
 const raft_log = std.log.scoped(.raft);
 
 pub const NodeId = raftwal_mod.NodeId;
@@ -1306,6 +1307,11 @@ pub const Node = struct {
         if (self.state != .leader) return RaftError.NotLeader;
         if (requests.len == 0) return;
 
+        // Sub-phase: propose_build — walk requests, validate + serialize each
+        // into a LogEntryBuffer, register the apply callback. Pure CPU work
+        // (no I/O), so anything > 100µs/batch points at zbuf encoding cost.
+        const t_build = std.time.microTimestamp();
+
         var entries = std.ArrayList(zen.LogEntryBuffer).empty;
         defer {
             for (entries.items) |*entry| entry.deinit();
@@ -1430,8 +1436,16 @@ pub const Node = struct {
             index += 1;
         }
 
+        metrics.g().observePhase("propose_build", t_build);
+
+        // Sub-phase: propose_persist — DiskWAL.append batches the framed
+        // records into one pwrite; sync() is the (currently HACK-disabled)
+        // fdatasync. This is the I/O-bound half of `propose`.
+        const t_persist = std.time.microTimestamp();
         try self.log.append(entries.items);
         try self.log.sync();
+        metrics.g().observePhase("propose_persist", t_persist);
+
         if (has_conf) self.pending_conf_change = true;
     }
 
@@ -1454,6 +1468,10 @@ pub const Node = struct {
             const req = self.proposal_requests.tryPop() orelse break;
             try batch.append(self.allocator, req);
         }
+        // Drain depth — emitted before the early-out so a separate "queue was
+        // empty" sample isn't accidentally generated (observeBatchSize skips
+        // on count==0 anyway, but the early return below would skip it too).
+        metrics.g().observeBatchSize(batch.items.len);
         if (batch.items.len == 0) return 0;
 
         defer for (batch.items) |req| self.allocator.free(req.data);
@@ -1565,7 +1583,11 @@ pub const Node = struct {
         while (!self.isShuttingDown()) {
             _ = self.event_ch.receive() catch return;
 
-            // Drain all queued inbound messages.
+            // Phase: inbound — drain inbound_ch (handle AE, AER, RV replies).
+            // We observe even when the queue was empty: the histogram includes
+            // a 0-bucket sample, which is information about how often the loop
+            // ran without inbound work to do.
+            var t = std.time.microTimestamp();
             while (self.inbound_ch.tryReceive()) |msg| {
                 defer self.allocator.free(msg.payload);
                 switch (msg.message_type) {
@@ -1575,11 +1597,25 @@ pub const Node = struct {
                     else => {},
                 }
             } else |_| {}
+            metrics.g().observePhase("inbound", t);
 
             const ci_before = self.commit_index.load(.seq_cst);
+
+            // Phase: propose — drain proposal queue, build entries, persist,
+            // register apply callbacks. Sub-phases ("propose_build" and
+            // "propose_persist") are observed inside appendProposalsToLeaderLog.
+            t = std.time.microTimestamp();
             // TODO: What happens to the rest of the requests?
             _ = self.processProposalRequests(64) catch {};
+            metrics.g().observePhase("propose", t);
+
+            // Phase: advance — advanceCommitIndex + applyConfChanges + notify
+            // the apply loop. Cheap on the leader, but worth measuring because
+            // a slow apply notify would back-pressure proposes.
+            t = std.time.microTimestamp();
             self.advance();
+            metrics.g().observePhase("advance", t);
+
             const ci_advanced = self.commit_index.load(.seq_cst) > ci_before;
 
             var heartbeat_due = false;
@@ -1588,7 +1624,13 @@ pub const Node = struct {
                 heartbeat_due = self.tick() catch false;
                 last_tick = now;
             }
+
+            // Phase: broadcast — send AE to every peer that has work to ship.
+            // This is the chunk that doubled throughput when peers went away
+            // (single-node bench), so it's the prime suspect under multi-node.
+            t = std.time.microTimestamp();
             self.maybeBroadcast(heartbeat_due or ci_advanced);
+            metrics.g().observePhase("broadcast", t);
         }
     }
 

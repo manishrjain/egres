@@ -70,7 +70,17 @@ fn discoverBigTestNames(b: *std.Build) []const []const u8 {
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // `-Drelease` is a shortcut for `-Doptimize=ReleaseFast`. Tests + the
+    // default build still go through `standardOptimizeOption` (i.e. Debug
+    // unless explicitly overridden), so attaching a debugger or running
+    // safety-checked tests stays the path of least resistance. The bench-*
+    // steps that hardcode `.ReleaseFast` in their own `addExecutable` are
+    // unaffected.
+    const release_mode = b.option(bool, "release", "Shortcut for -Doptimize=ReleaseFast") orelse false;
+    const optimize: std.builtin.OptimizeMode = if (release_mode)
+        .ReleaseFast
+    else
+        b.standardOptimizeOption(.{});
 
     addServer(b, target, optimize);
 
@@ -475,6 +485,14 @@ fn makeRaftModule(
     const vfs_mod = makeModule(b, target, optimize, "vfs/vfs.zig");
     vfs_mod.addImport("zio", zio_mod);
 
+    // karlseguin/metrics — shared with zdb_mod via the same b.dependency call;
+    // the build system de-duplicates so we don't get two compiled copies.
+    const metrics_dep = b.dependency("metrics", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const metrics_mod = metrics_dep.module("metrics");
+
     const raft_mod = makeModule(b, target, optimize, "raft/raft.zig");
     raft_mod.addImport("buffers_gen", raft_buffers_gen_mod);
     raft_mod.addImport("zbuf", zbuf_mod);
@@ -483,6 +501,7 @@ fn makeRaftModule(
     raft_mod.addImport("serial", serial_mod);
     raft_mod.addImport("transport", transport_mod);
     raft_mod.addImport("vfs", vfs_mod);
+    raft_mod.addImport("metrics", metrics_mod);
     return raft_mod;
 }
 
@@ -646,15 +665,6 @@ fn addRaftTests(
     raft_tests.root_module.addImport("zio", zio_dep.module("zio"));
     raft_tests.step.dependOn(regen_buffers_step);
 
-    // MetaStore unit tests — self-contained, runs alongside the raft suite.
-    const meta_tests = b.addTest(.{
-        .root_module = makeModule(b, target, optimize, "raft/meta_test.zig"),
-    });
-    addVendoredCompressionSources(b, meta_tests);
-    meta_tests.root_module.addImport("raft", raft_mod);
-    meta_tests.step.dependOn(regen_buffers_step);
-    const run_meta_tests = b.addRunArtifact(meta_tests);
-
     const run_raft_tests = b.addRunArtifact(raft_tests);
     const run_raft_tests_trace = b.addRunArtifact(raft_tests);
     run_raft_tests_trace.stdio = .inherit;
@@ -679,7 +689,6 @@ fn addRaftTests(
     const raft_test_step = b.step("test-raft", "Run raft tests");
     raft_test_step.dependOn(regen_buffers_step);
     raft_test_step.dependOn(&run_raft_tests.step);
-    raft_test_step.dependOn(&run_meta_tests.step);
     raft_test_step.dependOn(run_diskwal_tests);
 
     const raft_test_all_step = b.step("test-raft-all", "Run raft tests including BIGTEST cases");

@@ -43,6 +43,10 @@ const RunCfg = struct {
     monitor_interval_ms: u64 = 10_000,
     bootstrap_timeout_ms: u64 = 30_000,
     stop_grace_ms: u64 = 2000,
+    /// SIGKILL any stale `zdb-server` / `zdb-bench` processes before starting.
+    /// Useful between iterative runs where a previous server crashed without
+    /// releasing its raft port — saves the user from running pkill manually.
+    kill_existing: bool = false,
 
     pub const docs = .{
         .self = "Full benchmark run: clean → start cluster → bootstrap → loadgen → stop.",
@@ -57,6 +61,7 @@ const RunCfg = struct {
         .monitor_interval_ms = "Sampling interval for the /stats monitor fiber.",
         .bootstrap_timeout_ms = "Giveup budget for the namespace-create bootstrap loop.",
         .stop_grace_ms = "SIGTERM-to-SIGKILL grace window when tearing servers down.",
+        .kill_existing = "SIGKILL any stale zdb-server/zdb-bench processes before starting (best-effort).",
     };
 };
 
@@ -242,6 +247,26 @@ fn spawnServer(
     return .{ .node = node, .child = child, .log_file = log_file };
 }
 
+/// Best-effort SIGKILL for any stale `zdb-server` / `zdb-bench` processes.
+/// Useful when a previous run crashed and left a server bound to the raft
+/// port. We use `pkill -9 -f` rather than tracking PIDs ourselves because
+/// the stragglers are by definition not children of this process.
+///
+/// pkill exits 0 on at least one match, 1 on no match — both are fine
+/// outcomes, so we discard the exit code. A 500ms pause after lets
+/// SIGKILL actually take effect and ports release before we try to bind.
+fn killStaleServers(alloc: std.mem.Allocator) !void {
+    inline for (.{ "zdb-server", "zdb-bench" }) |name| {
+        var killer = std.process.Child.init(&.{ "pkill", "-9", "-f", name }, alloc);
+        killer.stdin_behavior = .Ignore;
+        killer.stdout_behavior = .Ignore;
+        killer.stderr_behavior = .Ignore;
+        _ = killer.spawnAndWait() catch {};
+        std.log.info("killed any stale {s} processes", .{name});
+    }
+    try zio.sleep(zio.Duration.fromMilliseconds(500));
+}
+
 fn stopServer(sp: *ServerProc) void {
     _ = std.posix.kill(sp.child.id, std.posix.SIG.TERM) catch {};
     zio.sleep(zio.Duration.fromMilliseconds(cfg_run.stop_grace_ms)) catch {};
@@ -374,6 +399,8 @@ fn cmdRun(alloc: std.mem.Allocator) !void {
     const bench_bin = try std.fs.path.join(alloc, &.{ root, "zig-out", "bin", "zdb-bench" });
     defer alloc.free(bench_bin);
 
+    if (cfg_run.kill_existing) try killStaleServers(alloc);
+
     try cmdClean(alloc);
     try std.fs.cwd().makePath(data_root);
     try std.fs.cwd().makePath(log_root);
@@ -470,6 +497,21 @@ fn cmdRun(alloc: std.mem.Allocator) !void {
     // --- stop monitor, servers (via defer) ---
     mon_ctx.stop.store(true, .release);
     _ = mon_handle.join();
+
+    // Dump a final /stats blob from each node so the histograms (which the
+    // tsv monitor doesn't track) are visible post-run. Written to disk
+    // alongside the per-node logs; printed file paths in the summary log.
+    var sn: u32 = 1;
+    while (sn <= cfg_run.nodes) : (sn += 1) {
+        const blob = sendStats(alloc, sn) catch continue;
+        defer alloc.free(blob);
+        const path = std.fmt.allocPrint(alloc, "{s}/stats-node{d}.txt", .{ log_root, sn }) catch continue;
+        defer alloc.free(path);
+        const f = std.fs.cwd().createFile(path, .{ .truncate = true }) catch continue;
+        defer f.close();
+        _ = f.write(blob) catch {};
+        std.log.info("final stats dumped: {s}", .{path});
+    }
 
     std.log.info("run complete; metrics at {s}", .{metrics_path});
 }

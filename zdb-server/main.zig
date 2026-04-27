@@ -124,8 +124,13 @@ pub fn main() !void {
     zdb.vfs.VFS.initGlobal(.{ .bytes_per_sec = 500 * 1024 * 1024 });
 
     // Initialize global metrics before anything that might increment them.
+    // zdb owns storage-layer metrics; raft owns its own propose-phase
+    // histograms — they live in separate Metrics structs but both surface
+    // through /stats once the server's handleStats walks both globals.
     try zdb.metrics.initGlobal(allocator);
     defer zdb.metrics.deinitGlobal();
+    try raft.metrics.initGlobal(allocator);
+    defer raft.metrics.deinitGlobal();
 
     // Runtime pool singleton — created first so all runtimes are available.
     const pool = try runtime.Pool.init(allocator, .{});
