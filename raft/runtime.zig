@@ -36,13 +36,8 @@ pub const RaftRuntime = struct {
     pub fn run(self: *RaftRuntime) !void {
         if (self.node.transport == null) try self.node.initTransport();
 
-        var group = zio.group();
-        defer group.wait() catch {};
-        try group.spawn(node_mod.Node.tickLoop, .{ self.node, self.node.config.tick_interval_ms });
-        try group.spawn(node_mod.Node.mainLoop, .{ self.node, self.node.config.tick_interval_ms });
-        try group.spawn(node_mod.Node.applyLoop, .{self.node});
+        try self.node.blockingRunAllLoops();
     }
-
 };
 
 // -- requestJoin: client-side join protocol over mux --

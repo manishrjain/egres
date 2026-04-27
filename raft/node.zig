@@ -160,6 +160,7 @@ pub const Node = struct {
     apply_ts: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Broadcast signal fired after every `apply_ts` advance. Waiters in
     /// `waitUntilApplied` are woken and re-check their target.
+    /// TODO: Get rid of apply_ts_notify. Who's using it and why.
     apply_ts_notify: zio.Notify = .init,
     conf_applied_index: u64,
     leader_id: ?NodeId,
@@ -1494,9 +1495,33 @@ pub const Node = struct {
         return batch.items.len;
     }
 
+    pub fn blockingRunAllLoops(self: *Node) !void {
+        var group = zio.group();
+
+        try group.spawn(tickLoop, .{ self, self.config.tick_interval_ms });
+        try group.spawn(mainLoop, .{ self, self.config.tick_interval_ms });
+        try group.spawn(applyLoop, .{self});
+
+        group.wait() catch {};
+    }
+
     fn notifyApplyCallbacks(self: *Node) void {
         // DO NOT BLOCK
         self.commit_ch.trySend(1) catch {};
+    }
+
+    pub fn callbackLoop(self: *Node) void {
+        // TODO: The while loop should wait for a signal
+        while (true) {
+            const ci = self.commit_index.load(.monotonic);
+            const head = self.apply_callbacks.peek() catch continue;
+            if (head.entry.index <= ci) {
+                const ready = self.apply_callbacks.tryReceive() catch continue;
+                // TODO: Do we really need apply_callbacks to use a channel? Or, can we just use our
+                // thread-safe queue.
+                ready.cb(ready.ctx, ready.entry, .committed);
+            }
+        }
     }
 
     pub fn applyLoop(self: *Node) void {

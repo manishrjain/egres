@@ -101,6 +101,7 @@ pub fn build(b: *std.Build) void {
     _ = addRaftMultiprocHarness(b, target, optimize, raft_mod, regen_buffers_step);
     addBenchZio(b, target, optimize);
     addBenchDiskwal(b, target, optimize, raft_mod, regen_buffers_step);
+    addBenchQueue(b, target, optimize, raft_mod);
     const net_test_step = addNetTests(b, target, optimize);
 
     const all_test_step = b.step("test", "Run all tests");
@@ -743,6 +744,32 @@ fn addBenchZio(
 
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench-zio", "Run zio vs std.Thread benchmarks");
+    bench_step.dependOn(&run_bench.step);
+}
+
+fn addBenchQueue(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    raft_mod: *std.Build.Module,
+) void {
+    // Reuse zio + utils modules already wired through raft_mod so we don't
+    // recompile them — same trick as bench-diskwal.
+    const zio_mod = raft_mod.import_table.get("zio").?;
+    const utils_mod = raft_mod.import_table.get("utils").?;
+
+    const bench_exe = b.addExecutable(.{
+        .name = "queue-bench",
+        // Always ReleaseFast — Debug Mutex/Condvar overhead swamps the
+        // measurement, and we're comparing fast paths.
+        .root_module = makeModule(b, target, .ReleaseFast, "benchmarks/queue_bench.zig"),
+    });
+    bench_exe.root_module.addImport("zio", zio_mod);
+    bench_exe.root_module.addImport("utils", utils_mod);
+    _ = optimize;
+
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench-queue", "Run utils.Queue vs zio.Channel benchmark");
     bench_step.dependOn(&run_bench.step);
 }
 
