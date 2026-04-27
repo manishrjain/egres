@@ -180,10 +180,15 @@ pub const Node = struct {
     allocator: std.mem.Allocator,
 
     prng: std.Random.DefaultPrng,
-    proposal_requests: zio.Channel(ProposalRequest) = undefined,
+    proposal_ch: zio.Channel(ProposalRequest) = undefined,
     apply_callbacks: zio.Channel(PendingApply) = undefined,
     event_ch: zio.Channel(u8) = undefined,
-    commit_ch: zio.Channel(u8) = undefined,
+    // Broadcast notify fired by `advance()` whenever commit_index moves
+    // forward. Both applyLoop (state-machine apply) and callbackLoop
+    // (proposal-callback firing) wait on it. Notify is the right primitive
+    // here — a Channel is rendezvous (one signal = one receiver), which
+    // would let the two loops race for each commit signal.
+    commit_notify: zio.Notify = .init,
     inbound_ch: zio.Channel(InboundMsg) = undefined,
     shutting_down: std.atomic.Value(bool),
 
@@ -254,10 +259,9 @@ pub const Node = struct {
             .file_acks = utils.SafeHashMap(u64, *PendingFileAck).init(allocator),
             .file_requests = utils.SafeHashMap(u64, *utils.WaitGroup).init(allocator),
         };
-        node.proposal_requests = try zio.Channel(ProposalRequest).initAlloc(allocator, proposal_queue_capacity);
+        node.proposal_ch = try zio.Channel(ProposalRequest).initAlloc(allocator, proposal_queue_capacity);
         node.apply_callbacks = try zio.Channel(PendingApply).initAlloc(allocator, 1024);
         node.event_ch = try zio.Channel(u8).initAlloc(allocator, 1);
-        node.commit_ch = try zio.Channel(u8).initAlloc(allocator, 1);
         node.inbound_ch = try zio.Channel(InboundMsg).initAlloc(allocator, 1024);
         errdefer allocator.destroy(node);
         for (peers) |peer| {
@@ -302,19 +306,17 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
-        self.proposal_requests.close(.immediate);
-        while (self.proposal_requests.tryReceive()) |req| {
+        self.proposal_ch.close(.immediate);
+        while (self.proposal_ch.tryReceive()) |req| {
             self.allocator.free(req.data);
             req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .shutdown);
         } else |_| {}
-        self.proposal_requests.deinit();
+        self.proposal_ch.deinit();
         self.failAllPendingCallbacks(.shutdown);
         self.apply_callbacks.close(.immediate);
         self.apply_callbacks.deinit();
         self.event_ch.close(.immediate);
         self.event_ch.deinit();
-        self.commit_ch.close(.immediate);
-        self.commit_ch.deinit();
 
         self.inbound_ch.close(.graceful);
         while (self.inbound_ch.tryReceive()) |msg| {
@@ -772,14 +774,15 @@ pub const Node = struct {
     }
 
     pub fn startShutdown(self: *Node) void {
-        self.shutting_down.store(true, .seq_cst);
-        self.proposal_requests.close(.graceful);
+        self.shutting_down.store(true, .release);
+        self.proposal_ch.close(.graceful);
         self.event_ch.close(.graceful);
-        self.commit_ch.close(.graceful);
+        // Wake applyLoop + callbackLoop so they observe isShuttingDown() and exit.
+        self.commit_notify.broadcast();
     }
 
     pub fn isShuttingDown(self: *const Node) bool {
-        return self.shutting_down.load(.seq_cst);
+        return self.shutting_down.load(.acquire);
     }
 
     /// Returns true if a heartbeat is due (leader only).
@@ -962,7 +965,7 @@ pub const Node = struct {
             .prev_log_index = prev_index,
             .prev_log_term = prev_term,
             .entries = entry_offsets.items,
-            .leader_commit = self.commit_index.load(.seq_cst),
+            .leader_commit = self.commit_index.load(.acquire),
         });
         _ = try ae_writer.finishWithTail();
         const bytes = try buf.toOwnedSlice(self.allocator);
@@ -1189,14 +1192,14 @@ pub const Node = struct {
         }
 
         // utils.logEvery(10, "node {d}: handleAE entries={d} leaderCommit={d} ci={d} lastIndex={d}", .{
-        //     self.id, ae_entries_len, ae.leaderCommit(), self.commit_index.load(.seq_cst), self.log.lastIndex(),
+        //     self.id, ae_entries_len, ae.leaderCommit(), self.commit_index.load(.acquire), self.log.lastIndex(),
         // });
 
-        if (ae.leaderCommit() > self.commit_index.load(.seq_cst)) {
+        if (ae.leaderCommit() > self.commit_index.load(.acquire)) {
             const last_index = self.log.lastIndex();
             const new_ci = if (ae.leaderCommit() < last_index) ae.leaderCommit() else last_index;
-            dbg("node {d}: advancing commit_index {d} -> {d}", .{ self.id, self.commit_index.load(.seq_cst), new_ci });
-            self.commit_index.store(new_ci, .seq_cst);
+            dbg("node {d}: advancing commit_index {d} -> {d}", .{ self.id, self.commit_index.load(.acquire), new_ci });
+            self.commit_index.store(new_ci, .release);
         }
         try self.sendAppendEntriesReply(leader_id, .{
             .success = true,
@@ -1287,7 +1290,7 @@ pub const Node = struct {
         if (self.isShuttingDown()) return error.QueueClosed;
         const owned = try self.allocator.dupe(u8, data);
         errdefer self.allocator.free(owned);
-        self.proposal_requests.trySend(.{
+        self.proposal_ch.trySend(.{
             .data = owned,
             .apply_cb = cb,
             .ctx = ctx,
@@ -1460,7 +1463,7 @@ pub const Node = struct {
     pub fn processProposalRequests(self: *Node, max_batch: usize) RaftError!usize {
         _ = max_batch;
         if (self.isShuttingDown()) {
-            while (self.proposal_requests.tryReceive()) |req| {
+            while (self.proposal_ch.tryReceive()) |req| {
                 self.allocator.free(req.data);
                 req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .shutdown);
             } else |_| {}
@@ -1471,7 +1474,7 @@ pub const Node = struct {
         defer batch.deinit(self.allocator);
 
         while (true) {
-            const req = self.proposal_requests.tryReceive() catch break;
+            const req = self.proposal_ch.tryReceive() catch break;
             try batch.append(self.allocator, req);
         }
         // Drain depth — emitted before the early-out so a separate "queue was
@@ -1506,44 +1509,58 @@ pub const Node = struct {
         try group.spawn(tickLoop, .{ self, self.config.tick_interval_ms });
         try group.spawn(mainLoop, .{ self, self.config.tick_interval_ms });
         try group.spawn(applyLoop, .{self});
+        try group.spawn(callbackLoop, .{self});
 
         group.wait() catch {};
     }
 
-    fn notifyApplyCallbacks(self: *Node) void {
-        // DO NOT BLOCK
-        self.commit_ch.trySend(1) catch {};
+    fn notifyCommitAdvanced(self: *Node) void {
+        self.commit_notify.broadcast();
     }
 
+    /// Drains `apply_callbacks` for entries whose index is ≤ commit_index,
+    /// firing each callback with `.committed`. The callback channel is in
+    /// log-index order (populated by `appendProposalsToLeaderLog`), so a
+    /// peek/receive loop is sufficient — no map/scan needed.
+    ///
+    /// Re-check before wait: commit_notify is edge-triggered, so a broadcast
+    /// that fires while we're inside the drain loop is lost. Snapshot
+    /// commit_index at the start, drain against it, then load again before
+    /// waiting — if it advanced, loop without waiting so we never miss
+    /// callbacks.
     pub fn callbackLoop(self: *Node) void {
-        // TODO: The while loop should wait for a signal
-        while (true) {
-            const ci = self.commit_index.load(.monotonic);
-            const head = self.apply_callbacks.peek() catch continue;
-            if (head.entry.index <= ci) {
-                const ready = self.apply_callbacks.tryReceive() catch continue;
-                // TODO: Do we really need apply_callbacks to use a channel? Or, can we just use our
-                // thread-safe queue.
+        while (!self.isShuttingDown()) {
+            const ci_seen = self.commit_index.load(.acquire);
+            while (true) {
+                const head = self.apply_callbacks.peek() catch break;
+                if (head.entry.index > ci_seen) break;
+                const ready = self.apply_callbacks.tryReceive() catch break;
                 ready.cb(ready.ctx, ready.entry, .committed);
             }
+            if (self.commit_index.load(.acquire) > ci_seen) continue;
+            self.commit_notify.wait() catch return;
         }
     }
 
+    /// Re-check before wait for the same lost-wakeup reason as callbackLoop:
+    /// applyCommits captures commit_index at entry and stops there, so any
+    /// commits that landed during the apply loop need a fresh re-check.
     pub fn applyLoop(self: *Node) void {
         // TODO: Use this loop to replay all the logs from last snapshot.
         // Actually, if we just set the apply index to the last snapshot index, then this would
         // automatically apply all the pending entries anyway. We just need to trigger it.
         while (!self.isShuttingDown()) {
             self.applyCommits();
-            _ = self.commit_ch.receive() catch return;
+            if (self.apply_index.load(.acquire) < self.commit_index.load(.acquire)) continue;
+            self.commit_notify.wait() catch return;
         }
     }
 
     const max_apply_bytes: u64 = 16 * 1024 * 1024; // 16 MiB per batch
 
     pub fn applyCommits(self: *Node) void {
-        var ai = self.apply_index.load(.seq_cst);
-        const ci = self.commit_index.load(.seq_cst);
+        var ai = self.apply_index.load(.acquire);
+        const ci = self.commit_index.load(.acquire);
         if (ai >= ci) {
             return;
         }
@@ -1572,21 +1589,17 @@ pub const Node = struct {
                     }
                 }
                 ai = entry.index;
-                self.apply_index.store(ai, .seq_cst);
+                self.apply_index.store(ai, .release);
                 // Advance apply_ts AFTER the state machine has applied the
                 // entry (or is a no-op for empty-data ticks). Matches the
                 // read contract: "apply_ts >= T implies every entry with
                 // timestamp <= T is visible."
-                _ = self.apply_ts.fetchMax(reader.timestamp(), .release);
+                _ = self.apply_ts.fetchMax(reader.timestamp(), .acq_rel);
                 // Wake any reader blocked in waitUntilApplied.
                 self.apply_ts_notify.broadcast();
-
-                // Fire proposal callback if one exists for this index (leader only).
-                const head = self.apply_callbacks.peek() catch continue;
-                if (head.entry.index == entry.index) {
-                    const ready = self.apply_callbacks.tryReceive() catch continue;
-                    ready.cb(ready.ctx, ready.entry, .committed);
-                }
+                // Proposal callbacks now fire from `callbackLoop` as soon
+                // as commit advances — they no longer wait for the state
+                // machine to apply. See advance() → notifyCommitAdvanced.
             }
         }
         dbg(
@@ -1629,7 +1642,7 @@ pub const Node = struct {
             } else |_| {}
             metrics.g().observePhase("inbound", t);
 
-            const ci_before = self.commit_index.load(.seq_cst);
+            const ci_before = self.commit_index.load(.acquire);
 
             // Phase: propose — drain proposal queue, build entries, persist,
             // register apply callbacks. Sub-phases ("propose_build" and
@@ -1646,7 +1659,7 @@ pub const Node = struct {
             self.advance();
             metrics.g().observePhase("advance", t);
 
-            const ci_advanced = self.commit_index.load(.seq_cst) > ci_before;
+            const ci_advanced = self.commit_index.load(.acquire) > ci_before;
 
             var heartbeat_due = false;
             const now = std.time.microTimestamp();
@@ -1812,24 +1825,27 @@ pub const Node = struct {
 
         const quorum_pos = matches.items.len - self.quorum_size;
         const candidate = matches.items[quorum_pos];
-        if (candidate <= self.commit_index.load(.seq_cst)) return;
+        if (candidate <= self.commit_index.load(.acquire)) return;
 
         const term = self.log.term(candidate) catch return orelse return;
         if (term != self.current_term) return;
-        self.commit_index.store(candidate, .seq_cst);
+        self.commit_index.store(candidate, .release);
     }
 
-    // commit_index udvances when leader sees a quorum match.
+    // commit_index advances when leader sees a quorum match.
     // apply_index advances when entries are applied to the state machine (via callbacks).
     // conf_applied_index advances when conf changes are applied to raft membership.
     pub fn advance(self: *Node) void {
         self.advanceCommitIndex();
         self.applyConfChanges();
-        self.notifyApplyCallbacks();
+        // Wakes both applyLoop (state-machine apply) and callbackLoop
+        // (proposal-callback firing). Callbacks fire as soon as commit
+        // advances — they do not wait for the state-machine apply.
+        self.notifyCommitAdvanced();
     }
 
     fn applyConfChanges(self: *Node) void {
-        const ci = self.commit_index.load(.seq_cst);
+        const ci = self.commit_index.load(.acquire);
         if (self.conf_applied_index >= ci) return;
         dbg("applyConfChanges node={d} conf_applied={d} ci={d}", .{ self.id, self.conf_applied_index, ci });
 

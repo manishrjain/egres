@@ -115,6 +115,7 @@ pub const TestCluster = struct {
             entry.group.spawn(Node.tickLoop, .{ entry.node, entry.node.config.tick_interval_ms }) catch {};
             entry.group.spawn(Node.mainLoop, .{ entry.node, entry.node.config.tick_interval_ms }) catch {};
             entry.group.spawn(Node.applyLoop, .{entry.node}) catch {};
+            entry.group.spawn(Node.callbackLoop, .{entry.node}) catch {};
         }
         std.debug.print("TestCluster.init: done\n", .{});
         return cluster;
