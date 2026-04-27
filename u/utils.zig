@@ -106,101 +106,95 @@ pub const ThreadSafeError = struct {
     }
 };
 
-// Queue blocks producers when full and consumers when empty.
-// Queue is thread safe.
-// TODO: Switch with a channel which works nicely with zio.
-pub fn Queue(comptime T: type, comptime capacity: usize) type {
+/// DEPRECATED — prefer `zio.Channel(T)` for new code. Channel covers every
+/// use case this Queue does:
+///   - fail-fast push/pop: `Channel.trySend` / `Channel.tryReceive`
+///   - blocking push/pop: `Channel.send` / `Channel.receive` (yields fiber)
+///   - bounded capacity with `error.ChannelFull` semantics
+/// Benchmarks (see git history of benchmarks/queue_bench.zig) confirmed the
+/// two are within a few percent on the fast path; Channel additionally has
+/// targeted park-and-wake when callers genuinely need to block, and a
+/// direct sender→receiver handoff path that this Queue can't replicate.
+/// New callers: use `zio.Channel`. Existing callers: this is kept only for
+/// any out-of-tree user; consider migrating.
+///
+/// Thread-safe FIFO queue: ArrayList-backed, grows on demand up to `max`.
+/// `push` returns `error.QueueFull` past the cap; `pop` returns null when
+/// empty. Non-blocking — callers wait externally if they need to. MUST be
+/// used from a fiber (zio.Mutex).
+pub fn Queue(comptime T: type) type {
     return struct {
         const Self = @This();
-        pub const Error = error{QueueClosed};
+        pub const Error = error{ QueueClosed, QueueFull, OutOfMemory };
 
-        buf: [capacity]T = undefined,
+        allocator: std.mem.Allocator,
+        items: std.ArrayList(T) = .{},
         head: usize = 0,
-        len: usize = 0,
         closed: bool = false,
-        mutex: std.Thread.Mutex = .{},
-        not_empty: std.Thread.Condition = .{},
-        not_full: std.Thread.Condition = .{},
+        max: usize,
+        mutex: zio.Mutex = .init,
 
-        pub fn pushOrClosed(q: *Self, item: T) Error!void {
-            q.mutex.lock();
+        pub fn init(allocator: std.mem.Allocator, max: usize) Self {
+            return .{ .allocator = allocator, .max = max };
+        }
+
+        pub fn deinit(q: *Self) void {
+            q.items.deinit(q.allocator);
+            q.head = 0;
+        }
+
+        pub fn push(q: *Self, item: T) Error!void {
+            q.mutex.lockUncancelable();
             defer q.mutex.unlock();
-
-            while (q.len == capacity and !q.closed) {
-                q.not_full.wait(&q.mutex);
-            }
             if (q.closed) return error.QueueClosed;
-
-            q.buf[(q.head + q.len) % capacity] = item;
-            q.len += 1;
-            q.not_empty.signal();
+            const live = q.items.items.len - q.head;
+            if (live >= q.max) return error.QueueFull;
+            try q.items.append(q.allocator, item);
         }
 
-        pub fn tryPush(q: *Self, item: T) bool {
-            q.mutex.lock();
+        pub fn pop(q: *Self) ?T {
+            q.mutex.lockUncancelable();
             defer q.mutex.unlock();
-
-            if (q.closed or q.len == capacity) return false;
-            q.buf[(q.head + q.len) % capacity] = item;
-            q.len += 1;
-            q.not_empty.signal();
-            return true;
-        }
-
-        pub fn popOrNull(q: *Self) ?T {
-            q.mutex.lock();
-            defer q.mutex.unlock();
-
-            while (q.len == 0 and !q.closed) {
-                q.not_empty.wait(&q.mutex);
+            if (q.head >= q.items.items.len) return null;
+            const item = q.items.items[q.head];
+            q.head += 1;
+            // Compact when at least half the underlying buffer is dead
+            // (head consumes >= half). Keeps memory bounded and amortizes
+            // the shift cost over the live entries.
+            if (q.head * 2 >= q.items.items.len) {
+                const live = q.items.items.len - q.head;
+                if (live > 0) {
+                    std.mem.copyForwards(T, q.items.items[0..live], q.items.items[q.head..]);
+                }
+                q.items.items.len = live;
+                q.head = 0;
             }
-            if (q.len == 0) return null;
-
-            const item = q.buf[q.head];
-            q.head = (q.head + 1) % capacity;
-            q.len -= 1;
-            q.not_full.signal();
-            return item;
-        }
-
-        pub fn tryPop(q: *Self) ?T {
-            q.mutex.lock();
-            defer q.mutex.unlock();
-
-            if (q.len == 0) return null;
-            const item = q.buf[q.head];
-            q.head = (q.head + 1) % capacity;
-            q.len -= 1;
-            q.not_full.signal();
             return item;
         }
 
         pub fn peek(q: *Self) ?T {
-            q.mutex.lock();
+            q.mutex.lockUncancelable();
             defer q.mutex.unlock();
-            if (q.len == 0) return null;
-            return q.buf[q.head];
+            if (q.head >= q.items.items.len) return null;
+            return q.items.items[q.head];
         }
 
         pub fn count(q: *Self) usize {
-            q.mutex.lock();
+            q.mutex.lockUncancelable();
             defer q.mutex.unlock();
-            return q.len;
+            return q.items.items.len - q.head;
         }
 
         pub fn isClosed(q: *Self) bool {
-            q.mutex.lock();
+            q.mutex.lockUncancelable();
             defer q.mutex.unlock();
             return q.closed;
         }
 
         pub fn close(q: *Self) void {
-            q.mutex.lock();
+            q.mutex.lockUncancelable();
             defer q.mutex.unlock();
-            if (q.closed) return;
             q.closed = true;
-            q.not_empty.broadcast();
-            q.not_full.broadcast();
         }
     };
 }

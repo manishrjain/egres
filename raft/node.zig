@@ -58,6 +58,7 @@ pub const RaftError = error{
     LastVoter,
     InvalidBytes,
     QueueClosed,
+    QueueFull,
 } || RaftLogError || zen.Error;
 
 pub const Peer = struct {
@@ -179,7 +180,7 @@ pub const Node = struct {
     allocator: std.mem.Allocator,
 
     prng: std.Random.DefaultPrng,
-    proposal_requests: ProposalQueue,
+    proposal_requests: zio.Channel(ProposalRequest) = undefined,
     apply_callbacks: zio.Channel(PendingApply) = undefined,
     event_ch: zio.Channel(u8) = undefined,
     commit_ch: zio.Channel(u8) = undefined,
@@ -205,7 +206,7 @@ pub const Node = struct {
     };
 
     pub const ProposalType = enum { data, conf };
-    const ProposalQueue = utils.Queue(ProposalRequest, 4096);
+    const proposal_queue_capacity: usize = 4096;
     const ProposalRequest = struct {
         data: []u8,
         apply_cb: ApplyCallback,
@@ -249,11 +250,11 @@ pub const Node = struct {
             .config = config,
             .allocator = allocator,
             .prng = prng,
-            .proposal_requests = .{},
             .shutting_down = std.atomic.Value(bool).init(false),
             .file_acks = utils.SafeHashMap(u64, *PendingFileAck).init(allocator),
             .file_requests = utils.SafeHashMap(u64, *utils.WaitGroup).init(allocator),
         };
+        node.proposal_requests = try zio.Channel(ProposalRequest).initAlloc(allocator, proposal_queue_capacity);
         node.apply_callbacks = try zio.Channel(PendingApply).initAlloc(allocator, 1024);
         node.event_ch = try zio.Channel(u8).initAlloc(allocator, 1);
         node.commit_ch = try zio.Channel(u8).initAlloc(allocator, 1);
@@ -301,11 +302,12 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
-        self.proposal_requests.close();
-        while (self.proposal_requests.tryPop()) |req| {
+        self.proposal_requests.close(.immediate);
+        while (self.proposal_requests.tryReceive()) |req| {
             self.allocator.free(req.data);
             req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .shutdown);
-        }
+        } else |_| {}
+        self.proposal_requests.deinit();
         self.failAllPendingCallbacks(.shutdown);
         self.apply_callbacks.close(.immediate);
         self.apply_callbacks.deinit();
@@ -771,7 +773,7 @@ pub const Node = struct {
 
     pub fn startShutdown(self: *Node) void {
         self.shutting_down.store(true, .seq_cst);
-        self.proposal_requests.close();
+        self.proposal_requests.close(.graceful);
         self.event_ch.close(.graceful);
         self.commit_ch.close(.graceful);
     }
@@ -1285,12 +1287,15 @@ pub const Node = struct {
         if (self.isShuttingDown()) return error.QueueClosed;
         const owned = try self.allocator.dupe(u8, data);
         errdefer self.allocator.free(owned);
-        try self.proposal_requests.pushOrClosed(.{
+        self.proposal_requests.trySend(.{
             .data = owned,
             .apply_cb = cb,
             .ctx = ctx,
             .proposal_type = proposal_type,
-        });
+        }) catch |err| switch (err) {
+            error.ChannelClosed => return error.QueueClosed,
+            error.ChannelFull => return error.QueueFull,
+        };
         self.event_ch.trySend(1) catch {};
     }
 
@@ -1455,10 +1460,10 @@ pub const Node = struct {
     pub fn processProposalRequests(self: *Node, max_batch: usize) RaftError!usize {
         _ = max_batch;
         if (self.isShuttingDown()) {
-            while (self.proposal_requests.tryPop()) |req| {
+            while (self.proposal_requests.tryReceive()) |req| {
                 self.allocator.free(req.data);
                 req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .shutdown);
-            }
+            } else |_| {}
             return 0;
         }
 
@@ -1466,7 +1471,7 @@ pub const Node = struct {
         defer batch.deinit(self.allocator);
 
         while (true) {
-            const req = self.proposal_requests.tryPop() orelse break;
+            const req = self.proposal_requests.tryReceive() catch break;
             try batch.append(self.allocator, req);
         }
         // Drain depth — emitted before the early-out so a separate "queue was

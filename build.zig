@@ -82,7 +82,6 @@ pub fn build(b: *std.Build) void {
     else
         b.standardOptimizeOption(.{});
 
-    addServer(b, target, optimize);
 
     const schema_mod = makeSchemaModule(b, target, optimize);
     const regen_buffers_step = addRegenAllBuffers(b, target, optimize, schema_mod);
@@ -224,23 +223,6 @@ fn isSkippedPath(path: []const u8) bool {
         std.mem.startsWith(u8, path, ".git/") or
         std.mem.startsWith(u8, path, "zig-out/") or
         std.mem.startsWith(u8, path, "node_modules/");
-}
-
-fn addServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
-    const exe = b.addExecutable(.{
-        .name = "server",
-        .root_module = makeModule(b, target, optimize, "server.zig"),
-    });
-    addVendoredCompressionSources(b, exe);
-
-    b.installArtifact(exe);
-
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
-
-    const run_step = b.step("run", "Run the server");
-    run_step.dependOn(&run_cmd.step);
 }
 
 fn addZbufCli(
