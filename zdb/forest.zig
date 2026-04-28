@@ -146,6 +146,27 @@ pub const Memtables = struct {
         return self.current.memoryUsage();
     }
 
+    /// Aggregate sizes for the active + immutable memtables, taken under
+    /// one lock. Used by the stats dump so we don't have to chain three
+    /// separate lookups (each of which would re-acquire the lock).
+    pub const Stats = struct {
+        active_bytes: usize,
+        immutable_bytes: usize,
+        immutable_count: usize,
+    };
+
+    pub fn stats(self: *Memtables) Stats {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        var imm_bytes: usize = 0;
+        for (self.immutables.items) |imm| imm_bytes += imm.memoryUsage();
+        return .{
+            .active_bytes = self.current.memoryUsage(),
+            .immutable_bytes = imm_bytes,
+            .immutable_count = self.immutables.items.len,
+        };
+    }
+
     /// Look up a key across current and immutable memtables.
     /// Returns a duped Item owned by the caller.
     pub fn get(self: *Memtables, allocator: std.mem.Allocator, search_key: Key) !?Item {
@@ -310,10 +331,6 @@ pub const Forest = struct {
     /// Callers can use shouldFreeze() afterward to decide whether to propose
     /// a memtable freeze through Raft.
     pub fn put(self: *Forest, items: []const Item) !void {
-        // TEMP: measuring raw Raft throughput — skip the memtable write so
-        // timings isolate WAL + quorum + apply dispatch from storage cost.
-        // Revert this return to re-enable storage apply.
-        if (true) return;
         for (items) |item| {
             try self.memtables.put(item.key, item.value);
         }
@@ -419,7 +436,7 @@ pub const Forest = struct {
             }
 
             const file_id = self.next_file_id.fetchAdd(1, .monotonic);
-            const path = try options.sstPath(self.allocator, self.opts.dir,file_id);
+            const path = try options.sstPath(self.allocator, self.opts.dir, file_id);
 
             try handles.append(self.allocator, try zio.spawn(writeAndSyncTable, .{
                 self.allocator, tb, path, file_id, tree_id, &flush_err,
@@ -660,9 +677,230 @@ pub const Forest = struct {
         return self.memtables.peekOldest() != null;
     }
 
+    // -----------------------------------------------------------------------
+    // Stats dump
+    // -----------------------------------------------------------------------
+
+    /// What slice of the forest the caller wants to see. Default is a
+    /// top-level summary that aggregates across all trees.
+    pub const StatsScope = union(enum) {
+        forest,
+        tree: u64,
+        namespace: u32,
+    };
+
+    pub const StatsOpts = struct {
+        scope: StatsScope = .forest,
+    };
+
+    /// writeStats produces a hierarchical, human-readable text dump of
+    /// current LSM state to `w`. Unlike the Prometheus metrics endpoint,
+    /// this is for ops drill-down: per-tree shape, per-level sizes,
+    /// pending compactions. Snapshot is best-effort — locks are taken
+    /// briefly per section, so a concurrent flush/compaction may show
+    /// itself half-applied. Acceptable for a debug endpoint.
+    pub fn writeStats(self: *Forest, w: *std.Io.Writer, opts: StatsOpts) !void {
+        switch (opts.scope) {
+            .forest => try self.writeForestStats(w),
+            .tree => |id| try self.writeTreeStats(w, id),
+            .namespace => |ns| try self.writeNamespaceStats(w, ns),
+        }
+    }
+
+    fn writeForestStats(self: *Forest, w: *std.Io.Writer) !void {
+        const mt = self.memtables.stats();
+        try w.print("forest:\n", .{});
+        try w.print("  memtables: active=", .{});
+        try writeBytes(w, mt.active_bytes);
+        try w.print(" immutable={d} (", .{mt.immutable_count});
+        try writeBytes(w, mt.immutable_bytes);
+        try w.print(" pending flush)\n", .{});
+        try w.print("  flush_pending: {d}\n", .{mt.immutable_count});
+
+        // Per-level aggregate (sum + max-with-tree).
+        const max_levels = self.opts.max_levels;
+        const Agg = struct {
+            tables_total: u64 = 0,
+            tables_max: u64 = 0,
+            tables_max_tree: u64 = 0,
+            bytes_total: u64 = 0,
+            bytes_max: u64 = 0,
+            bytes_max_tree: u64 = 0,
+        };
+        const aggs = try self.allocator.alloc(Agg, max_levels);
+        defer self.allocator.free(aggs);
+        for (aggs) |*a| a.* = .{};
+
+        // Per-level "compactions wanted" rollup.
+        const Wanted = struct {
+            count: u64 = 0,
+            score_max: f64 = 0,
+            score_max_tree: u64 = 0,
+        };
+        const wanted = try self.allocator.alloc(Wanted, max_levels);
+        defer self.allocator.free(wanted);
+        for (wanted) |*x| x.* = .{};
+
+        // Largest tree (sum across levels).
+        var largest_tree_id: u64 = 0;
+        var largest_tree_size: i64 = 0;
+        var tree_count: usize = 0;
+
+        // Walk trees under the forest read lock, but only briefly: collect
+        // the numbers we need, release. Each level access takes its own
+        // lock inside numTables/getTotalSize.
+        {
+            self.mu.lockShared();
+            defer self.mu.unlockShared();
+            tree_count = self.trees.count();
+            var it = self.trees.iterator();
+            while (it.next()) |kv| {
+                const tree_id = kv.key_ptr.*;
+                const tree = kv.value_ptr.*;
+
+                var tree_total: i64 = 0;
+                for (tree.levels, 0..) |*lv, idx| {
+                    if (idx >= max_levels) break;
+                    const tcount: u64 = @intCast(lv.numTables());
+                    const tbytes: u64 = @intCast(lv.getTotalSize());
+                    tree_total += @intCast(tbytes);
+
+                    aggs[idx].tables_total += tcount;
+                    if (tcount > aggs[idx].tables_max) {
+                        aggs[idx].tables_max = tcount;
+                        aggs[idx].tables_max_tree = tree_id;
+                    }
+                    aggs[idx].bytes_total += tbytes;
+                    if (tbytes > aggs[idx].bytes_max) {
+                        aggs[idx].bytes_max = tbytes;
+                        aggs[idx].bytes_max_tree = tree_id;
+                    }
+                }
+                if (tree_total > largest_tree_size) {
+                    largest_tree_size = tree_total;
+                    largest_tree_id = tree_id;
+                }
+
+                if (tree.compact_candidate) |c| {
+                    if (c.level < max_levels) {
+                        wanted[c.level].count += 1;
+                        if (c.score > wanted[c.level].score_max) {
+                            wanted[c.level].score_max = c.score;
+                            wanted[c.level].score_max_tree = tree_id;
+                        }
+                    }
+                }
+            }
+        }
+
+        try w.print("  trees: {d}\n", .{tree_count});
+        try w.print("  largest_tree: id={d} size=", .{largest_tree_id});
+        try writeBytes(w, @intCast(largest_tree_size));
+        try w.print("\n\n", .{});
+
+        try w.print("  level summary (across all trees):\n", .{});
+        for (aggs, 0..) |a, idx| {
+            // Skip levels that have nothing — shows max_levels=7 dumps cleanly.
+            if (a.tables_total == 0 and a.bytes_total == 0) continue;
+            try w.print("    L{d}: tables={d} (max={d} in tree {d})  bytes=", .{
+                idx, a.tables_total, a.tables_max, a.tables_max_tree,
+            });
+            try writeBytes(w, a.bytes_total);
+            try w.print(" (max=", .{});
+            try writeBytes(w, a.bytes_max);
+            try w.print(" in tree {d})\n", .{a.bytes_max_tree});
+        }
+
+        var any_wanted = false;
+        for (wanted) |x| if (x.count > 0) {
+            any_wanted = true;
+            break;
+        };
+        if (any_wanted) {
+            try w.print("\n  compactions wanted:\n", .{});
+            for (wanted, 0..) |x, idx| {
+                if (x.count == 0) continue;
+                try w.print("    L{d}: trees={d} score_max={d:.2} (tree {d})\n", .{
+                    idx, x.count, x.score_max, x.score_max_tree,
+                });
+            }
+        }
+    }
+
+    fn writeTreeStats(self: *Forest, w: *std.Io.Writer, tree_id: u64) !void {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        const tree = self.trees.get(tree_id) orelse {
+            try w.print("tree id={d}: not found\n", .{tree_id});
+            return;
+        };
+        const ns_id: u32 = if (self.ms.trees.get(tree_id)) |ts| ts.namespace_id else 0;
+        const total = tree.totalSize();
+
+        try w.print("tree id={d} namespace={d} size=", .{ tree_id, ns_id });
+        try writeBytes(w, @intCast(total));
+        try w.print("\n", .{});
+
+        for (tree.levels, 0..) |*lv, idx| {
+            const tcount = lv.numTables();
+            const tbytes: u64 = @intCast(lv.getTotalSize());
+            if (tcount == 0 and tbytes == 0) continue;
+            try w.print("  L{d}: {d} tables, ", .{ idx, tcount });
+            try writeBytes(w, tbytes);
+            try w.print("\n", .{});
+        }
+        if (tree.compact_candidate) |c| {
+            try w.print("  compact_candidate: L{d} score={d:.2}\n", .{ c.level, c.score });
+        }
+    }
+
+    fn writeNamespaceStats(self: *Forest, w: *std.Io.Writer, ns_id: u32) !void {
+        try w.print("namespace={d}:\n", .{ns_id});
+        var any = false;
+        // Collect tree ids in this namespace under the lock, then drop and
+        // call writeTreeStats for each (which re-acquires its own lock).
+        var ids: std.ArrayList(u64) = .{};
+        defer ids.deinit(self.allocator);
+        {
+            self.mu.lockShared();
+            defer self.mu.unlockShared();
+            var it = self.ms.trees.iterator();
+            while (it.next()) |kv| {
+                if (kv.value_ptr.namespace_id != ns_id) continue;
+                try ids.append(self.allocator, kv.key_ptr.*);
+            }
+        }
+        for (ids.items) |id| {
+            any = true;
+            try writeTreeStats(self, w, id);
+        }
+        if (!any) try w.print("  (no trees)\n", .{});
+    }
+
+    /// Pretty-print a byte count: KiB / MiB / GiB / TiB. Two decimal places
+    /// of precision past the smallest meaningful unit.
+    fn writeBytes(w: *std.Io.Writer, b: u64) !void {
+        const kib: u64 = 1024;
+        const mib: u64 = 1024 * kib;
+        const gib: u64 = 1024 * mib;
+        const tib: u64 = 1024 * gib;
+        if (b >= tib) {
+            try w.print("{d:.2}TiB", .{@as(f64, @floatFromInt(b)) / @as(f64, @floatFromInt(tib))});
+        } else if (b >= gib) {
+            try w.print("{d:.2}GiB", .{@as(f64, @floatFromInt(b)) / @as(f64, @floatFromInt(gib))});
+        } else if (b >= mib) {
+            try w.print("{d:.2}MiB", .{@as(f64, @floatFromInt(b)) / @as(f64, @floatFromInt(mib))});
+        } else if (b >= kib) {
+            try w.print("{d:.2}KiB", .{@as(f64, @floatFromInt(b)) / @as(f64, @floatFromInt(kib))});
+        } else {
+            try w.print("{d}B", .{b});
+        }
+    }
+
     /// Check if an SST file exists on disk.
     pub fn hasFile(self: *Forest, file_id: u64) bool {
-        const path = options.sstPath(self.allocator, self.opts.dir,file_id) catch return false;
+        const path = options.sstPath(self.allocator, self.opts.dir, file_id) catch return false;
         defer self.allocator.free(path);
         std.fs.cwd().access(path, .{}) catch return false;
         return true;
@@ -725,7 +963,7 @@ pub const Forest = struct {
 
     /// Read an SST file from disk. Caller owns the returned slice.
     pub fn readFile(self: *Forest, allocator: std.mem.Allocator, file_id: u64) ?[]const u8 {
-        const path = options.sstPath(self.allocator, self.opts.dir,file_id) catch return null;
+        const path = options.sstPath(self.allocator, self.opts.dir, file_id) catch return null;
         defer self.allocator.free(path);
         const handle = vfs.g().openFile(allocator, path, .{}) catch return null;
         defer handle.close();

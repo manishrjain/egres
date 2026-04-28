@@ -15,7 +15,17 @@ pub const NsCreateCmd = struct {
     ns: u32,
 };
 
-pub const StatsCmd = struct {};
+/// `stats`                 → Prometheus dump (existing behavior; loadtest scrapes this)
+/// `stats forest`          → hierarchical forest summary
+/// `stats tree=<N>`        → forest summary scoped to one tree
+/// `stats namespace=<N>`   → forest summary for trees in one namespace
+pub const StatsCmd = struct {
+    filter: Filter = .prom,
+    tree_id: u64 = 0,
+    ns_id: u32 = 0,
+
+    pub const Filter = enum { prom, forest, tree, namespace };
+};
 
 /// Dump cluster topology + per-peer raft progress (as the queried node
 /// sees it). Best-effort snapshot — races against conf changes are
@@ -78,11 +88,16 @@ pub fn readCommand(r: *std.Io.Reader, line_buf: []u8) !?Command {
 }
 
 fn readLine(r: *std.Io.Reader, buf: []u8) ![]const u8 {
-    // takeDelimiterExclusive returns a slice into the reader's internal
-    // buffer — we copy into `buf` so the line survives subsequent reader use.
-    const line = try r.takeDelimiterExclusive('\n');
-    if (line.len > buf.len) return error.LineTooLong;
-    const end = if (line.len > 0 and line[line.len - 1] == '\r') line.len - 1 else line.len;
+    // takeDelimiterInclusive returns the bytes up to AND INCLUDING the
+    // '\n' so the cursor advances past the delimiter. The Exclusive
+    // variant leaves the '\n' in the buffer, which makes the next read
+    // return an empty slice — readCommand's blank-line skip then loops
+    // forever on the same byte. Strip the trailing '\n' (and an optional
+    // '\r' before it) before copying into the caller's buffer.
+    const line = try r.takeDelimiterInclusive('\n');
+    var end = line.len - 1; // drop '\n'
+    if (end > 0 and line[end - 1] == '\r') end -= 1;
+    if (end > buf.len) return error.LineTooLong;
     @memcpy(buf[0..end], line[0..end]);
     return buf[0..end];
 }
@@ -225,7 +240,23 @@ fn parseLine(line: []const u8) !Command {
         if (ns == 0) return error.InvalidNamespace; // 0 is a sentinel
         return .{ .ns_create = .{ .ns = ns } };
     } else if (std.mem.eql(u8, cmd, "stats")) {
-        return .{ .stats = .{} };
+        const sub = it.next() orelse return .{ .stats = .{} };
+        if (std.mem.eql(u8, sub, "forest")) {
+            return .{ .stats = .{ .filter = .forest } };
+        }
+        // Look for `tree=<N>` or `namespace=<N>`. Anything else is an error.
+        const eq = std.mem.indexOfScalar(u8, sub, '=') orelse return error.InvalidStatsFilter;
+        const k = sub[0..eq];
+        const v = sub[eq + 1 ..];
+        if (std.mem.eql(u8, k, "tree")) {
+            const id = std.fmt.parseInt(u64, v, 10) catch return error.InvalidStatsFilter;
+            return .{ .stats = .{ .filter = .tree, .tree_id = id } };
+        }
+        if (std.mem.eql(u8, k, "namespace")) {
+            const id = std.fmt.parseInt(u32, v, 10) catch return error.InvalidStatsFilter;
+            return .{ .stats = .{ .filter = .namespace, .ns_id = id } };
+        }
+        return error.InvalidStatsFilter;
     } else if (std.mem.eql(u8, cmd, "info")) {
         return .{ .info = .{} };
     } else {

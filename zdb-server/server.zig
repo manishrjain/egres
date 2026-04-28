@@ -76,7 +76,10 @@ pub const StorageImpl = struct {
                     });
                     total_bytes += val.len;
                 }
+
+                // Write this to Forest.
                 try self.forest.put(items.items);
+
                 try metrics.g().bytes_written.incrBy(.{
                     .source = "user",
                     .namespace_id = ns,
@@ -423,8 +426,8 @@ pub const ZdbServer = struct {
                     log.info("NS CREATE ns={d}", .{req.ns});
                     self.handleNsCreate(stream, req) catch return;
                 },
-                .stats => |_| {
-                    self.handleStats(stream) catch return;
+                .stats => |req| {
+                    self.handleStats(stream, req) catch return;
                 },
                 .info => |_| {
                     self.handleInfo(stream) catch return;
@@ -718,16 +721,22 @@ pub const ZdbServer = struct {
         try stream.writeAll(body.writer.buffered(), .none);
     }
 
-    fn handleStats(self: *ZdbServer, stream: zio.net.Stream) !void {
-        // Snapshot into a buffer so we write in a single syscall. The metrics
-        // lib emits each metric terminated by '\n'; we append one extra '\n'
-        // so the response ends in a blank line — clients read until \n\n.
-        // Both metric namespaces (zdb storage + raft propose-phase) are
-        // walked through the same writer so they appear in one /stats blob.
+    fn handleStats(self: *ZdbServer, stream: zio.net.Stream, req: proto.StatsCmd) !void {
+        // Snapshot into a buffer so we write in a single syscall. Clients
+        // read until '\n\n' so we always terminate the body with a blank line.
         var body: std.Io.Writer.Allocating = .init(self.allocator);
         defer body.deinit();
-        try m.write(zdb.metrics.g(), &body.writer);
-        try m.write(raft.metrics.g(), &body.writer);
+        switch (req.filter) {
+            .prom => {
+                // Both metric namespaces (zdb storage + raft propose-phase)
+                // walk through the same writer so they appear in one blob.
+                try m.write(zdb.metrics.g(), &body.writer);
+                try m.write(raft.metrics.g(), &body.writer);
+            },
+            .forest => try self.forest.writeStats(&body.writer, .{ .scope = .forest }),
+            .tree => try self.forest.writeStats(&body.writer, .{ .scope = .{ .tree = req.tree_id } }),
+            .namespace => try self.forest.writeStats(&body.writer, .{ .scope = .{ .namespace = req.ns_id } }),
+        }
         try body.writer.writeByte('\n');
         try stream.writeAll(body.writer.buffered(), .none);
     }

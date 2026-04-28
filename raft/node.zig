@@ -1646,15 +1646,20 @@ pub const Node = struct {
             for (result.entries) |entry| {
                 const reader = zen.LogEntryReader.parseRoot(entry.bytes) catch continue;
 
-                if (reader.isNormal()) {
+                if (reader.isNormal() and reader.data().len > 0) {
                     if (self.state_machine) |s| {
-                        if (reader.data().len > 0) {
-                            s.apply(.{
-                                .index = entry.index,
-                                .term = entry.term,
-                                .timestamp = reader.timestamp(),
-                            }, reader.data());
-                        }
+                        // One observation per state-machine apply call —
+                        // each carries one Raft entry's worth of work
+                        // (e.g. a batched forest.put). Lets us see whether
+                        // the apply path is the bottleneck when commit
+                        // outpaces apply.
+                        const t_apply = std.time.microTimestamp();
+                        s.apply(.{
+                            .index = entry.index,
+                            .term = entry.term,
+                            .timestamp = reader.timestamp(),
+                        }, reader.data());
+                        metrics.g().observePhase("apply", t_apply);
                     }
                 }
                 ai = entry.index;

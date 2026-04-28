@@ -47,6 +47,10 @@ const RunCfg = struct {
     /// Useful between iterative runs where a previous server crashed without
     /// releasing its raft port — saves the user from running pkill manually.
     kill_existing: bool = false,
+    /// Where to put `data/`, `logs/`, and `metrics.tsv`. Empty string ⇒
+    /// repo root (legacy default). Use this to point to a larger
+    /// filesystem (e.g. /data/egres).
+    workdir: []const u8 = "",
 
     pub const docs = .{
         .self = "Full benchmark run: clean → start cluster → bootstrap → loadgen → stop.",
@@ -62,6 +66,7 @@ const RunCfg = struct {
         .bootstrap_timeout_ms = "Giveup budget for the namespace-create bootstrap loop.",
         .stop_grace_ms = "SIGTERM-to-SIGKILL grace window when tearing servers down.",
         .kill_existing = "SIGKILL any stale zdb-server/zdb-bench processes before starting (best-effort).",
+        .workdir = "Directory holding data/, logs/, metrics.tsv. Empty = repo root.",
     };
 };
 
@@ -406,25 +411,28 @@ fn monitorFiber(ctx: *MonitorCtx) void {
 
 // --- subcommands ------------------------------------------------------------
 
-fn cleanWorkdir(alloc: std.mem.Allocator, keep_logs: bool) !void {
-    const root = try repoRoot(alloc);
-    defer alloc.free(root);
-    const always = [_][]const u8{ "loadtest-data", "loadtest-metrics.tsv" };
+fn cleanWorkdir(alloc: std.mem.Allocator, work_root: []const u8, keep_logs: bool) !void {
+    const always = [_][]const u8{ "data", "metrics.tsv" };
     for (always) |name| {
-        const p = try std.fs.path.join(alloc, &.{ root, name });
+        const p = try std.fs.path.join(alloc, &.{ work_root, name });
         defer alloc.free(p);
         std.fs.cwd().deleteTree(p) catch {};
     }
     if (!keep_logs) {
-        const p = try std.fs.path.join(alloc, &.{ root, "loadtest-logs" });
+        const p = try std.fs.path.join(alloc, &.{ work_root, "logs" });
         defer alloc.free(p);
         std.fs.cwd().deleteTree(p) catch {};
     }
-    std.log.info("cleaned (keep_logs={})", .{keep_logs});
+    std.log.info("cleaned {s} (keep_logs={})", .{ work_root, keep_logs });
 }
 
 fn cmdClean(alloc: std.mem.Allocator) !void {
-    return cleanWorkdir(alloc, false);
+    // `loadtest clean` honors the same --run="workdir=..." override. If
+    // unset, falls back to repo root (legacy behavior).
+    const root = try repoRoot(alloc);
+    defer alloc.free(root);
+    const work_root = if (cfg_run.workdir.len > 0) cfg_run.workdir else root;
+    return cleanWorkdir(alloc, work_root, false);
 }
 
 fn cmdStats(alloc: std.mem.Allocator, node: u32) !void {
@@ -437,11 +445,18 @@ fn cmdStats(alloc: std.mem.Allocator, node: u32) !void {
 fn cmdRun(alloc: std.mem.Allocator) !void {
     const root = try repoRoot(alloc);
     defer alloc.free(root);
-    const data_root = try std.fs.path.join(alloc, &.{ root, "loadtest-data" });
+    // Server/bench binaries always live in the repo's zig-out/bin; only
+    // the writable workdir (data + logs + metrics) is configurable.
+    const work_root = if (cfg_run.workdir.len > 0)
+        try alloc.dupe(u8, cfg_run.workdir)
+    else
+        try alloc.dupe(u8, root);
+    defer alloc.free(work_root);
+    const data_root = try std.fs.path.join(alloc, &.{ work_root, "data" });
     defer alloc.free(data_root);
-    const log_root = try std.fs.path.join(alloc, &.{ root, "loadtest-logs" });
+    const log_root = try std.fs.path.join(alloc, &.{ work_root, "logs" });
     defer alloc.free(log_root);
-    const metrics_path = try std.fs.path.join(alloc, &.{ root, "loadtest-metrics.tsv" });
+    const metrics_path = try std.fs.path.join(alloc, &.{ work_root, "metrics.tsv" });
     defer alloc.free(metrics_path);
     const server_bin = try std.fs.path.join(alloc, &.{ root, "zig-out", "bin", "zdb-server" });
     defer alloc.free(server_bin);
@@ -452,7 +467,7 @@ fn cmdRun(alloc: std.mem.Allocator) !void {
 
     // Start every run from a clean log directory so node logs and final
     // stats files always belong to just this run.
-    try cleanWorkdir(alloc, false);
+    try cleanWorkdir(alloc, work_root, false);
     try std.fs.cwd().makePath(data_root);
     try std.fs.cwd().makePath(log_root);
 
