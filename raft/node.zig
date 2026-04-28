@@ -35,6 +35,12 @@ pub const Config = struct {
     election_timeout_max_ticks: u32 = 20,
     max_entries_per_msg: u32 = 64,
     max_msg_size: u32 = 1_048_576,
+    /// Peers within `lockstep_cutoff` of the slowest in-window peer share a
+    /// single AppendEntries (built once, fan-out via RefValue). Followers
+    /// already at the higher index walk past the duplicate prefix entries
+    /// (term-match check) and only WAL-append the new tail. Outliers beyond
+    /// this cutoff get their own AE to avoid shipping huge duplicate prefixes.
+    lockstep_cutoff: u32 = 32,
     enable_prevote: bool = true,
 
     pub fn validate(self: Config) !void {
@@ -923,32 +929,72 @@ pub const Node = struct {
 
     /// Send AppendEntries only to peers that are behind (need entries or commit update).
     pub fn maybeBroadcast(self: *Node, do_send: bool) void {
+        if (!do_send) return;
         if (self.state != .leader) return;
-        const last = self.log.lastIndex();
+        const tr = self.transport orelse return;
+        const cutoff = self.config.lockstep_cutoff;
+
+        // Pass 1: highest next_index across peers — the "leading" position.
+        var top: u64 = 0;
+        {
+            var it = self.peers.iterator();
+            while (it.next()) |kv| {
+                if (kv.value_ptr.*.next_index > top) top = kv.value_ptr.*.next_index;
+            }
+        }
+        if (top == 0) return; // no peers at all
+        const window_lo = if (top > cutoff) top - cutoff else 0;
+
+        // Pass 2: min next_index of peers in [window_lo, top]. That cluster
+        // shares one AE built at cluster_min — followers ahead walk past
+        // duplicate prefix entries (term-match check) and only WAL-append
+        // the new tail. Stragglers (below window_lo) get their own AE.
+        var cluster_min: u64 = top;
+        {
+            var it = self.peers.iterator();
+            while (it.next()) |kv| {
+                const p = kv.value_ptr.*;
+                if (p.next_index >= window_lo and p.next_index < cluster_min) {
+                    cluster_min = p.next_index;
+                }
+            }
+        }
+
+        // Build the cluster AE once. Even single-peer clusters take this
+        // path — building once + RefValue overhead is sub-µs, and the
+        // common steady-state has all peers in the same cluster.
+        const cluster_value = self.buildAppendEntries(cluster_min) catch return;
+        defer cluster_value.decrRef();
+
+        // Pass 3: send. In-window peers share the cluster AE; stragglers
+        // build & send their own.
         var it = self.peers.iterator();
         while (it.next()) |kv| {
-            const peer = kv.value_ptr.*;
-            // Send if peer needs entries or doesn't know about our commit.
-            if (do_send or peer.match_index < last or peer.next_index <= last) {
+            const p = kv.value_ptr.*;
+            if (p.next_index >= window_lo) {
+                tr.sendMsg(kv.key_ptr.*, .p0, serial_mod.msg_type_raft, cluster_value) catch {};
+            } else {
                 self.sendAppendEntries(kv.key_ptr.*) catch {};
             }
         }
     }
 
-    pub fn sendAppendEntries(self: *Node, peer: NodeId) RaftError!void {
-        if (self.state != .leader) return;
-        const state = self.peers.getPtr(peer) orelse return;
-        const prev_index = if (state.next_index == 0) 0 else state.next_index - 1;
+    /// Build an AppendEntries starting from `from_index`, wrapped in a
+    /// refcounted `RefValue` (caller owns one ref). Used both by the per-peer
+    /// send path and the grouped fan-out path in `maybeBroadcast` — the
+    /// latter shares the same RefValue across multiple peers.
+    fn buildAppendEntries(self: *Node, from_index: u64) RaftError!*utils.RefValue {
+        const prev_index = if (from_index == 0) 0 else from_index - 1;
         const prev_term: u64 = if (prev_index == 0) 0 else (try self.log.term(prev_index)) orelse 0;
         var result = try self.log.entriesRange(.{
-            .lo = state.next_index,
-            .hi = state.next_index + self.config.max_entries_per_msg,
+            .lo = from_index,
+            .hi = from_index + self.config.max_entries_per_msg,
             .max_bytes = 32 * 1024 * 1024, // 32 MiB
         });
         defer result.deinit();
 
         var buf = std.ArrayList(u8).empty;
-        defer buf.deinit(self.allocator);
+        errdefer buf.deinit(self.allocator);
 
         var ae_writer = try zen.AppendEntriesWriter.initWithBuf(self.allocator, &buf);
         defer ae_writer.deinit();
@@ -979,7 +1025,21 @@ pub const Node = struct {
         });
         _ = try ae_writer.finishWithTail();
         const bytes = try buf.toOwnedSlice(self.allocator);
-        self.sendEncoded(peer, bytes);
+        return utils.RefValue.init(self.allocator, bytes) catch |err| {
+            self.allocator.free(bytes);
+            return err;
+        };
+    }
+
+    pub fn sendAppendEntries(self: *Node, peer: NodeId) RaftError!void {
+        if (self.state != .leader) return;
+        const state = self.peers.getPtr(peer) orelse return;
+        const tr = self.transport orelse return;
+        const value = try self.buildAppendEntries(state.next_index);
+        defer value.decrRef();
+        tr.sendMsg(peer, .p0, serial_mod.msg_type_raft, value) catch |err| {
+            utils.logEvery(5, "sendMsg to {d} failed: {s}", .{ peer, @errorName(err) });
+        };
     }
 
     fn handleRequestVote(self: *Node, rv: zen.RequestVoteReader) RaftError!void {
@@ -1653,6 +1713,7 @@ pub const Node = struct {
             metrics.g().observePhase("inbound", t);
 
             const ci_before = self.commit_index.load(.acquire);
+            const last_before = self.log.lastIndex();
 
             // Phase: propose — drain proposal queue, build entries, persist,
             // register apply callbacks. Sub-phases ("propose_build" and
@@ -1670,6 +1731,7 @@ pub const Node = struct {
             metrics.g().observePhase("advance", t);
 
             const ci_advanced = self.commit_index.load(.acquire) > ci_before;
+            const log_grew = self.log.lastIndex() > last_before;
 
             var heartbeat_due = false;
             const now = std.time.microTimestamp();
@@ -1682,7 +1744,7 @@ pub const Node = struct {
             // This is the chunk that doubled throughput when peers went away
             // (single-node bench), so it's the prime suspect under multi-node.
             t = std.time.microTimestamp();
-            self.maybeBroadcast(heartbeat_due or ci_advanced);
+            self.maybeBroadcast(heartbeat_due or ci_advanced or log_grew);
             metrics.g().observePhase("broadcast", t);
         }
     }
