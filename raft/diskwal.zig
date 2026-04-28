@@ -493,6 +493,11 @@ pub const wal = struct {
     /// implies on-disk persistence). On rotation, this is flushed to the
     /// outgoing file before creating the next one.
     write_buf: std.ArrayList(u8) = .empty,
+    /// Highest log index whose framed bytes are on disk. `addEntries`
+    /// consults this before letting the cache evict: if the entry about
+    /// to be evicted has index > last_synced_index, we flush write_buf
+    /// first. Preserves the invariant "every entry is in cache OR on disk."
+    last_synced_index: u64 = 0,
 
     const Pos = struct {
         file_idx: usize,
@@ -966,6 +971,7 @@ pub const wal = struct {
         // durable point, so no separate fdatasync is needed.
         try self.current.flushWriteBuffer(self.write_buf.items);
         self.write_buf.clearRetainingCapacity();
+        self.last_synced_index = self.current.lastEntry().index;
 
         const prev = self.current.lastEntry();
 
@@ -990,7 +996,7 @@ pub const wal = struct {
         const first_reader = try entries[0].initReader();
         const first_index = first_reader.index();
         if (first_index <= self.lastIndex()) {
-            self.truncateFrom(first_index);
+            try self.truncateFrom(first_index);
         }
 
         // Raft invariant: written indices must be strictly contiguous.
@@ -1017,6 +1023,16 @@ pub const wal = struct {
             // Buffer the CRC-framed record (no I/O), update in-memory slots.
             try self.current.appendRecordToBuffer(&self.write_buf, bytes, reader);
 
+            // If the cache is about to evict an entry that hasn't been
+            // pwritten yet, flush write_buf first. Otherwise reads of the
+            // evicted index would miss in cache AND on disk.
+            if (self.cache.isFull()) {
+                if (self.cache.oldestIndex()) |oldest| {
+                    if (oldest > self.last_synced_index) {
+                        try self.sync(true);
+                    }
+                }
+            }
             // Populate cache so reads see the entry pre-sync.
             self.cache.append(reader.index(), reader.term(), bytes) catch {};
         }
@@ -1046,11 +1062,19 @@ pub const wal = struct {
         self.current.write_offset = log_file_offset;
         self.cache.clear();
         self.write_buf.clearRetainingCapacity();
+        self.last_synced_index = 0;
     }
 
     // Drops entries from `from_index` onward, keeping prefix entries intact.
     // This is used by Raft conflict resolution when a leader overwrites suffix.
-    pub fn truncateFrom(self: *wal, from_index: u64) void {
+    pub fn truncateFrom(self: *wal, from_index: u64) !void {
+        // Flush any pending unsynced records first. write_buf may contain
+        // records BELOW from_index that we want to preserve, plus records
+        // AT/ABOVE from_index we want to discard. Splitting it in-place is
+        // O(n) and fiddly; sync gets the prefix on disk, then we truncate
+        // disk + slots in one shot.
+        if (self.write_buf.items.len > 0) try self.sync(true);
+
         const pos = self.slotGe(from_index);
         if (pos.slot_idx == 0) return;
 
@@ -1066,10 +1090,10 @@ pub const wal = struct {
         self.current.truncateFromSlot(pos.slot_idx);
         self.current.is_current = true;
         self.cache.truncateFrom(from_index);
-        // Any buffered (not-yet-pwritten) records were appended for the
-        // truncated suffix on `current`; drop them so the next append starts
-        // fresh from the truncated write_offset.
-        self.write_buf.clearRetainingCapacity();
+        // last_synced_index can't exceed what's still in the log.
+        if (from_index > 0 and self.last_synced_index >= from_index) {
+            self.last_synced_index = from_index - 1;
+        }
     }
 
     pub fn sync(self: *wal, _: bool) !void {
@@ -1079,6 +1103,7 @@ pub const wal = struct {
         if (self.write_buf.items.len == 0) return;
         try self.current.flushWriteBuffer(self.write_buf.items);
         self.write_buf.clearRetainingCapacity();
+        self.last_synced_index = self.lastIndex();
     }
 };
 
@@ -1108,6 +1133,9 @@ pub const DiskWAL = struct {
         if (snap.index > 0 and wf.firstIndex() != snap.index + 1) {
             return error.CorruptLogFile;
         }
+
+        // Recovery: every entry the wal just discovered is on disk and durable.
+        wf.last_synced_index = wf.lastIndex();
 
         return .{
             .allocator = allocator,
@@ -1225,7 +1253,7 @@ pub const DiskWAL = struct {
     pub fn truncateFrom(self: *DiskWAL, from_index: u64) raftlog.RaftLogError!void {
         try self.mu.lock();
         defer self.mu.unlock();
-        self.wal_store.truncateFrom(from_index);
+        self.wal_store.truncateFrom(from_index) catch |err| return mapToRaftLogError(err);
     }
 
     pub fn compactUntil(self: *DiskWAL, index: u64) raftlog.RaftLogError!void {
@@ -1293,6 +1321,18 @@ pub const EntryCache = struct {
         }
         self.head = 0;
         self.len = 0;
+    }
+
+    /// Raft index of the oldest entry — the one a full-cache `append`
+    /// would overwrite. `null` if cache is empty or disabled.
+    pub fn oldestIndex(self: *const EntryCache) ?u64 {
+        if (self.buf.len == 0 or self.len == 0) return null;
+        return self.buf[self.head].index;
+    }
+
+    /// True if the next `append` would have to evict an existing entry.
+    pub fn isFull(self: *const EntryCache) bool {
+        return self.buf.len > 0 and self.len == self.buf.len;
     }
 
     pub fn append(self: *EntryCache, index: u64, term_val: u64, bytes: []const u8) !void {
