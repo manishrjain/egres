@@ -221,23 +221,31 @@ fn spawnServer(
     try std.fs.cwd().makePath(data_dir);
     const log_file = try std.fs.cwd().createFile(log_path, .{ .truncate = true });
 
-    const raft_s = try raftAddrStr(alloc, node);
-    defer alloc.free(raft_s);
     const client_s = try clientAddrStr(alloc, node);
     defer alloc.free(client_s);
 
-    // We route the child's stdout+stderr into a per-node log file by launching
-    // through `sh -c ... >log 2>&1`. Zig's std.process.Child doesn't expose a
-    // first-class way to dup2 a fd into the child's stdout/stderr in 0.15, so
-    // a shell wrapper is the simplest portable path. The `exec` prefix means
-    // sh replaces itself with the server process — so `child.id` IS the
-    // server PID, and SIGTERM to it goes to the server, not a stray sh.
+    // Route the child's stdout+stderr into a per-node log file by launching
+    // through `sh -c ... >log 2>&1`. Zig's std.process.Child doesn't expose
+    // a first-class way to dup2 a fd into the child's stdout/stderr in
+    // 0.15, so a shell wrapper is the simplest portable path. The `exec`
+    // prefix means sh replaces itself with the server process — so
+    // `child.id` IS the server PID, and SIGTERM to it goes to the server,
+    // not a stray sh. We use the canonical flags.zig form
+    // `--<module>="k=v; k=v"` — one quoted payload per registered config.
+    // `offset=node` keeps each server's raft/client ports distinct without
+    // duplicating the per-port arithmetic on this side.
     var cmd_buf: std.ArrayList(u8) = .empty;
     defer cmd_buf.deinit(alloc);
     var w = cmd_buf.writer(alloc);
-    try w.print("exec '{s}' --id {d} --cluster-id 1 --raft-addr '{s}' --client-addr '{s}' --data-dir '{s}'", .{ server_bin, node, raft_s, client_s, data_dir });
-    if (seeds) |s| try w.print(" --seeds '{s}'", .{s});
-    try w.print(" >'{s}' 2>&1", .{log_path});
+    // flags.zig renders field names as kebab-case in the help output and
+    // accepts the same form in payloads (`raft_port` → `raft-port`,
+    // `cluster_id` → `cluster-id`, etc). Match that here.
+    try w.print(
+        "exec '{s}' --listen=\"raft-port={d}; client-port={d}; offset={d}\" --raft=\"id={d}; cluster-id=1; tick-ms=20",
+        .{ server_bin, cfg_ports.raft_port_base, cfg_ports.client_port_base, node, node },
+    );
+    if (seeds) |s| try w.print("; seeds={s}", .{s});
+    try w.print("\" --data=\"dir={s}\" >'{s}' 2>&1", .{ data_dir, log_path });
     try cmd_buf.append(alloc, 0); // null-terminate for sh
 
     var child = std.process.Child.init(

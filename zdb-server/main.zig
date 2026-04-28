@@ -4,94 +4,82 @@ const raft = @import("raft");
 const zdb = @import("zdb");
 const runtime = @import("runtime");
 const zdb_server = @import("zdb_server");
+const flags = @import("flags");
 
 pub const std_options = std.Options{
     .log_level = .debug,
 };
 
-const ParsedArgs = struct {
-    id: raft.NodeId,
-    cluster_id: u64,
-    raft_addr: []const u8,
-    client_addr: []const u8,
-    data_dir: []const u8,
-    seeds: []const []const u8,
-    tick_ms: u32,
+/// `--listen` — where the server binds. Actual addresses are
+/// `<host>:<port+offset>` for both raft and client. `offset` makes it
+/// trivial to bring up N servers on one host without spelling out
+/// per-node port assignments.
+const ListenCfg = struct {
+    host: []const u8 = "127.0.0.1",
+    raft_port: u16 = 9000,
+    client_port: u16 = 8000,
+    offset: u16 = 0,
+
+    pub const docs = .{
+        .self = "Where the server listens. Both raft and client ports get +offset.",
+        .host = "Hostname/IP to bind both the raft and client listeners on.",
+        .raft_port = "Base port for raft peer connections. Actual port = raft_port + offset.",
+        .client_port = "Base port for client/stats connections. Actual port = client_port + offset.",
+        .offset = "Added to both raft_port and client_port. Convenient when running several servers on one host (e.g. offset=2 ⇒ raft=9002, client=8002).",
+    };
 };
 
-fn usage() void {
-    std.debug.print(
-        "usage: zdb-server --id <n> --cluster-id <n> --raft-addr <ip:port> " ++
-            "--client-addr <ip:port> --data-dir <path> [--seeds <addr1,addr2,...>] [--tick-ms <n>]\n",
-        .{},
-    );
-}
+/// `--raft` — Raft node identity and cluster wiring. `id` is required (must
+/// be > 0). `seeds` is comma-separated; if empty, the node bootstraps as a
+/// single-node cluster.
+const RaftCfg = struct {
+    id: u64 = 0,
+    cluster_id: u64 = 1,
+    seeds: []const u8 = "",
+    tick_ms: u32 = 20,
 
-fn parseSeeds(text: []const u8, allocator: std.mem.Allocator) ![]const []const u8 {
-    var seeds = std.ArrayList([]const u8).empty;
-    errdefer seeds.deinit(allocator);
+    pub const docs = .{
+        .self = "Raft identity and cluster wiring.",
+        .id = "Raft node ID (required, must be > 0).",
+        .cluster_id = "Cluster ID for handshake gating.",
+        .seeds = "Comma-separated raft addresses of existing peers. Empty = bootstrap as a single-node cluster.",
+        .tick_ms = "Raft tick interval in milliseconds.",
+    };
+};
+
+/// `--data` — on-disk locations. `dir` is required; `wal_dir` defaults to
+/// `dir` if empty (single-disk setup) but can be pointed at a faster
+/// device (e.g. NVMe) for write-ahead log throughput.
+const DataCfg = struct {
+    dir: []const u8 = "",
+    wal_dir: []const u8 = "",
+
+    pub const docs = .{
+        .self = "Storage paths. WAL can live on a faster device than the LSM forest.",
+        .dir = "Directory holding the LSM forest. Required.",
+        .wal_dir = "Directory holding the raft WAL. Empty = same as `dir`.",
+    };
+};
+
+fn parseSeedList(text: []const u8, allocator: std.mem.Allocator) ![]const []const u8 {
+    var list = std.ArrayList([]const u8).empty;
+    errdefer list.deinit(allocator);
     var it = std.mem.splitScalar(u8, text, ',');
     while (it.next()) |s| {
-        if (s.len > 0) try seeds.append(allocator, s);
+        if (s.len > 0) try list.append(allocator, s);
     }
-    return seeds.toOwnedSlice(allocator);
+    return list.toOwnedSlice(allocator);
 }
 
-fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs {
-    var id: ?raft.NodeId = null;
-    var cluster_id: u64 = 1;
-    var raft_addr: ?[]const u8 = null;
-    var client_addr: ?[]const u8 = null;
-    var data_dir: ?[]const u8 = null;
-    var seeds: []const []const u8 = &.{};
-    var tick_ms: u32 = 20;
-
-    var i: usize = 1;
-    while (i < argv.len) {
-        const arg = argv[i];
-        if (std.mem.eql(u8, arg, "--id")) {
-            i += 1;
-            if (i >= argv.len) return error.InvalidArgs;
-            id = try std.fmt.parseInt(raft.NodeId, argv[i], 10);
-        } else if (std.mem.eql(u8, arg, "--cluster-id")) {
-            i += 1;
-            if (i >= argv.len) return error.InvalidArgs;
-            cluster_id = try std.fmt.parseInt(u64, argv[i], 10);
-        } else if (std.mem.eql(u8, arg, "--raft-addr")) {
-            i += 1;
-            if (i >= argv.len) return error.InvalidArgs;
-            raft_addr = argv[i];
-        } else if (std.mem.eql(u8, arg, "--client-addr")) {
-            i += 1;
-            if (i >= argv.len) return error.InvalidArgs;
-            client_addr = argv[i];
-        } else if (std.mem.eql(u8, arg, "--data-dir")) {
-            i += 1;
-            if (i >= argv.len) return error.InvalidArgs;
-            data_dir = argv[i];
-        } else if (std.mem.eql(u8, arg, "--seeds")) {
-            i += 1;
-            if (i >= argv.len) return error.InvalidArgs;
-            seeds = try parseSeeds(argv[i], allocator);
-        } else if (std.mem.eql(u8, arg, "--tick-ms")) {
-            i += 1;
-            if (i >= argv.len) return error.InvalidArgs;
-            tick_ms = try std.fmt.parseInt(u32, argv[i], 10);
-        } else {
-            return error.InvalidArgs;
-        }
-        i += 1;
-    }
-
-    return .{
-        .id = id orelse return error.InvalidArgs,
-        .cluster_id = cluster_id,
-        .raft_addr = raft_addr orelse return error.InvalidArgs,
-        .client_addr = client_addr orelse return error.InvalidArgs,
-        .data_dir = data_dir orelse return error.InvalidArgs,
-        .seeds = seeds,
-        .tick_ms = tick_ms,
-    };
+/// Dump `--help` from the flag registry. flags.zig renders one line per
+/// field with default + docstring, plus a header per registered module.
+fn usage(alloc: std.mem.Allocator) void {
+    var help: std.ArrayList(u8) = .empty;
+    defer help.deinit(alloc);
+    flags.g().writeHelpAll(&help) catch {};
+    const stderr = std.fs.File.stderr();
+    _ = stderr.write(help.items) catch {};
+    _ = stderr.write("\n") catch {};
 }
 
 const log = std.log.scoped(.zdb_main);
@@ -100,6 +88,21 @@ fn deinitWithLog(comptime msg: []const u8, ptr: anytype) void {
     ptr.deinit();
     log.info("deinit: " ++ msg ++ " done", .{});
 }
+
+/// Bundle passed to appMain — the parsed-flags snapshots plus derived
+/// fields. `raft_addr` / `client_addr` are computed from
+/// `host:port+offset` once at startup and own their backing buffers.
+/// `seeds` is the comma-split version of `raft.seeds`. `wal_dir` is
+/// `data.wal_dir` if set, else `data.dir`.
+const Args = struct {
+    listen: ListenCfg,
+    raft: RaftCfg,
+    data: DataCfg,
+    raft_addr: []const u8,
+    client_addr: []const u8,
+    seeds: []const []const u8,
+    wal_dir: []const u8,
+};
 
 pub fn main() !void {
     defer log.info("shutdown complete", .{});
@@ -110,14 +113,67 @@ pub fn main() !void {
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
 
-    const args = parseArgs(allocator, argv) catch |err| {
-        usage();
-        return err;
-    };
-    defer allocator.free(args.seeds);
+    flags.initGlobal(allocator);
+    defer flags.deinitGlobal();
+    const live_listen = try flags.g().register("listen", ListenCfg);
+    const live_raft = try flags.g().register("raft", RaftCfg);
+    const live_data = try flags.g().register("data", DataCfg);
 
-    log.info("starting zdb-server id={d} cluster={d} raft={s} client={s} data={s} tick={d}ms seeds={d}", .{
-        args.id, args.cluster_id, args.raft_addr, args.client_addr, args.data_dir, args.tick_ms, args.seeds.len,
+    // --help is terminal; handle after registration so writeHelpAll has
+    // every module's fields populated.
+    for (argv[1..]) |a| {
+        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+            usage(allocator);
+            return;
+        }
+    }
+
+    var leftover: std.ArrayList([]const u8) = .empty;
+    defer leftover.deinit(allocator);
+    flags.g().parseArgv(argv[1..], &leftover) catch |err| {
+        std.log.err("flag parse failed: {s}", .{@errorName(err)});
+        usage(allocator);
+        std.process.exit(1);
+    };
+    if (leftover.items.len != 0) {
+        std.log.err("unexpected positional '{s}' — config goes through --listen/--raft/--data flags", .{leftover.items[0]});
+        usage(allocator);
+        std.process.exit(1);
+    }
+
+    const listen = live_listen.snapshot();
+    const raft_cfg = live_raft.snapshot();
+    const data_cfg = live_data.snapshot();
+    if (raft_cfg.id == 0 or data_cfg.dir.len == 0) {
+        std.log.err("--raft requires id (>0); --data requires dir", .{});
+        usage(allocator);
+        std.process.exit(1);
+    }
+
+    // Resolve listen addresses from host + base port + offset.
+    const raft_addr = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ listen.host, listen.raft_port + listen.offset });
+    defer allocator.free(raft_addr);
+    const client_addr = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ listen.host, listen.client_port + listen.offset });
+    defer allocator.free(client_addr);
+
+    // wal_dir defaults to data dir when empty — the common single-disk
+    // case. Setting it lets you put WAL on a faster device than the LSM.
+    const wal_dir = if (data_cfg.wal_dir.len > 0) data_cfg.wal_dir else data_cfg.dir;
+
+    const seeds = try parseSeedList(raft_cfg.seeds, allocator);
+    defer allocator.free(seeds);
+    const args: Args = .{
+        .listen = listen,
+        .raft = raft_cfg,
+        .data = data_cfg,
+        .raft_addr = raft_addr,
+        .client_addr = client_addr,
+        .seeds = seeds,
+        .wal_dir = wal_dir,
+    };
+
+    log.info("starting zdb-server id={d} cluster={d} raft={s} client={s} dir={s} wal={s} tick={d}ms seeds={d}", .{
+        raft_cfg.id, raft_cfg.cluster_id, raft_addr, client_addr, data_cfg.dir, wal_dir, raft_cfg.tick_ms, seeds.len,
     });
 
     // Initialize VFS with 500 MB/s bandwidth limit.
@@ -138,8 +194,8 @@ pub fn main() !void {
     log.info("runtime pool initialized", .{});
 
     // Open raft WAL.
-    log.info("opening raft WAL at {s}", .{args.data_dir});
-    var wal = try raft.DiskWAL.openPath(args.data_dir, allocator, 1024);
+    log.info("opening raft WAL at {s}", .{wal_dir});
+    var wal = try raft.DiskWAL.openPath(wal_dir, allocator, 1024);
     defer deinitWithLog("wal", &wal);
 
     const node = try raft.Node.init(
@@ -147,20 +203,20 @@ pub fn main() !void {
         &.{},
         &wal,
         .{
-            .id = args.id,
-            .cluster_id = args.cluster_id,
-            .listen_addr = args.raft_addr,
-            .tick_interval_ms = args.tick_ms,
+            .id = raft_cfg.id,
+            .cluster_id = raft_cfg.cluster_id,
+            .listen_addr = raft_addr,
+            .tick_interval_ms = raft_cfg.tick_ms,
         },
     );
     defer deinitWithLog("node", node);
 
-    log.info("raft node initialized id={d}", .{args.id});
+    log.info("raft node initialized id={d}", .{raft_cfg.id});
 
     // Open zdb forest.
-    log.info("opening forest at {s}", .{args.data_dir});
+    log.info("opening forest at {s}", .{data_cfg.dir});
     var forest = try zdb.forest.Forest.open(allocator, .{
-        .dir = args.data_dir,
+        .dir = data_cfg.dir,
     });
     defer {
         forest.close();
@@ -209,7 +265,7 @@ pub fn main() !void {
 /// Runs on the raft pool. Spawns raft runtime, client server (on query pool
 /// via runtime.pool() singleton), compaction loop (on background pool),
 /// and waits for SIGINT or SIGTERM to shut down.
-fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, node: *raft.Node, args: *const ParsedArgs) void {
+fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, node: *raft.Node, args: *const Args) void {
     log.info("inside appMain", .{});
     var group = zio.group();
     defer group.cancel();
@@ -291,12 +347,12 @@ fn runCompaction(s: *zdb_server.ZdbServer) void {
     handle.join();
 }
 
-fn runJoin(args: *const ParsedArgs, raft_rt: *raft.RaftRuntime) void {
+fn runJoin(args: *const Args, raft_rt: *raft.RaftRuntime) void {
     raft.joinCluster(
         raft_rt.allocator,
         args.seeds,
-        args.cluster_id,
-        args.id,
+        args.raft.cluster_id,
+        args.raft.id,
         args.raft_addr,
     ) catch |err| {
         std.log.err("cluster join failed: {s}", .{@errorName(err)});

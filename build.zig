@@ -533,6 +533,10 @@ fn addZdbServer(
     zdb_server_mod.addImport("runtime", runtime_mod);
     zdb_server_mod.addImport("metrics", metrics_mod);
 
+    // `flags` is its own module with no transitive deps; needed by main.zig
+    // for CLI parsing (single quoted `--node="k=v; k=v"` payload form).
+    const flags_mod = makeModule(b, target, optimize, "u/flags.zig");
+
     const exe = b.addExecutable(.{
         .name = "zdb-server",
         .root_module = makeModule(b, target, optimize, "zdb-server/main.zig"),
@@ -544,6 +548,7 @@ fn addZdbServer(
     exe.root_module.addImport("runtime", runtime_mod);
     exe.root_module.addImport("zdb_server", zdb_server_mod);
     exe.root_module.addImport("metrics", metrics_mod);
+    exe.root_module.addImport("flags", flags_mod);
     exe.step.dependOn(regen_buffers_step);
     b.installArtifact(exe);
 
