@@ -47,7 +47,7 @@ pub const Config = struct {
 pub const ConfigError = error{
     InvalidConfig,
 };
-pub const RaftWAL = raftwal_mod.RaftWAL;
+pub const DiskWAL = @import("diskwal.zig").DiskWAL;
 pub const RaftLogError = raftwal_mod.RaftLogError;
 
 pub const RaftError = error{
@@ -147,7 +147,7 @@ pub const Node = struct {
 
     current_term: u64,
     voted_for: ?NodeId,
-    log: RaftWAL,
+    log: *DiskWAL,
 
     state: State,
     commit_index: std.atomic.Value(u64),
@@ -211,7 +211,7 @@ pub const Node = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         peers: []const Peer,
-        log: RaftWAL,
+        log: *DiskWAL,
         config: Config,
     ) !*Node {
         try config.validate();

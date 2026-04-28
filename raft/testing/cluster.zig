@@ -5,45 +5,24 @@ pub const Node = raft.Node;
 pub const NodeId = raft.NodeId;
 pub const Config = raft.Config;
 
-pub const TestWalBackend = enum {
-    mem,
-    disk,
-};
-
-pub const test_wal_backend: TestWalBackend = .disk;
-
 pub const TestLog = struct {
-    mem: ?raft.MemWAL = null,
-    disk: ?raft.DiskWAL = null,
-    wal_dir: ?[]u8 = null,
+    disk: raft.DiskWAL,
+    wal_dir: []u8,
 
     pub fn init(allocator: std.mem.Allocator, id: NodeId) !TestLog {
-        var out: TestLog = .{};
-        switch (test_wal_backend) {
-            .mem => out.mem = raft.MemWAL.init(allocator),
-            .disk => {
-                const wal_dir = try makeWalDir(allocator, id);
-                out.wal_dir = wal_dir;
-                out.disk = try raft.DiskWAL.openPath(wal_dir, allocator, 1024);
-            },
-        }
-        return out;
-    }
-
-    pub fn deinit(self: *TestLog, allocator: std.mem.Allocator) void {
-        if (self.mem) |*log| log.deinit();
-        if (self.disk) |*storage| storage.deinit();
-        if (self.wal_dir) |wal_dir| {
+        const wal_dir = try makeWalDir(allocator, id);
+        errdefer {
             std.fs.cwd().deleteTree(wal_dir) catch {};
             allocator.free(wal_dir);
         }
+        const disk = try raft.DiskWAL.openPath(wal_dir, allocator, 1024);
+        return .{ .disk = disk, .wal_dir = wal_dir };
     }
 
-    pub fn asRaftWAL(self: *TestLog) raft.RaftWAL {
-        return switch (test_wal_backend) {
-            .mem => self.mem.?.asRaftWAL(),
-            .disk => self.disk.?.asRaftWAL(),
-        };
+    pub fn deinit(self: *TestLog, allocator: std.mem.Allocator) void {
+        self.disk.deinit();
+        std.fs.cwd().deleteTree(self.wal_dir) catch {};
+        allocator.free(self.wal_dir);
     }
 
     fn makeWalDir(allocator: std.mem.Allocator, id: NodeId) ![]u8 {
@@ -96,7 +75,7 @@ pub const TestCluster = struct {
             entry.node = try Node.init(
                 allocator,
                 peers,
-                entry.wal.asRaftWAL(),
+                &entry.wal.disk,
                 ncfg,
             );
             if (containsNode(learners, id)) {

@@ -35,7 +35,7 @@ fn makeLogEntry(
 
 fn appendEntry(
     alloc: std.mem.Allocator,
-    log: raft.RaftWAL,
+    log: *raft.DiskWAL,
     index: u64,
     term: u64,
     data: []const u8,
@@ -47,7 +47,7 @@ fn appendEntry(
 
 fn appendRange(
     alloc: std.mem.Allocator,
-    log: raft.RaftWAL,
+    log: *raft.DiskWAL,
     start: u64,
     end: u64,
     term: u64,
@@ -79,7 +79,7 @@ fn appendRange(
     }
 }
 
-fn checkRange(log: raft.RaftWAL, lo: u64, hi: u64) !void {
+fn checkRange(log: *raft.DiskWAL, lo: u64, hi: u64) !void {
     var result = log.entriesRange(.{ .lo = lo, .hi = hi }) catch |err| {
         std.debug.print("checkRange({d},{d}) entriesRange failed: {}\n", .{ lo, hi, err });
         return err;
@@ -142,7 +142,7 @@ test "diskwal term and index basics" {
 
     var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
     defer ds.deinit();
-    const log = ds.asRaftWAL();
+    const log = &ds;
 
     try std.testing.expectEqual(@as(u64, 1), log.firstIndex());
     try std.testing.expectEqual(@as(u64, 0), log.lastIndex());
@@ -169,7 +169,7 @@ test "diskwal entriesRange max_bytes keeps at least one" {
 
     var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
     defer ds.deinit();
-    const log = ds.asRaftWAL();
+    const log = &ds;
 
     try appendEntry(alloc, log, 1, 1, "1111");
     try appendEntry(alloc, log, 2, 1, "2222");
@@ -198,7 +198,7 @@ test "diskwal append overwrites conflicting suffix" {
 
     var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
     defer ds.deinit();
-    const log = ds.asRaftWAL();
+    const log = &ds;
 
     try appendEntry(alloc, log, 1, 1, "1");
     try appendEntry(alloc, log, 2, 1, "2");
@@ -230,7 +230,7 @@ test "diskwal truncateFrom drops suffix" {
 
     var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
     defer ds.deinit();
-    const log = ds.asRaftWAL();
+    const log = &ds;
 
     try appendEntry(alloc, log, 1, 1, "a");
     try appendEntry(alloc, log, 2, 1, "b");
@@ -253,7 +253,7 @@ test "diskwal persists hardstate and entries across reopen" {
     {
         var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
         defer ds.deinit();
-        const log = ds.asRaftWAL();
+        const log = &ds;
         try log.setHardState(.{
             .current_term = 7,
             .voted_for = 2,
@@ -266,7 +266,7 @@ test "diskwal persists hardstate and entries across reopen" {
     {
         var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
         defer ds2.deinit();
-        const log2 = ds2.asRaftWAL();
+        const log2 = &ds2;
         try std.testing.expectEqual(@as(u64, 2), log2.lastIndex());
         try std.testing.expectEqual(@as(?u64, 7), try log2.term(2));
         const hs = log2.hardState();
@@ -291,7 +291,7 @@ test "diskwal drops malformed trailing wal files on reopen" {
     {
         var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
         defer ds.deinit();
-        const log = ds.asRaftWAL();
+        const log = &ds;
         for (1..70) |i| {
             fillLargePayload(payload, @intCast(i));
             try appendEntry(alloc, log, @intCast(i), 1, payload);
@@ -329,7 +329,7 @@ test "diskwal drops malformed trailing wal files on reopen" {
     {
         var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
         defer ds2.deinit();
-        const log = ds2.asRaftWAL();
+        const log = &ds2;
         // Should have entries from the rotated file (at least the first segment's worth).
         try std.testing.expect(log.lastIndex() > 0);
     }
@@ -346,7 +346,7 @@ test "diskwal rejects snapshot-log firstIndex mismatch on reopen" {
     {
         var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
         defer ds.deinit();
-        const log = ds.asRaftWAL();
+        const log = &ds;
         try log.setSnapshot(.{ .index = 5, .term = 2, .data = "snap" });
         try log.sync();
     }
@@ -371,7 +371,7 @@ fn bigTestStorageImpl() !void {
     {
         var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
         defer ds.deinit();
-        const log = ds.asRaftWAL();
+        const log = &ds;
 
         try appendRange(alloc, log, 1, N, 1);
         try std.testing.expectEqual(N, log.lastIndex());
@@ -406,7 +406,7 @@ fn bigTestStorageImpl() !void {
     {
         var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
         defer ds2.deinit();
-        const log2 = ds2.asRaftWAL();
+        const log2 = &ds2;
         try std.testing.expectEqual(@as(u64, 60_099), log2.lastIndex());
         try checkRange(log2, 1, 60_100);
         try std.testing.expectEqual(@as(?u64, 4), try log2.term(60_000));
@@ -448,7 +448,7 @@ fn bigTestTruncateStorageImpl() !void {
 
     var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
     defer ds.deinit();
-    const log = ds.asRaftWAL();
+    const log = &ds;
 
     const num_entries: u64 = (raft.diskwal.max_num_entries * 3) / 2;
     const compact_to: u64 = raft.diskwal.max_num_entries + 10;
@@ -490,7 +490,7 @@ fn bigTestLargePayloadRotationImpl() !void {
     {
         var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
         defer ds.deinit();
-        const log = ds.asRaftWAL();
+        const log = &ds;
 
         var idx: u64 = 1;
         while (idx <= total_entries) : (idx += 1) {
@@ -541,7 +541,7 @@ fn bigTestLargePayloadRotationImpl() !void {
     {
         var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
         defer ds2.deinit();
-        const log2 = ds2.asRaftWAL();
+        const log2 = &ds2;
 
         try std.testing.expectEqual(total_entries, log2.lastIndex());
         try std.testing.expectEqual(@as(?u64, 1), try log2.term(1));
@@ -744,7 +744,7 @@ test "diskwal CURRENT.wal recovery after clean close" {
     {
         var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
         defer ds.deinit();
-        const log = ds.asRaftWAL();
+        const log = &ds;
         try appendRange(alloc, log, 1, 5, 1);
         try log.sync();
     }
@@ -753,7 +753,7 @@ test "diskwal CURRENT.wal recovery after clean close" {
     {
         var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
         defer ds.deinit();
-        const log = ds.asRaftWAL();
+        const log = &ds;
 
         try std.testing.expectEqual(@as(u64, 5), log.lastIndex());
         try std.testing.expectEqual(@as(?u64, 1), try log.term(1));
@@ -776,7 +776,7 @@ test "diskwal CRC corruption truncates at corrupt entry" {
     {
         var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
         defer ds.deinit();
-        const log = ds.asRaftWAL();
+        const log = &ds;
         try appendRange(alloc, log, 1, 5, 1);
         try log.sync();
     }
@@ -815,7 +815,7 @@ test "diskwal CRC corruption truncates at corrupt entry" {
     {
         var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
         defer ds.deinit();
-        const log = ds.asRaftWAL();
+        const log = &ds;
 
         try std.testing.expectEqual(@as(u64, 2), log.lastIndex());
         try checkRange(log, 1, 3);
@@ -844,7 +844,7 @@ test "diskwal rotation creates numbered file and new CURRENT.wal" {
     {
         var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
         defer ds.deinit();
-        const log = ds.asRaftWAL();
+        const log = &ds;
 
         const payload = try alloc.alloc(u8, payload_size);
         defer alloc.free(payload);
@@ -865,7 +865,7 @@ test "diskwal rotation creates numbered file and new CURRENT.wal" {
     {
         var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
         defer ds.deinit();
-        const log = ds.asRaftWAL();
+        const log = &ds;
 
         try std.testing.expectEqual(num_entries, log.lastIndex());
         // Check first, last, and a mid-rotation entry.

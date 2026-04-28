@@ -483,7 +483,6 @@ pub const wal = struct {
     current: *logFile, // points to files.items[files.items.len - 1]
     cache: EntryCache,
     next_fid: u64,
-    mu: zio.RwLock,
     /// Buffered framed records for the current file. `addEntries` appends
     /// here without touching disk; `sync` flushes via one pwrite (durable
     /// because the file was opened with O_DSYNC, so the syscall return
@@ -576,7 +575,6 @@ pub const wal = struct {
                 .current = &files.items[files.items.len - 1],
                 .cache = entry_cache,
                 .next_fid = 2,
-                .mu = .init,
             };
         }
 
@@ -648,8 +646,7 @@ pub const wal = struct {
                     .current = &opened.items[opened.items.len - 1],
                     .cache = entry_cache,
                     .next_fid = current.fid + 1,
-                    .mu = .init,
-                };
+                    };
             }
 
             // All files were malformed — start fresh.
@@ -670,7 +667,6 @@ pub const wal = struct {
                 .current = &files.items[files.items.len - 1],
                 .cache = entry_cache,
                 .next_fid = 2,
-                .mu = .init,
             };
         }
 
@@ -694,7 +690,6 @@ pub const wal = struct {
             .current = &opened.items[opened.items.len - 1],
             .cache = entry_cache,
             .next_fid = cur_fid + 1,
-            .mu = .init,
         };
     }
 
@@ -1089,6 +1084,10 @@ pub const DiskWAL = struct {
     /// the old `hard_state_cache` + `snapshot_cache` pointers go away.
     meta: meta.MetaStore,
     wal_store: wal,
+    /// Single rwlock guarding all DiskWAL state — covers both `meta` and
+    /// `wal_store` since the public API (hardState/snapshot/append/...)
+    /// can read/mutate either. Shared for reads, exclusive for writes.
+    mu: zio.RwLock = .init,
 
     pub fn openPath(
         path: []const u8,
@@ -1118,14 +1117,6 @@ pub const DiskWAL = struct {
         self.meta.deinit();
     }
 
-    pub fn asRaftWAL(self: *DiskWAL) raftlog.RaftWAL {
-        return .{ .ctx = self, .vtable = &vtable };
-    }
-
-    fn fromCtx(ctx: *anyopaque) *DiskWAL {
-        return @ptrCast(@alignCast(ctx));
-    }
-
     fn mapToRaftLogError(err: anyerror) raftlog.RaftLogError {
         return switch (err) {
             raftlog.RaftLogError.Compacted => raftlog.RaftLogError.Compacted,
@@ -1139,40 +1130,59 @@ pub const DiskWAL = struct {
         };
     }
 
-    // --- Implementation methods (no locking, caller must hold appropriate lock) ---
+    // --- Public API: each method takes the appropriate lock inline. Mode
+    // matches the prior vtable wrapping (shared for reads, exclusive for
+    // writes, _uncancelable for cheap struct-field reads where blocking
+    // on cancellation isn't useful).
 
-    fn hardState(self: *DiskWAL) *const raftlog.HardState {
+    pub fn hardState(self: *DiskWAL) *const raftlog.HardState {
+        self.mu.lockSharedUncancelable();
+        defer self.mu.unlockShared();
         return self.meta.hardState();
     }
 
-    fn setHardState(self: *DiskWAL, hs: raftlog.HardState) raftlog.RaftLogError!void {
+    pub fn setHardState(self: *DiskWAL, hs: raftlog.HardState) raftlog.RaftLogError!void {
+        try self.mu.lock();
+        defer self.mu.unlock();
         self.meta.setHardState(hs) catch |err| return mapToRaftLogError(err);
     }
 
-    fn snapshot(self: *DiskWAL) *const raftlog.Snapshot {
+    pub fn snapshot(self: *DiskWAL) *const raftlog.Snapshot {
+        self.mu.lockSharedUncancelable();
+        defer self.mu.unlockShared();
         return self.meta.snapshotState();
     }
 
-    fn setSnapshot(self: *DiskWAL, snap: raftlog.Snapshot) raftlog.RaftLogError!void {
+    pub fn setSnapshot(self: *DiskWAL, snap: raftlog.Snapshot) raftlog.RaftLogError!void {
+        try self.mu.lock();
+        defer self.mu.unlock();
         self.meta.setSnapshot(snap) catch |err| return mapToRaftLogError(err);
     }
 
-    fn firstIndex(self: *DiskWAL) u64 {
+    pub fn firstIndex(self: *DiskWAL) u64 {
+        self.mu.lockSharedUncancelable();
+        defer self.mu.unlockShared();
         return self.wal_store.firstIndex();
     }
 
-    fn lastIndex(self: *DiskWAL) u64 {
+    pub fn lastIndex(self: *DiskWAL) u64 {
+        self.mu.lockSharedUncancelable();
+        defer self.mu.unlockShared();
         return self.wal_store.lastIndex();
     }
 
-    fn lastTerm(self: *DiskWAL) u64 {
+    pub fn lastTerm(self: *DiskWAL) u64 {
+        self.mu.lockSharedUncancelable();
+        defer self.mu.unlockShared();
         const last_idx = self.wal_store.lastIndex();
         const snap_term = self.meta.snapshotState().term;
         if (last_idx == 0) return snap_term;
         return self.wal_store.term(last_idx) catch snap_term;
     }
 
-    fn term(self: *DiskWAL, idx: u64) raftlog.RaftLogError!?u64 {
+    pub fn term(self: *DiskWAL, idx: u64) raftlog.RaftLogError!?u64 {
+        try self.mu.lockShared();
+        defer self.mu.unlockShared();
         if (idx == 0) return 0;
         return self.wal_store.term(idx) catch |err| switch (err) {
             raftlog.RaftLogError.Compacted => null,
@@ -1182,13 +1192,17 @@ pub const DiskWAL = struct {
         };
     }
 
-    fn entriesRange(self: *DiskWAL, opts: raftlog.EntriesRangeOpts) raftlog.RaftLogError!raftlog.EntriesResult {
+    pub fn entriesRange(self: *DiskWAL, opts: raftlog.EntriesRangeOpts) raftlog.RaftLogError!raftlog.EntriesResult {
+        try self.mu.lockShared();
+        defer self.mu.unlockShared();
         return self.wal_store.allEntries(self.allocator, opts) catch |err| {
             return mapToRaftLogError(err);
         };
     }
 
-    fn firstIndexOfTerm(self: *DiskWAL, term_value: u64) u64 {
+    pub fn firstIndexOfTerm(self: *DiskWAL, term_value: u64) u64 {
+        self.mu.lockSharedUncancelable();
+        defer self.mu.unlockShared();
         var idx = self.wal_store.firstIndex();
         const last = self.wal_store.lastIndex();
         while (idx <= last) : (idx += 1) {
@@ -1198,108 +1212,31 @@ pub const DiskWAL = struct {
         return 0;
     }
 
-    fn append(self: *DiskWAL, entries: []const raftlog.LogEntryBuffer) raftlog.RaftLogError!void {
+    pub fn append(self: *DiskWAL, entries: []const raftlog.LogEntryBuffer) raftlog.RaftLogError!void {
+        try self.mu.lock();
+        defer self.mu.unlock();
         self.wal_store.addEntries(entries) catch |err| return mapToRaftLogError(err);
     }
 
-    fn truncateFrom(self: *DiskWAL, from_index: u64) raftlog.RaftLogError!void {
+    pub fn truncateFrom(self: *DiskWAL, from_index: u64) raftlog.RaftLogError!void {
+        try self.mu.lock();
+        defer self.mu.unlock();
         self.wal_store.truncateFrom(from_index);
     }
 
-    fn compactUntil(self: *DiskWAL, index: u64) raftlog.RaftLogError!void {
+    pub fn compactUntil(self: *DiskWAL, index: u64) raftlog.RaftLogError!void {
+        try self.mu.lock();
+        defer self.mu.unlock();
         self.wal_store.deleteBefore(index);
     }
 
-    fn sync(self: *DiskWAL) raftlog.RaftLogError!void {
+    pub fn sync(self: *DiskWAL) raftlog.RaftLogError!void {
         // MetaStore writes are durable inline (state.bin opens with O_DSYNC,
         // snapshot.bin uses tmp+rename+dir-sync), so only the WAL needs an
         // explicit sync here.
+        try self.mu.lockShared();
+        defer self.mu.unlockShared();
         self.wal_store.sync(true) catch |err| return mapToRaftLogError(err);
-    }
-
-    const vtable = raftlog.RaftWAL.VTable{
-        .hardState = withLock(.shared_uncancelable, hardState),
-        .setHardState = withLock(.exclusive, setHardState),
-        .snapshot = withLock(.shared_uncancelable, snapshot),
-        .setSnapshot = withLock(.exclusive, setSnapshot),
-        .firstIndex = withLock(.shared_uncancelable, firstIndex),
-        .lastIndex = withLock(.shared_uncancelable, lastIndex),
-        .lastTerm = withLock(.shared_uncancelable, lastTerm),
-        .term = withLock(.shared, term),
-        .entriesRange = withLock(.shared, entriesRange),
-        .firstIndexOfTerm = withLock(.shared_uncancelable, firstIndexOfTerm),
-        .append = withLock(.exclusive, append),
-        .truncateFrom = withLock(.exclusive, truncateFrom),
-        .compactUntil = withLock(.exclusive, compactUntil),
-        .sync = withLock(.shared, sync),
-    };
-
-    /// Generate a vtable-compatible function pointer that acquires a lock,
-    /// casts ctx to *DiskWAL, calls the implementation fn, then releases.
-    /// The impl fn takes (*DiskWAL, ...extra args) and returns RaftLogError!T.
-    /// The generated fn takes (*anyopaque, ...extra args) and returns RaftLogError!T.
-    fn VtableFn(comptime Impl: type) type {
-        const info = @typeInfo(Impl).@"fn";
-        const RetType = info.return_type.?;
-        // Build vtable param types: replace first param (*DiskWAL) with *anyopaque.
-        var vtable_params: [info.params.len]std.builtin.Type.Fn.Param = undefined;
-        for (info.params, 0..) |p, i| {
-            vtable_params[i] = if (i == 0) .{ .is_generic = false, .is_noalias = false, .type = *anyopaque } else p;
-        }
-        return *const @Type(.{ .@"fn" = .{
-            .calling_convention = .auto,
-            .is_generic = false,
-            .is_var_args = false,
-            .return_type = RetType,
-            .params = &vtable_params,
-        } });
-    }
-
-    const LockMode = enum { shared, shared_uncancelable, exclusive };
-
-    fn withLock(comptime mode: LockMode, comptime impl: anytype) VtableFn(@TypeOf(impl)) {
-        const Impl = @TypeOf(impl);
-        const param_count = @typeInfo(Impl).@"fn".params.len;
-
-        const Wrapper = struct {
-            fn acquire(self: *DiskWAL) switch (mode) {
-                .shared => zio.Cancelable!void,
-                .shared_uncancelable => void,
-                .exclusive => zio.Cancelable!void,
-            } {
-                switch (mode) {
-                    .shared => try self.wal_store.mu.lockShared(),
-                    .shared_uncancelable => self.wal_store.mu.lockSharedUncancelable(),
-                    .exclusive => try self.wal_store.mu.lock(),
-                }
-            }
-            fn release(self: *DiskWAL) void {
-                switch (mode) {
-                    .shared, .shared_uncancelable => self.wal_store.mu.unlockShared(),
-                    .exclusive => self.wal_store.mu.unlock(),
-                }
-            }
-        };
-
-        return switch (param_count) {
-            1 => &struct {
-                fn f(ctx: *anyopaque) @typeInfo(Impl).@"fn".return_type.? {
-                    const self = fromCtx(ctx);
-                    if (mode == .shared_uncancelable) Wrapper.acquire(self) else try Wrapper.acquire(self);
-                    defer Wrapper.release(self);
-                    return @call(.auto, impl, .{self});
-                }
-            }.f,
-            2 => &struct {
-                fn f(ctx: *anyopaque, a1: @typeInfo(Impl).@"fn".params[1].type.?) @typeInfo(Impl).@"fn".return_type.? {
-                    const self = fromCtx(ctx);
-                    if (mode == .shared_uncancelable) Wrapper.acquire(self) else try Wrapper.acquire(self);
-                    defer Wrapper.release(self);
-                    return @call(.auto, impl, .{ self, a1 });
-                }
-            }.f,
-            else => @compileError("withLockImpl: unsupported arity"),
-        };
     }
 };
 

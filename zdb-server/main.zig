@@ -133,12 +133,10 @@ pub fn main() !void {
     var wal = try raft.DiskWAL.openPath(args.data_dir, allocator, 1024);
     defer deinitWithLog("wal", &wal);
 
-    const wal_iface = wal.asRaftWAL();
-
     const node = try raft.Node.init(
         allocator,
         &.{},
-        wal_iface,
+        &wal,
         .{
             .id = args.id,
             .cluster_id = args.cluster_id,
