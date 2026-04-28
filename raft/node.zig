@@ -1518,11 +1518,10 @@ pub const Node = struct {
         metrics.g().observePhase("propose_build", t_build);
 
         // Sub-phase: propose_persist — DiskWAL.append batches the framed
-        // records into one pwrite; sync() is the (currently HACK-disabled)
-        // fdatasync. This is the I/O-bound half of `propose`.
+        // records into one pwrite. The fdatasync is no longer issued here;
+        // mainLoop spawns it in a fiber so it can overlap with broadcast.
         const t_persist = std.time.microTimestamp();
         try self.log.append(entries.items);
-        try self.log.sync();
         metrics.g().observePhase("propose_persist", t_persist);
 
         if (has_conf) self.pending_conf_change = true;
@@ -1687,6 +1686,15 @@ pub const Node = struct {
         }
     }
 
+    /// Helper used by mainLoop to spawn the WAL fsync into a sub-fiber so
+    /// the leader can broadcast AppendEntries while the local sync is in
+    /// flight (Raft paper §7 pipelining). Passes `log_grew` so the fiber
+    /// is a fast no-op on iterations that didn't append anything new.
+    fn syncLogTask(self: *Node, log_grew: bool) RaftLogError!void {
+        if (!log_grew) return;
+        return self.log.sync();
+    }
+
     /// Main processing loop. Blocks on event_ch, drains inbound messages,
     /// processes proposals, advances state, and broadcasts to peers.
     pub fn mainLoop(self: *Node, tick_interval_ms: u32) void {
@@ -1723,15 +1731,23 @@ pub const Node = struct {
             _ = self.processProposalRequests(64) catch {};
             metrics.g().observePhase("propose", t);
 
-            // Phase: advance — advanceCommitIndex + applyConfChanges + notify
-            // the apply loop. Cheap on the leader, but worth measuring because
-            // a slow apply notify would back-pressure proposes.
+            // Spawn WAL fsync into a sub-fiber so it can overlap with
+            // broadcast (Raft paper §7 pipelining). `log_grew=false` makes
+            // the spawned fiber a fast no-op. Defer-join handles the
+            // multi-voter case (sync runs concurrent with broadcast); the
+            // explicit early-join below handles single-voter where advance
+            // would otherwise commit unsynced entries.
+            const log_grew = self.log.lastIndex() > last_before;
+            var sync_handle = zio.spawn(syncLogTask, .{ self, log_grew }) catch @panic("zio.spawn syncLogTask");
+            defer _ = sync_handle.join();
+            if (self.quorum_size == 1) _ = sync_handle.join();
+
+            // Phase: advance — advanceCommitIndex + applyConfChanges + notify.
             t = std.time.microTimestamp();
             self.advance();
             metrics.g().observePhase("advance", t);
 
             const ci_advanced = self.commit_index.load(.acquire) > ci_before;
-            const log_grew = self.log.lastIndex() > last_before;
 
             var heartbeat_due = false;
             const now = std.time.microTimestamp();
@@ -1740,9 +1756,9 @@ pub const Node = struct {
                 last_tick = now;
             }
 
-            // Phase: broadcast — send AE to every peer that has work to ship.
-            // This is the chunk that doubled throughput when peers went away
-            // (single-node bench), so it's the prime suspect under multi-node.
+            // Phase: broadcast — for multi-voter clusters, the WAL fsync
+            // runs concurrently with these network sends. The deferred join
+            // at the bottom of this iteration awaits the sync.
             t = std.time.microTimestamp();
             self.maybeBroadcast(heartbeat_due or ci_advanced or log_grew);
             metrics.g().observePhase("broadcast", t);
