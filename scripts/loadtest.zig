@@ -42,7 +42,7 @@ const RunCfg = struct {
     duration_ms: u64 = 360_000, // 6 minutes
     monitor_interval_ms: u64 = 10_000,
     bootstrap_timeout_ms: u64 = 30_000,
-    stop_grace_ms: u64 = 2000,
+    stop_grace_ms: u64 = 10000,
     /// SIGKILL any stale `zdb-server` / `zdb-bench` processes before starting.
     /// Useful between iterative runs where a previous server crashed without
     /// releasing its raft port — saves the user from running pkill manually.
@@ -214,16 +214,6 @@ fn spawnServer(
     seeds: ?[]const u8,
 ) !ServerProc {
     try std.fs.cwd().makePath(data_dir);
-
-    // Preserve the previous run's log instead of truncating: if `log_path`
-    // exists, rename it to `log_path.<unix_seconds>` so post-mortem
-    // analysis of an earlier run survives the next iteration. The shell
-    // redirect (`>log_path 2>&1`) below will create a fresh file.
-    if (std.fs.cwd().access(log_path, .{})) |_| {
-        var rotated_buf: [256]u8 = undefined;
-        const rotated = std.fmt.bufPrint(&rotated_buf, "{s}.{d}", .{ log_path, std.time.timestamp() }) catch log_path;
-        std.fs.cwd().rename(log_path, rotated) catch {};
-    } else |_| {}
     const log_file = try std.fs.cwd().createFile(log_path, .{ .truncate = true });
 
     const raft_s = try raftAddrStr(alloc, node);
@@ -460,10 +450,9 @@ fn cmdRun(alloc: std.mem.Allocator) !void {
 
     if (cfg_run.kill_existing) try killStaleServers(alloc);
 
-    // keep_logs=true so the previous run's per-node logs survive — they
-    // get rotated to nodeN.log.<unix_seconds> by spawnServer below. Manual
-    // `loadtest clean` still wipes everything (cmdClean → keep_logs=false).
-    try cleanWorkdir(alloc, true);
+    // Start every run from a clean log directory so node logs and final
+    // stats files always belong to just this run.
+    try cleanWorkdir(alloc, false);
     try std.fs.cwd().makePath(data_root);
     try std.fs.cwd().makePath(log_root);
 
@@ -529,13 +518,20 @@ fn cmdRun(alloc: std.mem.Allocator) !void {
 
     var bench = std.process.Child.init(&.{
         bench_bin,
-        "--addr",           leader_client_addr,
-        "--clients",        clients_str,
-        "--verify-clients", verify_str,
-        "--records",        records_str,
-        "--value-size",     value_size_str,
-        "--namespaces",     ns_str,
-        "--batch-size",     batch_str,
+        "--addr",
+        leader_client_addr,
+        "--clients",
+        clients_str,
+        "--verify-clients",
+        verify_str,
+        "--records",
+        records_str,
+        "--value-size",
+        value_size_str,
+        "--namespaces",
+        ns_str,
+        "--batch-size",
+        batch_str,
         "--load",
     }, alloc);
     bench.stdout_behavior = .Inherit;

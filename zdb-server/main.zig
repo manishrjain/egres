@@ -208,7 +208,7 @@ pub fn main() !void {
 
 /// Runs on the raft pool. Spawns raft runtime, client server (on query pool
 /// via runtime.pool() singleton), compaction loop (on background pool),
-/// and waits for SIGINT to shut down.
+/// and waits for SIGINT or SIGTERM to shut down.
 fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, node: *raft.Node, args: *const ParsedArgs) void {
     log.info("inside appMain", .{});
     var group = zio.group();
@@ -237,12 +237,21 @@ fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, node: *ra
     log.info("appMain: spawning compaction loop on background pool", .{});
     group.spawn(runCompaction, .{zdb_srv}) catch return;
 
-    log.info("appMain: waiting for SIGINT (ctrl+c to shutdown)", .{});
-    var sig = zio.Signal.init(.interrupt) catch return;
-    defer sig.deinit();
-    sig.wait() catch return;
+    log.info("appMain: waiting for SIGINT/SIGTERM to shutdown", .{});
+    var sigint = zio.Signal.init(.interrupt) catch return;
+    defer sigint.deinit();
+    var sigterm = zio.Signal.init(.terminate) catch return;
+    defer sigterm.deinit();
 
-    log.info("received SIGINT, shutting down...", .{});
+    const result = zio.select(.{
+        .sigint = &sigint,
+        .sigterm = &sigterm,
+    }) catch return;
+
+    switch (result) {
+        .sigint => log.info("received SIGINT, shutting down...", .{}),
+        .sigterm => log.info("received SIGTERM, shutting down...", .{}),
+    }
     node.startShutdown();
 }
 
