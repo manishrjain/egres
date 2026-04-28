@@ -314,9 +314,20 @@ pub const ZdbServer = struct {
                 continue;
             }
             if (self.forest.bestCompactionCandidate()) |target| {
-                self.proposeCompaction(target) catch |err| {
-                    log.err("proposeCompaction failed: {s}", .{@errorName(err)});
-                };
+                // The candidate carries `needs_split=true` when the tree's
+                // Lmax has outgrown the split threshold. updateCompactCandidate
+                // sets this in the apply path (after every compaction/flush),
+                // so the dispatch here always reflects the latest applied
+                // state — no separate polling for splits is needed.
+                if (target.candidate.needs_split) {
+                    self.proposeSplit(target.tree_id) catch |err| {
+                        log.err("proposeSplit failed for tree {d}: {s}", .{ target.tree_id, @errorName(err) });
+                    };
+                } else {
+                    self.proposeCompaction(target) catch |err| {
+                        log.err("proposeCompaction failed: {s}", .{@errorName(err)});
+                    };
+                }
             } else {
                 zio.sleep(interval) catch return;
             }
@@ -351,6 +362,28 @@ pub const ZdbServer = struct {
         try self.distributeNewFiles(changes.items);
 
         const payload = try encodeManifestChange(self.allocator, 3, changes.items, &.{}, 0);
+        defer self.allocator.free(payload);
+        try self.proposeAndWait(payload);
+    }
+
+    fn proposeSplit(self: *ZdbServer, tree_id: u64) !void {
+        // buildSplit allocates table_changes / tree_changes on the arena;
+        // encodeManifestChange copies the bytes into a self-owned payload,
+        // so the arena can be torn down right after encode. No new SST
+        // files are produced (split just remaps existing tables between
+        // trees), so distributeNewFiles is unnecessary here. cmd=4 routes
+        // through applyManifestChange to applySplit on every node.
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const mc = try self.forest.buildSplit(arena.allocator(), tree_id) orelse return;
+
+        const payload = try encodeManifestChange(
+            self.allocator,
+            mc.cmd,
+            mc.table_changes,
+            mc.tree_changes,
+            0,
+        );
         defer self.allocator.free(payload);
         try self.proposeAndWait(payload);
     }

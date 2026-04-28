@@ -365,6 +365,7 @@ fn addZdbTests(
     const zdb_cache_tests = b.addTest(.{
         .root_module = makeModule(b, target, optimize, "zdb/cache.zig"),
     });
+    zdb_cache_tests.root_module.addImport("utils", utils_mod);
 
     zdb_levels_tests.root_module.addImport("zio", zio_mod);
     zdb_levels_tests.root_module.addImport("utils", utils_mod);

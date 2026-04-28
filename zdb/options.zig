@@ -33,8 +33,11 @@ pub const Options = struct {
     table_size_multiplier: i64 = 2,
     max_table_size: i64 = 128 * 1024 * 1024,
 
-    // Tree split threshold: split a tree into two when it exceeds this size.
-    tree_split_size: i64 = 6 * 1024 * 1024 * 1024, // 6 GiB
+    // Tree split threshold. Compared against the bottom level (Lmax) size
+    // after each compaction; when Lmax exceeds this, the tree splits at the
+    // median key into two trees. Lmax holds ~90% of an LSM tree's data, so
+    // this is effectively the per-tree size cap.
+    tree_split_size: i64 = 5 * 1024 * 1024 * 1024, // 5 GiB
 
     pub fn validate(self: Options) Error!void {
         // Badger semantics: exactly one compactor causes pathological level behavior.

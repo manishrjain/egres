@@ -189,10 +189,10 @@ pub fn testForestSplitTree() !void {
         const tree = f.getTree(1).?;
         try std.testing.expectEqual(@as(usize, 3), tree.levels[1].numTables());
 
-        // splitTree requires the write lock.
+        // splitTreeForTests requires the write lock.
         f.mu.lock();
         defer f.mu.unlock();
-        try f.splitTree(1);
+        try f.splitTreeForTests(1);
 
         // Now 2 trees should exist.
         try std.testing.expectEqual(@as(usize, 2), f.trees.count());

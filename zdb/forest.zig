@@ -971,24 +971,12 @@ pub const Forest = struct {
         return result.data;
     }
 
-    pub fn compact(self: *Forest) !bool {
-        const b = self.bestCompactionCandidate() orelse return false;
-        try b.tree.doCompact(b.candidate.level, &self.next_file_id);
-        self.table_cache.clearStale();
-
-        const linfo = b.tree.lowestLevelSize();
-        if (linfo.size > self.opts.tree_split_size) {
-            self.mu.lock();
-            defer self.mu.unlock();
-            try self.splitTree(b.tree_id);
-        }
-
-        return true;
-    }
-
-    /// splitTree splits the given tree at the median key of its bottommost level.
-    /// Caller must hold the write lock.
-    pub fn splitTree(self: *Forest, tree_id: u64) !void {
+    /// splitTreeForTests splits the given tree at the median key of its
+    /// bottommost level, locally, without going through Raft. **Test-only**
+    /// — production must propose splits through the manifest pipeline so
+    /// all nodes apply the same split deterministically; see
+    /// `proposeSplit` in zdb-server. Caller must hold the write lock.
+    pub fn splitTreeForTests(self: *Forest, tree_id: u64) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const mc = try self.buildSplit(arena.allocator(), tree_id) orelse return;
