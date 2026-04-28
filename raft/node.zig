@@ -1523,15 +1523,14 @@ pub const Node = struct {
         // mainLoop spawns it in a fiber so it can overlap with broadcast.
         const t_persist = std.time.microTimestamp();
         try self.log.append(entries.items);
-        metrics.g().observePhase("propose_persist", t_persist);
+        metrics.g().observePhase("log_append", t_persist);
 
         if (has_conf) self.pending_conf_change = true;
     }
 
     // processProposalRequests is just checking for proposals in proposal_requests queue, and
     // proposing them. This is only relevant to the leader node. Followers won't have this.
-    pub fn processProposalRequests(self: *Node, max_batch: usize) RaftError!usize {
-        _ = max_batch;
+    pub fn processProposalRequests(self: *Node) RaftError!usize {
         if (self.isShuttingDown()) {
             while (self.proposal_ch.tryReceive()) |req| {
                 self.allocator.free(req.data);
@@ -1727,8 +1726,7 @@ pub const Node = struct {
             // register apply callbacks. Sub-phases ("propose_build" and
             // "propose_persist") are observed inside appendProposalsToLeaderLog.
             t = std.time.microTimestamp();
-            // TODO: What happens to the rest of the requests?
-            _ = self.processProposalRequests(64) catch {};
+            _ = self.processProposalRequests() catch {};
             metrics.g().observePhase("propose", t);
             const log_grew = self.log.lastIndex() > last_before;
 
@@ -1751,7 +1749,7 @@ pub const Node = struct {
                 sync_handle.join() catch |err| {
                     raft_log.err("node {d}: sync_handle.join (pre-advance) failed: {s}", .{ self.id, @errorName(err) });
                 };
-                metrics.g().observePhase("sync_wait", t);
+                metrics.g().observePhase("log_sync_q_one", t);
                 sync_pending = false;
             }
 
@@ -1784,7 +1782,7 @@ pub const Node = struct {
                 sync_handle.join() catch |err| {
                     raft_log.err("node {d}: sync_handle.join (post-broadcast) failed: {s}", .{ self.id, @errorName(err) });
                 };
-                metrics.g().observePhase("sync_wait", t);
+                metrics.g().observePhase("log_sync_q_many", t);
             }
         }
     }

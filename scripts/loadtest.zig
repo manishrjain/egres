@@ -214,6 +214,16 @@ fn spawnServer(
     seeds: ?[]const u8,
 ) !ServerProc {
     try std.fs.cwd().makePath(data_dir);
+
+    // Preserve the previous run's log instead of truncating: if `log_path`
+    // exists, rename it to `log_path.<unix_seconds>` so post-mortem
+    // analysis of an earlier run survives the next iteration. The shell
+    // redirect (`>log_path 2>&1`) below will create a fresh file.
+    if (std.fs.cwd().access(log_path, .{})) |_| {
+        var rotated_buf: [256]u8 = undefined;
+        const rotated = std.fmt.bufPrint(&rotated_buf, "{s}.{d}", .{ log_path, std.time.timestamp() }) catch log_path;
+        std.fs.cwd().rename(log_path, rotated) catch {};
+    } else |_| {}
     const log_file = try std.fs.cwd().createFile(log_path, .{ .truncate = true });
 
     const raft_s = try raftAddrStr(alloc, node);
@@ -406,15 +416,25 @@ fn monitorFiber(ctx: *MonitorCtx) void {
 
 // --- subcommands ------------------------------------------------------------
 
-fn cmdClean(alloc: std.mem.Allocator) !void {
+fn cleanWorkdir(alloc: std.mem.Allocator, keep_logs: bool) !void {
     const root = try repoRoot(alloc);
     defer alloc.free(root);
-    inline for (.{ "loadtest-data", "loadtest-logs", "loadtest-metrics.tsv" }) |name| {
+    const always = [_][]const u8{ "loadtest-data", "loadtest-metrics.tsv" };
+    for (always) |name| {
         const p = try std.fs.path.join(alloc, &.{ root, name });
         defer alloc.free(p);
         std.fs.cwd().deleteTree(p) catch {};
     }
-    std.log.info("cleaned", .{});
+    if (!keep_logs) {
+        const p = try std.fs.path.join(alloc, &.{ root, "loadtest-logs" });
+        defer alloc.free(p);
+        std.fs.cwd().deleteTree(p) catch {};
+    }
+    std.log.info("cleaned (keep_logs={})", .{keep_logs});
+}
+
+fn cmdClean(alloc: std.mem.Allocator) !void {
+    return cleanWorkdir(alloc, false);
 }
 
 fn cmdStats(alloc: std.mem.Allocator, node: u32) !void {
@@ -440,7 +460,10 @@ fn cmdRun(alloc: std.mem.Allocator) !void {
 
     if (cfg_run.kill_existing) try killStaleServers(alloc);
 
-    try cmdClean(alloc);
+    // keep_logs=true so the previous run's per-node logs survive — they
+    // get rotated to nodeN.log.<unix_seconds> by spawnServer below. Manual
+    // `loadtest clean` still wipes everything (cmdClean → keep_logs=false).
+    try cleanWorkdir(alloc, true);
     try std.fs.cwd().makePath(data_root);
     try std.fs.cwd().makePath(log_root);
 
