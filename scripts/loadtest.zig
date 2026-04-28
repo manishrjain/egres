@@ -277,6 +277,45 @@ fn stopServer(sp: *ServerProc) void {
 
 // --- bootstrap ---------------------------------------------------------------
 
+/// Promote every non-bootstrap node from learner → voter. Joiners (nodes
+/// 2..N) come up as learners by default; without this step they never
+/// participate in quorum and the leader's `quorum_size` stays at 1.
+fn promoteLearnersToVoters(alloc: std.mem.Allocator) !void {
+    var leader_node: u32 = 1;
+    var node: u32 = 2;
+    while (node <= cfg_run.nodes) : (node += 1) {
+        const deadline = std.time.milliTimestamp() + @as(i64, @intCast(cfg_run.bootstrap_timeout_ms));
+        while (true) {
+            if (std.time.milliTimestamp() > deadline) {
+                std.log.err("promote timeout for node {d}", .{node});
+                return error.PromoteTimeout;
+            }
+            const cmd = try std.fmt.allocPrint(alloc, "conf to_voter {d}\n", .{node});
+            defer alloc.free(cmd);
+            const resp = sendLineRecvLine(alloc, leader_node, cmd) catch {
+                try zio.sleep(zio.Duration.fromMilliseconds(500));
+                continue;
+            };
+            defer alloc.free(resp);
+
+            if (std.mem.startsWith(u8, resp, "OK")) {
+                std.log.info("promoted node {d} to voter via leader {d}", .{ node, leader_node });
+                break;
+            }
+            if (std.mem.startsWith(u8, resp, "NOT_LEADER ")) {
+                const id_str = resp["NOT_LEADER ".len..];
+                const leader_id = std.fmt.parseInt(u32, id_str, 10) catch 0;
+                if (leader_id != 0 and leader_id != leader_node) {
+                    leader_node = leader_id;
+                }
+                try zio.sleep(zio.Duration.fromMilliseconds(200));
+                continue;
+            }
+            try zio.sleep(zio.Duration.fromMilliseconds(500));
+        }
+    }
+}
+
 fn bootstrapNamespaces(alloc: std.mem.Allocator, ns_count: u32) !void {
     var leader_node: u32 = 1;
     const deadline = std.time.milliTimestamp() + @as(i64, @intCast(cfg_run.bootstrap_timeout_ms));
@@ -435,6 +474,9 @@ fn cmdRun(alloc: std.mem.Allocator) !void {
 
     // --- let Raft elect, then bootstrap ---
     try zio.sleep(zio.Duration.fromSeconds(1));
+    // Promote joining nodes from learner → voter so we run as a real
+    // multi-voter cluster. Skipped automatically when nodes == 1.
+    try promoteLearnersToVoters(alloc);
     try bootstrapNamespaces(alloc, cfg_run.namespaces);
 
     // --- monitor fiber ---

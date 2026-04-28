@@ -8,6 +8,7 @@ pub const Command = union(enum) {
     conf: ConfCmd,
     ns_create: NsCreateCmd,
     stats: StatsCmd,
+    info: InfoCmd,
 };
 
 pub const NsCreateCmd = struct {
@@ -15,6 +16,11 @@ pub const NsCreateCmd = struct {
 };
 
 pub const StatsCmd = struct {};
+
+/// Dump cluster topology + per-peer raft progress (as the queried node
+/// sees it). Best-effort snapshot — races against conf changes are
+/// possible but tolerated; this is an admin endpoint, not a hot path.
+pub const InfoCmd = struct {};
 
 pub const SetCmd = struct {
     ns: u32,
@@ -57,12 +63,18 @@ pub const ConfCmd = struct {
 };
 
 /// Read one text command from the buffered reader. Returns null on EOF.
+/// Blank lines are skipped silently — common in line-based protocols
+/// where intermediate tools (nc, terminal, etc.) sometimes inject a
+/// trailing empty line on EOF.
 pub fn readCommand(r: *std.Io.Reader, line_buf: []u8) !?Command {
-    const line = readLine(r, line_buf) catch |err| switch (err) {
-        error.EndOfStream => return null,
-        else => return err,
-    };
-    return try parseLine(line);
+    while (true) {
+        const line = readLine(r, line_buf) catch |err| switch (err) {
+            error.EndOfStream => return null,
+            else => return err,
+        };
+        if (line.len == 0) continue;
+        return try parseLine(line);
+    }
 }
 
 fn readLine(r: *std.Io.Reader, buf: []u8) ![]const u8 {
@@ -214,6 +226,8 @@ fn parseLine(line: []const u8) !Command {
         return .{ .ns_create = .{ .ns = ns } };
     } else if (std.mem.eql(u8, cmd, "stats")) {
         return .{ .stats = .{} };
+    } else if (std.mem.eql(u8, cmd, "info")) {
+        return .{ .info = .{} };
     } else {
         return error.UnknownCommand;
     }

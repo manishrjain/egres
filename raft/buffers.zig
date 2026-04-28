@@ -94,7 +94,7 @@ pub const AppendEntriesReply = schema.Table(.{
     .{ .id = 2, .name = "status", .ty = schema.B64 },
     .{ .name = "success", .ty = schema.Bool(.{ .field_id = 2, .bit = 0 }) },
     .{ .id = 3, .name = "from", .ty = schema.U64 },
-    .{ .id = 4, .name = "match_index", .ty = schema.U64 },
+    .{ .id = 4, .name = "last_index", .ty = schema.U64 },
     .{ .id = 5, .name = "conflict_term", .ty = schema.U64 },
     .{ .id = 6, .name = "conflict_index", .ty = schema.U64 },
 });

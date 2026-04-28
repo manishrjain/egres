@@ -1968,7 +1968,7 @@ pub const AppendEntriesReplyStruct = struct {
     term: u64 = 0,
     status: u64 = 0,
     from: u64 = 0,
-    match_index: u64 = 0,
+    last_index: u64 = 0,
     conflict_term: u64 = 0,
     conflict_index: u64 = 0,
 
@@ -1978,7 +1978,7 @@ pub const AppendEntriesReplyStruct = struct {
             .term = r.term(),
             .status = r.status(),
             .from = r.from(),
-            .match_index = r.matchIndex(),
+            .last_index = r.lastIndex(),
             .conflict_term = r.conflictTerm(),
             .conflict_index = r.conflictIndex(),
         };
@@ -2009,7 +2009,7 @@ pub const AppendEntriesReplyStruct = struct {
             .term = self.term,
             .status = self.status,
             .from = self.from,
-            .match_index = self.match_index,
+            .last_index = self.last_index,
             .conflict_term = self.conflict_term,
             .conflict_index = self.conflict_index,
         };
@@ -2030,7 +2030,7 @@ pub const AppendEntriesReplyStruct = struct {
         try writer.setTerm(self.term);
         try writer.statusSet(self.status);
         try writer.setFrom(self.from);
-        try writer.setMatchIndex(self.match_index);
+        try writer.setLastIndex(self.last_index);
         try writer.setConflictTerm(self.conflict_term);
         try writer.setConflictIndex(self.conflict_index);
         const result = try writer.finish();
@@ -2099,7 +2099,7 @@ pub const AppendEntriesReplyReader = struct {
         return zbuf.readU64(self.buf, @as(usize, self.base + 20)) catch 0;
     }
 
-    pub fn matchIndex(self: Self) u64 {
+    pub fn lastIndex(self: Self) u64 {
         const slot_end = @as(u32, self.base) + 36;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
@@ -2151,7 +2151,7 @@ pub const AppendEntriesReplyBuffer = struct {
         try writer.setTerm(reader.term());
         try writer.statusSet(reader.status());
         try writer.setFrom(reader.from());
-        try writer.setMatchIndex(reader.matchIndex());
+        try writer.setLastIndex(reader.lastIndex());
         try writer.setConflictTerm(reader.conflictTerm());
         try writer.setConflictIndex(reader.conflictIndex());
         const result = try writer.finish();
@@ -2255,7 +2255,7 @@ pub const AppendEntriesReplyWriter = struct {
         try zbuf.patchU64(out.items, self.base + 20, v);
     }
 
-    pub fn setMatchIndex(self: *Self, v: u64) Error!void {
+    pub fn setLastIndex(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
         try zbuf.patchU64(out.items, self.base + 28, v);
     }
@@ -2279,7 +2279,7 @@ pub const AppendEntriesReplyWriter = struct {
         if (@hasField(Values, "term")) try self.setTerm(@field(values, "term"));
         if (@hasField(Values, "status")) try self.statusSet(@field(values, "status"));
         if (@hasField(Values, "from")) try self.setFrom(@field(values, "from"));
-        if (@hasField(Values, "match_index")) try self.setMatchIndex(@field(values, "match_index"));
+        if (@hasField(Values, "last_index")) try self.setLastIndex(@field(values, "last_index"));
         if (@hasField(Values, "conflict_term")) try self.setConflictTerm(@field(values, "conflict_term"));
         if (@hasField(Values, "conflict_index")) try self.setConflictIndex(@field(values, "conflict_index"));
     }

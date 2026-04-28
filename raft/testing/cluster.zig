@@ -210,7 +210,7 @@ pub const TestCluster = struct {
             try peers.append(allocator, .{
                 .id = id,
                 .next_index = 1,
-                .match_index = 0,
+                .last_index = 0,
                 .role = role,
             });
         }

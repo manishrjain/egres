@@ -388,14 +388,13 @@ pub const ZdbServer = struct {
 
         while (!self.node.isShuttingDown()) {
             const cmd = proto.readCommand(r, line_buf) catch |err| {
-                if (ops > 0) {
-                    log.info("client disconnected after {d} ops: {s}", .{ ops, @errorName(err) });
-                } else {
-                    log.debug("client error: {s}", .{@errorName(err)});
-                }
-                // Send error back for parse errors, then continue.
-                proto.writeErr(stream, @errorName(err)) catch return;
-                continue;
+                // A parse error leaves the byte stream in an unknown state
+                // (mid-line, oversized line, etc.) — continuing the loop
+                // here would spam ERR until the client gives up. Close
+                // instead; the client can reconnect with a fresh stream.
+                log.warn("client parse error after {d} ops: {s} — closing", .{ ops, @errorName(err) });
+                proto.writeErr(stream, @errorName(err)) catch {};
+                return;
             } orelse {
                 log.info("client disconnected after {d} ops (EOF)", .{ops});
                 return;
@@ -426,6 +425,9 @@ pub const ZdbServer = struct {
                 },
                 .stats => |_| {
                     self.handleStats(stream) catch return;
+                },
+                .info => |_| {
+                    self.handleInfo(stream) catch return;
                 },
             }
         }
@@ -643,6 +645,77 @@ pub const ZdbServer = struct {
             },
             else => try proto.writeErr(stream, @tagName(ctx.status)),
         }
+    }
+
+    fn handleInfo(self: *ZdbServer, stream: zio.net.Stream) !void {
+        // Best-effort snapshot of node + peer state. Races against an
+        // in-flight conf change are possible (peers map mutated by
+        // mainLoop's applyConfChange); accepted because this is an admin
+        // endpoint, not a hot path. Output is one `node` line per cluster
+        // member with the same column shape, so progress is visually
+        // alignable. The local node's line carries extra cluster-wide
+        // fields (term/leader/quorum/commit/apply/first) at the end.
+        // Blank line terminates — same shape as `stats` so simple clients
+        // can read until `\n\n`.
+        var body: std.Io.Writer.Allocating = .init(self.allocator);
+        defer body.deinit();
+        const w = &body.writer;
+
+        const node = self.node;
+        const leader_id = node.getLeaderId() orelse 0;
+        const last_idx = node.log.lastIndex();
+
+        // Self row — `last` = local last_index (Raft's `lastLogIndex`),
+        // `next` = last+1 (the index the next append would write).
+        // Role is left-padded to 9 chars so the column aligns with peer
+        // rows regardless of "leader" / "follower" / "voter" / etc.
+        // Cluster-wide extras (term/leader/quorum/commit/apply/log range)
+        // come at the end of the line.
+        try w.print(
+            "node id={d} role={s:<9} last={d} next={d} addr={s}  term={d} leader={d} quorum={d} commit={d} apply={d} log=[{d},{d}]\n",
+            .{
+                node.id,
+                @tagName(node.state),
+                last_idx,
+                last_idx + 1,
+                node.config.listen_addr,
+                node.current_term,
+                leader_id,
+                node.quorum_size,
+                node.commit_index.load(.acquire),
+                node.apply_index.load(.acquire),
+                node.log.firstIndex(),
+                last_idx,
+            },
+        );
+
+        // Peer rows. Only the leader has authoritative match/next per
+        // peer (Raft's `matchIndex[]` is leader-side state); followers
+        // don't track each other's replication progress. So followers
+        // show just role + addr — the operator should query the leader
+        // (route via `leader=` in the self-row above) for real progress.
+        const is_leader = node.state == .leader;
+        var it = node.peers.iterator();
+        while (it.next()) |kv| {
+            const peer = kv.value_ptr.*;
+            if (is_leader) {
+                try w.print("node id={d} role={s:<9} last={d} next={d} addr={s}\n", .{
+                    kv.key_ptr.*,
+                    @tagName(peer.role),
+                    peer.last_index,
+                    peer.next_index,
+                    peer.addr,
+                });
+            } else {
+                try w.print("node id={d} role={s:<9} addr={s}\n", .{
+                    kv.key_ptr.*,
+                    @tagName(peer.role),
+                    peer.addr,
+                });
+            }
+        }
+        try w.writeByte('\n');
+        try stream.writeAll(body.writer.buffered(), .none);
     }
 
     fn handleStats(self: *ZdbServer, stream: zio.net.Stream) !void {

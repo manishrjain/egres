@@ -71,7 +71,8 @@ pub const Peer = struct {
     id: NodeId,
     next_index: u64,
     // Highest log index known to be replicated on this peer (leader view).
-    match_index: u64,
+    // Raft's `matchIndex[i]` — kept here under the more readable name.
+    last_index: u64,
     role: PeerRole,
     addr: []const u8 = "",
 };
@@ -754,7 +755,7 @@ pub const Node = struct {
         while (peer_it.next()) |kv| {
             const p = kv.value_ptr.*;
             dbg("  peer id={d} role={s} addr={s} match={d} next={d}", .{
-                p.id, @tagName(p.role), p.addr, p.match_index, p.next_index,
+                p.id, @tagName(p.role), p.addr, p.last_index, p.next_index,
             });
         }
     }
@@ -908,7 +909,7 @@ pub const Node = struct {
         var it = self.peers.iterator();
         while (it.next()) |kv| {
             kv.value_ptr.next_index = 1;
-            kv.value_ptr.match_index = 0;
+            kv.value_ptr.last_index = 0;
         }
 
         // On bootstrap (first leader election, no conf changes yet), register
@@ -1199,7 +1200,7 @@ pub const Node = struct {
         if (ae_term < self.current_term) {
             try self.sendAppendEntriesReply(leader_id, .{
                 .success = false,
-                .match_index = 0,
+                .last_index = 0,
                 .conflict_term = 0,
                 .conflict_index = self.log.lastIndex() + 1,
             });
@@ -1218,7 +1219,7 @@ pub const Node = struct {
             if (prev_term_opt == null or prev_term_opt.? != ae.prevLogTerm()) {
                 try self.sendAppendEntriesReply(leader_id, .{
                     .success = false,
-                    .match_index = 0,
+                    .last_index = 0,
                     .conflict_term = prev_term_opt orelse 0,
                     .conflict_index = if (prev_term_opt) |t| self.log.firstIndexOfTerm(t) else self.log.lastIndex() + 1,
                 });
@@ -1273,7 +1274,7 @@ pub const Node = struct {
         }
         try self.sendAppendEntriesReply(leader_id, .{
             .success = true,
-            .match_index = self.log.lastIndex(),
+            .last_index = self.log.lastIndex(),
             .conflict_term = 0,
             .conflict_index = 0,
         });
@@ -1303,9 +1304,9 @@ pub const Node = struct {
         }
 
         if (self.peers.getPtr(from)) |state| {
-            const match_index = aer.matchIndex();
-            state.match_index = match_index;
-            state.next_index = match_index + 1;
+            const last_idx = aer.lastIndex();
+            state.last_index = last_idx;
+            state.next_index = last_idx + 1;
         }
     }
 
@@ -1690,8 +1691,7 @@ pub const Node = struct {
     /// the leader can broadcast AppendEntries while the local sync is in
     /// flight (Raft paper §7 pipelining). Passes `log_grew` so the fiber
     /// is a fast no-op on iterations that didn't append anything new.
-    fn syncLogTask(self: *Node, log_grew: bool) RaftLogError!void {
-        if (!log_grew) return;
+    fn syncLogTask(self: *Node) RaftLogError!void {
         return self.log.sync();
     }
 
@@ -1730,17 +1730,30 @@ pub const Node = struct {
             // TODO: What happens to the rest of the requests?
             _ = self.processProposalRequests(64) catch {};
             metrics.g().observePhase("propose", t);
+            const log_grew = self.log.lastIndex() > last_before;
 
             // Spawn WAL fsync into a sub-fiber so it can overlap with
-            // broadcast (Raft paper §7 pipelining). `log_grew=false` makes
-            // the spawned fiber a fast no-op. Defer-join handles the
-            // multi-voter case (sync runs concurrent with broadcast); the
-            // explicit early-join below handles single-voter where advance
-            // would otherwise commit unsynced entries.
-            const log_grew = self.log.lastIndex() > last_before;
-            var sync_handle = zio.spawn(syncLogTask, .{ self, log_grew }) catch @panic("zio.spawn syncLogTask");
-            defer _ = sync_handle.join();
-            if (self.quorum_size == 1) _ = sync_handle.join();
+            // broadcast (Raft paper §7 pipelining). `addEntries` already
+            // populated cache + write_buf; the spawned `sync()` does the
+            // pwrite (durable due to O_DSYNC) on a separate fiber.
+            var sync_handle = zio.spawn(syncLogTask, .{self}) catch @panic("zio.spawn syncLogTask");
+            // Tracks whether we still need to join the sync handle. Set to
+            // false in the q==1 branch (where we wait early). We capture
+            // this decision *before* advance(), since advance can apply
+            // conf changes that mutate quorum_size mid-iteration.
+            var sync_pending: bool = true;
+
+            // When quorum_size == 1, advance() would commit through the
+            // just-appended (unsynced) entries since the leader is sole
+            // voter. Wait for sync before advance in that case.
+            if (self.quorum_size == 1) {
+                t = std.time.microTimestamp();
+                sync_handle.join() catch |err| {
+                    raft_log.err("node {d}: sync_handle.join (pre-advance) failed: {s}", .{ self.id, @errorName(err) });
+                };
+                metrics.g().observePhase("sync_wait", t);
+                sync_pending = false;
+            }
 
             // Phase: advance — advanceCommitIndex + applyConfChanges + notify.
             t = std.time.microTimestamp();
@@ -1757,11 +1770,22 @@ pub const Node = struct {
             }
 
             // Phase: broadcast — for multi-voter clusters, the WAL fsync
-            // runs concurrently with these network sends. The deferred join
-            // at the bottom of this iteration awaits the sync.
+            // runs concurrently with these network sends.
             t = std.time.microTimestamp();
             self.maybeBroadcast(heartbeat_due or ci_advanced or log_grew);
             metrics.g().observePhase("broadcast", t);
+
+            // Phase: sync_wait — time waiting for the sync fiber to finish
+            // AFTER broadcast already completed. Near-zero when sync fully
+            // overlapped broadcast; positive when broadcast finished first
+            // and we're still waiting on disk.
+            if (sync_pending) {
+                t = std.time.microTimestamp();
+                sync_handle.join() catch |err| {
+                    raft_log.err("node {d}: sync_handle.join (post-broadcast) failed: {s}", .{ self.id, @errorName(err) });
+                };
+                metrics.g().observePhase("sync_wait", t);
+            }
         }
     }
 
@@ -1874,7 +1898,7 @@ pub const Node = struct {
 
     fn sendAppendEntriesReply(self: *Node, to: NodeId, opts: struct {
         success: bool,
-        match_index: u64,
+        last_index: u64,
         conflict_term: u64,
         conflict_index: u64,
     }) !void {
@@ -1885,7 +1909,7 @@ pub const Node = struct {
             .term = self.current_term,
             .success = opts.success,
             .from = self.id,
-            .match_index = opts.match_index,
+            .last_index = opts.last_index,
             .conflict_term = opts.conflict_term,
             .conflict_index = opts.conflict_index,
         });
@@ -1910,7 +1934,7 @@ pub const Node = struct {
         var it = self.peers.valueIterator();
         while (it.next()) |peer| {
             if (peer.role != .voter) continue;
-            matches.append(self.allocator, peer.match_index) catch return;
+            matches.append(self.allocator, peer.last_index) catch return;
         }
 
         if (matches.items.len == 0) return;
@@ -2030,7 +2054,7 @@ pub const Node = struct {
         _ = self.peers.put(id, .{
             .id = id,
             .next_index = self.log.lastIndex() + 1,
-            .match_index = 0,
+            .last_index = 0,
             .role = role,
             .addr = owned_addr,
         }) catch {
