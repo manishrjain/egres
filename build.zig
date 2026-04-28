@@ -89,6 +89,7 @@ pub fn build(b: *std.Build) void {
     // TODO: rewrite multiproc harness to use zdb-server
     _ = addRaftMultiprocHarness(b, target, optimize, raft_mod, regen_buffers_step);
     addBenchZio(b, target, optimize);
+    addBenchDiskwal(b, target, optimize, raft_mod, regen_buffers_step);
     const net_test_step = addNetTests(b, target, optimize);
 
     const all_test_step = b.step("test", "Run all tests");
@@ -682,6 +683,37 @@ fn addBenchZio(
 
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench-zio", "Run zio vs std.Thread benchmarks");
+    bench_step.dependOn(&run_bench.step);
+}
+
+fn addBenchDiskwal(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    raft_mod: *std.Build.Module,
+    regen_buffers_step: *std.Build.Step,
+) void {
+    // Reuse modules already wired through raft_mod so we don't recompile
+    // vfs/zio from scratch and get duplicate-file errors.
+    const zio_mod = raft_mod.import_table.get("zio").?;
+    const vfs_mod = raft_mod.import_table.get("vfs").?;
+
+    const bench_exe = b.addExecutable(.{
+        .name = "diskwal-bench",
+        // Always ReleaseFast — a Debug WAL bench is useless (allocator
+        // overhead swamps the measurement).
+        .root_module = makeModule(b, target, .ReleaseFast, "benchmarks/diskwal_bench.zig"),
+    });
+    bench_exe.root_module.addImport("zio", zio_mod);
+    bench_exe.root_module.addImport("raft", raft_mod);
+    bench_exe.root_module.addImport("vfs", vfs_mod);
+    bench_exe.step.dependOn(regen_buffers_step);
+    b.installArtifact(bench_exe);
+    _ = optimize;
+
+    const run_bench = b.addRunArtifact(bench_exe);
+    if (b.args) |fwd_args| run_bench.addArgs(fwd_args);
+    const bench_step = b.step("bench-diskwal", "Run DiskWAL append/fsync benchmark");
     bench_step.dependOn(&run_bench.step);
 }
 

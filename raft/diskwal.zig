@@ -130,7 +130,7 @@ pub const logFile = struct {
 
         var handle = try vfs_inst.openFile(alloc, path, .{
             .mode = .default,
-            .flags = .{ .writable = true },
+            .flags = .{ .writable = true, .dsync = true },
         });
         errdefer handle.close();
 
@@ -208,7 +208,7 @@ pub const logFile = struct {
 
         var handle = try vfs_inst.openFile(alloc, path, .{
             .mode = .default,
-            .flags = .{ .writable = true },
+            .flags = .{ .writable = true, .dsync = true },
         });
         errdefer handle.close();
 
@@ -289,7 +289,7 @@ pub const logFile = struct {
 
         var handle = try vfs_inst.createFile(path, .{
             .mode = .default,
-            .flags = .{ .writable = true, .truncate = true },
+            .flags = .{ .writable = true, .truncate = true, .dsync = true },
         });
         errdefer handle.close();
 
@@ -321,7 +321,10 @@ pub const logFile = struct {
     }
 
     pub fn syncFile(self: *logFile) !void {
-        try self.handle.sync();
+        // NOTE:We are opening files with dsync =  true, we can just turn this off.
+        // try self.handle.sync();
+        _ = self;
+        return;
     }
 
     pub fn truncateFile(self: *logFile, size: u64) !void {
@@ -481,6 +484,12 @@ pub const wal = struct {
     cache: EntryCache,
     next_fid: u64,
     mu: zio.RwLock,
+    /// Buffered framed records for the current file. `addEntries` appends
+    /// here without touching disk; `sync` flushes via one pwrite (durable
+    /// because the file was opened with O_DSYNC, so the syscall return
+    /// implies on-disk persistence). On rotation, this is flushed to the
+    /// outgoing file before creating the next one.
+    write_buf: std.ArrayList(u8) = .empty,
 
     const Pos = struct {
         file_idx: usize,
@@ -693,6 +702,7 @@ pub const wal = struct {
         self.cache.deinit();
         for (self.files.items) |*lf| lf.deinit();
         self.files.deinit(self.allocator);
+        self.write_buf.deinit(self.allocator);
         self.allocator.free(self.dir_path);
     }
 
@@ -951,17 +961,18 @@ pub const wal = struct {
     }
 
     /// Flush pending writes, write header to current file, then create a new file.
-    fn rotate(self: *wal, write_buf: *std.ArrayList(u8)) !void {
-        // Flush any pending writes before rotation.
-        try self.current.flushWriteBuffer(write_buf.items);
-        write_buf.shrinkRetainingCapacity(0);
+    fn rotate(self: *wal) !void {
+        // Mid-batch rotation: flush whatever's accumulated for the outgoing
+        // file before we move to a new one. With O_DSYNC the pwrite is the
+        // durable point, so no separate fdatasync is needed.
+        try self.current.flushWriteBuffer(self.write_buf.items);
+        self.write_buf.clearRetainingCapacity();
 
         const prev = self.current.lastEntry();
 
-        // Write header with slot metadata, truncate to actual data, sync.
+        // Write header with slot metadata, truncate to actual data.
         try self.current.writeHeader();
         try self.current.truncateFile(self.current.write_offset);
-        try self.current.syncFile();
 
         // Mark current as rotated.
         self.current.is_current = false;
@@ -986,11 +997,9 @@ pub const wal = struct {
         // Raft invariant: written indices must be strictly contiguous.
         if (first_index != self.current.lastEntry().index + 1) return raftlog.RaftLogError.Invalid;
 
-        // Batch writes into a single buffer, flush once (or per rotation boundary).
-        var write_buf = std.ArrayList(u8).empty;
-        defer write_buf.deinit(self.allocator);
-
-        // This loop validates batch-internal continuity while buffering writes.
+        // Append into self.write_buf — the actual pwrite is deferred to
+        // sync(). Cache + slot table get updated immediately so reads see
+        // the new entries before they hit disk.
         var expected_index = first_index;
         for (entries) |entry_buf| {
             const reader = try entry_buf.initReader();
@@ -1001,20 +1010,17 @@ pub const wal = struct {
             if (self.current.firstEmptySlot() >= max_num_entries or
                 self.current.write_offset + record_header_size + bytes.len > log_file_size)
             {
-                // Segment full: flush buffer, rotate, continue in new file.
-                // rotate() flushes write_buf and resets it.
-                try self.rotate(&write_buf);
+                // Segment full: rotate (which flushes self.write_buf to the
+                // outgoing file before creating the new one).
+                try self.rotate();
             }
 
             // Buffer the CRC-framed record (no I/O), update in-memory slots.
-            try self.current.appendRecordToBuffer(&write_buf, bytes, reader);
+            try self.current.appendRecordToBuffer(&self.write_buf, bytes, reader);
 
-            // Populate cache.
+            // Populate cache so reads see the entry pre-sync.
             self.cache.append(reader.index(), reader.term(), bytes) catch {};
         }
-
-        // Flush remaining writes in one call.
-        try self.current.flushWriteBuffer(write_buf.items);
     }
 
     pub fn deleteBefore(self: *wal, raft_index: u64) void {
@@ -1040,6 +1046,7 @@ pub const wal = struct {
         self.current.slots.shrinkRetainingCapacity(1);
         self.current.write_offset = log_file_offset;
         self.cache.clear();
+        self.write_buf.clearRetainingCapacity();
     }
 
     // Drops entries from `from_index` onward, keeping prefix entries intact.
@@ -1060,12 +1067,19 @@ pub const wal = struct {
         self.current.truncateFromSlot(pos.slot_idx);
         self.current.is_current = true;
         self.cache.truncateFrom(from_index);
+        // Any buffered (not-yet-pwritten) records were appended for the
+        // truncated suffix on `current`; drop them so the next append starts
+        // fresh from the truncated write_offset.
+        self.write_buf.clearRetainingCapacity();
     }
 
     pub fn sync(self: *wal, _: bool) !void {
-
-        // The other files should have already been synced. No need to resync them.
-        try self.current.syncFile();
+        // Flush the buffered framed records via one pwrite. With O_DSYNC the
+        // syscall returns only after the data is on disk, so no separate
+        // fdatasync is needed. (Older segments were flushed at rotation.)
+        if (self.write_buf.items.len == 0) return;
+        try self.current.flushWriteBuffer(self.write_buf.items);
+        self.write_buf.clearRetainingCapacity();
     }
 };
 
