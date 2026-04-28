@@ -144,8 +144,12 @@ pub const Limiter = struct {
         const elapsed_ms = now - old_refill;
         if (elapsed_ms <= 0) return;
 
-        const elapsed: u64 = @intCast(elapsed_ms);
-        const added = @min(self.pages_per_sec, elapsed * self.pages_per_sec / 1_000);
+        // Clamp elapsed to one second: the bucket caps at `pages_per_sec`
+        // anyway (one second's worth of capacity), so longer gaps add no
+        // more pages — and clamping prevents `elapsed * pages_per_sec`
+        // from overflowing u64 on long pauses or extreme rate configs.
+        const elapsed: u64 = @min(@as(u64, @intCast(elapsed_ms)), 1_000);
+        const added = elapsed * self.pages_per_sec / 1_000;
         if (added == 0) return;
 
         // Race to claim this refill window.

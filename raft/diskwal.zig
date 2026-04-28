@@ -475,6 +475,10 @@ pub const logFile = struct {
     }
 };
 
+/// Inner WAL implementation. NOT internally synchronized — assumes the
+/// caller (`DiskWAL`) holds `DiskWAL.mu` in the appropriate mode (shared
+/// for reads, exclusive for mutations). Exposing `wal` directly without
+/// going through `DiskWAL` is unsafe under concurrency.
 pub const wal = struct {
     allocator: std.mem.Allocator,
     vfs_inst: *const vfs_mod.VFS,

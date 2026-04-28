@@ -272,11 +272,14 @@ var g_limiter: bandwidth.Limiter = undefined;
 var g_vfs: VFS = undefined;
 var g_initialized = false;
 
-/// Returns the global VFS instance. Lazily initialized with unlimited bandwidth.
-/// Call `VFS.initGlobal()` before this to configure bandwidth.
+/// Returns the global VFS instance. Lazily initialized with a generous-but-
+/// finite default (1 TiB/s) — high enough to be effectively unthrottled
+/// for any realistic disk workload, low enough that `tryRefill`'s
+/// `elapsed_ms * pages_per_sec` arithmetic stays well within u64 even with
+/// the per-call elapsed clamp. Call `VFS.initGlobal()` to override.
 pub fn g() *VFS {
     if (!g_initialized) {
-        g_limiter = bandwidth.Limiter.init(.{ .bytes_per_sec = std.math.maxInt(u64) });
+        g_limiter = bandwidth.Limiter.init(.{ .bytes_per_sec = 1024 * 1024 * 1024 * 1024 });
         g_vfs = .{ .bw = &g_limiter };
         g_initialized = true;
     }
