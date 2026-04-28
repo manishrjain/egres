@@ -460,10 +460,12 @@ fn makeRaftModule(
 
     const serial_mod = makeModule(b, target, optimize, "net/serial.zig");
     serial_mod.addImport("zio", zio_mod);
+    serial_mod.addImport("utils", utils_mod);
 
     const transport_mod = makeModule(b, target, optimize, "net/transport.zig");
     transport_mod.addImport("zio", zio_mod);
     transport_mod.addImport("serial", serial_mod);
+    transport_mod.addImport("utils", utils_mod);
 
     const vfs_mod = makeModule(b, target, optimize, "vfs/vfs.zig");
     vfs_mod.addImport("zio", zio_mod);
@@ -797,12 +799,17 @@ fn addNetTests(
     });
     const zio_mod = zio_dep.module("zio");
 
+    const utils_mod_test = makeModule(b, target, optimize, "u/utils.zig");
+    utils_mod_test.addImport("zio", zio_mod);
+
     const serial_mod_test = makeModule(b, target, optimize, "net/serial.zig");
     serial_mod_test.addImport("zio", zio_mod);
+    serial_mod_test.addImport("utils", utils_mod_test);
 
     const transport_mod = makeModule(b, target, optimize, "net/transport.zig");
     transport_mod.addImport("zio", zio_mod);
     transport_mod.addImport("serial", serial_mod_test);
+    transport_mod.addImport("utils", utils_mod_test);
 
     // TODO: Rewrite transport_test.zig to use Serial instead of Mux.
     const net_test_step = b.step("test-net", "Run net tests");

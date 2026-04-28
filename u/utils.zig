@@ -106,6 +106,42 @@ pub const ThreadSafeError = struct {
     }
 };
 
+/// Heap-allocated, ref-counted byte buffer. Used to share payloads across
+/// fan-out send paths (e.g. AE / file push) without per-peer memcpy: caller
+/// wraps an owned slice in `RefValue.init`, then `incrRef` per peer and
+/// hands each ref off to the transport queue. Each writer fiber `decrRef`s
+/// after writing — when the count reaches zero, the data slice and the
+/// RefValue itself are freed with the original allocator.
+pub const RefValue = struct {
+    data: []u8,
+    allocator: std.mem.Allocator,
+    ref: std.atomic.Value(i32),
+
+    pub fn init(allocator: std.mem.Allocator, data: []u8) !*RefValue {
+        const v = try allocator.create(RefValue);
+        v.* = .{ .data = data, .allocator = allocator, .ref = std.atomic.Value(i32).init(1) };
+        return v;
+    }
+
+    pub fn incrRef(self: *RefValue) *RefValue {
+        _ = self.ref.fetchAdd(1, .monotonic);
+        return self;
+    }
+
+    pub fn decrRef(self: *RefValue) void {
+        const prev = self.ref.fetchSub(1, .acq_rel);
+        std.debug.assert(prev > 0);
+        if (prev == 1) {
+            self.allocator.free(self.data);
+            self.allocator.destroy(self);
+        }
+    }
+
+    pub fn byteSize(self: *const RefValue) usize {
+        return self.data.len;
+    }
+};
+
 /// DEPRECATED — prefer `zio.Channel(T)` for new code. Channel covers every
 /// use case this Queue does:
 ///   - fail-fast push/pop: `Channel.trySend` / `Channel.tryReceive`

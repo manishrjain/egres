@@ -1,6 +1,7 @@
 const std = @import("std");
 const zio = @import("zio");
 const serial_mod = @import("serial");
+const utils = @import("utils");
 const Serial = serial_mod.Serial;
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.transport);
@@ -233,11 +234,13 @@ pub const Transport = struct {
         return listener.socket.address.ip.getPort();
     }
 
-    /// Queue a message for sending to a peer. Non-blocking.
-    pub fn sendMsg(self: *Transport, peer_id: u64, priority: Priority, message_type: u16, payload: []const u8) !void {
+    /// Queue a refcounted payload for sending to a peer. Non-blocking.
+    /// Borrows `value`: `queueMsg` incrRefs on successful enqueue (writer
+    /// decrRefs after sending). Caller retains its own ref and is responsible
+    /// for decrRef'ing when done. Fan-out is just calling this once per peer.
+    pub fn sendMsg(self: *Transport, peer_id: u64, priority: Priority, message_type: u16, value: *utils.RefValue) !void {
         const s = self.getPeerConn(peer_id, priority) orelse return error.PeerNotConnected;
-        const owned = try self.allocator.dupe(u8, payload);
-        s.queueMsg(message_type, owned);
+        s.queueMsg(message_type, value);
     }
 
     fn acceptLoop(self: *Transport) void {

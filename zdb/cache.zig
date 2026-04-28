@@ -20,41 +20,13 @@
 //! For []const u8 keys, the cache takes ownership of the key on put.
 
 const std = @import("std");
+const utils = @import("utils");
 const Allocator = std.mem.Allocator;
 
-// ---------------------------------------------------------------------------
-// Value — heap-allocated, ref-counted cache entry
-// ---------------------------------------------------------------------------
-
-pub const Value = struct {
-    data: []u8,
-    allocator: Allocator,
-    ref: std.atomic.Value(i32),
-
-    pub fn init(allocator: Allocator, data: []u8) !*Value {
-        const v = try allocator.create(Value);
-        v.* = .{ .data = data, .allocator = allocator, .ref = std.atomic.Value(i32).init(1) };
-        return v;
-    }
-
-    pub fn incrRef(self: *Value) *Value {
-        _ = self.ref.fetchAdd(1, .monotonic);
-        return self;
-    }
-
-    pub fn decrRef(self: *Value) void {
-        const prev = self.ref.fetchSub(1, .acq_rel);
-        std.debug.assert(prev > 0);
-        if (prev == 1) {
-            self.allocator.free(self.data);
-            self.allocator.destroy(self);
-        }
-    }
-
-    pub fn byteSize(self: *const Value) usize {
-        return self.data.len;
-    }
-};
+// Re-export the canonical refcounted buffer from utils. Kept under the old
+// name so existing cache call sites (`cache_mod.Value.init`, `incrRef`, etc.)
+// keep compiling without churn.
+pub const Value = utils.RefValue;
 
 // ---------------------------------------------------------------------------
 // Helpers

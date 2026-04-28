@@ -591,14 +591,20 @@ pub const Node = struct {
 
             // Build payload: [8B file_id][4B crc32][data]
             const payload = try self.allocator.alloc(u8, 12 + data.len);
-            defer self.allocator.free(payload);
             std.mem.writeInt(u64, payload[0..8], file_id, .little);
             std.mem.writeInt(u32, payload[8..12], std.hash.crc.Crc32Iscsi.hash(data), .little);
             @memcpy(payload[12..], data);
 
+            // Wrap once; sendMsg incrRefs per peer enqueued, no per-peer copy.
+            const value = utils.RefValue.init(self.allocator, payload) catch {
+                self.allocator.free(payload);
+                continue;
+            };
+            defer value.decrRef();
+
             var peer_it = self.peers.iterator();
             while (peer_it.next()) |kv| {
-                tr.sendMsg(kv.key_ptr.*, .p1, serial_mod.msg_type_file_push, payload) catch {};
+                tr.sendMsg(kv.key_ptr.*, .p1, serial_mod.msg_type_file_push, value) catch {};
             }
         }
 
@@ -652,11 +658,15 @@ pub const Node = struct {
 
         // Send all requested IDs in one message: [N * 8B file_ids]
         const payload = try self.allocator.alloc(u8, file_ids.len * 8);
-        defer self.allocator.free(payload);
         for (file_ids, 0..) |fid, i| {
             std.mem.writeInt(u64, payload[i * 8 ..][0..8], fid, .little);
         }
-        tr.sendMsg(leader, .p1, serial_mod.msg_type_file_request, payload) catch |err| {
+        const value = utils.RefValue.init(self.allocator, payload) catch {
+            self.allocator.free(payload);
+            return;
+        };
+        defer value.decrRef();
+        tr.sendMsg(leader, .p1, serial_mod.msg_type_file_request, value) catch |err| {
             raft_log.err("requestFiles: send failed: {s}", .{@errorName(err)});
         };
 
@@ -1716,12 +1726,18 @@ pub const Node = struct {
     }
 
     fn sendEncoded(self: *Node, to: NodeId, payload: []u8) void {
-        if (self.transport) |tr| {
-            tr.sendMsg(to, .p0, serial_mod.msg_type_raft, payload) catch |err| {
-                utils.logEvery(5, "sendMsg to {d} failed: {s}", .{ to, @errorName(err) });
-            };
-        }
-        self.allocator.free(payload);
+        const tr = self.transport orelse {
+            self.allocator.free(payload);
+            return;
+        };
+        const value = utils.RefValue.init(self.allocator, payload) catch {
+            self.allocator.free(payload);
+            return;
+        };
+        defer value.decrRef();
+        tr.sendMsg(to, .p0, serial_mod.msg_type_raft, value) catch |err| {
+            utils.logEvery(5, "sendMsg to {d} failed: {s}", .{ to, @errorName(err) });
+        };
     }
 
     fn decodeConfChange(self: *Node, reader: zen.ConfChangeReader) RaftError!ConfChange {

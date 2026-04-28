@@ -1,5 +1,6 @@
 const std = @import("std");
 const zio = @import("zio");
+const utils = @import("utils");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.serial);
 
@@ -16,7 +17,10 @@ pub const msg_type_file_request: u16 = 7; // [N * 8B file_ids]
 
 pub const OutboundMsg = struct {
     message_type: u16,
-    payload: []u8, // owned, freed after send
+    /// Refcounted payload. The queue holds one ref; writerLoop decrRefs
+    /// after sending. Multiple peers can share the same RefValue via
+    /// `incrRef` so fan-out sends avoid memcpy.
+    value: *utils.RefValue,
 };
 
 pub const Serial = struct {
@@ -65,7 +69,7 @@ pub const Serial = struct {
     pub fn closeConn(self: *Serial) void {
         self.outbound.close(.graceful);
         while (self.outbound.tryReceive()) |msg| {
-            self.allocator.free(msg.payload);
+            msg.value.decrRef();
         } else |_| {}
 
         if (!self.closed) {
@@ -75,14 +79,15 @@ pub const Serial = struct {
     }
 
     /// Queue an outbound message. Non-blocking; drops on full channel.
-    pub fn queueMsg(self: *Serial, message_type: u16, payload: []u8) void {
-        if (self.drop_messages.load(.acquire)) {
-            self.allocator.free(payload);
-            return;
-        }
-        self.outbound.trySend(.{ .message_type = message_type, .payload = payload }) catch |err| {
+    /// Borrows `value` — `incrRef`s on successful enqueue (the writer fiber
+    /// decrRefs after sending). On drop or full channel, no incrRef happens
+    /// so the caller's refcount is unchanged. Caller retains its ref.
+    pub fn queueMsg(self: *Serial, message_type: u16, value: *utils.RefValue) void {
+        if (self.drop_messages.load(.acquire)) return;
+        _ = value.incrRef();
+        self.outbound.trySend(.{ .message_type = message_type, .value = value }) catch |err| {
             log.err("queueMsg: channel full, dropping message: {s}", .{@errorName(err)});
-            self.allocator.free(payload);
+            value.decrRef();
         };
     }
 
@@ -180,8 +185,8 @@ pub const Serial = struct {
     fn writerLoop(self: *Serial) void {
         while (true) {
             const msg = self.outbound.receive() catch return;
-            defer self.allocator.free(msg.payload);
-            self.send(msg.message_type, msg.payload) catch |err| {
+            defer msg.value.decrRef();
+            self.send(msg.message_type, msg.value.data) catch |err| {
                 log.err("writerLoop send failed: {s}", .{@errorName(err)});
                 return;
             };
