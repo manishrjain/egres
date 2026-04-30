@@ -1,12 +1,17 @@
 const std = @import("std");
 
-pub const Kind = enum { u16, u32, u64, bytes, array, table, b64, bool };
+pub const Kind = enum { u16, u32, u64, bytes, array, table, b64, bool, enum_ };
 
 pub const Field = struct {
     id: u32,
     has_wire_id: bool,
     name: []const u8,
     ty: type,
+};
+
+pub const Variant = struct {
+    name: []const u8,
+    tag: u8,
 };
 
 pub const U16 = struct {
@@ -36,6 +41,19 @@ pub fn Bool(comptime cfg: struct { field_id: u32, bit: u16 }) type {
 pub const Bytes = struct {
     pub const schema_kind: Kind = .bytes;
 };
+
+pub fn EnumDef(comptime variant_list: anytype) type {
+    return struct {
+        pub const schema_variants = variant_list;
+    };
+}
+
+pub fn Enum(comptime EnumT: type) type {
+    return struct {
+        pub const schema_kind: Kind = .enum_;
+        pub const enum_def: type = EnumT;
+    };
+}
 
 pub fn Array(comptime T: type) type {
     return struct {
@@ -103,7 +121,24 @@ pub fn slotSize(comptime T: type) u16 {
         .array => 8,
         .table => 4,
         .bool => 0,
+        .enum_ => 1,
     };
+}
+
+pub fn enumDefOf(comptime T: type) type {
+    if (kindOf(T) != .enum_) @compileError("not an enum field");
+    return T.enum_def;
+}
+
+pub fn enumVariants(comptime EnumT: type) []const Variant {
+    if (!@hasDecl(EnumT, "schema_variants")) @compileError("EnumDef missing schema_variants");
+    const raw = EnumT.schema_variants;
+    var out: [raw.len]Variant = undefined;
+    for (raw, 0..) |v, i| {
+        out[i] = .{ .name = v.name, .tag = v.tag };
+    }
+    const out_const = out;
+    return &out_const;
 }
 
 pub fn boolFieldId(comptime T: type) u32 {

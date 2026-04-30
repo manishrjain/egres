@@ -30,8 +30,8 @@ fn buildTable(alloc: std.mem.Allocator, set_root_node: bool) !gen.TableBuffer {
     try n1.setName("n1");
     try n1.set(.{
         .value = 1000,
-        .is_active = true,
-        .is_bootstrapping = true,
+        .lifecycle = .bootstrapping,
+        .is_pinned = true,
     });
     const leaves = [_]u32{ l1_off, l2_res.offset };
     try n1.setCells(&leaves);
@@ -40,7 +40,7 @@ fn buildTable(alloc: std.mem.Allocator, set_root_node: bool) !gen.TableBuffer {
     const n1_u64_values = [_]u64{ 100, 200 };
     try n1.setU32Values(&n1_u32_values);
     try n1.setU64Values(&n1_u64_values);
-    try n1.statusSetBit(33);
+    try n1.flagsSetBit(33);
     const n1_res = try n1.finish();
     const n1_off = n1_res.offset;
 
@@ -54,10 +54,10 @@ fn buildTable(alloc: std.mem.Allocator, set_root_node: bool) !gen.TableBuffer {
     try n2.setU32Values(&n2_no_u32_values);
     try n2.setU64Values(&n2_u64_values);
     try n2.setRowCell(gen.NullOffset);
-    try n2.statusSet(0x8);
-    try n2.statusClearBit(3);
-    try n2.setIsDraining(true);
-    try n2.lifecycleSetBit(41);
+    try n2.flagsSet(0x8);
+    try n2.flagsClearBit(3);
+    try n2.setLifecycle(.retiring);
+    try n2.setIsDeleted(true);
     const n2_res = try n2.finish();
     const n2_off = n2_res.offset;
 
@@ -113,11 +113,10 @@ test "zbuf format roundtrip" {
     try std.testing.expect(l0.cellHot());
     try std.testing.expect(!l1.cellHot());
     try std.testing.expect(!l1.cellFlagsHasBit(3));
-    try std.testing.expect(n0.isActive());
-    try std.testing.expect(n0.statusHasBit(33));
-    try std.testing.expect(n0.isBootstrapping());
-    try std.testing.expect(n0.lifecycleHasBit(1));
-    try std.testing.expect(!n0.lifecycleHasBit(41));
+    try std.testing.expectEqual(gen.LifecycleEnum.bootstrapping, n0.lifecycle());
+    try std.testing.expect(n0.isPinned());
+    try std.testing.expect(!n0.isDeleted());
+    try std.testing.expect(n0.flagsHasBit(33));
     try std.testing.expectEqual(@as(u32, 3), n0.u32ValuesLen());
     try std.testing.expectEqual(@as(u32, 2), n0.u64ValuesLen());
     try std.testing.expectEqual(@as(u32, 11), try n0.u32ValuesAt(0));
@@ -130,12 +129,11 @@ test "zbuf format roundtrip" {
     try std.testing.expectEqualSlices(u8, "n2", n1.name());
     try std.testing.expectEqual(@as(u64, 2000), n1.value());
     try std.testing.expectEqual(@as(u32, 0), n1.cellsLen());
-    try std.testing.expect(n1.isDraining());
-    try std.testing.expect(n1.statusHasBit(33));
-    try std.testing.expect(!n1.statusHasBit(3));
-    try std.testing.expect(n1.isRetiring());
-    try std.testing.expect(n1.lifecycleHasBit(41));
-    try std.testing.expect(!n1.lifecycleHasBit(1));
+    try std.testing.expectEqual(gen.LifecycleEnum.retiring, n1.lifecycle());
+    try std.testing.expect(n1.isDeleted());
+    try std.testing.expect(!n1.isPinned());
+    try std.testing.expect(!n1.flagsHasBit(3));
+    try std.testing.expect(!n1.flagsHasBit(33));
     try std.testing.expectEqual(@as(u32, 0), n1.u32ValuesLen());
     try std.testing.expectEqual(@as(u32, 1), n1.u64ValuesLen());
     try std.testing.expectEqual(@as(u64, 9000), try n1.u64ValuesAt(0));
@@ -148,13 +146,13 @@ test "bitset direct operations" {
     defer buf.deinit(std.testing.allocator);
 
     var node = try gen.RowWriter.initWithBuf(std.testing.allocator, &buf);
-    try node.statusSetBit(0);
-    try node.statusSetBit(63);
-    try std.testing.expect(try node.statusHasBit(0));
-    try std.testing.expect(try node.statusHasBit(63));
-    try node.statusClearBit(0);
-    try std.testing.expect(!(try node.statusHasBit(0)));
-    try node.statusSet(0);
+    try node.flagsSetBit(0);
+    try node.flagsSetBit(63);
+    try std.testing.expect(try node.flagsHasBit(0));
+    try std.testing.expect(try node.flagsHasBit(63));
+    try node.flagsClearBit(0);
+    try std.testing.expect(!(try node.flagsHasBit(0)));
+    try node.flagsSet(0);
 
     const off_res = try node.finish();
     const off = off_res.offset;
@@ -168,41 +166,64 @@ test "bitset direct operations" {
         .Row => |v| v,
         else => return error.Invalid,
     };
-    try std.testing.expect(!view.statusHasBit(0));
-    try std.testing.expect(!view.statusHasBit(63));
+    try std.testing.expect(!view.flagsHasBit(0));
+    try std.testing.expect(!view.flagsHasBit(63));
 }
 
-test "multiple b64 backing fields stay independent" {
+test "enum field roundtrips and is independent of flag bits" {
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
+
+    // Set the enum to .draining and a couple of independent flag bits.
+    var node = try gen.RowWriter.initWithBuf(std.testing.allocator, &buf);
+    try node.setLifecycle(.draining);
+    try node.flagsSetBit(0); // is_pinned
+    try node.flagsSetBit(1); // is_deleted
+
+    // Mutating flags must not affect the enum slot, and vice versa.
+    try node.setLifecycle(.retiring);
+    try std.testing.expect(try node.flagsHasBit(0));
+    try std.testing.expect(try node.flagsHasBit(1));
+
+    const off_res = try node.finish();
+    const off = off_res.offset;
+    var payload: std.ArrayList(u8) = .{};
+    defer payload.deinit(std.testing.allocator);
+    try payload.appendSlice(std.testing.allocator, buf.items);
+    try gen.addTail(std.testing.allocator, &payload, gen.RowReader, off);
+
+    const msg = try gen.parseMessageWithTail(payload.items);
+    const view = switch (msg) {
+        .Row => |v| v,
+        else => return error.Invalid,
+    };
+    try std.testing.expectEqual(gen.LifecycleEnum.retiring, view.lifecycle());
+    try std.testing.expect(view.isPinned());
+    try std.testing.expect(view.isDeleted());
+}
+
+test "enum unknown tag falls into catch-all" {
+    // Forward-compat: a wire byte whose value isn't a named variant must still
+    // produce a well-formed enum value (the `_,` catch-all variant). We
+    // simulate a "future" schema by writing an unknown tag through the same
+    // public API — the enum's catch-all variant lets us round-trip arbitrary
+    // u8 values without losing them.
     var buf: std.ArrayList(u8) = .{};
     defer buf.deinit(std.testing.allocator);
 
     var node = try gen.RowWriter.initWithBuf(std.testing.allocator, &buf);
-    try node.statusSetBit(10);
-    try node.lifecycleSetBit(10);
-    try node.lifecycleSetBit(41);
-    try node.statusClearBit(10);
+    try node.setLifecycle(@enumFromInt(99));
+    const res = try node.finish();
 
-    try std.testing.expect(!(try node.statusHasBit(10)));
-    try std.testing.expect(try node.lifecycleHasBit(10));
-    try std.testing.expect(try node.lifecycleHasBit(41));
-
-    const off_res = try node.finish();
-    const off = off_res.offset;
-    var payload: std.ArrayList(u8) = .{};
-    defer payload.deinit(std.testing.allocator);
-    try payload.appendSlice(std.testing.allocator, buf.items);
-    try gen.addTail(std.testing.allocator, &payload, gen.RowReader, off);
-
-    const msg = try gen.parseMessageWithTail(payload.items);
-    const view = switch (msg) {
-        .Row => |v| v,
-        else => return error.Invalid,
+    const reader = try gen.RowReader.init(buf.items, res.offset);
+    const got = reader.lifecycle();
+    try std.testing.expectEqual(@as(u8, 99), @intFromEnum(got));
+    // Switch on it: the catch-all `_` arm catches unknown tags safely.
+    const named: bool = switch (got) {
+        .active, .draining, .bootstrapping, .retiring => true,
+        _ => false,
     };
-    try std.testing.expect(!view.statusHasBit(10));
-    try std.testing.expect(view.lifecycleHasBit(10));
-    try std.testing.expect(view.lifecycleHasBit(41));
-    try std.testing.expect(!view.isActive());
-    try std.testing.expect(view.isRetiring());
+    try std.testing.expect(!named);
 }
 
 test "array toSliceAlloc for u16/u32/u64" {
@@ -418,8 +439,8 @@ test "clone deep copies nested struct" {
     const r0_orig = original.rows[0];
     const r0_clone = cloned.rows[0];
     try std.testing.expectEqual(r0_orig.value, r0_clone.value);
-    try std.testing.expect(r0_orig.is_active == r0_clone.is_active);
-    try std.testing.expect(r0_orig.is_bootstrapping == r0_clone.is_bootstrapping);
+    try std.testing.expectEqual(r0_orig.lifecycle, r0_clone.lifecycle);
+    try std.testing.expect(r0_orig.is_pinned == r0_clone.is_pinned);
     try std.testing.expectEqualSlices(u8, r0_orig.name, r0_clone.name);
     try std.testing.expect(r0_orig.name.ptr != r0_clone.name.ptr);
 
@@ -444,15 +465,15 @@ test "clone deep copies nested struct" {
     try std.testing.expectEqualSlices(u64, r0_orig.u64_values, r0_clone.u64_values);
     try std.testing.expect(r0_orig.u64_values.ptr != r0_clone.u64_values.ptr);
 
-    // Row 1: null row_cell, empty cells, b64 fields.
+    // Row 1: null row_cell, empty cells, b64 + enum fields.
     const r1_orig = original.rows[1];
     const r1_clone = cloned.rows[1];
     try std.testing.expectEqual(r1_orig.value, r1_clone.value);
-    try std.testing.expect(r1_orig.is_draining == r1_clone.is_draining);
+    try std.testing.expectEqual(r1_orig.lifecycle, r1_clone.lifecycle);
+    try std.testing.expect(r1_orig.is_deleted == r1_clone.is_deleted);
     try std.testing.expectEqual(r1_orig.cells.len, r1_clone.cells.len);
     try std.testing.expect(r1_clone.row_cell == null);
-    try std.testing.expectEqual(r1_orig.status, r1_clone.status);
-    try std.testing.expectEqual(r1_orig.lifecycle, r1_clone.lifecycle);
+    try std.testing.expectEqual(r1_orig.flags, r1_clone.flags);
 
     // Optional nested table on the root.
     try std.testing.expect(cloned.table_row != null);

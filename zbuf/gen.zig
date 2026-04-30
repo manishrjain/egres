@@ -46,7 +46,8 @@ pub fn main() !void {
         try w.writeAll("pub const Ownership = zbuf.Ownership;\n\n");
 
         // Emit code for each table declared in u/buffers.zig.
-        // Emit tail helpers and message parser for this generated module.
+        // Enums must come first — table fields may reference enum types by name.
+        try emitEnumTypes(w);
         try emitTailHelpers(w);
         try emitMessageParser(w);
 
@@ -92,6 +93,55 @@ fn tableNameForType(comptime T: type) []const u8 {
         if (entry.ty == T) return entry.name;
     }
     @compileError("unknown table type");
+}
+
+// Walk all `pub const` declarations in buffers.zig to find enum-def types
+// (those produced by schema.EnumDef). No explicit registry required.
+fn isEnumDefType(comptime T: type) bool {
+    const ti = @typeInfo(T);
+    if (ti != .@"struct") return false;
+    return @hasDecl(T, "schema_variants");
+}
+
+fn enumNameForType(comptime T: type) []const u8 {
+    // Resolve a schema enum-def type to the `pub const` name it was bound to
+    // in buffers.zig. The generator emits {Name}Enum for each.
+    const decls = @typeInfo(defs).@"struct".decls;
+    inline for (decls) |d| {
+        const Field = @TypeOf(@field(defs, d.name));
+        if (Field == type) {
+            const DeclT = @field(defs, d.name);
+            if (DeclT == T) return d.name;
+        }
+    }
+    @compileError("enum type not found as a `pub const` in buffers.zig");
+}
+
+fn emitEnumTypes(w: anytype) !void {
+    const decls = @typeInfo(defs).@"struct".decls;
+    inline for (decls) |d| {
+        const Field = @TypeOf(@field(defs, d.name));
+        if (Field != type) continue;
+        const DeclT = @field(defs, d.name);
+        if (!comptime isEnumDefType(DeclT)) continue;
+
+        // Compile-time validation: tags fit in u8 and are unique.
+        const variants = comptime schema.enumVariants(DeclT);
+        comptime {
+            for (variants, 0..) |v, i| {
+                if (v.tag >= 256) @compileError("enum tag exceeds u8 range");
+                for (variants[i + 1 ..]) |o| {
+                    if (o.tag == v.tag) @compileError("duplicate enum tag");
+                }
+            }
+        }
+        try w.print("pub const {s}Enum = enum(u8) {{\n", .{d.name});
+        inline for (variants) |v| {
+            try w.print("    {s} = {d},\n", .{ v.name, v.tag });
+        }
+        try w.writeAll("    _,\n");
+        try w.writeAll("};\n\n");
+    }
 }
 
 fn boolBitWidthForKind(comptime k: schema.Kind) u16 {
@@ -343,6 +393,13 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
                 try emitBoolGetter(w, bits_field.offset, bit_index);
                 try w.writeAll("    }\n\n");
             },
+            .enum_ => {
+                const enum_def = comptime schema.enumDefOf(info.ty);
+                const enum_name = enumNameForType(enum_def);
+                try w.print("    pub fn {s}(self: Self) {s}Enum {{\n", .{ name_camel, enum_name });
+                try emitEnumGetter(w, info.offset);
+                try w.writeAll("    }\n\n");
+            },
         }
     }
 
@@ -430,7 +487,7 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
         const name_lower = try schema.camelName(alloc, info.name);
         defer alloc.free(name_lower);
         switch (comptime schema.kindOf(info.ty)) {
-            .u16, .u32, .u64, .bytes, .bool => {
+            .u16, .u32, .u64, .bytes, .bool, .enum_ => {
                 try w.print("        try writer.set{s}(reader.{s}());\n", .{ name_camel, name_lower });
             },
             .b64 => {
@@ -674,6 +731,13 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
                 try emitBoolSetter(w, bits_field.offset, bit_index);
                 try w.writeAll("    }\n\n");
             },
+            .enum_ => {
+                const enum_def = comptime schema.enumDefOf(info.ty);
+                const enum_name = enumNameForType(enum_def);
+                try w.print("    pub fn set{s}(self: *Self, v: {s}Enum) Error!void {{\n", .{ name_camel, enum_name });
+                try emitEnumSetter(w, info.offset);
+                try w.writeAll("    }\n\n");
+            },
             // table handled above
         }
     }
@@ -745,6 +809,11 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
             .u64 => try w.print("    {s}: u64 = 0,\n", .{info.name}),
             .b64 => try w.print("    {s}: u64 = 0,\n", .{info.name}),
             .bool => try w.print("    {s}: bool = false,\n", .{info.name}),
+            .enum_ => {
+                const enum_def = comptime schema.enumDefOf(info.ty);
+                const enum_name = enumNameForType(enum_def);
+                try w.print("    {s}: {s}Enum = @enumFromInt(0),\n", .{ info.name, enum_name });
+            },
             .bytes => try w.print("    {s}: []const u8 = &.{{}},\n", .{info.name}),
             .array => {
                 const child = comptime schema.childOfArray(info.ty);
@@ -776,7 +845,7 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
         const name_camel = try schema.camelName(alloc, info.name);
         defer alloc.free(name_camel);
         switch (comptime schema.kindOf(info.ty)) {
-            .u16, .u32, .u64, .b64, .bool => {
+            .u16, .u32, .u64, .b64, .bool, .enum_ => {
                 try w.print("            .{s} = r.{s}(),\n", .{ info.name, name_camel });
             },
             else => {},
@@ -940,7 +1009,7 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
     try w.print("        var s = {s}Struct{{\n", .{table_name});
     inline for (infos) |info| {
         switch (comptime schema.kindOf(info.ty)) {
-            .u16, .u32, .u64, .b64, .bool => {
+            .u16, .u32, .u64, .b64, .bool, .enum_ => {
                 try w.print("            .{s} = self.{s},\n", .{ info.name, info.name });
             },
             else => {},
@@ -1038,7 +1107,7 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
         const name_lower = try schema.camelName(alloc, info.name);
         defer alloc.free(name_lower);
         switch (comptime schema.kindOf(info.ty)) {
-            .u16, .u32, .u64, .bytes, .bool => {
+            .u16, .u32, .u64, .bytes, .bool, .enum_ => {
                 try w.print("        try writer.set{s}(self.{s});\n", .{ name_camel, info.name });
             },
             .b64 => {
@@ -1168,6 +1237,19 @@ fn emitBoolSetter(w: anytype, bits_offset: u16, bit_index: u16) !void {
     try w.writeAll("            word &= ~(@as(u64, 1) << bit);\n");
     try w.writeAll("        }\n");
     try w.writeAll("        try zbuf.patchU64(out.items, word_off, word);\n");
+}
+
+fn emitEnumGetter(w: anytype, offset: u16) !void {
+    try w.print("        const slot_end = @as(u32, self.base) + {d};\n", .{offset + 1});
+    try w.writeAll("        const header_end = @as(u32, self.base) + self.size_bytes;\n");
+    try w.writeAll("        if (slot_end > header_end) return @enumFromInt(0);\n");
+    try w.print("        const v = zbuf.readU8(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{offset});
+    try w.writeAll("        return @enumFromInt(v);\n");
+}
+
+fn emitEnumSetter(w: anytype, offset: u16) !void {
+    try w.writeAll("        const out = self.bufMut();\n");
+    try w.print("        try zbuf.patchU8(out.items, self.base + {d}, @intFromEnum(v));\n", .{offset});
 }
 
 fn emitArrayLenGetter(w: anytype, offset: u16, elem_size: u16) !void {

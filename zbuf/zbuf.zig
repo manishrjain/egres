@@ -46,6 +46,11 @@ pub fn readMessageTail(buf: []const u8) !MessageTail {
         .offset = offset,
     };
 }
+pub fn readU8(buf: []const u8, off: usize) !u8 {
+    if (off + 1 > buf.len) return Error.OutOfBounds;
+    return buf[off];
+}
+
 pub fn readU16(buf: []const u8, off: usize) !u16 {
     if (off + 2 > buf.len) return Error.OutOfBounds;
     return readIntLittle(u16, buf, off);
@@ -59,6 +64,11 @@ pub fn readU32(buf: []const u8, off: usize) !u32 {
 pub fn readU64(buf: []const u8, off: usize) !u64 {
     if (off + 8 > buf.len) return Error.OutOfBounds;
     return readIntLittle(u64, buf, off);
+}
+
+pub fn writeU8At(buf: []u8, off: usize, v: u8) !void {
+    if (off + 1 > buf.len) return Error.OutOfBounds;
+    buf[off] = v;
 }
 
 pub fn writeU16At(buf: []u8, off: usize, v: u16) !void {
@@ -153,6 +163,10 @@ pub fn sliceAt(buf: []const u8, off: u32, len: u32) ![]const u8 {
     const end: usize = start + len;
     if (end > buf.len) return Error.OutOfBounds;
     return buf[start..end];
+}
+
+pub fn patchU8(buf: []u8, off: u32, v: u8) !void {
+    try writeU8At(buf, off, v);
 }
 
 pub fn patchU32(buf: []u8, off: u32, v: u32) !void {

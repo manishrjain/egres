@@ -7,19 +7,26 @@ pub const Cell = schema.Table(.{
     .{ .name = "cell_hot", .ty = schema.Bool(.{ .field_id = 3, .bit = 0 }) },
 });
 
+// Mutually-exclusive lifecycle state — encoded as a single u8 enum slot.
+pub const Lifecycle = schema.EnumDef(.{
+    .{ .name = "active", .tag = 0 },
+    .{ .name = "draining", .tag = 1 },
+    .{ .name = "bootstrapping", .tag = 2 },
+    .{ .name = "retiring", .tag = 3 },
+});
+
 pub const Row = schema.Table(.{
     .{ .id = 1, .name = "name", .ty = schema.Bytes },
     .{ .id = 2, .name = "value", .ty = schema.U64 },
     .{ .id = 3, .name = "cells", .ty = schema.Array(Cell) },
     .{ .id = 4, .name = "row_cell", .ty = Cell },
-    .{ .id = 5, .name = "status", .ty = schema.B64 },
-    .{ .id = 6, .name = "lifecycle", .ty = schema.B64 },
+    // Independent flag bits — can co-exist (e.g. row may be both pinned AND deleted).
+    .{ .id = 5, .name = "flags", .ty = schema.B64 },
+    .{ .name = "is_pinned", .ty = schema.Bool(.{ .field_id = 5, .bit = 0 }) },
+    .{ .name = "is_deleted", .ty = schema.Bool(.{ .field_id = 5, .bit = 1 }) },
+    .{ .id = 6, .name = "lifecycle", .ty = schema.Enum(Lifecycle) },
     .{ .id = 7, .name = "u32_values", .ty = schema.Array(schema.U32) },
     .{ .id = 8, .name = "u64_values", .ty = schema.Array(schema.U64) },
-    .{ .name = "is_active", .ty = schema.Bool(.{ .field_id = 5, .bit = 0 }) },
-    .{ .name = "is_draining", .ty = schema.Bool(.{ .field_id = 5, .bit = 33 }) },
-    .{ .name = "is_bootstrapping", .ty = schema.Bool(.{ .field_id = 6, .bit = 1 }) },
-    .{ .name = "is_retiring", .ty = schema.Bool(.{ .field_id = 6, .bit = 41 }) },
 });
 
 pub const Table = schema.Table(.{
