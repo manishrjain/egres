@@ -65,6 +65,8 @@ pub const RaftError = error{
     InvalidBytes,
     QueueClosed,
     QueueFull,
+    CommitFailed,
+    NotCommitted,
 } || RaftLogError || zen.Error;
 
 pub const Peer = struct {
@@ -168,7 +170,6 @@ pub const Node = struct {
     apply_ts: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Broadcast signal fired after every `apply_ts` advance. Waiters in
     /// `waitUntilApplied` are woken and re-check their target.
-    /// TODO: Get rid of apply_ts_notify. Who's using it and why.
     apply_ts_notify: zio.Notify = .init,
     conf_applied_index: u64,
     leader_id: ?NodeId,
@@ -313,7 +314,7 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
-        self.proposal_ch.close(.immediate);
+        self.proposal_ch.close(.graceful);
         while (self.proposal_ch.tryReceive()) |req| {
             self.allocator.free(req.data);
             req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .shutdown);
@@ -1351,6 +1352,32 @@ pub const Node = struct {
         return self.proposeWithCallback(data, cb, ctx, .data);
     }
 
+    /// Synchronous wrapper around `proposeDataChange` — propose a data
+    /// entry and block until it commits (or fails). Used by callers that
+    /// don't need to track the commit asynchronously (clock ticks,
+    /// manifest changes from compaction loops, etc). The wait doubles as
+    /// a rate-limit: the caller fiber stays parked until commit, so it
+    /// can't pile up more than one in-flight proposal.
+    pub fn proposeAndWait(self: *Node, data: []const u8) RaftError!void {
+        var ctx = WaitCtx{ .status = .committed };
+        ctx.wg.init();
+        ctx.wg.add(1);
+        try self.proposeDataChange(data, &onWaitCommit, @ptrCast(&ctx));
+        ctx.wg.wait() catch return error.CommitFailed;
+        if (ctx.status != .committed) return error.NotCommitted;
+    }
+
+    const WaitCtx = struct {
+        wg: utils.WaitGroup = .{},
+        status: CommitStatus,
+    };
+
+    fn onWaitCommit(ctx_raw: *anyopaque, _: Entry, status: CommitStatus) void {
+        const ctx: *WaitCtx = @ptrCast(@alignCast(ctx_raw));
+        ctx.status = status;
+        ctx.wg.done();
+    }
+
     fn proposeWithCallback(
         self: *Node,
         data: []const u8,
@@ -1579,6 +1606,7 @@ pub const Node = struct {
         try group.spawn(mainLoop, .{ self, self.config.tick_interval_ms });
         try group.spawn(applyLoop, .{self});
         try group.spawn(callbackLoop, .{self});
+        try group.spawn(clockTickLoop, .{self});
 
         group.wait() catch {};
     }
@@ -1688,6 +1716,32 @@ pub const Node = struct {
         while (!self.isShuttingDown()) {
             zio.sleep(tick_dur) catch return;
             self.event_ch.trySend(1) catch {};
+        }
+    }
+
+    /// Adaptive HLC tick loop. On the leader only: wakes every 400 ms and
+    /// checks whether wall-clock seconds have advanced past the last log
+    /// entry's HLC second. If yes, proposes an empty-data LogEntry so
+    /// `apply_ts` advances on followers even during write-quiet periods.
+    /// During active writes, each user mutation naturally advances the
+    /// last log entry's second, so no tick fires. Followers are passive —
+    /// they receive the leader's empty entries via normal AppendEntries
+    /// replication and advance their own `apply_ts` on apply.
+    ///
+    /// The wait-for-commit doubles as a rate-limit: only one tick can be
+    /// in flight at a time, so burst-piling under apply lag is impossible.
+    pub fn clockTickLoop(self: *Node) void {
+        const poll = zio.Duration.fromMilliseconds(400);
+        while (!self.isShuttingDown()) {
+            zio.sleep(poll) catch return;
+            if (!self.isLeader()) continue;
+            const last_ts = utils.hlc.HLC.fromU64(self.lastLogTimestamp());
+            const wall_sec: u32 = @intCast(std.time.timestamp());
+            if (wall_sec <= last_ts.seconds) continue;
+
+            self.proposeAndWait(&.{}) catch |err| {
+                raft_log.warn("clock tick propose failed: {s}", .{@errorName(err)});
+            };
         }
     }
 

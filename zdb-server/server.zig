@@ -249,29 +249,8 @@ pub const ZdbServer = struct {
         group.spawn(runMemtableLoop, .{self}) catch return;
         group.spawn(runFlushLoop, .{self}) catch return;
         group.spawn(runLevelsLoop, .{self}) catch return;
-        group.spawn(runClockTickLoop, .{self}) catch return;
         group.wait() catch {};
         log.info("compaction loops exiting (shutdown)", .{});
-    }
-
-    /// Adaptive clock tick fiber. Wakes every 400ms; if the wall-clock second
-    /// has moved past the last log entry's second on this leader, propose an
-    /// empty-data LogEntry so apply_ts advances even during write-quiet
-    /// periods. During active writes each Mutation naturally advances the
-    /// last log entry's second so no tick is emitted.
-    fn runClockTickLoop(self: *ZdbServer) void {
-        const poll = zio.Duration.fromMilliseconds(400);
-        while (!self.node.isShuttingDown()) {
-            zio.sleep(poll) catch return;
-            if (!self.node.isLeader()) continue;
-            const last_ts = raft.utils.hlc.HLC.fromU64(self.node.lastLogTimestamp());
-            const wall_sec: u32 = @intCast(std.time.timestamp());
-            if (wall_sec > last_ts.seconds) {
-                self.proposeAndWait(&.{}) catch |err| {
-                    log.warn("clock tick propose failed: {s}", .{@errorName(err)});
-                };
-            }
-        }
     }
 
     fn runMemtableLoop(self: *ZdbServer) void {
@@ -338,7 +317,7 @@ pub const ZdbServer = struct {
         const new_id = self.forest.next_file_id.fetchAdd(1, .monotonic);
         const payload = try encodeManifestChange(self.allocator, 1, &.{}, &.{}, new_id);
         defer self.allocator.free(payload);
-        try self.proposeAndWait(payload);
+        try self.node.proposeAndWait(payload);
     }
 
     fn proposeFlush(self: *ZdbServer) !void {
@@ -351,7 +330,7 @@ pub const ZdbServer = struct {
 
         const payload = try encodeManifestChange(self.allocator, 2, changes.items, &.{}, result.memtable_id);
         defer self.allocator.free(payload);
-        try self.proposeAndWait(payload);
+        try self.node.proposeAndWait(payload);
     }
 
     fn proposeCompaction(self: *ZdbServer, target: Forest.CompactionTarget) !void {
@@ -363,7 +342,7 @@ pub const ZdbServer = struct {
 
         const payload = try encodeManifestChange(self.allocator, 3, changes.items, &.{}, 0);
         defer self.allocator.free(payload);
-        try self.proposeAndWait(payload);
+        try self.node.proposeAndWait(payload);
     }
 
     fn proposeSplit(self: *ZdbServer, tree_id: u64) !void {
@@ -385,7 +364,7 @@ pub const ZdbServer = struct {
             0,
         );
         defer self.allocator.free(payload);
-        try self.proposeAndWait(payload);
+        try self.node.proposeAndWait(payload);
     }
 
     /// Send new SST files to peers and wait for quorum acks.
@@ -397,15 +376,6 @@ pub const ZdbServer = struct {
         }
         if (file_ids.items.len == 0) return;
         try self.node.sendAndWaitForFileQuorum(file_ids.items);
-    }
-
-    fn proposeAndWait(self: *ZdbServer, payload: []const u8) !void {
-        var ctx = CommitCtx{ .status = .committed };
-        ctx.wg.init();
-        ctx.wg.add(1);
-        try self.node.proposeDataChange(payload, &onCommit, @ptrCast(&ctx));
-        ctx.wg.wait() catch return error.CommitFailed;
-        if (ctx.status != .committed) return error.NotCommitted;
     }
 
     fn handleClient(self: *ZdbServer, stream: zio.net.Stream) void {
@@ -804,7 +774,7 @@ pub const ZdbServer = struct {
         };
         defer self.allocator.free(payload);
 
-        self.proposeAndWait(payload) catch |err| {
+        self.node.proposeAndWait(payload) catch |err| {
             log.err("ns create propose failed: {s}", .{@errorName(err)});
             try proto.writeErr(stream, @errorName(err));
             return;
