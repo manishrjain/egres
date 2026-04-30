@@ -146,7 +146,7 @@ fn sendLineRecvLine(alloc: std.mem.Allocator, node: u32, cmd: []const u8) ![]u8 
 fn sendStats(alloc: std.mem.Allocator, node: u32) ![]u8 {
     const stream = try connectNode(node);
     defer stream.close();
-    try stream.writeAll("stats\n", .none);
+    try stream.writeAll("zdb\n", .none);
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
@@ -526,36 +526,29 @@ fn cmdRun(alloc: std.mem.Allocator) !void {
     // --- load generator (child process) ---
     const leader_client_addr = try clientAddrStr(alloc, 1);
     defer alloc.free(leader_client_addr);
-    const clients_str = try std.fmt.allocPrint(alloc, "{d}", .{cfg_run.clients});
-    defer alloc.free(clients_str);
-    const verify_str = try std.fmt.allocPrint(alloc, "{d}", .{cfg_run.verify_clients});
-    defer alloc.free(verify_str);
-    const records_str = try std.fmt.allocPrint(alloc, "{d}", .{cfg_run.records});
-    defer alloc.free(records_str);
-    const value_size_str = try std.fmt.allocPrint(alloc, "{d}", .{cfg_run.value_size});
-    defer alloc.free(value_size_str);
-    const ns_str = try std.fmt.allocPrint(alloc, "{d}", .{cfg_run.namespaces});
-    defer alloc.free(ns_str);
-    const batch_str = try std.fmt.allocPrint(alloc, "{d}", .{cfg_run.batch_size});
-    defer alloc.free(batch_str);
+    // zdb-bench parses one quoted `--bench="k=v; k=v"` payload per the
+    // flags.zig convention. Field names are kebab-case (read-pct,
+    // verify-clients, value-size, batch-size).
+    const bench_payload = try std.fmt.allocPrint(
+        alloc,
+        "addr={s}; clients={d}; verify-clients={d}; records={d}; value-size={d}; namespaces={d}; batch-size={d}; phase=load",
+        .{
+            leader_client_addr,
+            cfg_run.clients,
+            cfg_run.verify_clients,
+            cfg_run.records,
+            cfg_run.value_size,
+            cfg_run.namespaces,
+            cfg_run.batch_size,
+        },
+    );
+    defer alloc.free(bench_payload);
+    const bench_flag = try std.fmt.allocPrint(alloc, "--bench={s}", .{bench_payload});
+    defer alloc.free(bench_flag);
 
     var bench = std.process.Child.init(&.{
         bench_bin,
-        "--addr",
-        leader_client_addr,
-        "--clients",
-        clients_str,
-        "--verify-clients",
-        verify_str,
-        "--records",
-        records_str,
-        "--value-size",
-        value_size_str,
-        "--namespaces",
-        ns_str,
-        "--batch-size",
-        batch_str,
-        "--load",
+        bench_flag,
     }, alloc);
     bench.stdout_behavior = .Inherit;
     bench.stderr_behavior = .Inherit;

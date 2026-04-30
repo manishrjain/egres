@@ -434,11 +434,14 @@ pub const ZdbServer = struct {
                     log.info("NS CREATE ns={d}", .{req.ns});
                     self.handleNsCreate(stream, req) catch return;
                 },
-                .stats => |req| {
-                    self.handleStats(stream, req) catch return;
+                .zdb => |req| {
+                    self.handleZdb(stream, req) catch return;
                 },
-                .info => |_| {
-                    self.handleInfo(stream) catch return;
+                .raft => |_| {
+                    self.handleRaft(stream) catch return;
+                },
+                .help => |_| {
+                    proto.writeHelp(stream) catch return;
                 },
             }
         }
@@ -603,7 +606,7 @@ pub const ZdbServer = struct {
         }
     }
 
-    fn handleInfo(self: *ZdbServer, stream: zio.net.Stream) !void {
+    fn handleRaft(self: *ZdbServer, stream: zio.net.Stream) !void {
         // Best-effort snapshot of node + peer state. Races against an
         // in-flight conf change are possible (peers map mutated by
         // mainLoop's applyConfChange); accepted because this is an admin
@@ -674,7 +677,7 @@ pub const ZdbServer = struct {
         try stream.writeAll(body.writer.buffered(), .none);
     }
 
-    fn handleStats(self: *ZdbServer, stream: zio.net.Stream, req: proto.StatsCmd) !void {
+    fn handleZdb(self: *ZdbServer, stream: zio.net.Stream, req: proto.ZdbCmd) !void {
         // Snapshot into a buffer so we write in a single syscall. Clients
         // read until '\n\n' so we always terminate the body with a blank line.
         var body: std.Io.Writer.Allocating = .init(self.allocator);

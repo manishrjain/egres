@@ -568,11 +568,14 @@ fn addZdbBench(
     });
     const zio_mod = zio_dep.module("zio");
 
+    const flags_mod = makeModule(b, target, optimize, "u/flags.zig");
+
     const exe = b.addExecutable(.{
         .name = "zdb-bench",
         .root_module = makeModule(b, target, optimize, "benchmark.zig"),
     });
     exe.root_module.addImport("zio", zio_mod);
+    exe.root_module.addImport("flags", flags_mod);
     b.installArtifact(exe);
 
     const install = b.addInstallArtifact(exe, .{});

@@ -7,19 +7,46 @@ pub const Command = union(enum) {
     get: GetCmd,
     conf: ConfCmd,
     ns_create: NsCreateCmd,
-    stats: StatsCmd,
-    info: InfoCmd,
+    zdb: ZdbCmd,
+    raft: RaftCmd,
+    help: HelpCmd,
 };
+
+pub const HelpCmd = struct {};
+
+/// Static text dumped by the `help` command. Lives next to the parser so
+/// any time we add or change a verb, the help text gets touched in the
+/// same diff. Keep entries one-line where possible.
+pub const help_text =
+    \\Available commands (text protocol, '\n' delimited):
+    \\
+    \\  help                            show this message
+    \\  set <ns> <key> <value>          single write
+    \\  set-batch <ns> <count>          batch write; followed by count*2
+    \\                                  whitespace-separated tokens (k1 v1 k2 v2 ...)
+    \\                                  tokens prefixed with 0x are hex-decoded
+    \\  get <ns> <key> [<read_ts>]      read; optional read_ts blocks until
+    \\                                  this node's apply_ts >= read_ts
+    \\  conf <action> <node_id> [<addr>] cluster membership change
+    \\                                  actions: add, to_voter, to_learner, remove, addr
+    \\  ns create <ns>                  create a namespace
+    \\  zdb                             Prometheus-format storage metrics dump
+    \\  zdb forest                      hierarchical forest summary
+    \\  zdb tree=<id>                   forest summary scoped to one tree
+    \\  zdb namespace=<id>              forest summary for trees in one namespace
+    \\  raft                            cluster topology + per-peer log progress
+    \\
+;
 
 pub const NsCreateCmd = struct {
     ns: u32,
 };
 
-/// `stats`                 → Prometheus dump (existing behavior; loadtest scrapes this)
-/// `stats forest`          → hierarchical forest summary
-/// `stats tree=<N>`        → forest summary scoped to one tree
-/// `stats namespace=<N>`   → forest summary for trees in one namespace
-pub const StatsCmd = struct {
+/// `zdb`                 → Prometheus dump (existing behavior; loadtest scrapes this)
+/// `zdb forest`          → hierarchical forest summary
+/// `zdb tree=<N>`        → forest summary scoped to one tree
+/// `zdb namespace=<N>`   → forest summary for trees in one namespace
+pub const ZdbCmd = struct {
     filter: Filter = .prom,
     tree_id: u64 = 0,
     ns_id: u32 = 0,
@@ -27,10 +54,10 @@ pub const StatsCmd = struct {
     pub const Filter = enum { prom, forest, tree, namespace };
 };
 
-/// Dump cluster topology + per-peer raft progress (as the queried node
-/// sees it). Best-effort snapshot — races against conf changes are
+/// `raft` → cluster topology + per-peer raft progress as the queried
+/// node sees it. Best-effort snapshot — races against conf changes are
 /// possible but tolerated; this is an admin endpoint, not a hot path.
-pub const InfoCmd = struct {};
+pub const RaftCmd = struct {};
 
 pub const SetCmd = struct {
     ns: u32,
@@ -312,26 +339,28 @@ fn parseLine(line: []const u8) !Command {
         const ns = std.fmt.parseInt(u32, ns_str, 10) catch return error.InvalidNamespace;
         if (ns == 0) return error.InvalidNamespace; // 0 is a sentinel
         return .{ .ns_create = .{ .ns = ns } };
-    } else if (std.mem.eql(u8, cmd, "stats")) {
-        const sub = it.next() orelse return .{ .stats = .{} };
+    } else if (std.mem.eql(u8, cmd, "zdb")) {
+        const sub = it.next() orelse return .{ .zdb = .{} };
         if (std.mem.eql(u8, sub, "forest")) {
-            return .{ .stats = .{ .filter = .forest } };
+            return .{ .zdb = .{ .filter = .forest } };
         }
         // Look for `tree=<N>` or `namespace=<N>`. Anything else is an error.
-        const eq = std.mem.indexOfScalar(u8, sub, '=') orelse return error.InvalidStatsFilter;
+        const eq = std.mem.indexOfScalar(u8, sub, '=') orelse return error.InvalidZdbFilter;
         const k = sub[0..eq];
         const v = sub[eq + 1 ..];
         if (std.mem.eql(u8, k, "tree")) {
-            const id = std.fmt.parseInt(u64, v, 10) catch return error.InvalidStatsFilter;
-            return .{ .stats = .{ .filter = .tree, .tree_id = id } };
+            const id = std.fmt.parseInt(u64, v, 10) catch return error.InvalidZdbFilter;
+            return .{ .zdb = .{ .filter = .tree, .tree_id = id } };
         }
         if (std.mem.eql(u8, k, "namespace")) {
-            const id = std.fmt.parseInt(u32, v, 10) catch return error.InvalidStatsFilter;
-            return .{ .stats = .{ .filter = .namespace, .ns_id = id } };
+            const id = std.fmt.parseInt(u32, v, 10) catch return error.InvalidZdbFilter;
+            return .{ .zdb = .{ .filter = .namespace, .ns_id = id } };
         }
-        return error.InvalidStatsFilter;
-    } else if (std.mem.eql(u8, cmd, "info")) {
-        return .{ .info = .{} };
+        return error.InvalidZdbFilter;
+    } else if (std.mem.eql(u8, cmd, "raft")) {
+        return .{ .raft = .{} };
+    } else if (std.mem.eql(u8, cmd, "help")) {
+        return .{ .help = .{} };
     } else {
         return error.UnknownCommand;
     }
@@ -349,6 +378,14 @@ pub fn writeSetOk(stream: zio.net.Stream, commit_ts: u64) !void {
     var buf: [32]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "OK {d}\n", .{commit_ts}) catch unreachable;
     try stream.writeAll(s, .none);
+}
+
+/// Write the static help text followed by a blank line. Same termination
+/// shape as `zdb` / `raft` so simple line-buffered clients can read until
+/// `\n\n`.
+pub fn writeHelp(stream: zio.net.Stream) !void {
+    try stream.writeAll(help_text, .none);
+    try stream.writeAll("\n", .none);
 }
 
 /// Write an error response: "ERR <msg>\n"

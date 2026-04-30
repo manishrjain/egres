@@ -1,11 +1,15 @@
 const std = @import("std");
 const zio = @import("zio");
+const flags = @import("flags");
 const proto = @import("zdb-server/protocol.zig");
 
 const Timestamp = zio.Timestamp;
 const Duration = zio.Duration;
 const log = std.log.scoped(.zdb_client);
 
+/// Flag-registered config. `phase` is a string ("load" / "run" / "both")
+/// — flags.zig doesn't support enum-typed fields. Two callsites below
+/// compare with `std.mem.eql` instead of an enum tag.
 const Args = struct {
     addr: []const u8 = "127.0.0.1:8001",
     clients: u32 = 1,
@@ -13,19 +17,24 @@ const Args = struct {
     ops: u64 = 10000,
     read_pct: u8 = 50,
     value_size: u32 = 100,
-    phase: Phase = .both,
-    /// Number of namespaces to spread traffic across. Each id in [1..=namespaces]
-    /// must already exist (create via `ns create <id>` before loading). A key
-    /// with id k goes to namespace nsFor(k) = (k % namespaces) + 1.
     namespaces: u32 = 1,
-    verify_clients: u32 = 0, // concurrent verifier fibers during load phase
-    /// Writes per batch. 1 = one write per Raft proposal (original behavior).
-    /// Higher batch_size amortizes Raft commit cost across many writes —
-    /// expect near-linear throughput improvement up to the point where
-    /// batch-encoding CPU or TCP MSS limits kick in.
+    verify_clients: u32 = 0,
     batch_size: u32 = 1,
+    phase: []const u8 = "both",
 
-    const Phase = enum { load, run, both };
+    pub const docs = .{
+        .self = "ZDB benchmark client (YCSB-shaped load + run phases).",
+        .addr = "Server address as ip:port.",
+        .clients = "Concurrent writer fiber count.",
+        .records = "Records to insert during load phase.",
+        .ops = "Operations per client during run phase.",
+        .read_pct = "Read percentage [0..100]: 0=write-only, 50=YCSB-A, 95=YCSB-B, 100=YCSB-C.",
+        .value_size = "Value size in bytes.",
+        .namespaces = "Spread traffic across N namespaces; each must already exist (ns create <id>). Keys hash deterministically: k → (k % namespaces) + 1.",
+        .verify_clients = "Concurrent read-verifier fibers active during load phase (0 disables).",
+        .batch_size = "Writes per set-batch proposal (1 = no batching). Higher amortizes Raft commit cost.",
+        .phase = "Which phase(s) to run: \"load\" (writes only), \"run\" (mixed read/write workload over already-loaded data), or \"both\" (load then run).",
+    };
 };
 
 /// Map a key id to its namespace. Deterministic so writers and verifiers
@@ -34,90 +43,13 @@ fn nsFor(key_id: u64, namespaces: u32) u32 {
     return @intCast((key_id % @as(u64, namespaces)) + 1);
 }
 
-fn usage() void {
-    std.debug.print(
-        \\usage: zdb-client [options]
-        \\
-        \\  --addr <ip:port>        server address (default: 127.0.0.1:8001)
-        \\  --clients <n>           concurrent writer clients (default: 1)
-        \\  --records <n>           records to load (default: 1000)
-        \\  --ops <n>               operations per client in run phase (default: 10000)
-        \\  --read-pct <0-100>      read percentage (default: 50, i.e. workload A)
-        \\  --value-size <n>        value size in bytes (default: 100)
-        \\  --namespaces <n>        spread traffic across n namespaces (default: 1).
-        \\                          Each id in [1..=n] must exist (ns create <id>).
-        \\  --verify-clients <n>    concurrent read-verifier fibers during load (default: 0)
-        \\  --batch-size <n>        writes per `set_batch` proposal (default: 1 = no batching)
-        \\  --load                  load phase only
-        \\  --run                   run phase only
-        \\
-        \\Workload presets (set via --read-pct):
-        \\  50  = YCSB-A (read-heavy update)
-        \\  95  = YCSB-B (read-mostly)
-        \\  100 = YCSB-C (read-only)
-        \\  0   = write-only
-        \\
-        \\Values are deterministic from key id. Reads in the run phase and the
-        \\verifier fibers compare returned bytes to the expected pattern; the
-        \\benchmark exits nonzero if any mismatch is observed.
-        \\
-    , .{});
-}
-
-fn parseArgs(argv: []const []const u8) !Args {
-    var args = Args{};
-    var i: usize = 1;
-    while (i < argv.len) {
-        const arg = argv[i];
-        if (std.mem.eql(u8, arg, "--addr")) {
-            i += 1;
-            if (i >= argv.len) return error.InvalidArgs;
-            args.addr = argv[i];
-        } else if (std.mem.eql(u8, arg, "--clients")) {
-            i += 1;
-            if (i >= argv.len) return error.InvalidArgs;
-            args.clients = try std.fmt.parseInt(u32, argv[i], 10);
-        } else if (std.mem.eql(u8, arg, "--records")) {
-            i += 1;
-            if (i >= argv.len) return error.InvalidArgs;
-            args.records = try std.fmt.parseInt(u64, argv[i], 10);
-        } else if (std.mem.eql(u8, arg, "--ops")) {
-            i += 1;
-            if (i >= argv.len) return error.InvalidArgs;
-            args.ops = try std.fmt.parseInt(u64, argv[i], 10);
-        } else if (std.mem.eql(u8, arg, "--read-pct")) {
-            i += 1;
-            if (i >= argv.len) return error.InvalidArgs;
-            args.read_pct = try std.fmt.parseInt(u8, argv[i], 10);
-            if (args.read_pct > 100) return error.InvalidArgs;
-        } else if (std.mem.eql(u8, arg, "--value-size")) {
-            i += 1;
-            if (i >= argv.len) return error.InvalidArgs;
-            args.value_size = try std.fmt.parseInt(u32, argv[i], 10);
-        } else if (std.mem.eql(u8, arg, "--namespaces")) {
-            i += 1;
-            if (i >= argv.len) return error.InvalidArgs;
-            args.namespaces = try std.fmt.parseInt(u32, argv[i], 10);
-            if (args.namespaces == 0) return error.InvalidArgs;
-        } else if (std.mem.eql(u8, arg, "--verify-clients")) {
-            i += 1;
-            if (i >= argv.len) return error.InvalidArgs;
-            args.verify_clients = try std.fmt.parseInt(u32, argv[i], 10);
-        } else if (std.mem.eql(u8, arg, "--batch-size")) {
-            i += 1;
-            if (i >= argv.len) return error.InvalidArgs;
-            args.batch_size = try std.fmt.parseInt(u32, argv[i], 10);
-            if (args.batch_size == 0) return error.InvalidArgs;
-        } else if (std.mem.eql(u8, arg, "--load")) {
-            args.phase = .load;
-        } else if (std.mem.eql(u8, arg, "--run")) {
-            args.phase = .run;
-        } else {
-            return error.InvalidArgs;
-        }
-        i += 1;
-    }
-    return args;
+fn usage(alloc: std.mem.Allocator) void {
+    var help: std.ArrayList(u8) = .empty;
+    defer help.deinit(alloc);
+    flags.g().writeHelpAll(&help) catch {};
+    const stderr = std.fs.File.stderr();
+    _ = stderr.write(help.items) catch {};
+    _ = stderr.write("\n") catch {};
 }
 
 // --- Text protocol (client side) ---
@@ -440,7 +372,7 @@ fn workerImpl(ctx: *WorkerCtx) !void {
     // to `bs` keys per `set_batch`. Batches break on namespace boundaries
     // (all kvs in one batch must share a namespace — that's how the server
     // is structured).
-    if (args.phase == .load or args.phase == .both) {
+    if (std.mem.eql(u8, args.phase, "load") or std.mem.eql(u8, args.phase, "both")) {
         const total = args.records;
         const n_clients: u64 = args.clients;
         const per_worker = total / n_clients;
@@ -505,7 +437,7 @@ fn workerImpl(ctx: *WorkerCtx) !void {
 
     // Run phase: random read/write mix. Reads retry on NOT_FOUND and verify
     // the returned value bytes against the expected deterministic pattern.
-    if (args.phase == .run or args.phase == .both) {
+    if (std.mem.eql(u8, args.phase, "run") or std.mem.eql(u8, args.phase, "both")) {
         log.info("worker {d}: run phase — {d} ops, {d}% reads", .{ ctx.id, args.ops, args.read_pct });
         const t0 = Timestamp.now(.monotonic);
         var i: u64 = 0;
@@ -693,7 +625,7 @@ fn printResults(args: *const Args, contexts: []WorkerCtx, shared: *const SharedS
         std.debug.print("\n", .{});
     }
 
-    if (args.phase == .load or args.phase == .both) {
+    if (std.mem.eql(u8, args.phase, "load") or std.mem.eql(u8, args.phase, "both")) {
         const load_recs = total.write_ok + total.write_err;
         if (load_ns > 0 and load_recs > 0) {
             const load_ops_sec = load_recs * 1_000_000_000 / load_ns;
@@ -704,7 +636,7 @@ fn printResults(args: *const Args, contexts: []WorkerCtx, shared: *const SharedS
             std.debug.print("  errors:    {d}\n", .{total.write_err});
         }
         // Reset write stats if both phases — load writes shouldn't mix with run writes.
-        if (args.phase == .both) {
+        if (std.mem.eql(u8, args.phase, "both")) {
             // Re-aggregate from scratch for run phase reporting below.
             total = .{};
             for (contexts) |*ctx| {
@@ -713,7 +645,7 @@ fn printResults(args: *const Args, contexts: []WorkerCtx, shared: *const SharedS
         }
     }
 
-    if (args.phase == .run or args.phase == .both) {
+    if (std.mem.eql(u8, args.phase, "run") or std.mem.eql(u8, args.phase, "both")) {
         const total_ops = total.read_ok + total.read_miss + total.read_err + total.write_ok + total.write_err;
         if (run_ns > 0 and total_ops > 0) {
             const ops_sec = total_ops * 1_000_000_000 / run_ns;
@@ -760,13 +692,46 @@ pub fn main() !void {
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
 
-    const args = parseArgs(argv) catch {
-        usage();
-        return;
-    };
+    flags.initGlobal(allocator);
+    defer flags.deinitGlobal();
+    const live = try flags.g().register("bench", Args);
 
-    std.debug.print("zdb-client: addr={s} clients={d} records={d} ops={d} read%={d} value_size={d}\n", .{
-        args.addr, args.clients, args.records, args.ops, args.read_pct, args.value_size,
+    for (argv[1..]) |a| {
+        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+            usage(allocator);
+            return;
+        }
+    }
+
+    var leftover: std.ArrayList([]const u8) = .empty;
+    defer leftover.deinit(allocator);
+    flags.g().parseArgv(argv[1..], &leftover) catch |err| {
+        std.log.err("flag parse failed: {s}", .{@errorName(err)});
+        usage(allocator);
+        std.process.exit(1);
+    };
+    if (leftover.items.len != 0) {
+        std.log.err("unexpected positional '{s}' — config goes through --bench flag", .{leftover.items[0]});
+        usage(allocator);
+        std.process.exit(1);
+    }
+
+    const args = live.snapshot();
+    if (args.read_pct > 100) {
+        std.log.err("--bench read_pct must be in [0..100]", .{});
+        std.process.exit(1);
+    }
+    if (args.namespaces == 0 or args.batch_size == 0) {
+        std.log.err("--bench namespaces and batch_size must be > 0", .{});
+        std.process.exit(1);
+    }
+    if (!std.mem.eql(u8, args.phase, "load") and !std.mem.eql(u8, args.phase, "run") and !std.mem.eql(u8, args.phase, "both")) {
+        std.log.err("--bench phase must be \"load\", \"run\", or \"both\"", .{});
+        std.process.exit(1);
+    }
+
+    std.debug.print("zdb-client: addr={s} clients={d} records={d} ops={d} read%={d} value_size={d} phase={s}\n", .{
+        args.addr, args.clients, args.records, args.ops, args.read_pct, args.value_size, args.phase,
     });
 
     const n_threads: u6 = @intCast(@max(2, args.clients));
