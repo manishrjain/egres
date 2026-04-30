@@ -101,12 +101,7 @@ pub const Table = struct {
         var table_index = try buffers.TableIndexStruct.fromReader(allocator, index_reader);
         errdefer table_index.deinit(allocator);
 
-        const codec: compress.Codec = if (table_index.is_lz4)
-            .lz4
-        else if (table_index.is_zstd)
-            .zstd
-        else
-            .none;
+        const codec: compress.Codec = @enumFromInt(@intFromEnum(table_index.compression));
 
         // Steal the fingerprints slice from the decoded index struct into a
         // BinaryFuse(u16) that we keep for the lifetime of this Table.  After

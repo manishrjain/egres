@@ -18,18 +18,21 @@ pub const BinaryFuseFilter = schema.Table(.{
     .{ .id = 6, .name = "fingerprints", .ty = schema.Array(schema.U16) },
 });
 
+// Tags chosen to match `u/compress.zig::Codec` so @enumFromInt(@intFromEnum(...))
+// is identity at the wire boundary.
+pub const Compression = schema.EnumDef(.{
+    .{ .name = "none", .tag = 0 },
+    .{ .name = "zstd", .tag = 1 },
+    .{ .name = "lz4", .tag = 2 },
+});
+
 pub const TableIndex = schema.Table(.{
     .{ .id = 1, .name = "max_version", .ty = schema.U64 },
     .{ .id = 2, .name = "key_count", .ty = schema.U32 },
     .{ .id = 3, .name = "uncompressed_size", .ty = schema.U32 },
     .{ .id = 4, .name = "compressed_size", .ty = schema.U32 },
     .{ .id = 5, .name = "stale_data_size", .ty = schema.U32 },
-
-    .{ .id = 6, .name = "compression", .ty = schema.B64 },
-    .{ .name = "is_none", .ty = schema.Bool(.{ .field_id = 6, .bit = 0 }) },
-    .{ .name = "is_lz4", .ty = schema.Bool(.{ .field_id = 6, .bit = 1 }) },
-    .{ .name = "is_zstd", .ty = schema.Bool(.{ .field_id = 6, .bit = 2 }) },
-
+    .{ .id = 6, .name = "compression", .ty = schema.Enum(Compression) },
     .{ .id = 7, .name = "last_key", .ty = schema.Bytes },
     .{ .id = 8, .name = "blocks", .ty = schema.Array(BlockIndex) },
     .{ .id = 9, .name = "binary_fuse", .ty = BinaryFuseFilter },

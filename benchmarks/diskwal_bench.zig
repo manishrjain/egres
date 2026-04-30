@@ -151,8 +151,7 @@ fn runOne(
                 .term = 1,
                 .timestamp = 0,
                 .data = payload,
-                .is_normal = true,
-                .is_conf_change = false,
+                .entry_type = zen.EntryTypeEnum.normal,
                 .conf_change = zen.NullOffset,
             });
             batch.appendAssumeCapacity(try writer.finishWithTail());

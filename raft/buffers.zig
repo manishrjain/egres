@@ -1,24 +1,32 @@
 const schema = @import("schema");
 
-// Enums from message.zig are encoded as u32 for now.
+// tag 0 reserved for undefined — a freshly-zeroed byte never decodes as a real change.
+pub const ChangeType = schema.EnumDef(.{
+    .{ .name = "unknown", .tag = 0 },
+    .{ .name = "add_voter", .tag = 1 },
+    .{ .name = "add_learner", .tag = 2 },
+    .{ .name = "to_voter", .tag = 3 },
+    .{ .name = "to_learner", .tag = 4 },
+    .{ .name = "remove_node", .tag = 5 },
+    .{ .name = "update_addr", .tag = 6 },
+});
+
 pub const ConfChange = schema.Table(.{
-    .{ .id = 1, .name = "change_type", .ty = schema.B64 },
-    .{ .name = "add_voter", .ty = schema.Bool(.{ .field_id = 1, .bit = 0 }) },
-    .{ .name = "add_learner", .ty = schema.Bool(.{ .field_id = 1, .bit = 1 }) },
-    .{ .name = "to_voter", .ty = schema.Bool(.{ .field_id = 1, .bit = 2 }) },
-    .{ .name = "to_learner", .ty = schema.Bool(.{ .field_id = 1, .bit = 3 }) },
-    .{ .name = "remove_node", .ty = schema.Bool(.{ .field_id = 1, .bit = 4 }) },
-    .{ .name = "update_addr", .ty = schema.Bool(.{ .field_id = 1, .bit = 5 }) },
+    .{ .id = 1, .name = "change_type", .ty = schema.Enum(ChangeType) },
     .{ .id = 2, .name = "node_id", .ty = schema.U64 },
     .{ .id = 3, .name = "addr", .ty = schema.Bytes },
+});
+
+pub const Role = schema.EnumDef(.{
+    .{ .name = "unknown", .tag = 0 },
+    .{ .name = "voter", .tag = 1 },
+    .{ .name = "learner", .tag = 2 },
 });
 
 pub const ConfStatePeer = schema.Table(.{
     .{ .id = 1, .name = "id", .ty = schema.U64 },
     .{ .id = 2, .name = "addr", .ty = schema.Bytes },
-    .{ .id = 3, .name = "role", .ty = schema.B64 },
-    .{ .name = "is_voter", .ty = schema.Bool(.{ .field_id = 3, .bit = 0 }) },
-    .{ .name = "is_learner", .ty = schema.Bool(.{ .field_id = 3, .bit = 1 }) },
+    .{ .id = 3, .name = "role", .ty = schema.Enum(Role) },
 });
 
 pub const ConfState = schema.Table(.{
@@ -47,6 +55,15 @@ pub const Snapshot = schema.Table(.{
     .{ .id = 4, .name = "conf_state", .ty = ConfState },
 });
 
+// tag 0 = .any: serves both as the safe default for an uninitialized byte and
+// as the wildcard filter in `EntriesRangeOpts.ty` (no real entry on the wire
+// is ever .any, so it never matches an actual entry).
+pub const EntryType = schema.EnumDef(.{
+    .{ .name = "any", .tag = 0 },
+    .{ .name = "normal", .tag = 1 },
+    .{ .name = "conf_change", .tag = 2 },
+});
+
 pub const LogEntry = schema.Table(.{
     .{ .id = 1, .name = "index", .ty = schema.U64 },
     .{ .id = 2, .name = "term", .ty = schema.U64 },
@@ -54,10 +71,7 @@ pub const LogEntry = schema.Table(.{
     // propose critical section (so log order == timestamp order).
     .{ .id = 3, .name = "timestamp", .ty = schema.U64 },
     .{ .id = 4, .name = "data", .ty = schema.Bytes },
-
-    .{ .id = 5, .name = "entry_type", .ty = schema.B64 },
-    .{ .name = "is_normal", .ty = schema.Bool(.{ .field_id = 5, .bit = 0 }) },
-    .{ .name = "is_conf_change", .ty = schema.Bool(.{ .field_id = 5, .bit = 1 }) },
+    .{ .id = 5, .name = "entry_type", .ty = schema.Enum(EntryType) },
     .{ .id = 6, .name = "conf_change", .ty = ConfChange },
 });
 

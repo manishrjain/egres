@@ -260,16 +260,13 @@ pub const Builder = struct {
         try index_writer.set(.{
             .blocks = block_offsets,
             .last_key = self.last_key.items,
-            .bloom_filter = "",
             .max_version = self.max_version,
             .key_count = self.key_count,
             .uncompressed_size = self.uncompressed_size,
             .compressed_size = self.compressed_size,
             .stale_data_size = self.stale_data_size,
-            .is_none = self.cfg.codec == .none,
-            .is_lz4 = self.cfg.codec == .lz4,
-            .is_zstd = self.cfg.codec == .zstd,
         });
+        try index_writer.setCompression(@enumFromInt(@intFromEnum(self.cfg.codec)));
         if (binary_fuse_off) |off| {
             try index_writer.setBinaryFuse(off);
         }

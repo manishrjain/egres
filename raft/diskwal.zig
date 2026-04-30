@@ -171,7 +171,7 @@ pub const logFile = struct {
             try slots_list.append(alloc, .{
                 .term = base.term + readInt(u32, slot[0..4], .little),
                 .index = base.index + index_delta,
-                .ty = @enumFromInt(readInt(u16, slot[6..8], .little)),
+                .ty = @enumFromInt(slot[6]),
                 .data_offset = readInt(u32, slot[8..12], .little),
                 .data_len = readInt(u32, slot[12..16], .little),
             });
@@ -259,7 +259,7 @@ pub const logFile = struct {
                 .index = reader.index(),
                 .data_offset = @intCast(log_file_offset + pos),
                 .data_len = payload_len,
-                .ty = if (reader.isConfChange()) .conf else .data,
+                .ty = reader.entryType(),
             });
 
             pos += record_header_size + payload_len;
@@ -414,7 +414,7 @@ pub const logFile = struct {
             .index = reader.index(),
             .data_offset = @intCast(self.write_offset),
             .data_len = payload_len,
-            .ty = if (reader.isConfChange()) .conf else .data,
+            .ty = reader.entryType(),
         });
         self.write_offset += needed;
     }
@@ -466,7 +466,8 @@ pub const logFile = struct {
 
             writeInt(u32, hdr_buf[off .. off + 4], @intCast(ent.term - self.baseEntry().term), .little);
             writeInt(u16, hdr_buf[off + 4 .. off + 6], @intCast(ent.index - self.baseEntry().index), .little);
-            writeInt(u16, hdr_buf[off + 6 .. off + 8], @intFromEnum(ent.ty), .little);
+            hdr_buf[off + 6] = @intFromEnum(ent.ty);
+            hdr_buf[off + 7] = 0; // reserved
             writeInt(u32, hdr_buf[off + 8 .. off + 12], ent.data_offset, .little);
             writeInt(u32, hdr_buf[off + 12 .. off + 16], ent.data_len, .little);
         }

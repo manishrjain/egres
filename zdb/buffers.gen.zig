@@ -7,6 +7,13 @@ pub const NullOffset: u32 = zbuf.NullOffset;
 
 pub const Ownership = zbuf.Ownership;
 
+pub const CompressionEnum = enum(u8) {
+    none = 0,
+    zstd = 1,
+    lz4 = 2,
+    _,
+};
+
 pub fn addTail(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), comptime T: type, offset: u32) Error!void {
     try zbuf.appendMessageTail(buf, alloc, T.TABLE_ID, T.VERSION, offset);
 }
@@ -297,24 +304,18 @@ pub const BlockIndexWriter = struct {
 };
 
 pub const TableIndexStruct = struct {
-    is_none: bool = false,
-    is_lz4: bool = false,
-    is_zstd: bool = false,
     max_version: u64 = 0,
     key_count: u32 = 0,
     uncompressed_size: u32 = 0,
     compressed_size: u32 = 0,
     stale_data_size: u32 = 0,
-    compression: u64 = 0,
+    compression: CompressionEnum = @enumFromInt(0),
     last_key: []const u8 = &.{},
     blocks: []BlockIndexStruct = &.{},
     binary_fuse: ?BinaryFuseFilterStruct = null,
 
     fn fromReaderValue(alloc: std.mem.Allocator, r: TableIndexReader) Error!TableIndexStruct {
         var s = TableIndexStruct{
-            .is_none = r.isNone(),
-            .is_lz4 = r.isLz4(),
-            .is_zstd = r.isZstd(),
             .max_version = r.maxVersion(),
             .key_count = r.keyCount(),
             .uncompressed_size = r.uncompressedSize(),
@@ -363,9 +364,6 @@ pub const TableIndexStruct = struct {
 
     fn cloneValue(self: TableIndexStruct, alloc: std.mem.Allocator) Error!TableIndexStruct {
         var s = TableIndexStruct{
-            .is_none = self.is_none,
-            .is_lz4 = self.is_lz4,
-            .is_zstd = self.is_zstd,
             .max_version = self.max_version,
             .key_count = self.key_count,
             .uncompressed_size = self.uncompressed_size,
@@ -397,15 +395,12 @@ pub const TableIndexStruct = struct {
 
     pub fn marshalTo(self: TableIndexStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try TableIndexWriter.initWithBuf(alloc, out);
-        try writer.setIsNone(self.is_none);
-        try writer.setIsLz4(self.is_lz4);
-        try writer.setIsZstd(self.is_zstd);
         try writer.setMaxVersion(self.max_version);
         try writer.setKeyCount(self.key_count);
         try writer.setUncompressedSize(self.uncompressed_size);
         try writer.setCompressedSize(self.compressed_size);
         try writer.setStaleDataSize(self.stale_data_size);
-        try writer.compressionSet(self.compression);
+        try writer.setCompression(self.compression);
         try writer.setLastKey(self.last_key);
         if (self.blocks.len > 0) {
             const offsets = try alloc.alloc(u32, self.blocks.len);
@@ -432,7 +427,7 @@ pub const TableIndexReader = struct {
 
     pub const VERSION: u16 = 1;
     pub const TABLE_ID: u16 = 46594;
-    pub const SIZE_BYTES: u16 = 56;
+    pub const SIZE_BYTES: u16 = 49;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -446,33 +441,6 @@ pub const TableIndexReader = struct {
         const size_bytes = try zbuf.readU16(buf, @as(usize, base + 2));
         if (@as(usize, base) + @as(usize, size_bytes) > buf.len) return zbuf.Error.OutOfBounds;
         return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
-    }
-
-    pub fn isNone(self: Self) bool {
-        const slot_end = @as(u32, self.base) + 36;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return false;
-        const word = zbuf.readU64(self.buf, @as(usize, self.base + 28)) catch 0;
-        const bit = @as(u6, @intCast(0));
-        return ((word >> bit) & 1) == 1;
-    }
-
-    pub fn isLz4(self: Self) bool {
-        const slot_end = @as(u32, self.base) + 36;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return false;
-        const word = zbuf.readU64(self.buf, @as(usize, self.base + 28)) catch 0;
-        const bit = @as(u6, @intCast(1));
-        return ((word >> bit) & 1) == 1;
-    }
-
-    pub fn isZstd(self: Self) bool {
-        const slot_end = @as(u32, self.base) + 36;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return false;
-        const word = zbuf.readU64(self.buf, @as(usize, self.base + 28)) catch 0;
-        const bit = @as(u6, @intCast(2));
-        return ((word >> bit) & 1) == 1;
     }
 
     pub fn maxVersion(self: Self) u64 {
@@ -510,36 +478,30 @@ pub const TableIndexReader = struct {
         return zbuf.readU32(self.buf, @as(usize, self.base + 24)) catch 0;
     }
 
-    pub fn compression(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 36;
+    pub fn compression(self: Self) CompressionEnum {
+        const slot_end = @as(u32, self.base) + 29;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 28)) catch 0;
-    }
-
-    pub fn compressionHasBit(self: Self, bit_index: u32) bool {
-        if (bit_index >= 64) return false;
-        const bit = @as(u6, @intCast(bit_index % 64));
-        const word = zbuf.readU64(self.buf, @as(usize, self.base + 28)) catch 0;
-        return ((word >> bit) & 1) == 1;
+        if (slot_end > header_end) return @enumFromInt(0);
+        const v = zbuf.readU8(self.buf, @as(usize, self.base + 28)) catch 0;
+        return @enumFromInt(v);
     }
 
     pub fn lastKey(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 44;
+        const slot_end = @as(u32, self.base) + 37;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return &[_]u8{};
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 36)) catch 0;
-        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 40)) catch 0;
+        const off = zbuf.readU32(self.buf, @as(usize, self.base + 29)) catch 0;
+        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 33)) catch 0;
         if (data_len == 0) return &[_]u8{};
         return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
     }
 
     fn blocksSlice(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 52;
+        const slot_end = @as(u32, self.base) + 45;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return &.{};
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 44)) catch return &.{};
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 48)) catch return &.{};
+        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 37)) catch return &.{};
+        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 41)) catch return &.{};
         if (elem_count == 0) return &.{};
         const end = @as(usize, index_off) + @as(usize, elem_count) * 4;
         if (end > self.buf.len) return &.{};
@@ -570,10 +532,10 @@ pub const TableIndexReader = struct {
     }
 
     pub fn binaryFuse(self: Self) ?BinaryFuseFilterReader {
-        const slot_end = @as(u32, self.base) + 56;
+        const slot_end = @as(u32, self.base) + 49;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return null;
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 52)) catch 0;
+        const off = zbuf.readU32(self.buf, @as(usize, self.base + 45)) catch 0;
         if (off == zbuf.NullOffset) return null;
         return BinaryFuseFilterReader.init(self.buf, off) catch null;
     }
@@ -581,18 +543,18 @@ pub const TableIndexReader = struct {
     pub fn verify(self: Self) Error!void {
         if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        const slot_end_36 = @as(u32, self.base) + 44;
-        if (slot_end_36 <= header_end) {
-            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 36));
-            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 40));
+        const slot_end_29 = @as(u32, self.base) + 37;
+        if (slot_end_29 <= header_end) {
+            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 29));
+            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 33));
             if (data_len > 0) {
                 _ = try zbuf.sliceAt(self.buf, off, data_len);
             }
         }
-        const slot_end_arr_44 = @as(u32, self.base) + 52;
-        if (slot_end_arr_44 <= header_end) {
-            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 44));
-            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 48));
+        const slot_end_arr_37 = @as(u32, self.base) + 45;
+        if (slot_end_arr_37 <= header_end) {
+            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 37));
+            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 41));
             if (elem_count > 0) {
                 const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
                 if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
@@ -632,15 +594,12 @@ pub const TableIndexBuffer = struct {
     pub fn cloneInto(self: @This(), alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         const reader = try self.initReader();
         var writer = try TableIndexWriter.initWithBuf(alloc, out);
-        try writer.setIsNone(reader.isNone());
-        try writer.setIsLz4(reader.isLz4());
-        try writer.setIsZstd(reader.isZstd());
         try writer.setMaxVersion(reader.maxVersion());
         try writer.setKeyCount(reader.keyCount());
         try writer.setUncompressedSize(reader.uncompressedSize());
         try writer.setCompressedSize(reader.compressedSize());
         try writer.setStaleDataSize(reader.staleDataSize());
-        try writer.compressionSet(reader.compression());
+        try writer.setCompression(reader.compression());
         try writer.setLastKey(reader.lastKey());
         const count_blocks: u32 = reader.blocksLen();
         if (count_blocks != 0) {
@@ -680,7 +639,7 @@ pub const TableIndexWriter = struct {
 
     pub const VERSION: u16 = 1;
     pub const TABLE_ID: u16 = 46594;
-    pub const SIZE_BYTES: u16 = 56;
+    pub const SIZE_BYTES: u16 = 49;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -690,7 +649,7 @@ pub const TableIndexWriter = struct {
         const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);
         try zbuf.writeU16At(buf.items, @as(usize, base), VERSION);
         try zbuf.writeU16At(buf.items, @as(usize, base + 2), SIZE_BYTES);
-        try zbuf.patchU32(buf.items, base + 52, zbuf.NullOffset);
+        try zbuf.patchU32(buf.items, base + 45, zbuf.NullOffset);
         return .{ .buf = buf, .owns_buf = false, .alloc = alloc, .base = base };
     }
 
@@ -701,47 +660,8 @@ pub const TableIndexWriter = struct {
         const base = try zbuf.reserveHeader(owned, alloc, SIZE_BYTES);
         try zbuf.writeU16At(owned.items, @as(usize, base), VERSION);
         try zbuf.writeU16At(owned.items, @as(usize, base + 2), SIZE_BYTES);
-        try zbuf.patchU32(owned.items, base + 52, zbuf.NullOffset);
+        try zbuf.patchU32(owned.items, base + 45, zbuf.NullOffset);
         return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
-    }
-
-    pub fn setIsNone(self: *Self, v: bool) Error!void {
-        const out = self.bufMut();
-        const word_off = self.base + 28;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        const bit = @as(u6, @intCast(0));
-        if (v) {
-            word |= (@as(u64, 1) << bit);
-        } else {
-            word &= ~(@as(u64, 1) << bit);
-        }
-        try zbuf.patchU64(out.items, word_off, word);
-    }
-
-    pub fn setIsLz4(self: *Self, v: bool) Error!void {
-        const out = self.bufMut();
-        const word_off = self.base + 28;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        const bit = @as(u6, @intCast(1));
-        if (v) {
-            word |= (@as(u64, 1) << bit);
-        } else {
-            word &= ~(@as(u64, 1) << bit);
-        }
-        try zbuf.patchU64(out.items, word_off, word);
-    }
-
-    pub fn setIsZstd(self: *Self, v: bool) Error!void {
-        const out = self.bufMut();
-        const word_off = self.base + 28;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        const bit = @as(u6, @intCast(2));
-        if (v) {
-            word |= (@as(u64, 1) << bit);
-        } else {
-            word &= ~(@as(u64, 1) << bit);
-        }
-        try zbuf.patchU64(out.items, word_off, word);
     }
 
     pub fn setMaxVersion(self: *Self, v: u64) Error!void {
@@ -769,69 +689,40 @@ pub const TableIndexWriter = struct {
         try zbuf.patchU32(out.items, self.base + 24, v);
     }
 
-    pub fn compressionSet(self: *Self, v: u64) Error!void {
+    pub fn setCompression(self: *Self, v: CompressionEnum) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 28, v);
-    }
-
-    pub fn compressionSetBit(self: *Self, bit_index: u32) Error!void {
-        const out = self.bufMut();
-        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
-        const bit = @as(u6, @intCast(bit_index % 64));
-        const word_off = self.base + 28;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        word |= (@as(u64, 1) << bit);
-        try zbuf.patchU64(out.items, word_off, word);
-    }
-
-    pub fn compressionClearBit(self: *Self, bit_index: u32) Error!void {
-        const out = self.bufMut();
-        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
-        const bit = @as(u6, @intCast(bit_index % 64));
-        const word_off = self.base + 28;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        word &= ~(@as(u64, 1) << bit);
-        try zbuf.patchU64(out.items, word_off, word);
-    }
-
-    pub fn compressionHasBit(self: *Self, bit_index: u32) Error!bool {
-        const out = self.bufMut();
-        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
-        const bit = @as(u6, @intCast(bit_index % 64));
-        const word_off = self.base + 28;
-        const word = try zbuf.readU64(out.items, @as(usize, word_off));
-        return ((word >> bit) & 1) == 1;
+        try zbuf.patchU8(out.items, self.base + 28, @intFromEnum(v));
     }
 
     pub fn setLastKey(self: *Self, data: []const u8) Error!void {
         const out = self.bufMut();
         if (data.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 36, 0);
-            try zbuf.patchU32(out.items, self.base + 40, 0);
+            try zbuf.patchU32(out.items, self.base + 29, 0);
+            try zbuf.patchU32(out.items, self.base + 33, 0);
             return;
         }
         const abs_off = try zbuf.appendBytes(out, self.alloc, data);
         const off = abs_off;
-        try zbuf.patchU32(out.items, self.base + 36, off);
-        try zbuf.patchU32(out.items, self.base + 40, @as(u32, @intCast(data.len)));
+        try zbuf.patchU32(out.items, self.base + 29, off);
+        try zbuf.patchU32(out.items, self.base + 33, @as(u32, @intCast(data.len)));
     }
 
     pub fn setBlocks(self: *Self, values: []const u32) Error!void {
         const out = self.bufMut();
         if (values.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 44, 0);
-            try zbuf.patchU32(out.items, self.base + 48, 0);
+            try zbuf.patchU32(out.items, self.base + 37, 0);
+            try zbuf.patchU32(out.items, self.base + 41, 0);
             return;
         }
         const abs_index_off = try zbuf.appendU32Slice(out, self.alloc, values);
         const index_off = abs_index_off;
-        try zbuf.patchU32(out.items, self.base + 44, index_off);
-        try zbuf.patchU32(out.items, self.base + 48, @as(u32, @intCast(values.len)));
+        try zbuf.patchU32(out.items, self.base + 37, index_off);
+        try zbuf.patchU32(out.items, self.base + 41, @as(u32, @intCast(values.len)));
     }
 
     pub fn setBinaryFuse(self: *Self, child_off: u32) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 52, child_off);
+        try zbuf.patchU32(out.items, self.base + 45, child_off);
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -839,15 +730,12 @@ pub const TableIndexWriter = struct {
         if (@typeInfo(Values) != .@"struct") {
             @compileError("set() expects a struct literal like .{ .field = value }");
         }
-        if (@hasField(Values, "is_none")) try self.setIsNone(@field(values, "is_none"));
-        if (@hasField(Values, "is_lz4")) try self.setIsLz4(@field(values, "is_lz4"));
-        if (@hasField(Values, "is_zstd")) try self.setIsZstd(@field(values, "is_zstd"));
         if (@hasField(Values, "max_version")) try self.setMaxVersion(@field(values, "max_version"));
         if (@hasField(Values, "key_count")) try self.setKeyCount(@field(values, "key_count"));
         if (@hasField(Values, "uncompressed_size")) try self.setUncompressedSize(@field(values, "uncompressed_size"));
         if (@hasField(Values, "compressed_size")) try self.setCompressedSize(@field(values, "compressed_size"));
         if (@hasField(Values, "stale_data_size")) try self.setStaleDataSize(@field(values, "stale_data_size"));
-        if (@hasField(Values, "compression")) try self.compressionSet(@field(values, "compression"));
+        if (@hasField(Values, "compression")) try self.setCompression(@field(values, "compression"));
         if (@hasField(Values, "last_key")) try self.setLastKey(@field(values, "last_key"));
         if (@hasField(Values, "blocks")) try self.setBlocks(@field(values, "blocks"));
         if (@hasField(Values, "binary_fuse")) try self.setBinaryFuse(@field(values, "binary_fuse"));

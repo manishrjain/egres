@@ -2,14 +2,13 @@ const std = @import("std");
 const zen = @import("buffers_gen");
 
 pub const NodeId = u64;
-pub const ConfChangeType = enum(u8) {
-    add_voter,
-    add_learner,
-    to_voter,
-    to_learner,
-    remove_node,
-    update_addr,
-};
+
+// Wire-format enums live in raft/buffers.zig; we just re-export the Zig types
+// so consumers can write `raftwal.ConfChangeType` instead of reaching into the
+// generated zbuf module directly.
+pub const ConfChangeType = zen.ChangeTypeEnum;
+pub const EntryType = zen.EntryTypeEnum;
+
 pub const ConfChange = struct {
     change_type: ConfChangeType,
     node_id: NodeId,
@@ -20,12 +19,6 @@ pub const HardState = zen.HardStateStruct;
 pub const Snapshot = zen.SnapshotStruct;
 pub const ConfState = zen.ConfStateStruct;
 pub const ConfStatePeer = zen.ConfStatePeerStruct;
-
-pub const EntryType = enum(u16) {
-    any = 0,
-    data = 1,
-    conf = 2,
-};
 
 pub const StoredEntry = struct {
     index: u64,
@@ -43,6 +36,8 @@ pub const EntriesRangeOpts = struct {
     lo: u64,
     hi: u64 = std.math.maxInt(u64),
     max_bytes: u64 = 64 * 1024 * 1024, // 64 MiB
+    // .any (tag 0) is the wildcard filter — an entry's wire-encoded type is
+    // .normal or .conf_change, never .any.
     ty: EntryType = .any,
 };
 

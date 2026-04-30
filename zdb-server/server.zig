@@ -152,7 +152,7 @@ pub const StorageImpl = struct {
 
         for (entries) |entry| {
             const reader = entry.initReader() catch continue;
-            if (!reader.isNormal()) continue;
+            if (reader.entryType() != .normal) continue;
             const data = reader.data();
             if (data.len == 0) continue;
 

@@ -20,10 +20,7 @@ pub const State = enum {
 pub const ConfChange = raftwal_mod.ConfChange;
 pub const ConfChangeType = raftwal_mod.ConfChangeType;
 
-pub const PeerRole = enum {
-    voter,
-    learner,
-};
+pub const PeerRole = zen.RoleEnum;
 
 pub const Config = struct {
     id: NodeId,
@@ -708,7 +705,7 @@ pub const Node = struct {
         const snap = self.log.snapshot();
         if (snap.conf_state) |cs| {
             for (cs.peers) |p| {
-                const role: PeerRole = if (p.is_voter) .voter else .learner;
+                const role: PeerRole = p.role;
                 if (p.id == self.id) {
                     // Restore our own role from conf state.
                     self.state = if (role == .learner) .learner else .follower;
@@ -730,7 +727,7 @@ pub const Node = struct {
         var lo = start;
         while (lo <= last) {
             var result = while (true) {
-                break self.log.entriesRange(.{ .lo = lo, .hi = last + 1, .ty = .conf }) catch |err| {
+                break self.log.entriesRange(.{ .lo = lo, .hi = last + 1, .ty = .conf_change }) catch |err| {
                     std.log.err("restoreConfState: entriesRange failed: {}, retrying...", .{err});
                     zio.sleep(.fromSeconds(1)) catch return;
                     continue;
@@ -770,11 +767,9 @@ pub const Node = struct {
         @memset(cs_peers, .{});
 
         // Add self.
-        const self_is_voter = self.state != .learner;
         cs_peers[0] = .{
             .id = self.id,
-            .is_voter = self_is_voter,
-            .is_learner = !self_is_voter,
+            .role = if (self.state != .learner) .voter else .learner,
         };
 
         var i: usize = 1;
@@ -783,8 +778,7 @@ pub const Node = struct {
             cs_peers[i] = .{
                 .id = peer.id,
                 .addr = try self.allocator.dupe(u8, peer.addr),
-                .is_voter = peer.role == .voter,
-                .is_learner = peer.role == .learner,
+                .role = peer.role,
             };
             i += 1;
         }
@@ -1329,12 +1323,7 @@ pub const Node = struct {
         var cc_writer = try zen.ConfChangeWriter.initWithBuf(self.allocator, &buf);
         defer cc_writer.deinit();
         try cc_writer.set(.{
-            .add_voter = cc.change_type == .add_voter,
-            .add_learner = cc.change_type == .add_learner,
-            .to_voter = cc.change_type == .to_voter,
-            .to_learner = cc.change_type == .to_learner,
-            .remove_node = cc.change_type == .remove_node,
-            .update_addr = cc.change_type == .update_addr,
+            .change_type = cc.change_type,
             .node_id = cc.node_id,
             .addr = cc.addr,
         });
@@ -1441,13 +1430,18 @@ pub const Node = struct {
                 }
 
                 const cc = try zen.ConfChangeReader.init(req.data, 0);
-                // TODO: Switch to enum here.
-                if (!cc.addVoter() and !cc.addLearner() and !cc.toVoter() and !cc.toLearner() and !cc.removeNode() and !cc.updateAddr()) {
-                    req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .invalid_req);
-                    continue;
+                const ct = cc.changeType();
+                // Reject the uninitialized default and any unknown variant from
+                // a future schema (forward-compat catch-all).
+                switch (ct) {
+                    .add_voter, .add_learner, .to_voter, .to_learner, .remove_node, .update_addr => {},
+                    .unknown, _ => {
+                        req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .invalid_req);
+                        continue;
+                    },
                 }
                 // Reject add if addr is missing or unparseable.
-                if (cc.addVoter() or cc.addLearner()) {
+                if (ct == .add_voter or ct == .add_learner) {
                     _ = zio.net.IpAddress.parseIpAndPort(cc.addr()) catch {
                         req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .invalid_addr);
                         continue;
@@ -1460,7 +1454,7 @@ pub const Node = struct {
                     }
                 }
 
-                if (cc.updateAddr()) {
+                if (ct == .update_addr) {
                     _ = zio.net.IpAddress.parseIpAndPort(cc.addr()) catch {
                         req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .invalid_addr);
                         continue;
@@ -1472,7 +1466,7 @@ pub const Node = struct {
                 }
 
                 // Reject if the target peer doesn't exist for changes that require it.
-                if (cc.toVoter() or cc.toLearner() or cc.removeNode()) {
+                if (ct == .to_voter or ct == .to_learner or ct == .remove_node) {
                     if (cc.nodeId() != self.id and !self.peers.contains(cc.nodeId())) {
                         req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .unknown_node);
                         continue;
@@ -1480,7 +1474,7 @@ pub const Node = struct {
                 }
 
                 // Reject if this would remove the last voter.
-                if (self.quorum_size <= 1 and (cc.toLearner() or cc.removeNode())) {
+                if (self.quorum_size <= 1 and (ct == .to_learner or ct == .remove_node)) {
                     req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .last_voter);
                     continue;
                 }
@@ -1509,13 +1503,13 @@ pub const Node = struct {
             // timestamp order — the invariant that makes applied_timestamp a
             // safe bound for consistent follower reads.
             const ts = utils.hlc.g().next().asU64();
+            const et: zen.EntryTypeEnum = if (is_conf) .conf_change else .normal;
             try writer.set(.{
                 .index = index,
                 .term = self.current_term,
                 .timestamp = ts,
                 .data = if (is_conf) &[_]u8{} else req.data,
-                .is_normal = !is_conf,
-                .is_conf_change = is_conf,
+                .entry_type = et,
                 .conf_change = cc_offset,
             });
             _ = try writer.finishWithTail();
@@ -1674,7 +1668,7 @@ pub const Node = struct {
             for (result.entries) |entry| {
                 const reader = zen.LogEntryReader.parseRoot(entry.bytes) catch continue;
 
-                if (reader.isNormal() and reader.data().len > 0) {
+                if (reader.entryType() == .normal and reader.data().len > 0) {
                     if (self.state_machine) |s| {
                         // One observation per state-machine apply call —
                         // each carries one Raft entry's worth of work
@@ -1901,20 +1895,8 @@ pub const Node = struct {
 
     fn decodeConfChange(self: *Node, reader: zen.ConfChangeReader) RaftError!ConfChange {
         _ = self;
-        const change_type: ConfChangeType = if (reader.addVoter())
-            .add_voter
-        else if (reader.addLearner())
-            .add_learner
-        else if (reader.toVoter())
-            .to_voter
-        else if (reader.toLearner())
-            .to_learner
-        else if (reader.removeNode())
-            .remove_node
-        else if (reader.updateAddr())
-            .update_addr
-        else
-            return RaftError.InvalidMessage;
+        const change_type = reader.changeType();
+        if (change_type == .unknown) return RaftError.InvalidMessage;
         return .{
             .change_type = change_type,
             .node_id = reader.nodeId(),
@@ -2028,7 +2010,7 @@ pub const Node = struct {
             var result = self.log.entriesRange(.{
                 .lo = self.conf_applied_index + 1,
                 .hi = ci + 1,
-                .ty = .conf,
+                .ty = .conf_change,
             }) catch return;
             defer result.deinit();
 
@@ -2067,6 +2049,7 @@ pub const Node = struct {
                     self.startShutdown();
                 },
                 .update_addr => {}, // Our own address — nothing to do locally.
+                .unknown, _ => {},
             }
         } else {
             switch (cc.change_type) {
@@ -2076,6 +2059,7 @@ pub const Node = struct {
                 .to_learner => self.setPeerRole(cc.node_id, .learner),
                 .remove_node => self.removePeer(cc.node_id),
                 .update_addr => self.updatePeerAddr(cc.node_id, cc.addr),
+                .unknown, _ => {},
             }
         }
         // Manage transport peers directly.
@@ -2267,8 +2251,7 @@ pub const Node = struct {
             .term = self.current_term,
             .timestamp = utils.hlc.g().next().asU64(),
             .data = data,
-            .is_normal = true,
-            .is_conf_change = false,
+            .entry_type = zen.EntryTypeEnum.normal,
             .conf_change = zen.NullOffset,
         });
         var entry = try writer.finishWithTail();

@@ -7,6 +7,31 @@ pub const NullOffset: u32 = zbuf.NullOffset;
 
 pub const Ownership = zbuf.Ownership;
 
+pub const ChangeTypeEnum = enum(u8) {
+    unknown = 0,
+    add_voter = 1,
+    add_learner = 2,
+    to_voter = 3,
+    to_learner = 4,
+    remove_node = 5,
+    update_addr = 6,
+    _,
+};
+
+pub const RoleEnum = enum(u8) {
+    unknown = 0,
+    voter = 1,
+    learner = 2,
+    _,
+};
+
+pub const EntryTypeEnum = enum(u8) {
+    any = 0,
+    normal = 1,
+    conf_change = 2,
+    _,
+};
+
 pub fn addTail(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), comptime T: type, offset: u32) Error!void {
     try zbuf.appendMessageTail(buf, alloc, T.TABLE_ID, T.VERSION, offset);
 }
@@ -53,24 +78,12 @@ pub const MessageReader = union(enum) {
 };
 
 pub const ConfChangeStruct = struct {
-    add_voter: bool = false,
-    add_learner: bool = false,
-    to_voter: bool = false,
-    to_learner: bool = false,
-    remove_node: bool = false,
-    update_addr: bool = false,
-    change_type: u64 = 0,
+    change_type: ChangeTypeEnum = @enumFromInt(0),
     node_id: u64 = 0,
     addr: []const u8 = &.{},
 
     fn fromReaderValue(alloc: std.mem.Allocator, r: ConfChangeReader) Error!ConfChangeStruct {
         var s = ConfChangeStruct{
-            .add_voter = r.addVoter(),
-            .add_learner = r.addLearner(),
-            .to_voter = r.toVoter(),
-            .to_learner = r.toLearner(),
-            .remove_node = r.removeNode(),
-            .update_addr = r.updateAddr(),
             .change_type = r.changeType(),
             .node_id = r.nodeId(),
         };
@@ -98,12 +111,6 @@ pub const ConfChangeStruct = struct {
 
     fn cloneValue(self: ConfChangeStruct, alloc: std.mem.Allocator) Error!ConfChangeStruct {
         var s = ConfChangeStruct{
-            .add_voter = self.add_voter,
-            .add_learner = self.add_learner,
-            .to_voter = self.to_voter,
-            .to_learner = self.to_learner,
-            .remove_node = self.remove_node,
-            .update_addr = self.update_addr,
             .change_type = self.change_type,
             .node_id = self.node_id,
         };
@@ -121,13 +128,7 @@ pub const ConfChangeStruct = struct {
 
     pub fn marshalTo(self: ConfChangeStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try ConfChangeWriter.initWithBuf(alloc, out);
-        try writer.setAddVoter(self.add_voter);
-        try writer.setAddLearner(self.add_learner);
-        try writer.setToVoter(self.to_voter);
-        try writer.setToLearner(self.to_learner);
-        try writer.setRemoveNode(self.remove_node);
-        try writer.setUpdateAddr(self.update_addr);
-        try writer.changeTypeSet(self.change_type);
+        try writer.setChangeType(self.change_type);
         try writer.setNodeId(self.node_id);
         try writer.setAddr(self.addr);
         const result = try writer.finish();
@@ -143,7 +144,7 @@ pub const ConfChangeReader = struct {
 
     pub const VERSION: u16 = 1;
     pub const TABLE_ID: u16 = 42241;
-    pub const SIZE_BYTES: u16 = 28;
+    pub const SIZE_BYTES: u16 = 21;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -159,87 +160,27 @@ pub const ConfChangeReader = struct {
         return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
     }
 
-    pub fn addVoter(self: Self) bool {
-        const slot_end = @as(u32, self.base) + 12;
+    pub fn changeType(self: Self) ChangeTypeEnum {
+        const slot_end = @as(u32, self.base) + 5;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return false;
-        const word = zbuf.readU64(self.buf, @as(usize, self.base + 4)) catch 0;
-        const bit = @as(u6, @intCast(0));
-        return ((word >> bit) & 1) == 1;
-    }
-
-    pub fn addLearner(self: Self) bool {
-        const slot_end = @as(u32, self.base) + 12;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return false;
-        const word = zbuf.readU64(self.buf, @as(usize, self.base + 4)) catch 0;
-        const bit = @as(u6, @intCast(1));
-        return ((word >> bit) & 1) == 1;
-    }
-
-    pub fn toVoter(self: Self) bool {
-        const slot_end = @as(u32, self.base) + 12;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return false;
-        const word = zbuf.readU64(self.buf, @as(usize, self.base + 4)) catch 0;
-        const bit = @as(u6, @intCast(2));
-        return ((word >> bit) & 1) == 1;
-    }
-
-    pub fn toLearner(self: Self) bool {
-        const slot_end = @as(u32, self.base) + 12;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return false;
-        const word = zbuf.readU64(self.buf, @as(usize, self.base + 4)) catch 0;
-        const bit = @as(u6, @intCast(3));
-        return ((word >> bit) & 1) == 1;
-    }
-
-    pub fn removeNode(self: Self) bool {
-        const slot_end = @as(u32, self.base) + 12;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return false;
-        const word = zbuf.readU64(self.buf, @as(usize, self.base + 4)) catch 0;
-        const bit = @as(u6, @intCast(4));
-        return ((word >> bit) & 1) == 1;
-    }
-
-    pub fn updateAddr(self: Self) bool {
-        const slot_end = @as(u32, self.base) + 12;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return false;
-        const word = zbuf.readU64(self.buf, @as(usize, self.base + 4)) catch 0;
-        const bit = @as(u6, @intCast(5));
-        return ((word >> bit) & 1) == 1;
-    }
-
-    pub fn changeType(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 12;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 4)) catch 0;
-    }
-
-    pub fn changeTypeHasBit(self: Self, bit_index: u32) bool {
-        if (bit_index >= 64) return false;
-        const bit = @as(u6, @intCast(bit_index % 64));
-        const word = zbuf.readU64(self.buf, @as(usize, self.base + 4)) catch 0;
-        return ((word >> bit) & 1) == 1;
+        if (slot_end > header_end) return @enumFromInt(0);
+        const v = zbuf.readU8(self.buf, @as(usize, self.base + 4)) catch 0;
+        return @enumFromInt(v);
     }
 
     pub fn nodeId(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 20;
+        const slot_end = @as(u32, self.base) + 13;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 12)) catch 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 5)) catch 0;
     }
 
     pub fn addr(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 28;
+        const slot_end = @as(u32, self.base) + 21;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return &[_]u8{};
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 20)) catch 0;
-        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 24)) catch 0;
+        const off = zbuf.readU32(self.buf, @as(usize, self.base + 13)) catch 0;
+        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 17)) catch 0;
         if (data_len == 0) return &[_]u8{};
         return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
     }
@@ -247,10 +188,10 @@ pub const ConfChangeReader = struct {
     pub fn verify(self: Self) Error!void {
         if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        const slot_end_20 = @as(u32, self.base) + 28;
-        if (slot_end_20 <= header_end) {
-            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 20));
-            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 24));
+        const slot_end_13 = @as(u32, self.base) + 21;
+        if (slot_end_13 <= header_end) {
+            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 13));
+            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 17));
             if (data_len > 0) {
                 _ = try zbuf.sliceAt(self.buf, off, data_len);
             }
@@ -280,13 +221,7 @@ pub const ConfChangeBuffer = struct {
     pub fn cloneInto(self: @This(), alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         const reader = try self.initReader();
         var writer = try ConfChangeWriter.initWithBuf(alloc, out);
-        try writer.setAddVoter(reader.addVoter());
-        try writer.setAddLearner(reader.addLearner());
-        try writer.setToVoter(reader.toVoter());
-        try writer.setToLearner(reader.toLearner());
-        try writer.setRemoveNode(reader.removeNode());
-        try writer.setUpdateAddr(reader.updateAddr());
-        try writer.changeTypeSet(reader.changeType());
+        try writer.setChangeType(reader.changeType());
         try writer.setNodeId(reader.nodeId());
         try writer.setAddr(reader.addr());
         const result = try writer.finish();
@@ -310,7 +245,7 @@ pub const ConfChangeWriter = struct {
 
     pub const VERSION: u16 = 1;
     pub const TABLE_ID: u16 = 42241;
-    pub const SIZE_BYTES: u16 = 28;
+    pub const SIZE_BYTES: u16 = 21;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -333,134 +268,27 @@ pub const ConfChangeWriter = struct {
         return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
     }
 
-    pub fn setAddVoter(self: *Self, v: bool) Error!void {
+    pub fn setChangeType(self: *Self, v: ChangeTypeEnum) Error!void {
         const out = self.bufMut();
-        const word_off = self.base + 4;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        const bit = @as(u6, @intCast(0));
-        if (v) {
-            word |= (@as(u64, 1) << bit);
-        } else {
-            word &= ~(@as(u64, 1) << bit);
-        }
-        try zbuf.patchU64(out.items, word_off, word);
-    }
-
-    pub fn setAddLearner(self: *Self, v: bool) Error!void {
-        const out = self.bufMut();
-        const word_off = self.base + 4;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        const bit = @as(u6, @intCast(1));
-        if (v) {
-            word |= (@as(u64, 1) << bit);
-        } else {
-            word &= ~(@as(u64, 1) << bit);
-        }
-        try zbuf.patchU64(out.items, word_off, word);
-    }
-
-    pub fn setToVoter(self: *Self, v: bool) Error!void {
-        const out = self.bufMut();
-        const word_off = self.base + 4;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        const bit = @as(u6, @intCast(2));
-        if (v) {
-            word |= (@as(u64, 1) << bit);
-        } else {
-            word &= ~(@as(u64, 1) << bit);
-        }
-        try zbuf.patchU64(out.items, word_off, word);
-    }
-
-    pub fn setToLearner(self: *Self, v: bool) Error!void {
-        const out = self.bufMut();
-        const word_off = self.base + 4;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        const bit = @as(u6, @intCast(3));
-        if (v) {
-            word |= (@as(u64, 1) << bit);
-        } else {
-            word &= ~(@as(u64, 1) << bit);
-        }
-        try zbuf.patchU64(out.items, word_off, word);
-    }
-
-    pub fn setRemoveNode(self: *Self, v: bool) Error!void {
-        const out = self.bufMut();
-        const word_off = self.base + 4;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        const bit = @as(u6, @intCast(4));
-        if (v) {
-            word |= (@as(u64, 1) << bit);
-        } else {
-            word &= ~(@as(u64, 1) << bit);
-        }
-        try zbuf.patchU64(out.items, word_off, word);
-    }
-
-    pub fn setUpdateAddr(self: *Self, v: bool) Error!void {
-        const out = self.bufMut();
-        const word_off = self.base + 4;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        const bit = @as(u6, @intCast(5));
-        if (v) {
-            word |= (@as(u64, 1) << bit);
-        } else {
-            word &= ~(@as(u64, 1) << bit);
-        }
-        try zbuf.patchU64(out.items, word_off, word);
-    }
-
-    pub fn changeTypeSet(self: *Self, v: u64) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 4, v);
-    }
-
-    pub fn changeTypeSetBit(self: *Self, bit_index: u32) Error!void {
-        const out = self.bufMut();
-        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
-        const bit = @as(u6, @intCast(bit_index % 64));
-        const word_off = self.base + 4;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        word |= (@as(u64, 1) << bit);
-        try zbuf.patchU64(out.items, word_off, word);
-    }
-
-    pub fn changeTypeClearBit(self: *Self, bit_index: u32) Error!void {
-        const out = self.bufMut();
-        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
-        const bit = @as(u6, @intCast(bit_index % 64));
-        const word_off = self.base + 4;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        word &= ~(@as(u64, 1) << bit);
-        try zbuf.patchU64(out.items, word_off, word);
-    }
-
-    pub fn changeTypeHasBit(self: *Self, bit_index: u32) Error!bool {
-        const out = self.bufMut();
-        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
-        const bit = @as(u6, @intCast(bit_index % 64));
-        const word_off = self.base + 4;
-        const word = try zbuf.readU64(out.items, @as(usize, word_off));
-        return ((word >> bit) & 1) == 1;
+        try zbuf.patchU8(out.items, self.base + 4, @intFromEnum(v));
     }
 
     pub fn setNodeId(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 12, v);
+        try zbuf.patchU64(out.items, self.base + 5, v);
     }
 
     pub fn setAddr(self: *Self, data: []const u8) Error!void {
         const out = self.bufMut();
         if (data.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 20, 0);
-            try zbuf.patchU32(out.items, self.base + 24, 0);
+            try zbuf.patchU32(out.items, self.base + 13, 0);
+            try zbuf.patchU32(out.items, self.base + 17, 0);
             return;
         }
         const abs_off = try zbuf.appendBytes(out, self.alloc, data);
         const off = abs_off;
-        try zbuf.patchU32(out.items, self.base + 20, off);
-        try zbuf.patchU32(out.items, self.base + 24, @as(u32, @intCast(data.len)));
+        try zbuf.patchU32(out.items, self.base + 13, off);
+        try zbuf.patchU32(out.items, self.base + 17, @as(u32, @intCast(data.len)));
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -468,13 +296,7 @@ pub const ConfChangeWriter = struct {
         if (@typeInfo(Values) != .@"struct") {
             @compileError("set() expects a struct literal like .{ .field = value }");
         }
-        if (@hasField(Values, "add_voter")) try self.setAddVoter(@field(values, "add_voter"));
-        if (@hasField(Values, "add_learner")) try self.setAddLearner(@field(values, "add_learner"));
-        if (@hasField(Values, "to_voter")) try self.setToVoter(@field(values, "to_voter"));
-        if (@hasField(Values, "to_learner")) try self.setToLearner(@field(values, "to_learner"));
-        if (@hasField(Values, "remove_node")) try self.setRemoveNode(@field(values, "remove_node"));
-        if (@hasField(Values, "update_addr")) try self.setUpdateAddr(@field(values, "update_addr"));
-        if (@hasField(Values, "change_type")) try self.changeTypeSet(@field(values, "change_type"));
+        if (@hasField(Values, "change_type")) try self.setChangeType(@field(values, "change_type"));
         if (@hasField(Values, "node_id")) try self.setNodeId(@field(values, "node_id"));
         if (@hasField(Values, "addr")) try self.setAddr(@field(values, "addr"));
     }
@@ -511,19 +333,15 @@ pub const ConfChangeWriter = struct {
 };
 
 pub const LogEntryStruct = struct {
-    is_normal: bool = false,
-    is_conf_change: bool = false,
     index: u64 = 0,
     term: u64 = 0,
     timestamp: u64 = 0,
     data: []const u8 = &.{},
-    entry_type: u64 = 0,
+    entry_type: EntryTypeEnum = @enumFromInt(0),
     conf_change: ?ConfChangeStruct = null,
 
     fn fromReaderValue(alloc: std.mem.Allocator, r: LogEntryReader) Error!LogEntryStruct {
         var s = LogEntryStruct{
-            .is_normal = r.isNormal(),
-            .is_conf_change = r.isConfChange(),
             .index = r.index(),
             .term = r.term(),
             .timestamp = r.timestamp(),
@@ -558,8 +376,6 @@ pub const LogEntryStruct = struct {
 
     fn cloneValue(self: LogEntryStruct, alloc: std.mem.Allocator) Error!LogEntryStruct {
         var s = LogEntryStruct{
-            .is_normal = self.is_normal,
-            .is_conf_change = self.is_conf_change,
             .index = self.index,
             .term = self.term,
             .timestamp = self.timestamp,
@@ -582,13 +398,11 @@ pub const LogEntryStruct = struct {
 
     pub fn marshalTo(self: LogEntryStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try LogEntryWriter.initWithBuf(alloc, out);
-        try writer.setIsNormal(self.is_normal);
-        try writer.setIsConfChange(self.is_conf_change);
         try writer.setIndex(self.index);
         try writer.setTerm(self.term);
         try writer.setTimestamp(self.timestamp);
         try writer.setData(self.data);
-        try writer.entryTypeSet(self.entry_type);
+        try writer.setEntryType(self.entry_type);
         if (self.conf_change) |child| {
             const child_off = try child.marshalTo(alloc, out);
             try writer.setConfChange(child_off);
@@ -606,7 +420,7 @@ pub const LogEntryReader = struct {
 
     pub const VERSION: u16 = 1;
     pub const TABLE_ID: u16 = 42242;
-    pub const SIZE_BYTES: u16 = 48;
+    pub const SIZE_BYTES: u16 = 41;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -620,24 +434,6 @@ pub const LogEntryReader = struct {
         const size_bytes = try zbuf.readU16(buf, @as(usize, base + 2));
         if (@as(usize, base) + @as(usize, size_bytes) > buf.len) return zbuf.Error.OutOfBounds;
         return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
-    }
-
-    pub fn isNormal(self: Self) bool {
-        const slot_end = @as(u32, self.base) + 44;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return false;
-        const word = zbuf.readU64(self.buf, @as(usize, self.base + 36)) catch 0;
-        const bit = @as(u6, @intCast(0));
-        return ((word >> bit) & 1) == 1;
-    }
-
-    pub fn isConfChange(self: Self) bool {
-        const slot_end = @as(u32, self.base) + 44;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return false;
-        const word = zbuf.readU64(self.buf, @as(usize, self.base + 36)) catch 0;
-        const bit = @as(u6, @intCast(1));
-        return ((word >> bit) & 1) == 1;
     }
 
     pub fn index(self: Self) u64 {
@@ -671,25 +467,19 @@ pub const LogEntryReader = struct {
         return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
     }
 
-    pub fn entryType(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 44;
+    pub fn entryType(self: Self) EntryTypeEnum {
+        const slot_end = @as(u32, self.base) + 37;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 36)) catch 0;
-    }
-
-    pub fn entryTypeHasBit(self: Self, bit_index: u32) bool {
-        if (bit_index >= 64) return false;
-        const bit = @as(u6, @intCast(bit_index % 64));
-        const word = zbuf.readU64(self.buf, @as(usize, self.base + 36)) catch 0;
-        return ((word >> bit) & 1) == 1;
+        if (slot_end > header_end) return @enumFromInt(0);
+        const v = zbuf.readU8(self.buf, @as(usize, self.base + 36)) catch 0;
+        return @enumFromInt(v);
     }
 
     pub fn confChange(self: Self) ?ConfChangeReader {
-        const slot_end = @as(u32, self.base) + 48;
+        const slot_end = @as(u32, self.base) + 41;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return null;
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 44)) catch 0;
+        const off = zbuf.readU32(self.buf, @as(usize, self.base + 37)) catch 0;
         if (off == zbuf.NullOffset) return null;
         return ConfChangeReader.init(self.buf, off) catch null;
     }
@@ -733,13 +523,11 @@ pub const LogEntryBuffer = struct {
     pub fn cloneInto(self: @This(), alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         const reader = try self.initReader();
         var writer = try LogEntryWriter.initWithBuf(alloc, out);
-        try writer.setIsNormal(reader.isNormal());
-        try writer.setIsConfChange(reader.isConfChange());
         try writer.setIndex(reader.index());
         try writer.setTerm(reader.term());
         try writer.setTimestamp(reader.timestamp());
         try writer.setData(reader.data());
-        try writer.entryTypeSet(reader.entryType());
+        try writer.setEntryType(reader.entryType());
         if (reader.confChange()) |child| {
             const child_buf = try ConfChangeBuffer.initWithOffset(alloc, @constCast(reader.buf), child.base, .borrowed);
             const child_off = try child_buf.cloneInto(alloc, out);
@@ -766,7 +554,7 @@ pub const LogEntryWriter = struct {
 
     pub const VERSION: u16 = 1;
     pub const TABLE_ID: u16 = 42242;
-    pub const SIZE_BYTES: u16 = 48;
+    pub const SIZE_BYTES: u16 = 41;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -776,7 +564,7 @@ pub const LogEntryWriter = struct {
         const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);
         try zbuf.writeU16At(buf.items, @as(usize, base), VERSION);
         try zbuf.writeU16At(buf.items, @as(usize, base + 2), SIZE_BYTES);
-        try zbuf.patchU32(buf.items, base + 44, zbuf.NullOffset);
+        try zbuf.patchU32(buf.items, base + 37, zbuf.NullOffset);
         return .{ .buf = buf, .owns_buf = false, .alloc = alloc, .base = base };
     }
 
@@ -787,34 +575,8 @@ pub const LogEntryWriter = struct {
         const base = try zbuf.reserveHeader(owned, alloc, SIZE_BYTES);
         try zbuf.writeU16At(owned.items, @as(usize, base), VERSION);
         try zbuf.writeU16At(owned.items, @as(usize, base + 2), SIZE_BYTES);
-        try zbuf.patchU32(owned.items, base + 44, zbuf.NullOffset);
+        try zbuf.patchU32(owned.items, base + 37, zbuf.NullOffset);
         return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
-    }
-
-    pub fn setIsNormal(self: *Self, v: bool) Error!void {
-        const out = self.bufMut();
-        const word_off = self.base + 36;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        const bit = @as(u6, @intCast(0));
-        if (v) {
-            word |= (@as(u64, 1) << bit);
-        } else {
-            word &= ~(@as(u64, 1) << bit);
-        }
-        try zbuf.patchU64(out.items, word_off, word);
-    }
-
-    pub fn setIsConfChange(self: *Self, v: bool) Error!void {
-        const out = self.bufMut();
-        const word_off = self.base + 36;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        const bit = @as(u6, @intCast(1));
-        if (v) {
-            word |= (@as(u64, 1) << bit);
-        } else {
-            word &= ~(@as(u64, 1) << bit);
-        }
-        try zbuf.patchU64(out.items, word_off, word);
     }
 
     pub fn setIndex(self: *Self, v: u64) Error!void {
@@ -845,43 +607,14 @@ pub const LogEntryWriter = struct {
         try zbuf.patchU32(out.items, self.base + 32, @as(u32, @intCast(data.len)));
     }
 
-    pub fn entryTypeSet(self: *Self, v: u64) Error!void {
+    pub fn setEntryType(self: *Self, v: EntryTypeEnum) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 36, v);
-    }
-
-    pub fn entryTypeSetBit(self: *Self, bit_index: u32) Error!void {
-        const out = self.bufMut();
-        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
-        const bit = @as(u6, @intCast(bit_index % 64));
-        const word_off = self.base + 36;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        word |= (@as(u64, 1) << bit);
-        try zbuf.patchU64(out.items, word_off, word);
-    }
-
-    pub fn entryTypeClearBit(self: *Self, bit_index: u32) Error!void {
-        const out = self.bufMut();
-        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
-        const bit = @as(u6, @intCast(bit_index % 64));
-        const word_off = self.base + 36;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        word &= ~(@as(u64, 1) << bit);
-        try zbuf.patchU64(out.items, word_off, word);
-    }
-
-    pub fn entryTypeHasBit(self: *Self, bit_index: u32) Error!bool {
-        const out = self.bufMut();
-        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
-        const bit = @as(u6, @intCast(bit_index % 64));
-        const word_off = self.base + 36;
-        const word = try zbuf.readU64(out.items, @as(usize, word_off));
-        return ((word >> bit) & 1) == 1;
+        try zbuf.patchU8(out.items, self.base + 36, @intFromEnum(v));
     }
 
     pub fn setConfChange(self: *Self, child_off: u32) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 44, child_off);
+        try zbuf.patchU32(out.items, self.base + 37, child_off);
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -889,13 +622,11 @@ pub const LogEntryWriter = struct {
         if (@typeInfo(Values) != .@"struct") {
             @compileError("set() expects a struct literal like .{ .field = value }");
         }
-        if (@hasField(Values, "is_normal")) try self.setIsNormal(@field(values, "is_normal"));
-        if (@hasField(Values, "is_conf_change")) try self.setIsConfChange(@field(values, "is_conf_change"));
         if (@hasField(Values, "index")) try self.setIndex(@field(values, "index"));
         if (@hasField(Values, "term")) try self.setTerm(@field(values, "term"));
         if (@hasField(Values, "timestamp")) try self.setTimestamp(@field(values, "timestamp"));
         if (@hasField(Values, "data")) try self.setData(@field(values, "data"));
-        if (@hasField(Values, "entry_type")) try self.entryTypeSet(@field(values, "entry_type"));
+        if (@hasField(Values, "entry_type")) try self.setEntryType(@field(values, "entry_type"));
         if (@hasField(Values, "conf_change")) try self.setConfChange(@field(values, "conf_change"));
     }
 
@@ -3122,16 +2853,12 @@ pub const JoinResponseWriter = struct {
 };
 
 pub const ConfStatePeerStruct = struct {
-    is_voter: bool = false,
-    is_learner: bool = false,
     id: u64 = 0,
     addr: []const u8 = &.{},
-    role: u64 = 0,
+    role: RoleEnum = @enumFromInt(0),
 
     fn fromReaderValue(alloc: std.mem.Allocator, r: ConfStatePeerReader) Error!ConfStatePeerStruct {
         var s = ConfStatePeerStruct{
-            .is_voter = r.isVoter(),
-            .is_learner = r.isLearner(),
             .id = r.id(),
             .role = r.role(),
         };
@@ -3159,8 +2886,6 @@ pub const ConfStatePeerStruct = struct {
 
     fn cloneValue(self: ConfStatePeerStruct, alloc: std.mem.Allocator) Error!ConfStatePeerStruct {
         var s = ConfStatePeerStruct{
-            .is_voter = self.is_voter,
-            .is_learner = self.is_learner,
             .id = self.id,
             .role = self.role,
         };
@@ -3178,11 +2903,9 @@ pub const ConfStatePeerStruct = struct {
 
     pub fn marshalTo(self: ConfStatePeerStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try ConfStatePeerWriter.initWithBuf(alloc, out);
-        try writer.setIsVoter(self.is_voter);
-        try writer.setIsLearner(self.is_learner);
         try writer.setId(self.id);
         try writer.setAddr(self.addr);
-        try writer.roleSet(self.role);
+        try writer.setRole(self.role);
         const result = try writer.finish();
         return result.offset;
     }
@@ -3196,7 +2919,7 @@ pub const ConfStatePeerReader = struct {
 
     pub const VERSION: u16 = 1;
     pub const TABLE_ID: u16 = 42250;
-    pub const SIZE_BYTES: u16 = 28;
+    pub const SIZE_BYTES: u16 = 21;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -3210,24 +2933,6 @@ pub const ConfStatePeerReader = struct {
         const size_bytes = try zbuf.readU16(buf, @as(usize, base + 2));
         if (@as(usize, base) + @as(usize, size_bytes) > buf.len) return zbuf.Error.OutOfBounds;
         return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
-    }
-
-    pub fn isVoter(self: Self) bool {
-        const slot_end = @as(u32, self.base) + 28;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return false;
-        const word = zbuf.readU64(self.buf, @as(usize, self.base + 20)) catch 0;
-        const bit = @as(u6, @intCast(0));
-        return ((word >> bit) & 1) == 1;
-    }
-
-    pub fn isLearner(self: Self) bool {
-        const slot_end = @as(u32, self.base) + 28;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return false;
-        const word = zbuf.readU64(self.buf, @as(usize, self.base + 20)) catch 0;
-        const bit = @as(u6, @intCast(1));
-        return ((word >> bit) & 1) == 1;
     }
 
     pub fn id(self: Self) u64 {
@@ -3247,18 +2952,12 @@ pub const ConfStatePeerReader = struct {
         return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
     }
 
-    pub fn role(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 28;
+    pub fn role(self: Self) RoleEnum {
+        const slot_end = @as(u32, self.base) + 21;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 20)) catch 0;
-    }
-
-    pub fn roleHasBit(self: Self, bit_index: u32) bool {
-        if (bit_index >= 64) return false;
-        const bit = @as(u6, @intCast(bit_index % 64));
-        const word = zbuf.readU64(self.buf, @as(usize, self.base + 20)) catch 0;
-        return ((word >> bit) & 1) == 1;
+        if (slot_end > header_end) return @enumFromInt(0);
+        const v = zbuf.readU8(self.buf, @as(usize, self.base + 20)) catch 0;
+        return @enumFromInt(v);
     }
 
     pub fn verify(self: Self) Error!void {
@@ -3297,11 +2996,9 @@ pub const ConfStatePeerBuffer = struct {
     pub fn cloneInto(self: @This(), alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         const reader = try self.initReader();
         var writer = try ConfStatePeerWriter.initWithBuf(alloc, out);
-        try writer.setIsVoter(reader.isVoter());
-        try writer.setIsLearner(reader.isLearner());
         try writer.setId(reader.id());
         try writer.setAddr(reader.addr());
-        try writer.roleSet(reader.role());
+        try writer.setRole(reader.role());
         const result = try writer.finish();
         return result.offset;
     }
@@ -3323,7 +3020,7 @@ pub const ConfStatePeerWriter = struct {
 
     pub const VERSION: u16 = 1;
     pub const TABLE_ID: u16 = 42250;
-    pub const SIZE_BYTES: u16 = 28;
+    pub const SIZE_BYTES: u16 = 21;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -3346,32 +3043,6 @@ pub const ConfStatePeerWriter = struct {
         return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
     }
 
-    pub fn setIsVoter(self: *Self, v: bool) Error!void {
-        const out = self.bufMut();
-        const word_off = self.base + 20;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        const bit = @as(u6, @intCast(0));
-        if (v) {
-            word |= (@as(u64, 1) << bit);
-        } else {
-            word &= ~(@as(u64, 1) << bit);
-        }
-        try zbuf.patchU64(out.items, word_off, word);
-    }
-
-    pub fn setIsLearner(self: *Self, v: bool) Error!void {
-        const out = self.bufMut();
-        const word_off = self.base + 20;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        const bit = @as(u6, @intCast(1));
-        if (v) {
-            word |= (@as(u64, 1) << bit);
-        } else {
-            word &= ~(@as(u64, 1) << bit);
-        }
-        try zbuf.patchU64(out.items, word_off, word);
-    }
-
     pub fn setId(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
         try zbuf.patchU64(out.items, self.base + 4, v);
@@ -3390,38 +3061,9 @@ pub const ConfStatePeerWriter = struct {
         try zbuf.patchU32(out.items, self.base + 16, @as(u32, @intCast(data.len)));
     }
 
-    pub fn roleSet(self: *Self, v: u64) Error!void {
+    pub fn setRole(self: *Self, v: RoleEnum) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 20, v);
-    }
-
-    pub fn roleSetBit(self: *Self, bit_index: u32) Error!void {
-        const out = self.bufMut();
-        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
-        const bit = @as(u6, @intCast(bit_index % 64));
-        const word_off = self.base + 20;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        word |= (@as(u64, 1) << bit);
-        try zbuf.patchU64(out.items, word_off, word);
-    }
-
-    pub fn roleClearBit(self: *Self, bit_index: u32) Error!void {
-        const out = self.bufMut();
-        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
-        const bit = @as(u6, @intCast(bit_index % 64));
-        const word_off = self.base + 20;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        word &= ~(@as(u64, 1) << bit);
-        try zbuf.patchU64(out.items, word_off, word);
-    }
-
-    pub fn roleHasBit(self: *Self, bit_index: u32) Error!bool {
-        const out = self.bufMut();
-        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
-        const bit = @as(u6, @intCast(bit_index % 64));
-        const word_off = self.base + 20;
-        const word = try zbuf.readU64(out.items, @as(usize, word_off));
-        return ((word >> bit) & 1) == 1;
+        try zbuf.patchU8(out.items, self.base + 20, @intFromEnum(v));
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -3429,11 +3071,9 @@ pub const ConfStatePeerWriter = struct {
         if (@typeInfo(Values) != .@"struct") {
             @compileError("set() expects a struct literal like .{ .field = value }");
         }
-        if (@hasField(Values, "is_voter")) try self.setIsVoter(@field(values, "is_voter"));
-        if (@hasField(Values, "is_learner")) try self.setIsLearner(@field(values, "is_learner"));
         if (@hasField(Values, "id")) try self.setId(@field(values, "id"));
         if (@hasField(Values, "addr")) try self.setAddr(@field(values, "addr"));
-        if (@hasField(Values, "role")) try self.roleSet(@field(values, "role"));
+        if (@hasField(Values, "role")) try self.setRole(@field(values, "role"));
     }
 
     pub fn finish(self: *Self) Error!ConfStatePeerBuffer {
