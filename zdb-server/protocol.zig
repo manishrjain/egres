@@ -113,6 +113,79 @@ fn isWs(c: u8) bool {
 /// parser's rejection threshold can't drift apart.
 pub const max_token_size: usize = 64 * 1024;
 
+/// One parsed key/value pair from the wire. Slices live in the
+/// surrounding `ParsedBatch.buf` (or in line_buf for single-set
+/// commands); the consumer must not retain them past the parse's
+/// owning structure's deinit.
+pub const KV = struct { key: []const u8, value: []const u8 };
+
+/// Fully parsed `set-batch` body: `count * 2` whitespace-delimited
+/// tokens organized into `count` (key, value) pairs. `buf` owns the
+/// concatenated token bytes; `kvs[i].key` / `kvs[i].value` slice into it.
+pub const ParsedBatch = struct {
+    ns: u32,
+    kvs: []KV,
+    buf: []u8,
+
+    pub fn deinit(self: *ParsedBatch, alloc: std.mem.Allocator) void {
+        alloc.free(self.kvs);
+        alloc.free(self.buf);
+    }
+};
+
+/// Read the body of a `set-batch` command — `count * 2` whitespace-
+/// delimited tokens (key1 value1 key2 value2 …) — into a stable
+/// `ParsedBatch`. Caller is responsible for `deinit`.
+///
+/// Two-phase: first concatenate all token bytes into `input` while
+/// recording (start, end) offsets in `ranges`, then resolve offsets to
+/// slices. We can't capture slices mid-loop because each
+/// `ensureUnusedCapacity` call may relocate `input`'s backing storage.
+pub fn readSetBatchBody(
+    r: *std.Io.Reader,
+    ns: u32,
+    count: u32,
+    alloc: std.mem.Allocator,
+) !ParsedBatch {
+    var input: std.ArrayList(u8) = .empty;
+    errdefer input.deinit(alloc);
+    try input.ensureTotalCapacity(alloc, 16 * 1024);
+
+    const Range = struct { start: u32, end: u32 };
+    const ranges = try alloc.alloc([2]Range, count);
+    defer alloc.free(ranges);
+
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        try input.ensureUnusedCapacity(alloc, max_token_size);
+        const k_start: u32 = @intCast(input.items.len);
+        try readToken(r, &input);
+        const k_end: u32 = @intCast(input.items.len);
+
+        try input.ensureUnusedCapacity(alloc, max_token_size);
+        const v_start: u32 = @intCast(input.items.len);
+        try readToken(r, &input);
+        const v_end: u32 = @intCast(input.items.len);
+
+        ranges[i] = .{
+            .{ .start = k_start, .end = k_end },
+            .{ .start = v_start, .end = v_end },
+        };
+    }
+
+    // input is stable now (no more growth). Hand its backing buffer to
+    // the ParsedBatch so the kv slices remain valid until deinit.
+    const buf = try input.toOwnedSlice(alloc);
+    errdefer alloc.free(buf);
+    const kvs = try alloc.alloc(KV, count);
+    for (ranges, 0..) |rng, j| kvs[j] = .{
+        .key = buf[rng[0].start..rng[0].end],
+        .value = buf[rng[1].start..rng[1].end],
+    };
+
+    return .{ .ns = ns, .kvs = kvs, .buf = buf };
+}
+
 /// Read one whitespace-delimited token, appending its bytes onto `buf`.
 /// Leading whitespace is skipped; the token ends at the next whitespace
 /// byte (or EOF). If prefixed with `0x`, the payload is hex-decoded in

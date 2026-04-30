@@ -415,7 +415,12 @@ pub const ZdbServer = struct {
                 },
                 .set_batch => |req| {
                     log.debug("SET_BATCH ns={d} count={d}", .{ req.ns, req.count });
-                    self.handleSetBatch(stream, r, req) catch return;
+                    var batch = proto.readSetBatchBody(r, req.ns, req.count, self.allocator) catch |err| {
+                        proto.writeErr(stream, @errorName(err)) catch {};
+                        return;
+                    };
+                    defer batch.deinit(self.allocator);
+                    self.handleSetBatch(stream, batch) catch return;
                 },
                 .get => |req| {
                     log.debug("GET ns={d} key={s} read_ts={d}", .{ req.ns, req.key, req.read_ts });
@@ -495,63 +500,8 @@ pub const ZdbServer = struct {
     /// reader into (key, value) pairs, encode as a single Mutations,
     /// propose once. Each token is hex-decoded if prefixed with `0x`,
     /// literal otherwise.
-    fn handleSetBatch(
-        self: *ZdbServer,
-        stream: zio.net.Stream,
-        r: *std.Io.Reader,
-        req: proto.SetBatchCmd,
-    ) !void {
-        // One ArrayList holds every key/value byte for the whole batch.
-        // Tokens are appended contiguously; we record (start,end) offsets
-        // during the loop and resolve them to slices only once the buffer
-        // is stable. Capturing slices mid-loop would be unsafe because
-        // `ensureUnusedCapacity` between tokens may reallocate and move
-        // the backing storage.
-        var input: std.ArrayList(u8) = .empty;
-        defer input.deinit(self.allocator);
-        try input.ensureTotalCapacity(self.allocator, 16 * 1024);
-
-        const Range = struct { start: u32, end: u32 };
-        const ranges = try self.allocator.alloc([2]Range, req.count);
-        defer self.allocator.free(ranges);
-
-        var i: u32 = 0;
-        while (i < req.count) : (i += 1) {
-            // Reserve the same budget the parser enforces, so
-            // `appendAssumeCapacity` inside readToken can never overflow
-            // even on maliciously oversized input — a too-long token
-            // surfaces as `error.TokenTooLong` rather than an assertion.
-            try input.ensureUnusedCapacity(self.allocator, proto.max_token_size);
-            const k_start: u32 = @intCast(input.items.len);
-            proto.readToken(r, &input) catch |err| {
-                try proto.writeErr(stream, @errorName(err));
-                return;
-            };
-            const k_end: u32 = @intCast(input.items.len);
-
-            try input.ensureUnusedCapacity(self.allocator, proto.max_token_size);
-            const v_start: u32 = @intCast(input.items.len);
-            proto.readToken(r, &input) catch |err| {
-                try proto.writeErr(stream, @errorName(err));
-                return;
-            };
-            const v_end: u32 = @intCast(input.items.len);
-
-            ranges[i] = .{
-                .{ .start = k_start, .end = k_end },
-                .{ .start = v_start, .end = v_end },
-            };
-        }
-
-        // Resolve offsets to slices — input is stable now, no more growth.
-        const kvs = try self.allocator.alloc(KV, req.count);
-        defer self.allocator.free(kvs);
-        for (ranges, 0..) |rng, j| kvs[j] = .{
-            .key = input.items[rng[0].start..rng[0].end],
-            .value = input.items[rng[1].start..rng[1].end],
-        };
-
-        const proposal_bytes = try encodeMutations(self.allocator, req.ns, kvs);
+    fn handleSetBatch(self: *ZdbServer, stream: zio.net.Stream, batch: proto.ParsedBatch) !void {
+        const proposal_bytes = try encodeMutations(self.allocator, batch.ns, batch.kvs);
         defer self.allocator.free(proposal_bytes);
 
         var ctx = CommitCtx{ .status = .committed };
@@ -844,12 +794,10 @@ fn encodeManifestChange(
     return buf.toOwnedSlice(allocator);
 }
 
-pub const KV = struct { key: []const u8, value: []const u8 };
-
 /// Encode one or more key-value writes as a single `Mutations` payload for
 /// proposeDataChange. All kvs in a batch share a namespace (keeps tree
 /// routing + apply simple) and land as one Raft log entry (one commit HLC).
-fn encodeMutations(allocator: std.mem.Allocator, namespace: u32, kvs: []const KV) ![]u8 {
+fn encodeMutations(allocator: std.mem.Allocator, namespace: u32, kvs: []const proto.KV) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
