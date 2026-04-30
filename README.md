@@ -2,17 +2,17 @@
 
 ## Regenerating Buffers Code
 
-The buffer schema lives in `u/buffers.zig` and the generated code is written to `u/buffers.gen.zig`.
+Buffer schemas live in `<module>/buffers.zig` files (e.g. `zbuf/buffers.zig`,
+`raft/buffers.zig`, `zdb/buffers.zig`). Each generates its `<module>/buffers.gen.zig`
+sibling.
 
-Regenerate the buffers code with:
+Regenerate every discovered `*/buffers.gen.zig` at once:
 
 ```bash
-zig build gen-zbuf
+zig build buffers
 ```
 
-This runs the build-time generator at `zbuf/gen.zig` and updates `u/buffers.gen.zig`.
-
-To generate for a specific schema file (and write `<input>.gen.zig` next to it), run:
+To generate for a specific schema file (writes `<input>.gen.zig` next to it):
 
 ```bash
 zig build zbuf -- path/to/buffers.zig

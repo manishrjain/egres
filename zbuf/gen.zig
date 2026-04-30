@@ -18,7 +18,7 @@ pub fn main() !void {
 
     var args = std.process.args();
     _ = args.next();
-    const out_path = args.next() orelse "u/buffers.gen.zig";
+    const out_path = args.next() orelse "zbuf/buffers.gen.zig";
 
     // Write to a .tmp file first; rename to out_path only on success.
     // This guarantees the final file is always complete: a partial write
@@ -45,7 +45,7 @@ pub fn main() !void {
         try w.writeAll("pub const NullOffset: u32 = zbuf.NullOffset;\n\n");
         try w.writeAll("pub const Ownership = zbuf.Ownership;\n\n");
 
-        // Emit code for each table declared in u/buffers.zig.
+        // Emit code for each table declared in the input buffers.zig.
         // Enums must come first — table fields may reference enum types by name.
         try emitEnumTypes(w);
         try emitTailHelpers(w);

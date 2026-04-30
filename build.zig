@@ -232,11 +232,11 @@ fn addZbufCli(
     schema_mod: *std.Build.Module,
 ) void {
     // Zbuf CLI: zig build zbuf -- path/to/buffers.zig
-    // Defaults to u/buffers.zig if no args are provided.
+    // Defaults to zbuf/buffers.zig (the test/example schema) if no args.
     const buffers_path = if (b.args) |args| blk: {
         if (args.len > 0) break :blk args[0];
-        break :blk "u/buffers.zig";
-    } else "u/buffers.zig";
+        break :blk "zbuf/buffers.zig";
+    } else "zbuf/buffers.zig";
 
     const out_path = generatedPathForSchema(b, buffers_path);
     const run_gen_step = addZbufGenRun(
