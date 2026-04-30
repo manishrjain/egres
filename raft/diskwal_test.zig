@@ -26,7 +26,7 @@ fn makeLogEntry(
         .index = index,
         .term = term,
         .data = data,
-        .entry_type = zen.EntryTypeEnum.normal,
+        .entry_type = zen.EntryTypeEnum.data,
         .conf_change = zen.NullOffset,
     });
     return writer.finishWithTail();

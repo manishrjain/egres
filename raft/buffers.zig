@@ -60,8 +60,8 @@ pub const Snapshot = schema.Table(.{
 // is ever .any, so it never matches an actual entry).
 pub const EntryType = schema.EnumDef(.{
     .{ .name = "any", .tag = 0 },
-    .{ .name = "normal", .tag = 1 },
-    .{ .name = "conf_change", .tag = 2 },
+    .{ .name = "data", .tag = 1 },
+    .{ .name = "conf", .tag = 2 },
 });
 
 pub const LogEntry = schema.Table(.{

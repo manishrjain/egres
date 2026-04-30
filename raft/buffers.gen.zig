@@ -27,8 +27,8 @@ pub const RoleEnum = enum(u8) {
 
 pub const EntryTypeEnum = enum(u8) {
     any = 0,
-    normal = 1,
-    conf_change = 2,
+    data = 1,
+    conf = 2,
     _,
 };
 

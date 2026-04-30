@@ -727,7 +727,7 @@ pub const Node = struct {
         var lo = start;
         while (lo <= last) {
             var result = while (true) {
-                break self.log.entriesRange(.{ .lo = lo, .hi = last + 1, .ty = .conf_change }) catch |err| {
+                break self.log.entriesRange(.{ .lo = lo, .hi = last + 1, .ty = .conf }) catch |err| {
                     std.log.err("restoreConfState: entriesRange failed: {}, retrying...", .{err});
                     zio.sleep(.fromSeconds(1)) catch return;
                     continue;
@@ -1503,7 +1503,7 @@ pub const Node = struct {
             // timestamp order — the invariant that makes applied_timestamp a
             // safe bound for consistent follower reads.
             const ts = utils.hlc.g().next().asU64();
-            const et: zen.EntryTypeEnum = if (is_conf) .conf_change else .normal;
+            const et: zen.EntryTypeEnum = if (is_conf) .conf else .data;
             try writer.set(.{
                 .index = index,
                 .term = self.current_term,
@@ -1668,7 +1668,7 @@ pub const Node = struct {
             for (result.entries) |entry| {
                 const reader = zen.LogEntryReader.parseRoot(entry.bytes) catch continue;
 
-                if (reader.entryType() == .normal and reader.data().len > 0) {
+                if (reader.entryType() == .data and reader.data().len > 0) {
                     if (self.state_machine) |s| {
                         // One observation per state-machine apply call —
                         // each carries one Raft entry's worth of work
@@ -2010,7 +2010,7 @@ pub const Node = struct {
             var result = self.log.entriesRange(.{
                 .lo = self.conf_applied_index + 1,
                 .hi = ci + 1,
-                .ty = .conf_change,
+                .ty = .conf,
             }) catch return;
             defer result.deinit();
 
@@ -2251,7 +2251,7 @@ pub const Node = struct {
             .term = self.current_term,
             .timestamp = utils.hlc.g().next().asU64(),
             .data = data,
-            .entry_type = zen.EntryTypeEnum.normal,
+            .entry_type = zen.EntryTypeEnum.data,
             .conf_change = zen.NullOffset,
         });
         var entry = try writer.finishWithTail();

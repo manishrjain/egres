@@ -37,7 +37,7 @@ pub const EntriesRangeOpts = struct {
     hi: u64 = std.math.maxInt(u64),
     max_bytes: u64 = 64 * 1024 * 1024, // 64 MiB
     // .any (tag 0) is the wildcard filter — an entry's wire-encoded type is
-    // .normal or .conf_change, never .any.
+    // .data or .conf, never .any.
     ty: EntryType = .any,
 };
 
