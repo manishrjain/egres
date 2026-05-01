@@ -1353,8 +1353,7 @@ pub const U32ArrayOnlyStruct = struct {
     values: []u32 = &.{},
 
     fn fromReaderValue(alloc: std.mem.Allocator, r: U32ArrayOnlyReader) Error!U32ArrayOnlyStruct {
-        var s = U32ArrayOnlyStruct{
-        };
+        var s = U32ArrayOnlyStruct{};
         errdefer s.deinit(alloc);
         s.values = try r.valuesToSliceAlloc(alloc);
         return s;
@@ -1378,8 +1377,7 @@ pub const U32ArrayOnlyStruct = struct {
     }
 
     fn cloneValue(self: U32ArrayOnlyStruct, alloc: std.mem.Allocator) Error!U32ArrayOnlyStruct {
-        var s = U32ArrayOnlyStruct{
-        };
+        var s = U32ArrayOnlyStruct{};
         errdefer s.deinit(alloc);
         s.values = try alloc.dupe(u32, self.values);
         return s;
@@ -1596,8 +1594,7 @@ pub const U64ArrayOnlyStruct = struct {
     values: []u64 = &.{},
 
     fn fromReaderValue(alloc: std.mem.Allocator, r: U64ArrayOnlyReader) Error!U64ArrayOnlyStruct {
-        var s = U64ArrayOnlyStruct{
-        };
+        var s = U64ArrayOnlyStruct{};
         errdefer s.deinit(alloc);
         s.values = try r.valuesToSliceAlloc(alloc);
         return s;
@@ -1621,8 +1618,7 @@ pub const U64ArrayOnlyStruct = struct {
     }
 
     fn cloneValue(self: U64ArrayOnlyStruct, alloc: std.mem.Allocator) Error!U64ArrayOnlyStruct {
-        var s = U64ArrayOnlyStruct{
-        };
+        var s = U64ArrayOnlyStruct{};
         errdefer s.deinit(alloc);
         s.values = try alloc.dupe(u64, self.values);
         return s;
@@ -1839,8 +1835,7 @@ pub const U16ArrayOnlyStruct = struct {
     values: []u16 = &.{},
 
     fn fromReaderValue(alloc: std.mem.Allocator, r: U16ArrayOnlyReader) Error!U16ArrayOnlyStruct {
-        var s = U16ArrayOnlyStruct{
-        };
+        var s = U16ArrayOnlyStruct{};
         errdefer s.deinit(alloc);
         s.values = try r.valuesToSliceAlloc(alloc);
         return s;
@@ -1864,8 +1859,7 @@ pub const U16ArrayOnlyStruct = struct {
     }
 
     fn cloneValue(self: U16ArrayOnlyStruct, alloc: std.mem.Allocator) Error!U16ArrayOnlyStruct {
-        var s = U16ArrayOnlyStruct{
-        };
+        var s = U16ArrayOnlyStruct{};
         errdefer s.deinit(alloc);
         s.values = try alloc.dupe(u16, self.values);
         return s;
@@ -2077,4 +2071,3 @@ pub const U16ArrayOnlyWriter = struct {
         }
     }
 };
-

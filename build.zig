@@ -82,7 +82,6 @@ pub fn build(b: *std.Build) void {
     else
         b.standardOptimizeOption(.{});
 
-
     const schema_mod = makeSchemaModule(b, target, optimize);
     const regen_buffers_step = addRegenAllBuffers(b, target, optimize, schema_mod);
     const raft_mod = makeRaftModule(b, target, optimize);
@@ -163,7 +162,12 @@ fn addZbufGenRun(
 
     const run_gen = b.addRunArtifact(gen);
     run_gen.addArg(out_path);
-    return &run_gen.step;
+
+    const fmt_gen = b.addFmt(.{
+        .paths = &.{out_path},
+    });
+    fmt_gen.step.dependOn(&run_gen.step);
+    return &fmt_gen.step;
 }
 
 fn addRegenAllBuffers(
@@ -490,7 +494,6 @@ fn makeRaftModule(
     raft_mod.addImport("metrics", metrics_mod);
     return raft_mod;
 }
-
 
 fn addZdbServer(
     b: *std.Build,
