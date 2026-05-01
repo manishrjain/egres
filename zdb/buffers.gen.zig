@@ -2085,7 +2085,8 @@ pub const KeyValueStruct = struct {
     value: []const u8 = &.{},
 
     fn fromReaderValue(alloc: std.mem.Allocator, r: KeyValueReader) Error!KeyValueStruct {
-        var s = KeyValueStruct{};
+        var s = KeyValueStruct{
+        };
         errdefer s.deinit(alloc);
         s.key = try alloc.dupe(u8, r.key());
         s.value = try alloc.dupe(u8, r.value());
@@ -2112,7 +2113,8 @@ pub const KeyValueStruct = struct {
     }
 
     fn cloneValue(self: KeyValueStruct, alloc: std.mem.Allocator) Error!KeyValueStruct {
-        var s = KeyValueStruct{};
+        var s = KeyValueStruct{
+        };
         errdefer s.deinit(alloc);
         s.key = try alloc.dupe(u8, self.key);
         s.value = try alloc.dupe(u8, self.value);
@@ -2619,3 +2621,4 @@ pub const MutationsWriter = struct {
         }
     }
 };
+

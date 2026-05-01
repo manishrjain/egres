@@ -1239,7 +1239,24 @@ pub const Node = struct {
 
             const start_idx: usize = if (append_from) |v| v else ae_entries_len;
             for (start_idx..ae_entries_len) |append_idx| {
-                const entry = try ae.entriesAtClone(self.allocator, @intCast(append_idx));
+                const entry_reader = try ae.entriesAt(@intCast(append_idx));
+                var entry_bytes: std.ArrayList(u8) = .empty;
+                errdefer entry_bytes.deinit(self.allocator);
+
+                const entry_off =
+                    try entry_reader.cloneInto(self.allocator, &entry_bytes);
+                try zen.addTail(
+                    self.allocator,
+                    &entry_bytes,
+                    zen.LogEntryReader,
+                    entry_off,
+                );
+                const owned = try entry_bytes.toOwnedSlice(self.allocator);
+                const entry = try zen.LogEntryBuffer.initWithTail(
+                    self.allocator,
+                    owned,
+                    .owned,
+                );
                 try entries_to_append.append(self.allocator, entry);
             }
             if (entries_to_append.items.len > 0) {

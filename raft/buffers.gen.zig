@@ -3078,7 +3078,8 @@ pub const ConfStateStruct = struct {
     peers: []ConfStatePeerStruct = &.{},
 
     fn fromReaderValue(alloc: std.mem.Allocator, r: ConfStateReader) Error!ConfStateStruct {
-        var s = ConfStateStruct{};
+        var s = ConfStateStruct{
+        };
         errdefer s.deinit(alloc);
         {
             const _cnt = r.peersLen();
@@ -3111,7 +3112,8 @@ pub const ConfStateStruct = struct {
     }
 
     fn cloneValue(self: ConfStateStruct, alloc: std.mem.Allocator) Error!ConfStateStruct {
-        var s = ConfStateStruct{};
+        var s = ConfStateStruct{
+        };
         errdefer s.deinit(alloc);
         {
             s.peers = try alloc.alloc(ConfStatePeerStruct, self.peers.len);
@@ -3879,3 +3881,4 @@ pub const SnapshotWriter = struct {
         }
     }
 };
+
