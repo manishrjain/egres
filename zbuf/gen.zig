@@ -218,9 +218,10 @@ fn requireBoolLayoutValid(comptime infos: anytype) void {
 
 fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime T: type, comptime table_id: u16, w: anytype) !void {
     // Compile-time layout calculation: field order, slot offsets, and header size.
+    // Header is just `size_bytes` (u16) at offset 0; field slots start at offset 2.
     const layout = comptime blk: {
         const fields = schema.sortFieldsById(T.fields);
-        var offset: u16 = 4; // version + size_bytes
+        var offset: u16 = 2; // size_bytes
         var infos: [fields.len]FieldInfo = undefined;
         for (fields, 0..) |f, i| {
             infos[i] = .{ .id = f.id, .name = f.name, .ty = f.ty, .offset = offset };
@@ -246,21 +247,24 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     try w.writeAll("    base: u32,\n");
     try w.writeAll("    size_bytes: u16,\n\n");
 
-    try w.print("    pub const VERSION: u16 = {d};\n", .{1});
     try w.print("    pub const TABLE_ID: u16 = {d};\n", .{table_id});
     try w.print("    pub const SIZE_BYTES: u16 = {d};\n\n", .{size_bytes});
 
+    // The root table is required to live at payload offset 0 (writers enforce
+    // this in finishWithTail); the tail just carries the table_id for type
+    // dispatch. So parseRoot strips the tail and inits at base=0.
     try w.writeAll("    pub fn parseRoot(buf: []const u8) Error!Self {\n");
     try w.writeAll("        const tail = try zbuf.readMessageTail(buf);\n");
     try w.writeAll("        if (tail.table_id != TABLE_ID) return zbuf.Error.Invalid;\n");
     try w.writeAll("        const payload_buf = buf[0 .. buf.len - zbuf.message_tail_size];\n");
-    try w.writeAll("        return init(payload_buf, tail.offset);\n");
+    try w.writeAll("        return init(payload_buf, 0);\n");
     try w.writeAll("    }\n\n");
 
     // init() validates that header fits in the buffer; field accessors are bounds-checked.
+    // Header is 2 bytes (just size_bytes at offset 0).
     try w.writeAll("    pub fn init(buf: []const u8, base: u32) Error!Self {\n");
-    try w.writeAll("        if (@as(usize, base) + 4 > buf.len) return zbuf.Error.OutOfBounds;\n");
-    try w.writeAll("        const size_bytes = try zbuf.readU16(buf, @as(usize, base + 2));\n");
+    try w.writeAll("        if (@as(usize, base) + 2 > buf.len) return zbuf.Error.OutOfBounds;\n");
+    try w.writeAll("        const size_bytes = try zbuf.readU16(buf, @as(usize, base));\n");
     try w.writeAll("        if (@as(usize, base) + @as(usize, size_bytes) > buf.len) return zbuf.Error.OutOfBounds;\n");
     try w.writeAll("        return .{ .buf = buf, .base = base, .size_bytes = size_bytes };\n");
     try w.writeAll("    }\n\n");
@@ -327,16 +331,11 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
                         try w.writeAll("        const child_off = zbuf.readU32(s, off) catch unreachable;\n");
                         try w.print("        return {s}Reader.init(self.buf, child_off);\n", .{child_name});
                         try w.writeAll("    }\n\n");
-                        try w.print("    pub fn {s}AtClone(self: Self, alloc: std.mem.Allocator, i: u32) Error!{s}Buffer {{\n", .{ name_camel_arr, child_name });
-                        try w.print("        const child = try self.{s}At(i);\n", .{name_camel_arr});
-                        try w.writeAll("        var out = std.ArrayList(u8).empty;\n");
-                        try w.writeAll("        errdefer out.deinit(alloc);\n");
-                        try w.print("        const child_buf = try {s}Buffer.initWithOffset(alloc, @constCast(self.buf), child.base, .borrowed);\n", .{child_name});
-                        try w.writeAll("        const child_off = try child_buf.cloneInto(alloc, &out);\n");
-                        try w.print("        try addTail(alloc, &out, {s}Reader, child_off);\n", .{child_name});
-                        try w.writeAll("        const bytes = try out.toOwnedSlice(alloc);\n");
-                        try w.print("        return {s}Buffer.initWithTail(alloc, bytes, .owned);\n", .{child_name});
-                        try w.writeAll("    }\n\n");
+                        // Note: there is no *AtClone helper. To clone a table out of a
+                        // parent buffer, callers do `cloneInto` into a fresh ArrayList
+                        // and then explicitly `addTail` if they want a tail-wrapped
+                        // message. Keeping tail addition user-triggered avoids hiding
+                        // wire-format details inside accessors.
                     },
                     .u16, .u32, .u64 => {
                         // Scalar arrays: validate backing region once via *Slice(), then delegate.
@@ -468,8 +467,8 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     try w.writeAll("    pub fn initWithTail(alloc: std.mem.Allocator, bytes: []u8, ownership: Ownership) Error!@This() {\n");
     try w.writeAll("        const tail = try zbuf.readMessageTail(bytes);\n");
     try w.print("        if (tail.table_id != {s}Reader.TABLE_ID) return zbuf.Error.Invalid;\n", .{table_name});
-    try w.print("        if (tail.table_version != {s}Reader.VERSION) return zbuf.Error.Invalid;\n", .{table_name});
-    try w.writeAll("        return .{ .alloc = alloc, .offset = tail.offset, .bytes = bytes, .ownership = ownership, .has_tail = true };\n");
+    // Root table is always at payload offset 0 (writers enforce in finishWithTail).
+    try w.writeAll("        return .{ .alloc = alloc, .offset = 0, .bytes = bytes, .ownership = ownership, .has_tail = true };\n");
     try w.writeAll("    }\n");
     try w.writeAll("    pub fn initWithOffset(alloc: std.mem.Allocator, bytes: []u8, offset: u32, ownership: Ownership) Error!@This() {\n");
     try w.writeAll("        return .{ .alloc = alloc, .offset = offset, .bytes = bytes, .ownership = ownership, .has_tail = false };\n");
@@ -565,7 +564,6 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     try w.writeAll("    owns_buf: bool,\n");
     try w.writeAll("    alloc: std.mem.Allocator,\n");
     try w.writeAll("    base: u32,\n\n");
-    try w.print("    pub const VERSION: u16 = {d};\n", .{1});
     try w.print("    pub const TABLE_ID: u16 = {d};\n", .{table_id});
     try w.print("    pub const SIZE_BYTES: u16 = {d};\n\n", .{size_bytes});
 
@@ -573,11 +571,10 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     try w.writeAll("        return self.buf orelse @panic(\"zbuf writer missing buffer\");\n");
     try w.writeAll("    }\n\n");
 
-    // initWithBuf() reserves the fixed header and writes version + size_bytes.
+    // initWithBuf() reserves the fixed header and writes size_bytes at base+0.
     try w.writeAll("    pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {\n");
     try w.writeAll("        const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);\n");
-    try w.writeAll("        try zbuf.writeU16At(buf.items, @as(usize, base), VERSION);\n");
-    try w.writeAll("        try zbuf.writeU16At(buf.items, @as(usize, base + 2), SIZE_BYTES);\n");
+    try w.writeAll("        try zbuf.writeU16At(buf.items, @as(usize, base), SIZE_BYTES);\n");
     inline for (infos) |info| {
         switch (comptime schema.kindOf(info.ty)) {
             .table => {
@@ -595,8 +592,7 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     try w.writeAll("        owned.* = .empty;\n");
     try w.writeAll("        errdefer alloc.destroy(owned);\n");
     try w.writeAll("        const base = try zbuf.reserveHeader(owned, alloc, SIZE_BYTES);\n");
-    try w.writeAll("        try zbuf.writeU16At(owned.items, @as(usize, base), VERSION);\n");
-    try w.writeAll("        try zbuf.writeU16At(owned.items, @as(usize, base + 2), SIZE_BYTES);\n");
+    try w.writeAll("        try zbuf.writeU16At(owned.items, @as(usize, base), SIZE_BYTES);\n");
     inline for (infos) |info| {
         switch (comptime schema.kindOf(info.ty)) {
             .table => {
@@ -775,9 +771,12 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     try w.writeAll("        return .{ .alloc = self.alloc, .offset = self.base, .bytes = null, .ownership = .borrowed, .has_tail = false };\n");
     try w.writeAll("    }\n");
     try w.writeAll("\n");
+    try w.writeAll("    /// Root must be at payload offset 0. Initialize the root writer first\n");
+    try w.writeAll("    /// on an empty buffer; children built later land at higher offsets.\n");
     try w.print("    pub fn finishWithTail(self: *Self) Error!{s}Buffer {{\n", .{table_name});
+    try w.writeAll("        if (self.base != 0) return zbuf.Error.Invalid;\n");
     try w.writeAll("        const out = self.bufMut();\n");
-    try w.writeAll("        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, VERSION, self.base);\n");
+    try w.writeAll("        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID);\n");
     try w.writeAll("        var result = try self.finish();\n");
     try w.writeAll("        result.has_tail = true;\n");
     try w.writeAll("        return result;\n");
@@ -1331,8 +1330,10 @@ fn emitBytesVerify(w: anytype, offset: u16) !void {
 }
 
 fn emitTailHelpers(w: anytype) !void {
-    try w.writeAll("pub fn addTail(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), comptime T: type, offset: u32) Error!void {\n");
-    try w.writeAll("    try zbuf.appendMessageTail(buf, alloc, T.TABLE_ID, T.VERSION, offset);\n");
+    // addTail tags an existing buffer with the type-id tail. The caller must
+    // ensure the root table sits at payload offset 0.
+    try w.writeAll("pub fn addTail(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), comptime T: type) Error!void {\n");
+    try w.writeAll("    try zbuf.appendMessageTail(buf, alloc, T.TABLE_ID);\n");
     try w.writeAll("}\n\n");
     try w.writeAll("pub fn parseTail(buf: []const u8) Error!zbuf.MessageTail {\n");
     try w.writeAll("    return zbuf.readMessageTail(buf);\n");
@@ -1342,7 +1343,7 @@ fn emitTailHelpers(w: anytype) !void {
     try w.writeAll("    const payload_buf = buf[0 .. buf.len - zbuf.message_tail_size];\n");
     try w.writeAll("    return switch (tail.table_id) {\n");
     inline for (defs.tables) |entry| {
-        try w.print("        {s}Reader.TABLE_ID => .{{ .{s} = try {s}Reader.init(payload_buf, tail.offset) }},\n", .{ entry.name, entry.name, entry.name });
+        try w.print("        {s}Reader.TABLE_ID => .{{ .{s} = try {s}Reader.init(payload_buf, 0) }},\n", .{ entry.name, entry.name, entry.name });
     }
     try w.writeAll("        else => zbuf.Error.Invalid,\n");
     try w.writeAll("    };\n");
