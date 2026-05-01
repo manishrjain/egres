@@ -193,18 +193,12 @@ pub const MetaStore = struct {
     /// still required to make the rename itself crash-safe.
     pub fn setSnapshot(self: *MetaStore, snap: zen.SnapshotStruct) !void {
         // Serialize the snapshot via the struct's own marshalTo, then append
-        // the zbuf tail so SnapshotReader.parseRoot can recover the message
-        // offset from the file bytes.
+        // the zbuf tail. Passing `off` lets zbuf validate the root-at-zero
+        // invariant even though the tail only stores the table id.
         var zbuf_bytes: std.ArrayList(u8) = .empty;
         defer zbuf_bytes.deinit(self.allocator);
         const off = try snap.marshalTo(self.allocator, &zbuf_bytes);
-        try zbuf.appendMessageTail(
-            &zbuf_bytes,
-            self.allocator,
-            zen.SnapshotReader.TABLE_ID,
-            zen.SnapshotReader.VERSION,
-            off,
-        );
+        try zbuf.appendMessageTail(&zbuf_bytes, self.allocator, zen.SnapshotReader.TABLE_ID, off);
 
         // Wrap with the file-level [crc32c][payload_len][zbuf] frame so we
         // detect a torn pwrite (e.g. a power loss mid-write of a multi-MB
@@ -263,13 +257,7 @@ pub const MetaStore = struct {
         var scratch: std.ArrayList(u8) = .empty;
         defer scratch.deinit(self.allocator);
         const off = try hs.marshalTo(self.allocator, &scratch);
-        try zbuf.appendMessageTail(
-            &scratch,
-            self.allocator,
-            zen.HardStateReader.TABLE_ID,
-            zen.HardStateReader.VERSION,
-            off,
-        );
+        try zbuf.appendMessageTail(&scratch, self.allocator, zen.HardStateReader.TABLE_ID, off);
         if (scratch.items.len > max_slot_payload_len) return Error.PayloadTooLarge;
 
         // Page-aligned heap buffer (zio fibers have small stacks; per

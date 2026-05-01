@@ -1000,14 +1000,8 @@ pub const Node = struct {
         try entry_offsets.ensureTotalCapacity(self.allocator, result.entries.len);
 
         for (result.entries) |entry_ref| {
-            var entry_buf = try zen.LogEntryBuffer.initWithTail(
-                self.allocator,
-                @constCast(entry_ref.bytes),
-                .borrowed,
-            );
-            defer entry_buf.deinit();
-
-            const entry_off = try entry_buf.cloneInto(self.allocator, &buf);
+            const entry_reader = try zen.LogEntryReader.parseRoot(entry_ref.bytes);
+            const entry_off = try entry_reader.cloneInto(self.allocator, &buf);
             try entry_offsets.append(self.allocator, entry_off);
         }
 
@@ -1490,13 +1484,8 @@ pub const Node = struct {
             var cc_offset: u32 = zen.NullOffset;
             if (is_conf) {
                 // req.data is a serialized ConfChange. Clone it into buf and get the offset.
-                var cc_buf = try zen.ConfChangeBuffer.initWithTail(
-                    self.allocator,
-                    req.data,
-                    .borrowed,
-                );
-                defer cc_buf.deinit();
-                cc_offset = try cc_buf.cloneInto(self.allocator, &buf);
+                const cc_reader = try zen.ConfChangeReader.parseRoot(req.data);
+                cc_offset = try cc_reader.cloneInto(self.allocator, &buf);
             }
 
             // Assign the HLC inside this critical section so log order matches

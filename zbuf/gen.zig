@@ -402,6 +402,74 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
         }
     }
 
+    try w.writeAll("    pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {\n");
+    try w.print("        var writer = try {s}Writer.initWithBuf(alloc, out);\n", .{table_name});
+    inline for (infos) |info| {
+        const name_camel = try schema.camelNameCapitalized(alloc, info.name);
+        defer alloc.free(name_camel);
+        const name_lower = try schema.camelName(alloc, info.name);
+        defer alloc.free(name_lower);
+        switch (comptime schema.kindOf(info.ty)) {
+            .u16, .u32, .u64, .bytes, .bool, .enum_ => {
+                try w.print("        try writer.set{s}(self.{s}());\n", .{ name_camel, name_lower });
+            },
+            .b64 => {
+                try w.print("        try writer.{s}Set(self.{s}());\n", .{ name_lower, name_lower });
+            },
+            .table => {
+                try w.print("        if (self.{s}()) |child| {{\n", .{name_lower});
+                try w.writeAll("            const child_off = try child.cloneInto(alloc, out);\n");
+                try w.print("            try writer.set{s}(child_off);\n", .{name_camel});
+                try w.writeAll("        }\n");
+            },
+            .array => {
+                const child = comptime schema.childOfArray(info.ty);
+                const child_kind = comptime schema.kindOf(child);
+                const name_camel_arr = try schema.camelName(alloc, info.name);
+                defer alloc.free(name_camel_arr);
+                switch (child_kind) {
+                    .table => {
+                        try w.print("        const count_{s}: u32 = self.{s}Len();\n", .{ name_camel_arr, name_camel_arr });
+                        try w.print("        if (count_{s} != 0) {{\n", .{name_camel_arr});
+                        try w.print("            var child_offsets_{s} = try alloc.alloc(u32, @intCast(count_{s}));\n", .{ name_camel_arr, name_camel_arr });
+                        try w.print("            defer alloc.free(child_offsets_{s});\n", .{name_camel_arr});
+                        try w.print("            var i_{s}: u32 = 0;\n", .{name_camel_arr});
+                        try w.print("            while (i_{s} < count_{s}) : (i_{s} += 1) {{\n", .{ name_camel_arr, name_camel_arr, name_camel_arr });
+                        try w.print("                const child = try self.{s}At(i_{s});\n", .{ name_camel_arr, name_camel_arr });
+                        try w.print("                child_offsets_{s}[@intCast(i_{s})] = try child.cloneInto(alloc, out);\n", .{ name_camel_arr, name_camel_arr });
+                        try w.writeAll("            }\n");
+                        try w.print("            try writer.set{s}(child_offsets_{s});\n", .{ name_camel, name_camel_arr });
+                        try w.writeAll("        }\n");
+                    },
+                    .u16, .u32, .u64 => {
+                        // Use ToSliceAlloc: validates once, single allocation, single copy.
+                        try w.print("        const values_{s} = try self.{s}ToSliceAlloc(alloc);\n", .{ name_camel_arr, name_camel_arr });
+                        try w.print("        defer alloc.free(values_{s});\n", .{name_camel_arr});
+                        try w.print("        if (values_{s}.len > 0) try writer.set{s}(values_{s});\n", .{ name_camel_arr, name_camel, name_camel_arr });
+                    },
+                    .b64 => {
+                        // b64 arrays: no ToSliceAlloc, use element-by-element loop.
+                        const scalar_ty = scalarTypeNameForKind(child_kind);
+                        try w.print("        const count_{s}: u32 = self.{s}Len();\n", .{ name_camel_arr, name_camel_arr });
+                        try w.print("        if (count_{s} != 0) {{\n", .{name_camel_arr});
+                        try w.print("            var values_{s} = try alloc.alloc({s}, @intCast(count_{s}));\n", .{ name_camel_arr, scalar_ty, name_camel_arr });
+                        try w.print("            defer alloc.free(values_{s});\n", .{name_camel_arr});
+                        try w.print("            var i_{s}: u32 = 0;\n", .{name_camel_arr});
+                        try w.print("            while (i_{s} < count_{s}) : (i_{s} += 1) {{\n", .{ name_camel_arr, name_camel_arr, name_camel_arr });
+                        try w.print("                values_{s}[@intCast(i_{s})] = try self.{s}At(i_{s});\n", .{ name_camel_arr, name_camel_arr, name_camel_arr, name_camel_arr });
+                        try w.writeAll("            }\n");
+                        try w.print("            try writer.set{s}(values_{s});\n", .{ name_camel, name_camel_arr });
+                        try w.writeAll("        }\n");
+                    },
+                    else => @compileError("unsupported array child kind"),
+                }
+            },
+        }
+    }
+    try w.writeAll("        const result = try writer.finish();\n");
+    try w.writeAll("        return result.offset;\n");
+    try w.writeAll("    }\n\n");
+
     // verify() provides optional bounds checking of nested data.
     const verify_needs_header_end = comptime blk: {
         var needed = false;
@@ -476,78 +544,6 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     try w.print("    pub fn initReader(self: @This()) Error!{s}Reader {{\n", .{table_name});
     try w.writeAll("        const payload = self.bytes orelse return zbuf.Error.Invalid;\n");
     try w.print("        return {s}Reader.init(payload, self.offset);\n", .{table_name});
-    try w.writeAll("    }\n");
-    try w.writeAll("    pub fn cloneInto(self: @This(), alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {\n");
-    try w.writeAll("        const reader = try self.initReader();\n");
-    try w.print("        var writer = try {s}Writer.initWithBuf(alloc, out);\n", .{table_name});
-    inline for (infos) |info| {
-        const name_camel = try schema.camelNameCapitalized(alloc, info.name);
-        defer alloc.free(name_camel);
-        const name_lower = try schema.camelName(alloc, info.name);
-        defer alloc.free(name_lower);
-        switch (comptime schema.kindOf(info.ty)) {
-            .u16, .u32, .u64, .bytes, .bool, .enum_ => {
-                try w.print("        try writer.set{s}(reader.{s}());\n", .{ name_camel, name_lower });
-            },
-            .b64 => {
-                try w.print("        try writer.{s}Set(reader.{s}());\n", .{ name_lower, name_lower });
-            },
-            .table => {
-                const child_name = tableNameForType(info.ty);
-                try w.print("        if (reader.{s}()) |child| {{\n", .{name_lower});
-                try w.print("            const child_buf = try {s}Buffer.initWithOffset(alloc, @constCast(reader.buf), child.base, .borrowed);\n", .{child_name});
-                try w.writeAll("            const child_off = try child_buf.cloneInto(alloc, out);\n");
-                try w.print("            try writer.set{s}(child_off);\n", .{name_camel});
-                try w.writeAll("        }\n");
-            },
-            .array => {
-                const child = comptime schema.childOfArray(info.ty);
-                const child_kind = comptime schema.kindOf(child);
-                const name_camel_arr = try schema.camelName(alloc, info.name);
-                defer alloc.free(name_camel_arr);
-                switch (child_kind) {
-                    .table => {
-                        const child_name = tableNameForType(child);
-                        try w.print("        const count_{s}: u32 = reader.{s}Len();\n", .{ name_camel_arr, name_camel_arr });
-                        try w.print("        if (count_{s} != 0) {{\n", .{name_camel_arr});
-                        try w.print("            var child_offsets_{s} = try alloc.alloc(u32, @intCast(count_{s}));\n", .{ name_camel_arr, name_camel_arr });
-                        try w.print("            defer alloc.free(child_offsets_{s});\n", .{name_camel_arr});
-                        try w.print("            var i_{s}: u32 = 0;\n", .{name_camel_arr});
-                        try w.print("            while (i_{s} < count_{s}) : (i_{s} += 1) {{\n", .{ name_camel_arr, name_camel_arr, name_camel_arr });
-                        try w.print("                const child = try reader.{s}At(i_{s});\n", .{ name_camel_arr, name_camel_arr });
-                        try w.print("                const child_buf = try {s}Buffer.initWithOffset(alloc, @constCast(reader.buf), child.base, .borrowed);\n", .{child_name});
-                        try w.print("                child_offsets_{s}[@intCast(i_{s})] = try child_buf.cloneInto(alloc, out);\n", .{ name_camel_arr, name_camel_arr });
-                        try w.writeAll("            }\n");
-                        try w.print("            try writer.set{s}(child_offsets_{s});\n", .{ name_camel, name_camel_arr });
-                        try w.writeAll("        }\n");
-                    },
-                    .u16, .u32, .u64 => {
-                        // Use ToSliceAlloc: validates once, single allocation, single copy.
-                        try w.print("        const values_{s} = try reader.{s}ToSliceAlloc(alloc);\n", .{ name_camel_arr, name_camel_arr });
-                        try w.print("        defer alloc.free(values_{s});\n", .{name_camel_arr});
-                        try w.print("        if (values_{s}.len > 0) try writer.set{s}(values_{s});\n", .{ name_camel_arr, name_camel, name_camel_arr });
-                    },
-                    .b64 => {
-                        // b64 arrays: no ToSliceAlloc, use element-by-element loop.
-                        const scalar_ty = scalarTypeNameForKind(child_kind);
-                        try w.print("        const count_{s}: u32 = reader.{s}Len();\n", .{ name_camel_arr, name_camel_arr });
-                        try w.print("        if (count_{s} != 0) {{\n", .{name_camel_arr});
-                        try w.print("            var values_{s} = try alloc.alloc({s}, @intCast(count_{s}));\n", .{ name_camel_arr, scalar_ty, name_camel_arr });
-                        try w.print("            defer alloc.free(values_{s});\n", .{name_camel_arr});
-                        try w.print("            var i_{s}: u32 = 0;\n", .{name_camel_arr});
-                        try w.print("            while (i_{s} < count_{s}) : (i_{s} += 1) {{\n", .{ name_camel_arr, name_camel_arr, name_camel_arr });
-                        try w.print("                values_{s}[@intCast(i_{s})] = try reader.{s}At(i_{s});\n", .{ name_camel_arr, name_camel_arr, name_camel_arr, name_camel_arr });
-                        try w.writeAll("            }\n");
-                        try w.print("            try writer.set{s}(values_{s});\n", .{ name_camel, name_camel_arr });
-                        try w.writeAll("        }\n");
-                    },
-                    else => @compileError("unsupported array child kind"),
-                }
-            },
-        }
-    }
-    try w.writeAll("        const result = try writer.finish();\n");
-    try w.writeAll("        return result.offset;\n");
     try w.writeAll("    }\n");
     try w.writeAll("    pub fn deinit(self: *@This()) void {\n");
     try w.writeAll("        if (self.bytes) |bytes| {\n");
@@ -776,7 +772,7 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     try w.print("    pub fn finishWithTail(self: *Self) Error!{s}Buffer {{\n", .{table_name});
     try w.writeAll("        if (self.base != 0) return zbuf.Error.Invalid;\n");
     try w.writeAll("        const out = self.bufMut();\n");
-    try w.writeAll("        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID);\n");
+    try w.writeAll("        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, self.base);\n");
     try w.writeAll("        var result = try self.finish();\n");
     try w.writeAll("        result.has_tail = true;\n");
     try w.writeAll("        return result;\n");
@@ -1263,7 +1259,6 @@ fn emitArrayLenGetter(w: anytype, offset: u16, elem_size: u16) !void {
     try w.writeAll("        return elem_count;\n");
 }
 
-
 fn emitArrayAtGetterScalar(
     w: anytype,
     offset: u16,
@@ -1332,8 +1327,8 @@ fn emitBytesVerify(w: anytype, offset: u16) !void {
 fn emitTailHelpers(w: anytype) !void {
     // addTail tags an existing buffer with the type-id tail. The caller must
     // ensure the root table sits at payload offset 0.
-    try w.writeAll("pub fn addTail(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), comptime T: type) Error!void {\n");
-    try w.writeAll("    try zbuf.appendMessageTail(buf, alloc, T.TABLE_ID);\n");
+    try w.writeAll("pub fn addTail(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), comptime T: type, offset: u32) Error!void {\n");
+    try w.writeAll("    try zbuf.appendMessageTail(buf, alloc, T.TABLE_ID, offset);\n");
     try w.writeAll("}\n\n");
     try w.writeAll("pub fn parseTail(buf: []const u8) Error!zbuf.MessageTail {\n");
     try w.writeAll("    return zbuf.readMessageTail(buf);\n");

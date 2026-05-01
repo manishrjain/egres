@@ -6,6 +6,8 @@ fn buildTable(alloc: std.mem.Allocator, set_root_node: bool) !gen.TableBuffer {
     var buf: std.ArrayList(u8) = .{};
     defer buf.deinit(alloc);
 
+    var root = try gen.TableWriter.initWithBuf(alloc, &buf);
+
     var l1 = try gen.CellWriter.initWithBuf(alloc, &buf);
     try l1.set(.{
         .tag = 1,
@@ -50,7 +52,7 @@ fn buildTable(alloc: std.mem.Allocator, set_root_node: bool) !gen.TableBuffer {
     const no_leaves = [_]u32{};
     try n2.setCells(&no_leaves);
     const n2_no_u32_values = [_]u32{};
-    const n2_u64_values = [_]u64{ 9000 };
+    const n2_u64_values = [_]u64{9000};
     try n2.setU32Values(&n2_no_u32_values);
     try n2.setU64Values(&n2_u64_values);
     try n2.setRowCell(gen.NullOffset);
@@ -61,7 +63,6 @@ fn buildTable(alloc: std.mem.Allocator, set_root_node: bool) !gen.TableBuffer {
     const n2_res = try n2.finish();
     const n2_off = n2_res.offset;
 
-    var root = try gen.TableWriter.initWithBuf(alloc, &buf);
     const nodes = [_]u32{ n1_off, n2_off };
     try root.setRows(&nodes);
     try root.setPayload("payload");
@@ -142,10 +143,8 @@ test "zbuf format roundtrip" {
 }
 
 test "bitset direct operations" {
-    var buf: std.ArrayList(u8) = .{};
-    defer buf.deinit(std.testing.allocator);
-
-    var node = try gen.RowWriter.initWithBuf(std.testing.allocator, &buf);
+    var node = try gen.RowWriter.init(std.testing.allocator);
+    defer node.deinit();
     try node.flagsSetBit(0);
     try node.flagsSetBit(63);
     try std.testing.expect(try node.flagsHasBit(0));
@@ -154,14 +153,11 @@ test "bitset direct operations" {
     try std.testing.expect(!(try node.flagsHasBit(0)));
     try node.flagsSet(0);
 
-    const off_res = try node.finish();
-    const off = off_res.offset;
-    var payload: std.ArrayList(u8) = .{};
-    defer payload.deinit(std.testing.allocator);
-    try payload.appendSlice(std.testing.allocator, buf.items);
-    try gen.addTail(std.testing.allocator, &payload, gen.RowReader, off);
+    var payload = try node.finishWithTail();
+    defer payload.deinit();
+    const bytes = payload.bytes orelse return error.Invalid;
 
-    const msg = try gen.parseMessageWithTail(payload.items);
+    const msg = try gen.parseMessageWithTail(bytes);
     const view = switch (msg) {
         .Row => |v| v,
         else => return error.Invalid,
@@ -171,11 +167,9 @@ test "bitset direct operations" {
 }
 
 test "enum field roundtrips and is independent of flag bits" {
-    var buf: std.ArrayList(u8) = .{};
-    defer buf.deinit(std.testing.allocator);
-
     // Set the enum to .draining and a couple of independent flag bits.
-    var node = try gen.RowWriter.initWithBuf(std.testing.allocator, &buf);
+    var node = try gen.RowWriter.init(std.testing.allocator);
+    defer node.deinit();
     try node.setLifecycle(.draining);
     try node.flagsSetBit(0); // is_pinned
     try node.flagsSetBit(1); // is_deleted
@@ -185,14 +179,11 @@ test "enum field roundtrips and is independent of flag bits" {
     try std.testing.expect(try node.flagsHasBit(0));
     try std.testing.expect(try node.flagsHasBit(1));
 
-    const off_res = try node.finish();
-    const off = off_res.offset;
-    var payload: std.ArrayList(u8) = .{};
-    defer payload.deinit(std.testing.allocator);
-    try payload.appendSlice(std.testing.allocator, buf.items);
-    try gen.addTail(std.testing.allocator, &payload, gen.RowReader, off);
+    var payload = try node.finishWithTail();
+    defer payload.deinit();
+    const bytes = payload.bytes orelse return error.Invalid;
 
-    const msg = try gen.parseMessageWithTail(payload.items);
+    const msg = try gen.parseMessageWithTail(bytes);
     const view = switch (msg) {
         .Row => |v| v,
         else => return error.Invalid,
@@ -283,12 +274,10 @@ test "size_bytes compatibility" {
     defer buf.deinit();
     const bytes = buf.bytes orelse return error.Invalid;
 
-    const tail = try @import("zbuf").zbuf.readMessageTail(bytes);
-    const base = tail.offset;
     const v1_size: u16 = gen.TableReader.SIZE_BYTES;
     const v2_size: u16 = v1_size + 4;
 
-    const slice = bytes[base + 2 .. base + 4];
+    const slice = bytes[2..4];
     const ptr = @as(*[2]u8, @ptrCast(slice.ptr));
     std.mem.writeInt(u16, ptr, v2_size, .little);
 

@@ -20,14 +20,18 @@ pub const MessageTail = struct {
 // arbitrary noise without paying for a 4-byte signature on every message.
 pub const message_magic: u16 = 0x425A;
 // 4-byte tail: u16 table_id + u16 magic. The root table is required to live
-// at payload offset 0 (enforced by writers via `finishWithTail`), so we don't
-// need to carry an offset. Schema versioning is a forever-additive discipline
-// at the field level (size_bytes handles it); we don't carry a per-message
-// version field anymore.
+// at payload offset 0. appendMessageTail accepts the caller's offset only to
+// validate that invariant; the offset is not stored.
 pub const message_tail_size: u16 = 4;
 const payload_alignment: usize = 4;
 
-pub fn appendMessageTail(list: *std.ArrayList(u8), alloc: std.mem.Allocator, table_id: u16) !void {
+pub fn appendMessageTail(
+    list: *std.ArrayList(u8),
+    alloc: std.mem.Allocator,
+    table_id: u16,
+    offset: u32,
+) !void {
+    if (offset != 0) return Error.Invalid;
     const start = list.items.len;
     try appendZeros(list, alloc, message_tail_size);
     try writeU16At(list.items, start + 0, table_id);
