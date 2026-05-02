@@ -177,11 +177,11 @@ pub const ForestState = struct {
             // Each record is a zbuf frame: [u64 hash | u32 len | payload].
             // OutOfBounds = clean EOF (truncate happens after the loop);
             // Invalid = CRC/hash mismatch — surface as ChecksumMismatch.
-            const payload = zbuf.readFrame(data[pos..]) catch |err| switch (err) {
+            const payload = zbuf.Frame.read(data[pos..]) catch |err| switch (err) {
                 zbuf.Error.OutOfBounds => break,
                 zbuf.Error.Invalid => return ManifestError.ChecksumMismatch,
             };
-            pos += zbuf.frame_prefix_size + payload.len;
+            pos += zbuf.Frame.hdr_size + payload.len;
 
             const reader = try buffers.ManifestChangeReader.parseRoot(payload);
 
@@ -259,7 +259,7 @@ pub const ForestState = struct {
             }
 
             const payload = try encodeChangeSet(alloc, table_changes.items, tree_changes.items);
-            _ = try zbuf.appendFrame(&out, alloc, payload);
+            _ = try zbuf.Frame.append(&out, alloc, payload);
         }
 
         // Create file, write everything in one call, sync, then rename into place.
@@ -299,7 +299,7 @@ pub const ForestState = struct {
         const payload = try encodeChangeSet(alloc, table_changes, tree_changes);
 
         var out = std.ArrayList(u8).empty;
-        const written = try zbuf.appendFrame(&out, alloc, payload);
+        const written = try zbuf.Frame.append(&out, alloc, payload);
 
         try self.handle.?.write(out.items, self.write_pos, .p0);
         self.write_pos += written;

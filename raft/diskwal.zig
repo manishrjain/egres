@@ -117,7 +117,7 @@ pub const logFile = struct {
 
         // Frame prefix [crc32c | len] gates the WalHeader bytes — strips the
         // zero padding after the message and verifies CRC in one pass.
-        const msg_bytes = zbuf.readFrame(hdr) catch return error.InvalidLogHeader;
+        const msg_bytes = zbuf.Frame.read(hdr) catch return error.InvalidLogHeader;
 
         // parseRoot validates the zbuf message tail (table_id 42255 = WalHeader).
         const hdr_reader = zen.WalHeaderReader.parseRoot(msg_bytes) catch
@@ -170,7 +170,7 @@ pub const logFile = struct {
         var wo: u64 = log_file_offset;
         if (slots_list.items.len > 1) {
             const last = slots_list.items[slots_list.items.len - 1];
-            wo = last.data_offset + zbuf.frame_prefix_size + last.data_len;
+            wo = last.data_offset + zbuf.Frame.hdr_size + last.data_len;
         }
 
         return .{
@@ -232,7 +232,7 @@ pub const logFile = struct {
         // verifies CRC and slices out the payload in one shot.
         var pos: usize = 0;
         while (pos < data.len) {
-            const payload = zbuf.readFrame(data[pos..]) catch |err| switch (err) {
+            const payload = zbuf.Frame.read(data[pos..]) catch |err| switch (err) {
                 // Truncated tail (final frame extends past file or fewer
                 // than 8 prefix bytes left) — leave the file alone, just stop.
                 zbuf.Error.OutOfBounds => break,
@@ -256,7 +256,7 @@ pub const logFile = struct {
                 .entry_type = reader.entryType(),
             });
 
-            pos += zbuf.frame_prefix_size + payload.len;
+            pos += zbuf.Frame.hdr_size + payload.len;
         }
 
         return .{
@@ -393,7 +393,7 @@ pub const logFile = struct {
         entry_bytes: []const u8,
         reader: zen.LogEntryReader,
     ) !void {
-        const sz = try zbuf.appendFrame(buf, self.allocator, entry_bytes);
+        const sz = try zbuf.Frame.append(buf, self.allocator, entry_bytes);
 
         // Update in-memory slot table.
         try self.slots.append(self.allocator, .{
@@ -424,13 +424,13 @@ pub const logFile = struct {
         if (ent.index == 0) return error.InvalidLogOffset;
 
         const rec_start = ent.data_offset - @as(u32, @intCast(buf_offset));
-        const rec_end = rec_start + zbuf.frame_prefix_size + ent.data_len;
+        const rec_end = rec_start + zbuf.Frame.hdr_size + ent.data_len;
         if (rec_end > buf.len) return error.InvalidLogOffset;
 
-        // readFrame validates the CRC over the payload bytes; mismatched
+        // Frame.read validates the CRC over the payload bytes; mismatched
         // bytes (e.g. partial torn write captured in our pre-read) surface
         // here as zbuf.Error.Invalid instead of silently returning bad data.
-        return zbuf.readFrame(buf[rec_start..rec_end]) catch error.CrcMismatch;
+        return zbuf.Frame.read(buf[rec_start..rec_end]) catch error.CrcMismatch;
     }
 
     /// Build the WAL header region as a single WalHeader zbuf message and
@@ -445,7 +445,7 @@ pub const logFile = struct {
         defer self.allocator.free(hdr_region);
         @memset(hdr_region, 0);
 
-        var msg_buf = std.ArrayList(u8).initBuffer(hdr_region[zbuf.frame_prefix_size..]);
+        var msg_buf = std.ArrayList(u8).initBuffer(hdr_region[zbuf.Frame.hdr_size..]);
         var hdr_writer = try zen.WalHeaderWriter.initWithBuf(self.allocator, &msg_buf);
 
         // Encode base_slot as a child first; capture its absolute offset
@@ -469,13 +469,13 @@ pub const logFile = struct {
 
         // The whole encoded header plus the 8-byte frame prefix must fit
         // in the reserved region; otherwise we'd corrupt the data region.
-        if (zbuf.frame_prefix_size + msg_buf.items.len > log_file_offset) {
+        if (zbuf.Frame.hdr_size + msg_buf.items.len > log_file_offset) {
             return error.InvalidLogHeader;
         }
 
         // Wrap the zbuf message in a [crc32c | len] frame so the read path
         // can find its end inside the zero-padded region and verify it.
-        try zbuf.writeFrame(hdr_region, msg_buf.items);
+        try zbuf.Frame.write(hdr_region, msg_buf.items);
 
         try self.handle.write(hdr_region, 0, .p0);
     }
@@ -844,7 +844,7 @@ pub const wal = struct {
 
             // Only count toward disk span if not in cache.
             if (self.cache.lookup(ent.index) == null) {
-                const rec_end: u32 = ent.data_offset + @as(u32, zbuf.frame_prefix_size) + ent.data_len;
+                const rec_end: u32 = ent.data_offset + @as(u32, zbuf.Frame.hdr_size) + ent.data_len;
                 if (plan.disk_bytes == 0) plan.disk_first_offset = ent.data_offset;
                 plan.disk_end_offset = rec_end;
                 plan.disk_bytes += ent.data_len;
@@ -945,7 +945,7 @@ pub const wal = struct {
                     // with ctx pointing at the StoredEntry to fill later.
                     try requests.append(alloc, .{
                         .offset = ent.data_offset,
-                        .len = zbuf.frame_prefix_size + ent.data_len,
+                        .len = zbuf.Frame.hdr_size + ent.data_len,
                         .ctx = sep,
                     });
                 }
@@ -956,7 +956,7 @@ pub const wal = struct {
                 try lf.handle.batchRead(&arena, requests.items, .p0);
                 for (requests.items) |req| {
                     const se: *raftlog.StoredEntry = @ptrCast(@alignCast(req.ctx.?));
-                    se.bytes = try zbuf.readFrame(req.data);
+                    se.bytes = try zbuf.Frame.read(req.data);
                 }
             }
 
@@ -1019,7 +1019,7 @@ pub const wal = struct {
 
             const bytes = entry_buf.bytes orelse return raftlog.RaftLogError.Invalid;
             if (self.current.firstEmptySlot() >= max_num_entries or
-                self.current.write_offset + zbuf.frame_prefix_size + bytes.len > log_file_size)
+                self.current.write_offset + zbuf.Frame.hdr_size + bytes.len > log_file_size)
             {
                 // Segment full: rotate (which flushes self.write_buf to the
                 // outgoing file before creating the new one).

@@ -783,7 +783,7 @@ test "diskwal CRC corruption truncates at corrupt entry" {
 
     // Corrupt the 3rd entry's payload by flipping a byte.
     // Entries start at log_file_offset (1 MiB). Each entry is framed as
-    // `[u64 hash | u32 len | payload]` — see zbuf.frame_prefix_size.
+    // `[u64 hash | u32 len | payload]` — see zbuf.Frame.hdr_size.
     {
         // The current file is 00001.wal (no rotation happened).
         const current_path = try std.fmt.allocPrint(alloc, "{s}/00001.wal", .{wal_dir});
@@ -792,9 +792,9 @@ test "diskwal CRC corruption truncates at corrupt entry" {
         defer file.close();
 
         // Read past the first two entries to find the 3rd entry's payload.
-        const prefix_size: usize = zbuf.frame_prefix_size;
+        const prefix_size: usize = zbuf.Frame.hdr_size;
         var offset: u64 = diskwal.log_file_offset;
-        var hdr_buf: [zbuf.frame_prefix_size]u8 = undefined;
+        var hdr_buf: [zbuf.Frame.hdr_size]u8 = undefined;
         for (0..2) |_| {
             _ = try file.preadAll(&hdr_buf, offset);
             // u32 length lives at byte 8 of the prefix (after the u64 hash).

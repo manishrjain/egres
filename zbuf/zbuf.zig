@@ -62,61 +62,68 @@ pub fn hash(payload: []const u8) u64 {
     return std.hash.XxHash3.hash(0, payload);
 }
 
-// 12-byte self-describing prefix for an arbitrary serialized payload:
-// [u64 hash][u32 length][payload bytes]. Lets the reader bound the
-// payload inside a larger fixed-size region (e.g. a zero-padded WAL
-// header) and verify it with one hash pass — no magic number / separate
-// length file needed.
-pub const frame_prefix_size: u16 = 12;
-
-/// In-place writer: place the [hash | len | payload] frame at the start
-/// of `dest`. `dest` must be at least `frame_prefix_size + payload.len`
-/// bytes long. Bytes after the payload are left untouched, so callers
-/// using a fixed-size region should @memset the region first.
+/// 12-byte self-describing prefix for an arbitrary serialized payload:
+/// `[u64 hash][u32 length][payload bytes]`. Lets the reader bound the
+/// payload inside a larger fixed-size region (e.g. a zero-padded WAL
+/// header) and verify it with one hash pass — no magic number / separate
+/// length file needed.
 ///
-/// Zero-copy fast path: if `payload` already aliases the destination slot
-/// (e.g. the caller wrapped `dest[frame_prefix_size..]` as an ArrayList
-/// build buffer and wrote the payload into it directly), the copy is
-/// skipped. One API serves both "build elsewhere, copy in" and "build in
-/// place, just stamp the prefix" callers.
-pub fn writeFrame(dest: []u8, payload: []const u8) !void {
-    if (payload.len > std.math.maxInt(u32)) return Error.OutOfBounds;
-    if (dest.len < @as(usize, frame_prefix_size) + payload.len) return Error.OutOfBounds;
-    try writeU64At(dest, 0, hash(payload));
-    try writeU32At(dest, 8, @intCast(payload.len));
-    const slot = dest[frame_prefix_size .. frame_prefix_size + payload.len];
-    if (payload.ptr != slot.ptr) @memcpy(slot, payload);
-}
+/// All four items below (prefix_size, write, append, read) operate on the
+/// same wire format; they're co-located so a future format tweak only
+/// needs to touch one block.
+pub const Frame = struct {
+    pub const hdr_size: u16 = 12;
 
-/// Streaming writer: append a framed payload onto an ArrayList. Mirrors
-/// the in-place form for callers that build their output incrementally.
-pub fn appendFrame(
-    list: *std.ArrayList(u8),
-    alloc: std.mem.Allocator,
-    payload: []const u8,
-) !usize {
-    if (payload.len > std.math.maxInt(u32)) return Error.OutOfBounds;
-    try list.ensureUnusedCapacity(alloc, frame_prefix_size + payload.len);
-    const start = list.items.len;
-    const sz = frame_prefix_size + payload.len;
-    list.items.len += sz;
-    try writeFrame(list.items[start..], payload);
-    return sz;
-}
+    /// In-place writer: place the [hash | len | payload] frame at the
+    /// start of `dest`. `dest` must be at least `prefix_size + payload.len`
+    /// bytes long. Bytes after the payload are left untouched, so callers
+    /// using a fixed-size region should @memset the region first.
+    ///
+    /// Zero-copy fast path: if `payload` already aliases the destination
+    /// slot (e.g. the caller wrapped `dest[prefix_size..]` as an ArrayList
+    /// build buffer and wrote the payload into it directly), the copy is
+    /// skipped. One API serves both "build elsewhere, copy in" and "build
+    /// in place, just stamp the prefix" callers.
+    pub fn write(dest: []u8, payload: []const u8) !void {
+        if (payload.len > std.math.maxInt(u32)) return Error.OutOfBounds;
+        if (dest.len < @as(usize, hdr_size) + payload.len) return Error.OutOfBounds;
+        try writeU64At(dest, 0, hash(payload));
+        try writeU32At(dest, 8, @intCast(payload.len));
+        const slot = dest[hdr_size .. hdr_size + payload.len];
+        if (payload.ptr != slot.ptr) @memcpy(slot, payload);
+    }
 
-/// Reads the frame prefix from `buf`, validates the encoded length fits
-/// within `buf`, and verifies the hash against the payload bytes. Returns
-/// a slice into `buf` covering just the payload (no copy).
-pub fn readFrame(buf: []const u8) ![]const u8 {
-    if (buf.len < frame_prefix_size) return Error.OutOfBounds;
-    const stored_hash = try readU64(buf, 0);
-    const len = try readU32(buf, 8);
-    const end = @as(usize, frame_prefix_size) + @as(usize, len);
-    if (end > buf.len) return Error.OutOfBounds;
-    const payload = buf[frame_prefix_size..end];
-    if (hash(payload) != stored_hash) return Error.Invalid;
-    return payload;
-}
+    /// Streaming writer: append a framed payload onto an ArrayList.
+    /// Mirrors `write` for callers that build their output incrementally.
+    /// Returns the total number of bytes appended (prefix + payload).
+    pub fn append(
+        list: *std.ArrayList(u8),
+        alloc: std.mem.Allocator,
+        payload: []const u8,
+    ) !usize {
+        if (payload.len > std.math.maxInt(u32)) return Error.OutOfBounds;
+        try list.ensureUnusedCapacity(alloc, hdr_size + payload.len);
+        const start = list.items.len;
+        const sz = hdr_size + payload.len;
+        list.items.len += sz;
+        try write(list.items[start..], payload);
+        return sz;
+    }
+
+    /// Reads the frame prefix from `buf`, validates the encoded length fits
+    /// within `buf`, and verifies the hash against the payload bytes.
+    /// Returns a slice into `buf` covering just the payload (no copy).
+    pub fn read(buf: []const u8) ![]const u8 {
+        if (buf.len < hdr_size) return Error.OutOfBounds;
+        const stored_hash = try readU64(buf, 0);
+        const len = try readU32(buf, 8);
+        const end = @as(usize, hdr_size) + @as(usize, len);
+        if (end > buf.len) return Error.OutOfBounds;
+        const payload = buf[hdr_size..end];
+        if (hash(payload) != stored_hash) return Error.Invalid;
+        return payload;
+    }
+};
 pub fn readU8(buf: []const u8, off: usize) !u8 {
     if (off + 1 > buf.len) return Error.OutOfBounds;
     return buf[off];

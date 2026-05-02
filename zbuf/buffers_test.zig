@@ -559,9 +559,9 @@ test "clone roundtrip matches marshal" {
     try std.testing.expectEqualSlices(u8, out_orig.items, out_clone.items);
 }
 
-test "frame round-trip preserves payload across writeFrame/readFrame" {
+test "frame round-trip preserves payload across Frame.write/Frame.read" {
     // Verifies the [u64 hash | u32 len | payload] frame layout:
-    // writeFrame must produce bytes that readFrame can recover unchanged.
+    // Frame.write must produce bytes that Frame.read can recover unchanged.
     // Sweeps lengths 0..=64 to cover every alignment relative to the
     // 12-byte prefix, plus a few larger and odd-modulo sizes.
     const alloc = std.testing.allocator;
@@ -569,7 +569,7 @@ test "frame round-trip preserves payload across writeFrame/readFrame" {
     var src: [4096]u8 = undefined;
     prng.random().bytes(&src);
 
-    const dest = try alloc.alloc(u8, 4096 + zbuf.frame_prefix_size);
+    const dest = try alloc.alloc(u8, 4096 + zbuf.Frame.hdr_size);
     defer alloc.free(dest);
 
     const sizes = blk: {
@@ -582,24 +582,24 @@ test "frame round-trip preserves payload across writeFrame/readFrame" {
 
     for (sizes) |size| {
         const payload = src[0..size];
-        try zbuf.writeFrame(dest, payload);
-        const got = try zbuf.readFrame(dest[0 .. zbuf.frame_prefix_size + size]);
+        try zbuf.Frame.write(dest, payload);
+        const got = try zbuf.Frame.read(dest[0 .. zbuf.Frame.hdr_size + size]);
         try std.testing.expectEqualSlices(u8, payload, got);
     }
 }
 
-test "frame readFrame rejects corrupt payload" {
-    // Flip a single byte in a written frame and confirm readFrame catches
+test "frame Frame.read rejects corrupt payload" {
+    // Flip a single byte in a written frame and confirm Frame.read catches
     // it. xxhash3 with full u64 output gives ~2⁻⁶⁴ false-negative odds;
     // a single-byte flip is overwhelmingly likely to be detected.
     const alloc = std.testing.allocator;
     const payload = "hello, framed world";
-    const dest = try alloc.alloc(u8, zbuf.frame_prefix_size + payload.len);
+    const dest = try alloc.alloc(u8, zbuf.Frame.hdr_size + payload.len);
     defer alloc.free(dest);
 
-    try zbuf.writeFrame(dest, payload);
+    try zbuf.Frame.write(dest, payload);
 
     // Corrupt one payload byte.
-    dest[zbuf.frame_prefix_size + 5] ^= 0x01;
-    try std.testing.expectError(zbuf.Error.Invalid, zbuf.readFrame(dest));
+    dest[zbuf.Frame.hdr_size + 5] ^= 0x01;
+    try std.testing.expectError(zbuf.Error.Invalid, zbuf.Frame.read(dest));
 }

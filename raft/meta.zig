@@ -199,7 +199,7 @@ pub const MetaStore = struct {
         // loss mid-write of a multi-MB snapshot) on the next recovery.
         var file_buf: std.ArrayList(u8) = .empty;
         defer file_buf.deinit(self.allocator);
-        _ = try zbuf.appendFrame(&file_buf, self.allocator, zbuf_bytes.items);
+        _ = try zbuf.Frame.append(&file_buf, self.allocator, zbuf_bytes.items);
 
         const tmp_path = try std.fs.path.join(self.allocator, &.{ self.dir_path, snapshot_tmp_name });
         defer self.allocator.free(tmp_path);
@@ -249,13 +249,13 @@ pub const MetaStore = struct {
         // Marshal HardState directly into the slot's payload region (the
         // bytes after the frame prefix). Wrap the writer with the message
         // tail so HardStateReader.parseRoot can decode it on recovery.
-        var scratch = std.ArrayList(u8).initBuffer(page[zbuf.frame_prefix_size..]);
+        var scratch = std.ArrayList(u8).initBuffer(page[zbuf.Frame.hdr_size..]);
         const off = try hs.marshalTo(self.allocator, &scratch);
         try zbuf.appendMessageTail(&scratch, self.allocator, zen.HardStateReader.TABLE_ID, off);
 
         // Stamp the [hash | len] frame prefix over the in-place payload
-        // (writeFrame's zero-copy fast path detects the alias).
-        try zbuf.writeFrame(page, scratch.items);
+        // (Frame.write's zero-copy fast path detects the alias).
+        try zbuf.Frame.write(page, scratch.items);
 
         const offset: u64 = @as(u64, slot_idx) * slot_size;
         try self.state_file.write(page, offset, .p0);
@@ -297,7 +297,7 @@ pub const MetaStore = struct {
     /// null on any validation failure (invalid hash, length out of range,
     /// or HardState parseRoot failure).
     fn parseSlot(slot: []const u8) ?zen.HardStateReader {
-        const payload = zbuf.readFrame(slot) catch return null;
+        const payload = zbuf.Frame.read(slot) catch return null;
         return zen.HardStateReader.parseRoot(payload) catch null;
     }
 
@@ -319,7 +319,7 @@ pub const MetaStore = struct {
 
         // zbuf.frame validates length-fits-in-buf and verifies the hash
         // in one pass; either failure mode means the snapshot is corrupt.
-        const payload = zbuf.readFrame(buf) catch return Error.SnapshotCorrupt;
+        const payload = zbuf.Frame.read(buf) catch return Error.SnapshotCorrupt;
 
         const reader = try zen.SnapshotReader.parseRoot(payload);
         // fromReader returns a *SnapshotStruct that owns its data + conf_state.
