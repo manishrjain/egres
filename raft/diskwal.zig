@@ -7,20 +7,6 @@ const vfs_mod = @import("vfs");
 const zio = @import("zio");
 const meta = @import("meta.zig");
 
-fn readInt(comptime T: type, buf: []const u8, endian: std.builtin.Endian) T {
-    const n = @divExact(@typeInfo(T).int.bits, 8);
-    std.debug.assert(buf.len >= n);
-    const p: *const [n]u8 = @ptrCast(buf.ptr);
-    return std.mem.readInt(T, p, endian);
-}
-
-fn writeInt(comptime T: type, buf: []u8, value: T, endian: std.builtin.Endian) void {
-    const n = @divExact(@typeInfo(T).int.bits, 8);
-    std.debug.assert(buf.len >= n);
-    const p: *[n]u8 = @ptrCast(buf.ptr);
-    std.mem.writeInt(T, p, value, endian);
-}
-
 // DiskWAL handles disk access and writes for the Raft write-ahead log.
 // Directory layout contains `wal.meta` and `<start-idx>.wal` segment files.
 //
