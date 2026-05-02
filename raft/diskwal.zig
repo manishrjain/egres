@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const raftlog = @import("raftwal.zig");
 const zen = @import("buffers_gen");
+const zbuf = @import("zbuf").zbuf;
 const vfs_mod = @import("vfs");
 const zio = @import("zio");
 const meta = @import("meta.zig");
@@ -66,10 +67,13 @@ fn writeInt(comptime T: type, buf: []u8, value: T, endian: std.builtin.Endian) v
 // mmap generally handles process crash safety well enough for default mode.
 // If hard sync is enabled, call msync/fdatasync after writes.
 
-pub const max_num_entries: usize = 60_000;
+// 1 MiB header / 37 bytes-per-slot ≈ 28,339 max slots; round down to 25k
+// to leave margin for the file header and any future schema growth
+// (zbuf's size_bytes lets us add fields without breaking older WAL files).
+pub const max_num_entries: usize = 25_000;
 pub const log_file_offset: usize = 1 << 20;
 pub const log_file_size: usize = 256 << 20;
-pub const entry_size: usize = 16;
+pub const entry_size: usize = zen.WalSlotReader.SIZE_BYTES;
 pub const log_suffix = ".wal";
 pub const log_header_magic: u32 = 0x57414C32; // "WAL2"
 pub const log_header_version: u32 = 1;
@@ -92,13 +96,11 @@ pub const err_not_found = error{NotFound};
 
 pub const EntryType = raftlog.EntryType;
 
-pub const entry = struct {
-    term: u64 = 0,
-    index: u64 = 0,
-    data_offset: u32 = 0,
-    data_len: u32 = 0,
-    ty: EntryType = .any,
-};
+/// In-memory slot entry. Same shape as the on-disk zbuf format
+/// (`zen.WalSlotStruct`) so we can read the disk slot directly with no
+/// translation. Fields default to zero so an all-zero buffer slot decodes
+/// as the empty sentinel (`index == 0`).
+pub const entry = zen.WalSlotStruct;
 
 pub const logFile = struct {
     fid: u64,
@@ -134,47 +136,37 @@ pub const logFile = struct {
         });
         errdefer handle.close();
 
-        // Read header region to get base entry and slots.
+        // Read the entire 1 MiB header region in one shot.
         const hdr_result = try handle.readAligned(alloc, 0, log_file_offset, .p0);
         defer hdr_result.free();
         const hdr = hdr_result.data;
 
-        if (hdr.len < log_header_size) return error.InvalidLogHeader;
-        const magic = readInt(u32, hdr[0..4], .little);
-        const version = readInt(u32, hdr[4..8], .little);
-        if (magic != log_header_magic or version != log_header_version) {
-            return error.InvalidLogHeader;
-        }
+        // Frame prefix [crc32c | len] gates the WalHeader bytes — strips the
+        // zero padding after the message and verifies CRC in one pass.
+        const msg_bytes = zbuf.readFrame(hdr) catch return error.InvalidLogHeader;
 
+        // parseRoot validates the zbuf message tail (table_id 42255 = WalHeader).
+        const hdr_reader = zen.WalHeaderReader.parseRoot(msg_bytes) catch
+            return error.InvalidLogHeader;
+
+        // base_slot is always written by writeHeader; missing means corruption.
+        const base_reader = hdr_reader.baseSlot() orelse return error.InvalidLogHeader;
         const base = entry{
-            .index = readInt(u64, hdr[8..16], .little),
-            .term = readInt(u64, hdr[16..24], .little),
-            .data_offset = 0,
-            .data_len = 0,
-            .ty = .any,
+            .term = base_reader.term(),
+            .index = base_reader.index(),
+            .timestamp = base_reader.timestamp(),
         };
 
-        // slots[0] = base entry, slots[1..] = data entries decoded from header.
         var slots_list = std.ArrayList(entry).empty;
         errdefer slots_list.deinit(alloc);
         try slots_list.append(alloc, base);
 
-        var slot_idx: usize = first_data_slot;
-        while (slot_idx < max_num_entries) : (slot_idx += 1) {
-            const off = log_header_size + slot_idx * entry_size;
-            if (off + entry_size > hdr.len) break;
-
-            const slot = hdr[off .. off + entry_size];
-            const index_delta = readInt(u16, slot[4..6], .little);
-            if (index_delta == 0) break;
-
-            try slots_list.append(alloc, .{
-                .term = base.term + readInt(u32, slot[0..4], .little),
-                .index = base.index + index_delta,
-                .ty = @enumFromInt(slot[6]),
-                .data_offset = readInt(u32, slot[8..12], .little),
-                .data_len = readInt(u32, slot[12..16], .little),
-            });
+        const slot_count = hdr_reader.slotsLen();
+        var i: u32 = 0;
+        while (i < slot_count) : (i += 1) {
+            const sr = try hdr_reader.slotsAt(i);
+            const srv = try zen.WalSlotStruct.fromReaderValue(alloc, sr);
+            try slots_list.append(alloc, srv);
         }
 
         var wo: u64 = log_file_offset;
@@ -259,7 +251,7 @@ pub const logFile = struct {
                 .index = reader.index(),
                 .data_offset = @intCast(log_file_offset + pos),
                 .data_len = payload_len,
-                .ty = reader.entryType(),
+                .entry_type = reader.entryType(),
             });
 
             pos += record_header_size + payload_len;
@@ -341,7 +333,7 @@ pub const logFile = struct {
 
     pub fn getEntry(self: *const logFile, slot_index: usize) entry {
         if (slot_index >= self.slots.items.len) {
-            return .{ .term = 0, .index = 0, .data_offset = 0, .data_len = 0, .ty = .any };
+            return .{ .term = 0, .index = 0, .data_offset = 0, .data_len = 0, .entry_type = .any };
         }
         return self.slots.items[slot_index];
     }
@@ -414,7 +406,7 @@ pub const logFile = struct {
             .index = reader.index(),
             .data_offset = @intCast(self.write_offset),
             .data_len = payload_len,
-            .ty = reader.entryType(),
+            .entry_type = reader.entryType(),
         });
         self.write_offset += needed;
     }
@@ -447,32 +439,53 @@ pub const logFile = struct {
         return payload;
     }
 
-    /// Write the header region for rotation: magic, version, base entry, delta-encoded slots.
+    /// Build the WAL header region as a single WalHeader zbuf message and
+    /// write it in one syscall. base_slot stores the previous file's last
+    /// entry (the raft index/term floor); slots stores every data entry in
+    /// arrival order. The encoded message must fit within `log_file_offset`;
+    /// the unused tail of the region is zero-padded. The zbuf message tail
+    /// (table_id + root offset) lets the reader validate the format with
+    /// `WalHeaderReader.parseRoot`, replacing the legacy magic/version check.
     pub fn writeHeader(self: *logFile) !void {
-        var hdr_buf = try self.allocator.alloc(u8, log_file_offset);
-        defer self.allocator.free(hdr_buf);
-        @memset(hdr_buf, 0);
+        var msg_buf: std.ArrayList(u8) = .empty;
+        defer msg_buf.deinit(self.allocator);
 
-        writeInt(u32, hdr_buf[0..4], log_header_magic, .little);
-        writeInt(u32, hdr_buf[4..8], log_header_version, .little);
-        writeInt(u64, hdr_buf[8..16], self.baseEntry().index, .little);
-        writeInt(u64, hdr_buf[16..24], self.baseEntry().term, .little);
+        var hdr_writer = try zen.WalHeaderWriter.initWithBuf(self.allocator, &msg_buf);
 
-        // Write data entries (skip base at [0]).
-        for (1..self.slots.items.len) |si| {
-            const off = log_header_size + si * entry_size;
-            if (off + entry_size > hdr_buf.len) break;
-            const ent = self.slots.items[si];
+        // Encode base_slot as a child first; capture its absolute offset
+        // within msg_buf and patch it into the parent header.
+        const base_off = try self.baseEntry().marshalTo(self.allocator, &msg_buf);
+        try hdr_writer.setBaseSlot(base_off);
 
-            writeInt(u32, hdr_buf[off .. off + 4], @intCast(ent.term - self.baseEntry().term), .little);
-            writeInt(u16, hdr_buf[off + 4 .. off + 6], @intCast(ent.index - self.baseEntry().index), .little);
-            hdr_buf[off + 6] = @intFromEnum(ent.ty);
-            hdr_buf[off + 7] = 0; // reserved
-            writeInt(u32, hdr_buf[off + 8 .. off + 12], ent.data_offset, .little);
-            writeInt(u32, hdr_buf[off + 12 .. off + 16], ent.data_len, .little);
+        // Each data entry becomes a WalSlot child; collect their offsets
+        // for setSlots, which writes them as the array index.
+        if (self.slots.items.len > 1) {
+            const data_slots = self.slots.items[1..];
+            const offsets = try self.allocator.alloc(u32, data_slots.len);
+            defer self.allocator.free(offsets);
+            for (data_slots, 0..) |ent, i| {
+                offsets[i] = try ent.marshalTo(self.allocator, &msg_buf);
+            }
+            try hdr_writer.setSlots(offsets);
         }
 
-        try self.handle.write(hdr_buf, 0, .p0);
+        _ = try hdr_writer.finishWithTail();
+
+        // The whole encoded header plus the 8-byte frame prefix must fit
+        // in the reserved region; otherwise we'd corrupt the data region.
+        if (zbuf.frame_prefix_size + msg_buf.items.len > log_file_offset) {
+            return error.InvalidLogHeader;
+        }
+
+        const hdr_region = try self.allocator.alloc(u8, log_file_offset);
+        defer self.allocator.free(hdr_region);
+        @memset(hdr_region, 0);
+
+        // Wrap the zbuf message in a [crc32c | len] frame so the read path
+        // can find its end inside the zero-padded region and verify it.
+        try zbuf.writeFrame(hdr_region, msg_buf.items);
+
+        try self.handle.write(hdr_region, 0, .p0);
     }
 };
 
@@ -764,7 +777,7 @@ pub const wal = struct {
 
     fn seekEntry(self: *wal, raft_index: u64) (Error || raftlog.RaftLogError || err_not_found)!entry {
         if (raft_index == 0) {
-            return .{ .term = 0, .index = 0, .data_offset = 0, .data_len = 0, .ty = .any };
+            return .{ .term = 0, .index = 0, .data_offset = 0, .data_len = 0, .entry_type = .any };
         }
 
         const pos = self.slotGe(raft_index);
@@ -825,7 +838,7 @@ pub const wal = struct {
             }
 
             // Apply type filter.
-            if (opts.ty != .any and ent.ty != opts.ty) continue;
+            if (opts.ty != .any and ent.entry_type != opts.ty) continue;
 
             // Check budget before including this entry.
             if (plan.match_count > 0 and opts.max_bytes > 0 and
@@ -913,7 +926,7 @@ pub const wal = struct {
             for (plan.scan_start..plan.scan_end) |si| {
                 const ent = lf.getEntry(si);
                 if (ent.index == 0) continue;
-                if (opts.ty != .any and ent.ty != opts.ty) continue;
+                if (opts.ty != .any and ent.entry_type != opts.ty) continue;
 
                 // Re-check budget (rounding safety).
                 if (out.items.len > 0 and opts.max_bytes > 0 and total_size + ent.data_len > opts.max_bytes) {

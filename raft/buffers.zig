@@ -64,6 +64,27 @@ pub const EntryType = schema.EnumDef(.{
     .{ .name = "conf", .tag = 2 },
 });
 
+// One row of the WAL's slot index. Slots live in the file header region;
+// each slot points at a CRC-framed record in the data region. `timestamp`
+// is the HLC timestamp from the LogEntry — copying it into the slot lets
+// snapshot policy ("retain at least N minutes of activity") read the slot
+// region without parsing payload bytes. Wire format is fixed-size; the
+// reader treats an all-zero slot as the empty sentinel via index() == 0.
+pub const WalSlot = schema.Table(.{
+    .{ .id = 1, .name = "term", .ty = schema.U64 },
+    .{ .id = 2, .name = "index", .ty = schema.U64 },
+    .{ .id = 3, .name = "timestamp", .ty = schema.U64 },
+    .{ .id = 4, .name = "data_offset", .ty = schema.U32 },
+    .{ .id = 5, .name = "data_len", .ty = schema.U32 },
+    .{ .id = 6, .name = "flags", .ty = schema.U16 },
+    .{ .id = 7, .name = "entry_type", .ty = schema.Enum(EntryType) },
+});
+
+pub const WalHeader = schema.Table(.{
+    .{ .id = 1, .name = "base_slot", .ty = WalSlot },
+    .{ .id = 2, .name = "slots", .ty = schema.Array(WalSlot) },
+});
+
 pub const LogEntry = schema.Table(.{
     .{ .id = 1, .name = "index", .ty = schema.U64 },
     .{ .id = 2, .name = "term", .ty = schema.U64 },
@@ -154,4 +175,6 @@ pub const tables = .{
     .{ .name = "ConfState", .ty = ConfState, .id = tableId(11) },
     .{ .name = "HardState", .ty = HardState, .id = tableId(12) },
     .{ .name = "Snapshot", .ty = Snapshot, .id = tableId(13) },
+    .{ .name = "WalSlot", .ty = WalSlot, .id = tableId(14) },
+    .{ .name = "WalHeader", .ty = WalHeader, .id = tableId(15) },
 };

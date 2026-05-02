@@ -46,6 +46,56 @@ pub fn readMessageTail(buf: []const u8) !MessageTail {
     const table_id = try readU16(buf, start + 0);
     return .{ .table_id = table_id };
 }
+
+// 8-byte self-describing prefix for an arbitrary serialized payload:
+// [u32 crc32c][u32 length][payload bytes]. Lets the reader bound the
+// payload inside a larger fixed-size region (e.g. a zero-padded WAL
+// header) and verify it with one CRC pass — without needing a magic
+// number or a separate length file. Castagnoli is the same variant used
+// elsewhere in the project for storage frames, so callers share one
+// hardware-accelerated hash path.
+pub const frame_prefix_size: u16 = 8;
+
+/// In-place writer: place the [crc | len | payload] frame at the start
+/// of `dest`. `dest` must be at least `frame_prefix_size + payload.len`
+/// bytes long. Bytes after the payload are left untouched, so callers
+/// using a fixed-size region should @memset the region first.
+pub fn writeFrame(dest: []u8, payload: []const u8) !void {
+    if (payload.len > std.math.maxInt(u32)) return Error.OutOfBounds;
+    if (dest.len < @as(usize, frame_prefix_size) + payload.len) return Error.OutOfBounds;
+    const crc = std.hash.crc.Crc32Iscsi.hash(payload);
+    try writeU32At(dest, 0, crc);
+    try writeU32At(dest, 4, @intCast(payload.len));
+    @memcpy(dest[frame_prefix_size .. frame_prefix_size + payload.len], payload);
+}
+
+/// Streaming writer: append a framed payload onto an ArrayList. Mirrors
+/// the in-place form for callers that build their output incrementally.
+pub fn appendFrame(
+    list: *std.ArrayList(u8),
+    alloc: std.mem.Allocator,
+    payload: []const u8,
+) !void {
+    if (payload.len > std.math.maxInt(u32)) return Error.OutOfBounds;
+    try list.ensureUnusedCapacity(alloc, frame_prefix_size + payload.len);
+    const start = list.items.len;
+    list.items.len += frame_prefix_size + payload.len;
+    try writeFrame(list.items[start..], payload);
+}
+
+/// Reads the frame prefix from `buf`, validates the encoded length fits
+/// within `buf`, and verifies the CRC against the payload bytes. Returns
+/// a slice into `buf` covering just the payload (no copy).
+pub fn readFrame(buf: []const u8) ![]const u8 {
+    if (buf.len < frame_prefix_size) return Error.OutOfBounds;
+    const crc = try readU32(buf, 0);
+    const len = try readU32(buf, 4);
+    const end = @as(usize, frame_prefix_size) + @as(usize, len);
+    if (end > buf.len) return Error.OutOfBounds;
+    const payload = buf[frame_prefix_size..end];
+    if (std.hash.crc.Crc32Iscsi.hash(payload) != crc) return Error.Invalid;
+    return payload;
+}
 pub fn readU8(buf: []const u8, off: usize) !u8 {
     if (off + 1 > buf.len) return Error.OutOfBounds;
     return buf[off];
