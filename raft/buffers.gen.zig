@@ -3332,6 +3332,7 @@ pub const ConfStateWriter = struct {
 };
 
 pub const HardStateStruct = struct {
+    seq: u64 = 0,
     current_term: u64 = 0,
     voted_for: u64 = 0,
     raft_id: u64 = 0,
@@ -3339,6 +3340,7 @@ pub const HardStateStruct = struct {
 
     pub fn fromReaderValue(alloc: std.mem.Allocator, r: HardStateReader) Error!HardStateStruct {
         var s = HardStateStruct{
+            .seq = r.seq(),
             .current_term = r.currentTerm(),
             .voted_for = r.votedFor(),
             .raft_id = r.raftId(),
@@ -3367,6 +3369,7 @@ pub const HardStateStruct = struct {
 
     fn cloneValue(self: HardStateStruct, alloc: std.mem.Allocator) Error!HardStateStruct {
         var s = HardStateStruct{
+            .seq = self.seq,
             .current_term = self.current_term,
             .voted_for = self.voted_for,
             .raft_id = self.raft_id,
@@ -3385,6 +3388,7 @@ pub const HardStateStruct = struct {
 
     pub fn marshalTo(self: HardStateStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try HardStateWriter.initWithBuf(alloc, out);
+        try writer.setSeq(self.seq);
         try writer.setCurrentTerm(self.current_term);
         try writer.setVotedFor(self.voted_for);
         try writer.setRaftId(self.raft_id);
@@ -3401,7 +3405,7 @@ pub const HardStateReader = struct {
     size_bytes: u16,
 
     pub const TABLE_ID: u16 = 42252;
-    pub const SIZE_BYTES: u16 = 34;
+    pub const SIZE_BYTES: u16 = 42;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -3417,36 +3421,44 @@ pub const HardStateReader = struct {
         return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
     }
 
-    pub fn currentTerm(self: Self) u64 {
+    pub fn seq(self: Self) u64 {
         const slot_end = @as(u32, self.base) + 10;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
         return zbuf.readU64(self.buf, @as(usize, self.base + 2)) catch 0;
     }
 
-    pub fn votedFor(self: Self) u64 {
+    pub fn currentTerm(self: Self) u64 {
         const slot_end = @as(u32, self.base) + 18;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
         return zbuf.readU64(self.buf, @as(usize, self.base + 10)) catch 0;
     }
 
-    pub fn raftId(self: Self) u64 {
+    pub fn votedFor(self: Self) u64 {
         const slot_end = @as(u32, self.base) + 26;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
         return zbuf.readU64(self.buf, @as(usize, self.base + 18)) catch 0;
     }
 
-    pub fn checkpointIndex(self: Self) u64 {
+    pub fn raftId(self: Self) u64 {
         const slot_end = @as(u32, self.base) + 34;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
         return zbuf.readU64(self.buf, @as(usize, self.base + 26)) catch 0;
     }
 
+    pub fn checkpointIndex(self: Self) u64 {
+        const slot_end = @as(u32, self.base) + 42;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 34)) catch 0;
+    }
+
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try HardStateWriter.initWithBuf(alloc, out);
+        try writer.setSeq(self.seq());
         try writer.setCurrentTerm(self.currentTerm());
         try writer.setVotedFor(self.votedFor());
         try writer.setRaftId(self.raftId());
@@ -3495,7 +3507,7 @@ pub const HardStateWriter = struct {
     base: u32,
 
     pub const TABLE_ID: u16 = 42252;
-    pub const SIZE_BYTES: u16 = 34;
+    pub const SIZE_BYTES: u16 = 42;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -3516,24 +3528,29 @@ pub const HardStateWriter = struct {
         return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
     }
 
-    pub fn setCurrentTerm(self: *Self, v: u64) Error!void {
+    pub fn setSeq(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
         try zbuf.patchU64(out.items, self.base + 2, v);
     }
 
-    pub fn setVotedFor(self: *Self, v: u64) Error!void {
+    pub fn setCurrentTerm(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
         try zbuf.patchU64(out.items, self.base + 10, v);
     }
 
-    pub fn setRaftId(self: *Self, v: u64) Error!void {
+    pub fn setVotedFor(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
         try zbuf.patchU64(out.items, self.base + 18, v);
     }
 
-    pub fn setCheckpointIndex(self: *Self, v: u64) Error!void {
+    pub fn setRaftId(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
         try zbuf.patchU64(out.items, self.base + 26, v);
+    }
+
+    pub fn setCheckpointIndex(self: *Self, v: u64) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU64(out.items, self.base + 34, v);
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -3541,6 +3558,7 @@ pub const HardStateWriter = struct {
         if (@typeInfo(Values) != .@"struct") {
             @compileError("set() expects a struct literal like .{ .field = value }");
         }
+        if (@hasField(Values, "seq")) try self.setSeq(@field(values, "seq"));
         if (@hasField(Values, "current_term")) try self.setCurrentTerm(@field(values, "current_term"));
         if (@hasField(Values, "voted_for")) try self.setVotedFor(@field(values, "voted_for"));
         if (@hasField(Values, "raft_id")) try self.setRaftId(@field(values, "raft_id"));

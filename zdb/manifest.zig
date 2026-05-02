@@ -2,6 +2,7 @@ const std = @import("std");
 const buffers = @import("buffers.gen.zig");
 const Key = @import("key.zig").Key;
 const vfs = @import("vfs");
+const zbuf = @import("zbuf").zbuf;
 
 // -------------------------------------------------------------------------
 // Constants
@@ -173,19 +174,14 @@ pub const ForestState = struct {
         while (true) {
             trunc_offset = pos;
 
-            if (pos + 8 > data.len) break;
-
-            const payload_len = std.mem.readInt(u32, data[pos..][0..4], .little);
-            const stored_crc = std.mem.readInt(u32, data[pos + 4 ..][0..4], .little);
-            pos += 8;
-
-            if (pos + payload_len > data.len) break;
-
-            const payload = data[pos .. pos + payload_len];
-            pos += payload_len;
-
-            const computed_crc = std.hash.crc.Crc32Iscsi.hash(payload);
-            if (computed_crc != stored_crc) return ManifestError.ChecksumMismatch;
+            // Each record is a zbuf frame: [u64 hash | u32 len | payload].
+            // OutOfBounds = clean EOF (truncate happens after the loop);
+            // Invalid = CRC/hash mismatch — surface as ChecksumMismatch.
+            const payload = zbuf.readFrame(data[pos..]) catch |err| switch (err) {
+                zbuf.Error.OutOfBounds => break,
+                zbuf.Error.Invalid => return ManifestError.ChecksumMismatch,
+            };
+            pos += zbuf.frame_prefix_size + payload.len;
 
             const reader = try buffers.ManifestChangeReader.parseRoot(payload);
 
@@ -263,13 +259,7 @@ pub const ForestState = struct {
             }
 
             const payload = try encodeChangeSet(alloc, table_changes.items, tree_changes.items);
-            var record_header: [8]u8 = undefined;
-            std.mem.writeInt(u32, record_header[0..4], @intCast(payload.len), .little);
-            std.mem.writeInt(u32, record_header[4..8], std.hash.crc.Crc32Iscsi.hash(payload), .little);
-
-            try out.ensureUnusedCapacity(alloc, 8 + payload.len);
-            out.appendSliceAssumeCapacity(&record_header);
-            out.appendSliceAssumeCapacity(payload);
+            _ = try zbuf.appendFrame(&out, alloc, payload);
         }
 
         // Create file, write everything in one call, sync, then rename into place.
@@ -309,16 +299,10 @@ pub const ForestState = struct {
         const payload = try encodeChangeSet(alloc, table_changes, tree_changes);
 
         var out = std.ArrayList(u8).empty;
-        try out.ensureTotalCapacity(alloc, 8 + payload.len);
-
-        out.appendNTimesAssumeCapacity(0, 8);
-        std.mem.writeInt(u32, out.items[0..4], @intCast(payload.len), .little);
-        const crc = std.hash.crc.Crc32Iscsi.hash(payload);
-        std.mem.writeInt(u32, out.items[4..8], crc, .little);
-        out.appendSliceAssumeCapacity(payload);
+        const written = try zbuf.appendFrame(&out, alloc, payload);
 
         try self.handle.?.write(out.items, self.write_pos, .p0);
-        self.write_pos += out.items.len;
+        self.write_pos += written;
         try self.handle.?.sync();
         _ = arena.reset(.free_all); // reclaim memory
 

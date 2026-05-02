@@ -4,6 +4,7 @@ const buffers = @import("../buffers.gen.zig");
 const compress = @import("utils").compression;
 const binaryfuse = @import("../binaryfusefilter.zig");
 const vfs = @import("vfs");
+const zbuf = @import("zbuf").zbuf;
 
 // Table layout (Badger-inspired, with zbuf for TableIndex/BlockOffset):
 //
@@ -18,7 +19,7 @@ const vfs = @import("vfs");
 // Block layout is set as:
 // | ------------------------------------------------------------------------|
 // | --- entries_region --- | --- offsets to entries, each offset is u32 --- |
-// | --  entry count u32 -- | -- block crc u32 -- |
+// | --  entry count u32 -- | -- block crc u64 -- |
 // | ------------------------------------------------------------------------|
 //
 // Note that we only store the start offset of each entry i, not the end, because
@@ -274,11 +275,11 @@ pub const Builder = struct {
         _ = try index_writer.finish();
 
         const index_len: u32 = @intCast(index_bytes.items.len);
-        const index_checksum = std.hash.crc.Crc32Iscsi.hash(index_bytes.items);
+        const index_checksum = zbuf.hash(index_bytes.items);
 
         try self.table_bytes.appendSlice(self.allocator, index_bytes.items);
         try appendU32(&self.table_bytes, self.allocator, index_len);
-        try appendU32(&self.table_bytes, self.allocator, index_checksum);
+        try appendU64(&self.table_bytes, self.allocator, index_checksum);
 
         const bytes = try self.table_bytes.toOwnedSlice(self.allocator);
         self.table_bytes = .empty;
@@ -291,9 +292,9 @@ pub const Builder = struct {
         // Block tail layout:
         // (entry_count + 1) offsets * 4 bytes each
         // + 4 bytes entry_count
-        // + 4 bytes checksum (CRC32)
+        // + 8 bytes checksum (xxhash3, see zbuf.hash)
         const tail_est =
-            (self.cur_offsets.items.len + 1) * 4 + 8;
+            (self.cur_offsets.items.len + 1) * 4 + 12;
         const estimated = self.cur_block.items.len + new_entry_est + tail_est;
         return estimated > self.cfg.target_block_size;
     }
@@ -306,16 +307,14 @@ pub const Builder = struct {
         const base_key = try self.allocator.dupe(u8, self.cur_base_key.items);
         errdefer self.allocator.free(base_key);
 
-        // Block tail: [u32 entry_off_0 ...][u32 entry_count][u32 block_crc32]
+        // Block tail: [u32 entry_off_0 ...][u32 entry_count][u64 block_hash]
         for (self.cur_offsets.items) |off| {
             try appendU32(&self.cur_block, self.allocator, off);
         }
         try appendU32(&self.cur_block, self.allocator, @intCast(self.cur_offsets.items.len));
 
-        // TODO: consider using zstd's hardware-accelerated CRC32C (ZSTD_XXH64 or
-        // the internal HW CRC32C via extern) instead of the stdlib table-driven impl.
-        const checksum = std.hash.crc.Crc32Iscsi.hash(self.cur_block.items);
-        try appendU32(&self.cur_block, self.allocator, checksum);
+        const checksum = zbuf.hash(self.cur_block.items);
+        try appendU64(&self.cur_block, self.allocator, checksum);
 
         // Track pre-compression size; CRC was computed over the uncompressed bytes.
         const raw_len: u32 = @intCast(self.cur_block.items.len);
@@ -361,5 +360,11 @@ fn appendU16(out: *std.ArrayList(u8), alloc: std.mem.Allocator, v: u16) !void {
 fn appendU32(out: *std.ArrayList(u8), alloc: std.mem.Allocator, v: u32) !void {
     var tmp: [4]u8 = undefined;
     std.mem.writeInt(u32, &tmp, v, .little);
+    try out.appendSlice(alloc, tmp[0..]);
+}
+
+fn appendU64(out: *std.ArrayList(u8), alloc: std.mem.Allocator, v: u64) !void {
+    var tmp: [8]u8 = undefined;
+    std.mem.writeInt(u64, &tmp, v, .little);
     try out.appendSlice(alloc, tmp[0..]);
 }

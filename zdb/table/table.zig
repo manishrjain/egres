@@ -1,4 +1,5 @@
 const std = @import("std");
+const zbuf = @import("zbuf").zbuf;
 const key_mod = @import("../key.zig");
 const Key = key_mod.Key;
 pub const Item = key_mod.Item;
@@ -20,6 +21,7 @@ pub const Error = idx.Error || buffers.Error || compress.Error ||
     CorruptTable,
 };
 
+// TODO: Consider using zbuf to store this.
 pub const BlockLayout = struct {
     offsets_off: usize,
     entry_count: usize,
@@ -75,18 +77,18 @@ pub const Table = struct {
         const t = try allocator.create(Table);
         errdefer allocator.destroy(t);
 
-        // Read the last 8 bytes to get index_len and checksum.
-        if (size < 8) return error.CorruptTable;
-        const trailer_offset: u64 = @intCast(size - 8);
-        const trailer_result = try handle.readAligned(allocator, trailer_offset, 8, priority);
+        // Read the trailer: [u32 index_len][u64 index_hash] (idx.trailer_len bytes).
+        if (size < idx.trailer_len) return error.CorruptTable;
+        const trailer_offset: u64 = @intCast(size - idx.trailer_len);
+        const trailer_result = try handle.readAligned(allocator, trailer_offset, idx.trailer_len, priority);
         defer trailer_result.free();
 
-        if (trailer_result.data.len < 8) return error.CorruptTable;
+        if (trailer_result.data.len < idx.trailer_len) return error.CorruptTable;
         const index_len = idx.readU32LE(trailer_result.data, 0) catch return error.CorruptTable;
-        const stored_checksum = idx.readU32LE(trailer_result.data, 4) catch return error.CorruptTable;
+        const stored_checksum = idx.readU64LE(trailer_result.data, 4) catch return error.CorruptTable;
 
         // Read index bytes.
-        const index_end: u64 = @intCast(size - 8);
+        const index_end: u64 = @intCast(size - idx.trailer_len);
         if (index_len > index_end) return error.CorruptTable;
         const index_offset = index_end - index_len;
         const index_result = try handle.readAligned(allocator, index_offset, index_len, priority);
@@ -94,7 +96,7 @@ pub const Table = struct {
 
         if (index_result.data.len < index_len) return error.CorruptTable;
         const index_bytes = index_result.data[0..index_len];
-        const got_checksum = std.hash.crc.Crc32Iscsi.hash(index_bytes);
+        const got_checksum = zbuf.hash(index_bytes);
         if (got_checksum != stored_checksum) return error.ChecksumMismatch;
 
         const index_reader = try buffers.TableIndexReader.init(index_bytes, 0);
@@ -232,13 +234,13 @@ pub const Table = struct {
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.allocator);
         const sz = try compress.decompress(self.allocator, self.codec, result.data, &out);
-        if (sz < 4) return error.CorruptTable;
+        // Block must contain at least the trailing u64 hash (see zbuf.hash).
+        if (sz < 8) return error.CorruptTable;
         std.debug.assert(out.items.len == sz);
 
-        // Checksum
-        const checksum_off = sz - 4;
-        const stored_checksum = try idx.readU32LE(out.items, checksum_off);
-        const got_checksum = std.hash.crc.Crc32Iscsi.hash(out.items[0..checksum_off]);
+        const checksum_off = sz - 8;
+        const stored_checksum = try idx.readU64LE(out.items, checksum_off);
+        const got_checksum = zbuf.hash(out.items[0..checksum_off]);
         if (stored_checksum != got_checksum) return error.ChecksumMismatch;
 
         // Create ref-counted Value with owned copy
@@ -276,11 +278,13 @@ pub const BlockIterator = struct {
     }
 
     fn parseBlockLayout(block: []const u8) Error!BlockLayout {
-        if (block.len < 8) return error.CorruptTable;
+        // Trailer is [u32 entry_count][u64 block_hash] (see builder.zig
+        // finishBlock); parseBlockLayout never validates the hash itself —
+        // that's already done in readBlockUncached's decompress step.
+        if (block.len < 12) return error.CorruptTable;
 
-        const checksum_off = block.len - 4;
-        if (checksum_off < 4) return error.CorruptTable;
-
+		// TODO: We should be running block checksums.
+        const checksum_off = block.len - 8;
         const count_off = checksum_off - 4;
         const entry_count_u32 = try idx.readU32LE(block, count_off);
         const entry_count: usize = @intCast(entry_count_u32);

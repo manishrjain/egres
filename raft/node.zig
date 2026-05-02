@@ -2,6 +2,7 @@ const std = @import("std");
 const zio = @import("zio");
 const raftwal_mod = @import("raftwal.zig");
 const zen = @import("buffers_gen");
+const zbuf = @import("zbuf").zbuf;
 const utils = @import("utils");
 const transport_mod = @import("transport");
 const Transport = transport_mod.Transport;
@@ -507,14 +508,16 @@ pub const Node = struct {
         const self: *Node = @ptrCast(@alignCast(ctx));
         switch (message_type) {
             serial_mod.msg_type_file_push => {
-                if (payload.len < 12) return;
-                const file_id = std.mem.readInt(u64, payload[0..8], .little);
-                const crc = std.mem.readInt(u32, payload[8..12], .little);
-                const data = payload[12..];
-                if (std.hash.crc.Crc32Iscsi.hash(data) != crc) {
-                    raft_log.err("file_push crc mismatch for file {d}", .{file_id});
+                // Wire format: zbuf.frame([u64 file_id || data]). file_id is
+                // *inside* the frame so a corrupt file_id fails hash check
+                // (otherwise we'd silently route the file to the wrong slot).
+                const inner = zbuf.readFrame(payload) catch {
+                    raft_log.err("file_push frame invalid", .{});
                     return;
-                }
+                };
+                if (inner.len < 8) return;
+                const file_id = std.mem.readInt(u64, inner[0..8], .little);
+                const data = inner[8..];
                 std.log.scoped(.file_event).info(
                     "node={d} event=p1_recv file_id={d} bytes={d}",
                     .{ self.id, file_id, data.len },
@@ -550,12 +553,22 @@ pub const Node = struct {
                         continue;
                     };
                     defer self.allocator.free(file_data);
-                    // Build file_push: [8B file_id][4B crc32][data]
-                    const push_payload = self.allocator.alloc(u8, 12 + file_data.len) catch continue;
+                    // Build file_push: zbuf.frame([u64 file_id || data]).
+                    // Lay out the file_id + data in the payload slot, then
+                    // stamp the prefix (writeFrame's zero-copy fast path
+                    // detects the alias — no second copy of file_data).
+                    const push_payload = self.allocator.alloc(u8, zbuf.frame_prefix_size + 8 + file_data.len) catch |err| {
+                        raft_log.err("file_request: alloc for {d} failed: {s}", .{ fid, @errorName(err) });
+                        continue;
+                    };
                     defer self.allocator.free(push_payload);
-                    std.mem.writeInt(u64, push_payload[0..8], fid, .little);
-                    std.mem.writeInt(u32, push_payload[8..12], std.hash.crc.Crc32Iscsi.hash(file_data), .little);
-                    @memcpy(push_payload[12..], file_data);
+                    const inner = push_payload[zbuf.frame_prefix_size..];
+                    std.mem.writeInt(u64, inner[0..8], fid, .little);
+                    @memcpy(inner[8..], file_data);
+                    zbuf.writeFrame(push_payload, inner) catch |err| {
+                        raft_log.err("file_request: writeFrame for {d} failed: {s}", .{ fid, @errorName(err) });
+                        continue;
+                    };
                     conn.send(serial_mod.msg_type_file_push, push_payload) catch |err| {
                         raft_log.err("file_request: push failed for {d}: {s}", .{ fid, @errorName(err) });
                     };
@@ -594,11 +607,13 @@ pub const Node = struct {
                 return error.OutOfMemory;
             };
 
-            // Build payload: [8B file_id][4B crc32][data]
-            const payload = try self.allocator.alloc(u8, 12 + data.len);
-            std.mem.writeInt(u64, payload[0..8], file_id, .little);
-            std.mem.writeInt(u32, payload[8..12], std.hash.crc.Crc32Iscsi.hash(data), .little);
-            @memcpy(payload[12..], data);
+            // Build payload: zbuf.frame([u64 file_id || data]). file_id sits
+            // inside the frame so the hash covers it.
+            const payload = try self.allocator.alloc(u8, zbuf.frame_prefix_size + 8 + data.len);
+            const inner = payload[zbuf.frame_prefix_size..];
+            std.mem.writeInt(u64, inner[0..8], file_id, .little);
+            @memcpy(inner[8..], data);
+            try zbuf.writeFrame(payload, inner);
 
             // Wrap once; sendMsg incrRefs per peer enqueued, no per-peer copy.
             const value = utils.RefValue.init(self.allocator, payload) catch {

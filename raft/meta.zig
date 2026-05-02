@@ -8,14 +8,15 @@
 //                   single write is durable on return (POSIX guarantees the
 //                   file-size update is part of data-integrity sync, since
 //                   without it the new bytes wouldn't be retrievable). The
-//                   payload is wrapped in `[crc32c][len][zbuf]` so we detect
-//                   torn bytes on read.
+//                   payload is wrapped in a zbuf frame so we detect torn
+//                   bytes on read.
 //
-// The double-buffer protects HardState against torn writes: each slot
-// carries `(crc32c, seq, payload_len, zbuf payload)`; on recovery we pick
-// the slot with the highest valid seq. A torn write to the just-written
-// slot fails CRC and recovery silently returns the previous (older)
-// durable state.
+// The double-buffer protects HardState against torn writes: each slot is a
+// zbuf frame around a serialized HardState, and HardState carries its own
+// monotonic `seq` field. On recovery we pick the slot whose decoded
+// HardState has the highest seq. A torn write to the just-written slot
+// fails the frame's hash check and recovery silently returns the previous
+// (older) durable state.
 //
 // HardState changes (votes, term bumps) are durable when `setHardState`
 // returns. Snapshots are durable when `setSnapshot` returns. There is no
@@ -32,12 +33,6 @@ const zbuf = @import("zbuf").zbuf;
 const slot_size: usize = 4096;
 const slot_count: usize = 2;
 const state_file_size: usize = slot_size * slot_count;
-// crc32c (4) + seq (8) + payload_len (4)
-const slot_header_size: usize = 16;
-const max_slot_payload_len: usize = slot_size - slot_header_size;
-
-// Snapshot file framing: crc32c (4) + payload_len (4) + zbuf bytes.
-const snapshot_header_size: usize = 8;
 
 const state_file_name = "state.bin";
 const snapshot_file_name = "snapshot.bin";
@@ -67,10 +62,9 @@ pub const MetaStore = struct {
     hard_state: zen.HardStateStruct,
     snapshot: *zen.SnapshotStruct,
 
-    /// Next sequence number to write to a slot. Monotonic per-process.
-    next_seq: u64,
     /// Index of the currently-durable slot (0 = slot A at offset 0,
     /// 1 = slot B at offset 4096). The next write goes to `1 - active_slot`.
+    /// The recovery sequence number lives in `hard_state.seq`.
     active_slot: u8,
 
     pub fn openPath(path: []const u8, alloc: std.mem.Allocator) !MetaStore {
@@ -121,16 +115,15 @@ pub const MetaStore = struct {
             .state_file = state_file,
             .hard_state = .{},
             .snapshot = empty_snap,
-            .next_seq = 0,
             .active_slot = 0,
         };
 
         if (fresh) {
             // Seed slot A with seq=0 and slot B with seq=1; both default-zero
-            // HardState. After this the highest-valid-seq winner is slot B.
-            try ms.writeSlot(0, ms.hard_state, 0);
-            try ms.writeSlot(1, ms.hard_state, 1);
-            ms.next_seq = 2;
+            // HardState. After this the highest-seq winner is slot B.
+            try ms.writeSlot(.{ .seq = 0 }, 0);
+            try ms.writeSlot(.{ .seq = 1 }, 1);
+            ms.hard_state = .{ .seq = 1 };
             ms.active_slot = 1;
         } else {
             try ms.recoverHardState();
@@ -173,17 +166,19 @@ pub const MetaStore = struct {
     }
 
     /// Persist a new HardState. Returns only after the new value is durable
-    /// (one O_DSYNC pwrite). Compares against the current in-memory state
-    /// and skips disk I/O on no-op writes — Raft already only calls us on
-    /// real changes, but this is a defensive backstop.
+    /// (one O_DSYNC pwrite). Raft only calls us on real changes, so we
+    /// don't gate on a no-op-skip comparison here.
+    ///
+    /// `seq` is internal bookkeeping: any caller-supplied value is discarded
+    /// and the durable record carries `self.hard_state.seq + 1`.
     pub fn setHardState(self: *MetaStore, hs: zen.HardStateStruct) !void {
-        if (std.meta.eql(hs, self.hard_state)) return;
+        var next = hs;
+        next.seq = self.hard_state.seq + 1;
 
         const inactive_slot: u8 = 1 - self.active_slot;
-        try self.writeSlot(self.next_seq, hs, inactive_slot);
-        self.hard_state = hs;
+        try self.writeSlot(next, inactive_slot);
+        self.hard_state = next;
         self.active_slot = inactive_slot;
-        self.next_seq += 1;
     }
 
     /// Persist a new Snapshot. Variable-size payload, so we use the
@@ -200,18 +195,11 @@ pub const MetaStore = struct {
         const off = try snap.marshalTo(self.allocator, &zbuf_bytes);
         try zbuf.appendMessageTail(&zbuf_bytes, self.allocator, zen.SnapshotReader.TABLE_ID, off);
 
-        // Wrap with the file-level [crc32c][payload_len][zbuf] frame so we
-        // detect a torn pwrite (e.g. a power loss mid-write of a multi-MB
-        // snapshot) on the next recovery.
+        // Wrap with a zbuf frame so we detect a torn pwrite (e.g. a power
+        // loss mid-write of a multi-MB snapshot) on the next recovery.
         var file_buf: std.ArrayList(u8) = .empty;
         defer file_buf.deinit(self.allocator);
-        try file_buf.resize(self.allocator, snapshot_header_size + zbuf_bytes.items.len);
-
-        std.mem.writeInt(u32, file_buf.items[4..8], @intCast(zbuf_bytes.items.len), .little);
-        @memcpy(file_buf.items[8..], zbuf_bytes.items);
-
-        const crc = std.hash.crc.Crc32Iscsi.hash(file_buf.items[4..]);
-        std.mem.writeInt(u32, file_buf.items[0..4], crc, .little);
+        _ = try zbuf.appendFrame(&file_buf, self.allocator, zbuf_bytes.items);
 
         const tmp_path = try std.fs.path.join(self.allocator, &.{ self.dir_path, snapshot_tmp_name });
         defer self.allocator.free(tmp_path);
@@ -248,31 +236,26 @@ pub const MetaStore = struct {
 
     /// Build slot bytes in memory and pwrite them. The state_file is opened
     /// with O_DSYNC, so the write returns only after the bytes are durable.
-    /// Layout: [crc32c:4][seq:8][payload_len:4][zbuf payload][zero pad].
-    /// CRC covers bytes [4..16+payload_len) — a single contiguous range.
-    fn writeSlot(self: *MetaStore, seq: u64, hs: zen.HardStateStruct, slot_idx: u8) !void {
-        // Marshal HardState to a zbuf payload + tail. Using marshalTo +
-        // appendMessageTail keeps the field-walk inside the struct itself
-        // — same pattern used elsewhere in the codebase.
-        var scratch: std.ArrayList(u8) = .empty;
-        defer scratch.deinit(self.allocator);
-        const off = try hs.marshalTo(self.allocator, &scratch);
-        try zbuf.appendMessageTail(&scratch, self.allocator, zen.HardStateReader.TABLE_ID, off);
-        if (scratch.items.len > max_slot_payload_len) return Error.PayloadTooLarge;
-
-        // Page-aligned heap buffer (zio fibers have small stacks; per
-        // CLAUDE.md we don't put 4 KiB on the stack). The alignment is
-        // forward-compat for a possible later O_DIRECT switch.
+    /// The slot is a zbuf frame `[u64 hash | u32 len | HardState payload]`
+    /// followed by zero padding to fill the 4 KiB slot.
+    fn writeSlot(self: *MetaStore, hs: zen.HardStateStruct, slot_idx: u8) !void {
+        // Page-aligned heap buffer (zio fibers have small stacks; we don't
+        // put 4 KiB on the stack). The alignment is forward-compat for a
+        // possible later O_DIRECT switch.
         const page = try self.allocator.alignedAlloc(u8, vfs.page_alignment, slot_size);
         defer self.allocator.free(page);
         @memset(page, 0);
 
-        std.mem.writeInt(u64, page[4..12], seq, .little);
-        std.mem.writeInt(u32, page[12..16], @intCast(scratch.items.len), .little);
-        @memcpy(page[16 .. 16 + scratch.items.len], scratch.items);
+        // Marshal HardState directly into the slot's payload region (the
+        // bytes after the frame prefix). Wrap the writer with the message
+        // tail so HardStateReader.parseRoot can decode it on recovery.
+        var scratch = std.ArrayList(u8).initBuffer(page[zbuf.frame_prefix_size..]);
+        const off = try hs.marshalTo(self.allocator, &scratch);
+        try zbuf.appendMessageTail(&scratch, self.allocator, zen.HardStateReader.TABLE_ID, off);
 
-        const crc = std.hash.crc.Crc32Iscsi.hash(page[4 .. 16 + scratch.items.len]);
-        std.mem.writeInt(u32, page[0..4], crc, .little);
+        // Stamp the [hash | len] frame prefix over the in-place payload
+        // (writeFrame's zero-copy fast path detects the alias).
+        try zbuf.writeFrame(page, scratch.items);
 
         const offset: u64 = @as(u64, slot_idx) * slot_size;
         try self.state_file.write(page, offset, .p0);
@@ -289,44 +272,33 @@ pub const MetaStore = struct {
         const a_ok = parseSlot(slot_a);
         const b_ok = parseSlot(slot_b);
 
-        // Pick highest valid seq; on tie (which shouldn't happen because
-        // we always increment), prefer slot B as a deterministic tiebreaker.
-        const winner: ?struct { idx: u8, seq: u64, payload: []const u8 } = blk: {
+        // Pick the slot whose HardState carries the higher `seq`. On tie
+        // (shouldn't happen — we always increment) prefer slot B as a
+        // deterministic tiebreaker.
+        const winner: ?struct { idx: u8, hs: zen.HardStateReader } = blk: {
             if (a_ok != null and b_ok != null) {
-                if (b_ok.?.seq >= a_ok.?.seq) {
-                    break :blk .{ .idx = 1, .seq = b_ok.?.seq, .payload = b_ok.?.payload };
+                if (b_ok.?.seq() >= a_ok.?.seq()) {
+                    break :blk .{ .idx = 1, .hs = b_ok.? };
                 } else {
-                    break :blk .{ .idx = 0, .seq = a_ok.?.seq, .payload = a_ok.?.payload };
+                    break :blk .{ .idx = 0, .hs = a_ok.? };
                 }
             }
-            if (a_ok) |x| break :blk .{ .idx = 0, .seq = x.seq, .payload = x.payload };
-            if (b_ok) |x| break :blk .{ .idx = 1, .seq = x.seq, .payload = x.payload };
+            if (a_ok) |r| break :blk .{ .idx = 0, .hs = r };
+            if (b_ok) |r| break :blk .{ .idx = 1, .hs = r };
             break :blk null;
         };
         const w = winner orelse return Error.MetaCorrupt;
 
-        const reader = try zen.HardStateReader.parseRoot(w.payload);
-        self.hard_state = .{
-            .current_term = reader.currentTerm(),
-            .voted_for = reader.votedFor(),
-            .raft_id = reader.raftId(),
-            .checkpoint_index = reader.checkpointIndex(),
-        };
+        self.hard_state = try zen.HardStateStruct.fromReaderValue(self.allocator, w.hs);
         self.active_slot = w.idx;
-        self.next_seq = w.seq + 1;
     }
 
-    /// Validate a single slot's CRC + header bounds, returning the payload
-    /// slice and seq on success. Returns null on any validation failure.
-    fn parseSlot(slot: []const u8) ?struct { seq: u64, payload: []const u8 } {
-        if (slot.len < slot_header_size) return null;
-        const stored_crc = std.mem.readInt(u32, slot[0..4], .little);
-        const seq = std.mem.readInt(u64, slot[4..12], .little);
-        const payload_len = std.mem.readInt(u32, slot[12..16], .little);
-        if (slot_header_size + @as(usize, payload_len) > slot.len) return null;
-        const computed_crc = std.hash.crc.Crc32Iscsi.hash(slot[4 .. 16 + payload_len]);
-        if (computed_crc != stored_crc) return null;
-        return .{ .seq = seq, .payload = slot[16 .. 16 + payload_len] };
+    /// Validate a single slot's frame and decode the HardState. Returns
+    /// null on any validation failure (invalid hash, length out of range,
+    /// or HardState parseRoot failure).
+    fn parseSlot(slot: []const u8) ?zen.HardStateReader {
+        const payload = zbuf.readFrame(slot) catch return null;
+        return zen.HardStateReader.parseRoot(payload) catch null;
     }
 
     fn recoverSnapshot(self: *MetaStore) !void {
@@ -345,13 +317,9 @@ pub const MetaStore = struct {
         defer result.free();
         const buf = result.data;
 
-        if (buf.len < snapshot_header_size) return Error.SnapshotCorrupt;
-        const stored_crc = std.mem.readInt(u32, buf[0..4], .little);
-        const payload_len = std.mem.readInt(u32, buf[4..8], .little);
-        if (snapshot_header_size + @as(usize, payload_len) > buf.len) return Error.SnapshotCorrupt;
-        const computed_crc = std.hash.crc.Crc32Iscsi.hash(buf[4 .. 8 + payload_len]);
-        if (computed_crc != stored_crc) return Error.SnapshotCorrupt;
-        const payload = buf[8 .. 8 + payload_len];
+        // zbuf.frame validates length-fits-in-buf and verifies the hash
+        // in one pass; either failure mode means the snapshot is corrupt.
+        const payload = zbuf.readFrame(buf) catch return Error.SnapshotCorrupt;
 
         const reader = try zen.SnapshotReader.parseRoot(payload);
         // fromReader returns a *SnapshotStruct that owns its data + conf_state.

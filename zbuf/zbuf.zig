@@ -47,19 +47,26 @@ pub fn readMessageTail(buf: []const u8) !MessageTail {
     return .{ .table_id = table_id };
 }
 
+// The single hash function used for ALL framing and integrity checks in
+// this project. Centralizing here means one decision, one comment, one
+// place to swap implementations.
+//
+// Choice: std.hash.XxHash3 (Zig stdlib, AVX2-vectorized via @Vector(8, u64)).
+// ~67 GiB/s on Zen 3 — ~5× faster than scalar SSE4.2 CRC32C, ~115× faster
+// than software CRC. Full u64 output gives a 2⁻⁶⁴ false-negative rate on
+// random/torn-write corruption (vs. 2⁻³² for a 32-bit CRC). CRC32C retains
+// a theoretical edge on single-bit and small-burst errors (provably 100%
+// vs. xxhash3's 1 − 2⁻⁶⁴) but the gap is ~10⁻¹⁰ — irrelevant at NVMe
+// error rates.
+pub fn hash(payload: []const u8) u64 {
+    return std.hash.XxHash3.hash(0, payload);
+}
+
 // 12-byte self-describing prefix for an arbitrary serialized payload:
-// [u64 xxhash3][u32 length][payload bytes]. Lets the reader bound the
+// [u64 hash][u32 length][payload bytes]. Lets the reader bound the
 // payload inside a larger fixed-size region (e.g. a zero-padded WAL
 // header) and verify it with one hash pass — no magic number / separate
 // length file needed.
-//
-// Hash choice: std.hash.XxHash3 (Zig stdlib, AVX2-vectorized). ~67 GiB/s
-// on Zen 3 — ~5× faster than scalar SSE4.2 CRC32C, ~115× faster than
-// software CRC. The full 64-bit output gives a 2⁻⁶⁴ false-negative rate
-// on random/torn-write corruption, vs. 2⁻³² for a 32-bit CRC. CRC32C
-// retains a theoretical edge on single-bit and small-burst errors
-// (provably 100% detection vs. xxhash3's 1 − 2⁻⁶⁴) but the practical
-// gap is ~10⁻¹⁰ and irrelevant at NVMe error rates.
 pub const frame_prefix_size: u16 = 12;
 
 /// In-place writer: place the [hash | len | payload] frame at the start
@@ -75,8 +82,7 @@ pub const frame_prefix_size: u16 = 12;
 pub fn writeFrame(dest: []u8, payload: []const u8) !void {
     if (payload.len > std.math.maxInt(u32)) return Error.OutOfBounds;
     if (dest.len < @as(usize, frame_prefix_size) + payload.len) return Error.OutOfBounds;
-    const hash = std.hash.XxHash3.hash(0, payload);
-    try writeU64At(dest, 0, hash);
+    try writeU64At(dest, 0, hash(payload));
     try writeU32At(dest, 8, @intCast(payload.len));
     const slot = dest[frame_prefix_size .. frame_prefix_size + payload.len];
     if (payload.ptr != slot.ptr) @memcpy(slot, payload);
@@ -103,12 +109,12 @@ pub fn appendFrame(
 /// a slice into `buf` covering just the payload (no copy).
 pub fn readFrame(buf: []const u8) ![]const u8 {
     if (buf.len < frame_prefix_size) return Error.OutOfBounds;
-    const hash = try readU64(buf, 0);
+    const stored_hash = try readU64(buf, 0);
     const len = try readU32(buf, 8);
     const end = @as(usize, frame_prefix_size) + @as(usize, len);
     if (end > buf.len) return Error.OutOfBounds;
     const payload = buf[frame_prefix_size..end];
-    if (std.hash.XxHash3.hash(0, payload) != hash) return Error.Invalid;
+    if (hash(payload) != stored_hash) return Error.Invalid;
     return payload;
 }
 pub fn readU8(buf: []const u8, off: usize) !u8 {
