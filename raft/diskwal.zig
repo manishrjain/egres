@@ -184,7 +184,7 @@ pub const logFile = struct {
         var wo: u64 = log_file_offset;
         if (slots_list.items.len > 1) {
             const last = slots_list.items[slots_list.items.len - 1];
-            wo = last.data_offset + record_header_size + last.data_len;
+            wo = last.data_offset + zbuf.frame_prefix_size + last.data_len;
         }
 
         return .{
@@ -438,14 +438,13 @@ pub const logFile = struct {
         if (ent.index == 0) return error.InvalidLogOffset;
 
         const rec_start = ent.data_offset - @as(u32, @intCast(buf_offset));
-        const rec_end = rec_start + record_header_size + ent.data_len;
+        const rec_end = rec_start + zbuf.frame_prefix_size + ent.data_len;
         if (rec_end > buf.len) return error.InvalidLogOffset;
 
-        // const stored_crc = readInt(u32, buf[rec_start .. rec_start + 4], .little);
-        const payload = buf[rec_start + record_header_size .. rec_end];
-        // if (stored_crc != computeCrc(payload)) return error.CrcMismatch;
-
-        return payload;
+        // readFrame validates the CRC over the payload bytes; mismatched
+        // bytes (e.g. partial torn write captured in our pre-read) surface
+        // here as zbuf.Error.Invalid instead of silently returning bad data.
+        return zbuf.readFrame(buf[rec_start..rec_end]) catch error.CrcMismatch;
     }
 
     /// Build the WAL header region as a single WalHeader zbuf message and
@@ -859,7 +858,7 @@ pub const wal = struct {
 
             // Only count toward disk span if not in cache.
             if (self.cache.lookup(ent.index) == null) {
-                const rec_end: u32 = ent.data_offset + @as(u32, record_header_size) + ent.data_len;
+                const rec_end: u32 = ent.data_offset + @as(u32, zbuf.frame_prefix_size) + ent.data_len;
                 if (plan.disk_bytes == 0) plan.disk_first_offset = ent.data_offset;
                 plan.disk_end_offset = rec_end;
                 plan.disk_bytes += ent.data_len;
@@ -960,7 +959,7 @@ pub const wal = struct {
                     // with ctx pointing at the StoredEntry to fill later.
                     try requests.append(alloc, .{
                         .offset = ent.data_offset,
-                        .len = record_header_size + ent.data_len,
+                        .len = zbuf.frame_prefix_size + ent.data_len,
                         .ctx = sep,
                     });
                 }
@@ -971,7 +970,7 @@ pub const wal = struct {
                 try lf.handle.batchRead(&arena, requests.items, .p0);
                 for (requests.items) |req| {
                     const se: *raftlog.StoredEntry = @ptrCast(@alignCast(req.ctx.?));
-                    se.bytes = req.data[record_header_size..];
+                    se.bytes = try zbuf.readFrame(req.data);
                 }
             }
 
@@ -1034,7 +1033,7 @@ pub const wal = struct {
 
             const bytes = entry_buf.bytes orelse return raftlog.RaftLogError.Invalid;
             if (self.current.firstEmptySlot() >= max_num_entries or
-                self.current.write_offset + record_header_size + bytes.len > log_file_size)
+                self.current.write_offset + zbuf.frame_prefix_size + bytes.len > log_file_size)
             {
                 // Segment full: rotate (which flushes self.write_buf to the
                 // outgoing file before creating the new one).
@@ -1296,12 +1295,6 @@ pub const DiskWAL = struct {
 // =========================================================================
 // New types for VFS-based WAL (used in upcoming refactor)
 // =========================================================================
-
-pub const record_header_size: usize = 8; // crc32c (4) + payload_len (4)
-
-pub fn computeCrc(payload: []const u8) u32 {
-    return std.hash.crc.Crc32Iscsi.hash(payload);
-}
 
 /// Fixed-capacity ring buffer of recent WAL entries. Entries are contiguous
 /// by raft index — append at tail, evict from head. O(1) append, O(1) lookup.
