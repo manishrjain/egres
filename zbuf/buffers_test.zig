@@ -558,3 +558,33 @@ test "clone roundtrip matches marshal" {
     try std.testing.expectEqual(off_orig, off_clone);
     try std.testing.expectEqualSlices(u8, out_orig.items, out_clone.items);
 }
+
+test "crc32c hardware path matches software at every length" {
+    // The SSE4.2 implementation processes 8 bytes at a time via crc32q
+    // and the unaligned tail (0–7 bytes) via crc32b. Sweeping every
+    // length 0..=64 covers all (chunk-count × tail-length) combinations
+    // up to 8 full chunks, which is the only way these loops can
+    // disagree if the wiring is off.
+    var prng = std.Random.DefaultPrng.init(0xCAFEBABE);
+    var buf: [4096]u8 = undefined;
+    prng.random().bytes(&buf);
+
+    var len: usize = 0;
+    while (len <= 64) : (len += 1) {
+        const slice = buf[0..len];
+        const sw = std.hash.crc.Crc32Iscsi.hash(slice);
+        const hw = zbuf.crc32c(slice);
+        try std.testing.expectEqual(sw, hw);
+    }
+
+    // A few mid-range and odd-modulo sizes to exercise the chunk loop
+    // with non-trivial tails and longer dependency chains.
+    const sizes = [_]usize{ 99, 100, 511, 512, 513, 1023, 1024, 1025, 4095, 4096 };
+    for (sizes) |size| {
+        const slice = buf[0..size];
+        try std.testing.expectEqual(
+            std.hash.crc.Crc32Iscsi.hash(slice),
+            zbuf.crc32c(slice),
+        );
+    }
+}

@@ -100,6 +100,7 @@ pub fn build(b: *std.Build) void {
     addBenchZio(b, target, optimize);
     addBenchDiskwal(b, target, optimize, raft_mod, regen_buffers_step);
     addBenchQueue(b, target, optimize, raft_mod);
+    addBenchCrc(b, target, optimize);
     const net_test_step = addNetTests(b, target, optimize);
 
     const all_test_step = b.step("test", "Run all tests");
@@ -740,6 +741,27 @@ fn addBenchZio(
 
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench-zio", "Run zio vs std.Thread benchmarks");
+    bench_step.dependOn(&run_bench.step);
+}
+
+fn addBenchCrc(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    _ = optimize;
+    const zbuf_mod = makeModule(b, target, .ReleaseFast, "zbuf.zig");
+
+    const bench_exe = b.addExecutable(.{
+        .name = "crc-bench",
+        // Always ReleaseFast — Debug bounds checks dominate the CRC inner
+        // loop and would make the throughput numbers meaningless.
+        .root_module = makeModule(b, target, .ReleaseFast, "benchmarks/crc_bench.zig"),
+    });
+    bench_exe.root_module.addImport("zbuf", zbuf_mod);
+
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench-crc", "Run CRC32C software vs. hardware throughput benchmark");
     bench_step.dependOn(&run_bench.step);
 }
 

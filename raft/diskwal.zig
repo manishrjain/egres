@@ -407,7 +407,7 @@ pub const logFile = struct {
         entry_bytes: []const u8,
         reader: zen.LogEntryReader,
     ) !void {
-        try zbuf.appendFrame(buf, self.allocator, entry_bytes);
+        const sz = try zbuf.appendFrame(buf, self.allocator, entry_bytes);
 
         // Update in-memory slot table.
         try self.slots.append(self.allocator, .{
@@ -417,7 +417,7 @@ pub const logFile = struct {
             .data_len = @intCast(entry_bytes.len),
             .entry_type = reader.entryType(),
         });
-        self.write_offset += zbuf.frame_prefix_size + entry_bytes.len;
+        self.write_offset += sz;
     }
 
     /// Flush a write buffer to disk in one call.
