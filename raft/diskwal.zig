@@ -68,11 +68,11 @@ fn writeInt(comptime T: type, buf: []u8, value: T, endian: std.builtin.Endian) v
 // If hard sync is enabled, call msync/fdatasync after writes.
 
 // 1 MiB header / 41 bytes-per-slot (37-byte WalSlot + 4-byte offset entry
-// in the WalHeader's slots array) ≈ 25,500 max slots; round down to 25k
+// in the WalHeader's slots array) ≈ 25,500 max slots; round down to 20k
 // to leave margin for the WalHeader struct, the frame prefix, and any
 // future schema growth (zbuf's size_bytes lets us add fields without
 // breaking older WAL files).
-pub const max_num_entries: usize = 25_000;
+pub const max_num_entries: usize = 20_000;
 pub const log_file_offset: usize = 1 << 20;
 pub const log_file_size: usize = 256 << 20;
 pub const log_suffix = ".wal";
