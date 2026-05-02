@@ -56,7 +56,7 @@ fn buildTable(alloc: std.mem.Allocator, set_root_node: bool) !gen.TableBuffer {
     try n2.setU32Values(&n2_no_u32_values);
     try n2.setU64Values(&n2_u64_values);
     try n2.setRowCell(gen.NullOffset);
-    try n2.flagsSet(0x8);
+    try n2.setFlags(0x8);
     try n2.flagsClearBit(3);
     try n2.setLifecycle(.retiring);
     try n2.setIsDeleted(true);
@@ -151,7 +151,7 @@ test "bitset direct operations" {
     try std.testing.expect(try node.flagsHasBit(63));
     try node.flagsClearBit(0);
     try std.testing.expect(!(try node.flagsHasBit(0)));
-    try node.flagsSet(0);
+    try node.setFlags(0);
 
     var payload = try node.finishWithTail();
     defer payload.deinit();
@@ -509,7 +509,7 @@ test "clone of simple scalar-only struct" {
 
     try std.testing.expectEqual(@as(u32, 42), cloned.tag);
     try std.testing.expect(cloned.cell_hot);
-    try std.testing.expectEqual(@as(u64, 0xFF), cloned.cell_flags);
+    try std.testing.expectEqual(@as(u16, 0xFF), cloned.cell_flags);
     try std.testing.expectEqualSlices(u8, &.{}, cloned.data);
 }
 

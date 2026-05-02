@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const Kind = enum { u16, u32, u64, bytes, array, table, b64, bool, enum_ };
+pub const Kind = enum { u16, u32, u64, bytes, array, table, bool, enum_ };
 
 pub const Field = struct {
     id: u32,
@@ -24,10 +24,6 @@ pub const U32 = struct {
 
 pub const U64 = struct {
     pub const schema_kind: Kind = .u64;
-};
-
-pub const B64 = struct {
-    pub const schema_kind: Kind = .b64;
 };
 
 pub fn Bool(comptime cfg: struct { field_id: u32, bit: u16 }) type {
@@ -89,7 +85,7 @@ pub fn requireKind(comptime T: type, comptime want: Kind) void {
 
 pub fn isScalar(comptime T: type) bool {
     return switch (kindOf(T)) {
-        .u16, .u32, .u64, .b64 => true,
+        .u16, .u32, .u64 => true,
         else => false,
     };
 }
@@ -116,7 +112,6 @@ pub fn slotSize(comptime T: type) u16 {
         .u16 => 2,
         .u32 => 4,
         .u64 => 8,
-        .b64 => 8,
         .bytes => 8,
         .array => 8,
         .table => 4,

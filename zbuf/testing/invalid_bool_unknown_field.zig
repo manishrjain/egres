@@ -1,7 +1,7 @@
 const schema = @import("schema");
 
 pub const BadUnknown = schema.Table(.{
-    .{ .id = 1, .name = "flags", .ty = schema.B64 },
+    .{ .id = 1, .name = "flags", .ty = schema.U16 },
     .{ .name = "ghost", .ty = schema.Bool(.{ .field_id = 99, .bit = 1 }) },
 });
 

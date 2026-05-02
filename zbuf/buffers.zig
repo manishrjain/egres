@@ -3,7 +3,7 @@ const schema = @import("schema");
 pub const Cell = schema.Table(.{
     .{ .id = 1, .name = "tag", .ty = schema.U32 },
     .{ .id = 2, .name = "data", .ty = schema.Bytes },
-    .{ .id = 3, .name = "cell_flags", .ty = schema.B64 },
+    .{ .id = 3, .name = "cell_flags", .ty = schema.U16 },
     .{ .name = "cell_hot", .ty = schema.Bool(.{ .field_id = 3, .bit = 0 }) },
 });
 
@@ -21,7 +21,7 @@ pub const Row = schema.Table(.{
     .{ .id = 3, .name = "cells", .ty = schema.Array(Cell) },
     .{ .id = 4, .name = "row_cell", .ty = Cell },
     // Independent flag bits — can co-exist (e.g. row may be both pinned AND deleted).
-    .{ .id = 5, .name = "flags", .ty = schema.B64 },
+    .{ .id = 5, .name = "flags", .ty = schema.U64 },
     .{ .name = "is_pinned", .ty = schema.Bool(.{ .field_id = 5, .bit = 0 }) },
     .{ .name = "is_deleted", .ty = schema.Bool(.{ .field_id = 5, .bit = 1 }) },
     .{ .id = 6, .name = "lifecycle", .ty = schema.Enum(Lifecycle) },

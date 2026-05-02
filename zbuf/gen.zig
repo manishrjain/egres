@@ -146,8 +146,10 @@ fn emitEnumTypes(w: anytype) !void {
 
 fn boolBitWidthForKind(comptime k: schema.Kind) u16 {
     return switch (k) {
-        .b64 => 64,
-        else => @compileError("bool backing field must be B64"),
+        .u16 => 16,
+        .u32 => 32,
+        .u64 => 64,
+        else => @compileError("bool backing field must be U16/U32/U64"),
     };
 }
 
@@ -155,7 +157,7 @@ fn arrayElemSizeForKind(comptime k: schema.Kind) u16 {
     return switch (k) {
         .u16 => 2,
         .u32 => 4,
-        .u64, .b64 => 8,
+        .u64 => 8,
         .table => 4, // table arrays store u32 offsets
         else => @compileError("unsupported array child kind"),
     };
@@ -165,8 +167,8 @@ fn scalarTypeNameForKind(comptime k: schema.Kind) []const u8 {
     return switch (k) {
         .u16 => "u16",
         .u32 => "u32",
-        .u64, .b64 => "u64",
-        else => @compileError("not a scalar array child kind"),
+        .u64 => "u64",
+        else => @compileError("not a scalar kind"),
     };
 }
 
@@ -174,9 +176,26 @@ fn scalarReadFnForKind(comptime k: schema.Kind) []const u8 {
     return switch (k) {
         .u16 => "readU16",
         .u32 => "readU32",
-        .u64, .b64 => "readU64",
-        else => @compileError("not a scalar array child kind"),
+        .u64 => "readU64",
+        else => @compileError("not a scalar kind"),
     };
+}
+
+fn scalarPatchFnForKind(comptime k: schema.Kind) []const u8 {
+    return switch (k) {
+        .u16 => "patchU16",
+        .u32 => "patchU32",
+        .u64 => "patchU64",
+        else => @compileError("not a scalar kind"),
+    };
+}
+
+fn hasBoolOverlay(comptime infos: anytype, comptime field_id: u32) bool {
+    inline for (infos) |other| {
+        if (schema.kindOf(other.ty) != .bool) continue;
+        if (schema.boolFieldId(other.ty) == field_id) return true;
+    }
+    return false;
 }
 
 fn findFieldInfoById(comptime infos: anytype, comptime field_id: u32) ?FieldInfo {
@@ -274,31 +293,26 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
         const name_camel = try schema.camelName(alloc, info.name);
         defer alloc.free(name_camel);
         switch (comptime schema.kindOf(info.ty)) {
-            .u16 => {
-                // Scalars are stored inline in the fixed header.
-                try w.print("    pub fn {s}(self: Self) u16 {{\n", .{name_camel});
-                try emitScalarGetter(w, info.offset, 2, "readU16");
+            .u16, .u32, .u64 => {
+                // Scalars are stored inline in the fixed header. If the field
+                // is referenced by Bool sub-fields, emit a HasBit accessor too.
+                const kind = comptime schema.kindOf(info.ty);
+                const ty_name = comptime scalarTypeNameForKind(kind);
+                const read_fn = comptime scalarReadFnForKind(kind);
+                const slot_bytes: u16 = comptime switch (kind) {
+                    .u16 => 2,
+                    .u32 => 4,
+                    .u64 => 8,
+                    else => unreachable,
+                };
+                try w.print("    pub fn {s}(self: Self) {s} {{\n", .{ name_camel, ty_name });
+                try emitScalarGetter(w, info.offset, slot_bytes, read_fn);
                 try w.writeAll("    }\n\n");
-            },
-            .u32 => {
-                // Scalars are stored inline in the fixed header.
-                try w.print("    pub fn {s}(self: Self) u32 {{\n", .{name_camel});
-                try emitScalarGetter(w, info.offset, 4, "readU32");
-                try w.writeAll("    }\n\n");
-            },
-            .u64 => {
-                // Scalars are stored inline in the fixed header.
-                try w.print("    pub fn {s}(self: Self) u64 {{\n", .{name_camel});
-                try emitScalarGetter(w, info.offset, 8, "readU64");
-                try w.writeAll("    }\n\n");
-            },
-            .b64 => {
-                try w.print("    pub fn {s}(self: Self) u64 {{\n", .{name_camel});
-                try emitBitsetGetter(w, info.offset);
-                try w.writeAll("    }\n\n");
-                try w.print("    pub fn {s}HasBit(self: Self, bit_index: u32) bool {{\n", .{name_camel});
-                try emitBitsetHasBit(w, info.offset);
-                try w.writeAll("    }\n\n");
+                if (comptime hasBoolOverlay(infos, info.id)) {
+                    try w.print("    pub fn {s}HasBit(self: Self, bit_index: u32) bool {{\n", .{name_camel});
+                    try emitBitsetHasBit(w, info.offset, kind);
+                    try w.writeAll("    }\n\n");
+                }
             },
             .bytes => {
                 // Bytes are stored as (off,len) in the header, pointing into the buffer.
@@ -364,17 +378,6 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
                         try w.writeAll("        return out;\n");
                         try w.writeAll("    }\n\n");
                     },
-                    .b64 => {
-                        // b64 arrays keep the old per-element approach (no *Slice / ToSliceAlloc).
-                        const scalar_ty = scalarTypeNameForKind(child_kind);
-                        const scalar_read_fn = scalarReadFnForKind(child_kind);
-                        try w.print("    pub fn {s}Len(self: Self) u32 {{\n", .{name_camel_arr});
-                        try emitArrayLenGetter(w, info.offset, elem_size);
-                        try w.writeAll("    }\n\n");
-                        try w.print("    pub fn {s}At(self: Self, i: u32) Error!{s} {{\n", .{ name_camel_arr, scalar_ty });
-                        try emitArrayAtGetterScalar(w, info.offset, elem_size, scalar_read_fn);
-                        try w.writeAll("    }\n\n");
-                    },
                     else => @compileError("unsupported array child kind"),
                 }
             },
@@ -387,9 +390,10 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
             .bool => {
                 const bits_field = findFieldInfoById(infos, schema.boolFieldId(info.ty)) orelse
                     @compileError("Bool field references unknown backing field id");
+                const bits_kind = comptime schema.kindOf(bits_field.ty);
                 const bit_index: u16 = schema.boolBitIndex(info.ty);
                 try w.print("    pub fn {s}(self: Self) bool {{\n", .{name_camel});
-                try emitBoolGetter(w, bits_field.offset, bit_index);
+                try emitBoolGetter(w, bits_field.offset, bit_index, bits_kind);
                 try w.writeAll("    }\n\n");
             },
             .enum_ => {
@@ -412,9 +416,6 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
         switch (comptime schema.kindOf(info.ty)) {
             .u16, .u32, .u64, .bytes, .bool, .enum_ => {
                 try w.print("        try writer.set{s}(self.{s}());\n", .{ name_camel, name_lower });
-            },
-            .b64 => {
-                try w.print("        try writer.{s}Set(self.{s}());\n", .{ name_lower, name_lower });
             },
             .table => {
                 try w.print("        if (self.{s}()) |child| {{\n", .{name_lower});
@@ -446,20 +447,6 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
                         try w.print("        const values_{s} = try self.{s}ToSliceAlloc(alloc);\n", .{ name_camel_arr, name_camel_arr });
                         try w.print("        defer alloc.free(values_{s});\n", .{name_camel_arr});
                         try w.print("        if (values_{s}.len > 0) try writer.set{s}(values_{s});\n", .{ name_camel_arr, name_camel, name_camel_arr });
-                    },
-                    .b64 => {
-                        // b64 arrays: no ToSliceAlloc, use element-by-element loop.
-                        const scalar_ty = scalarTypeNameForKind(child_kind);
-                        try w.print("        const count_{s}: u32 = self.{s}Len();\n", .{ name_camel_arr, name_camel_arr });
-                        try w.print("        if (count_{s} != 0) {{\n", .{name_camel_arr});
-                        try w.print("            var values_{s} = try alloc.alloc({s}, @intCast(count_{s}));\n", .{ name_camel_arr, scalar_ty, name_camel_arr });
-                        try w.print("            defer alloc.free(values_{s});\n", .{name_camel_arr});
-                        try w.print("            var i_{s}: u32 = 0;\n", .{name_camel_arr});
-                        try w.print("            while (i_{s} < count_{s}) : (i_{s} += 1) {{\n", .{ name_camel_arr, name_camel_arr, name_camel_arr });
-                        try w.print("                values_{s}[@intCast(i_{s})] = try self.{s}At(i_{s});\n", .{ name_camel_arr, name_camel_arr, name_camel_arr, name_camel_arr });
-                        try w.writeAll("            }\n");
-                        try w.print("            try writer.set{s}(values_{s});\n", .{ name_camel, name_camel_arr });
-                        try w.writeAll("        }\n");
                     },
                     else => @compileError("unsupported array child kind"),
                 }
@@ -606,40 +593,28 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
         const name_lower = try schema.camelName(alloc, info.name);
         defer alloc.free(name_lower);
         switch (comptime schema.kindOf(info.ty)) {
-            .u16 => {
-                // Patch inline scalar slot.
-                try w.print("    pub fn set{s}(self: *Self, v: u16) Error!void {{\n", .{name_camel});
+            .u16, .u32, .u64 => {
+                // Patch inline scalar slot. If the field is referenced by Bool
+                // sub-fields, also emit SetBit / ClearBit / HasBit helpers that
+                // operate on the same backing word.
+                const kind = comptime schema.kindOf(info.ty);
+                const ty_name = comptime scalarTypeNameForKind(kind);
+                const patch_fn = comptime scalarPatchFnForKind(kind);
+                try w.print("    pub fn set{s}(self: *Self, v: {s}) Error!void {{\n", .{ name_camel, ty_name });
                 try w.writeAll("        const out = self.bufMut();\n");
-                try w.print("        try zbuf.patchU16(out.items, self.base + {d}, v);\n", .{info.offset});
+                try w.print("        try zbuf.{s}(out.items, self.base + {d}, v);\n", .{ patch_fn, info.offset });
                 try w.writeAll("    }\n\n");
-            },
-            .u32 => {
-                // Patch inline scalar slot.
-                try w.print("    pub fn set{s}(self: *Self, v: u32) Error!void {{\n", .{name_camel});
-                try w.writeAll("        const out = self.bufMut();\n");
-                try w.print("        try zbuf.patchU32(out.items, self.base + {d}, v);\n", .{info.offset});
-                try w.writeAll("    }\n\n");
-            },
-            .u64 => {
-                // Patch inline scalar slot.
-                try w.print("    pub fn set{s}(self: *Self, v: u64) Error!void {{\n", .{name_camel});
-                try w.writeAll("        const out = self.bufMut();\n");
-                try w.print("        try zbuf.patchU64(out.items, self.base + {d}, v);\n", .{info.offset});
-                try w.writeAll("    }\n\n");
-            },
-            .b64 => {
-                try w.print("    pub fn {s}Set(self: *Self, v: u64) Error!void {{\n", .{name_lower});
-                try emitBitsetSetter(w, info.offset);
-                try w.writeAll("    }\n\n");
-                try w.print("    pub fn {s}SetBit(self: *Self, bit_index: u32) Error!void {{\n", .{name_lower});
-                try emitBitsetSetBit(w, info.offset);
-                try w.writeAll("    }\n\n");
-                try w.print("    pub fn {s}ClearBit(self: *Self, bit_index: u32) Error!void {{\n", .{name_lower});
-                try emitBitsetClearBit(w, info.offset);
-                try w.writeAll("    }\n\n");
-                try w.print("    pub fn {s}HasBit(self: *Self, bit_index: u32) Error!bool {{\n", .{name_lower});
-                try emitBitsetHasBitBuilder(w, info.offset);
-                try w.writeAll("    }\n\n");
+                if (comptime hasBoolOverlay(infos, info.id)) {
+                    try w.print("    pub fn {s}SetBit(self: *Self, bit_index: u32) Error!void {{\n", .{name_lower});
+                    try emitBitsetSetBit(w, info.offset, kind);
+                    try w.writeAll("    }\n\n");
+                    try w.print("    pub fn {s}ClearBit(self: *Self, bit_index: u32) Error!void {{\n", .{name_lower});
+                    try emitBitsetClearBit(w, info.offset, kind);
+                    try w.writeAll("    }\n\n");
+                    try w.print("    pub fn {s}HasBit(self: *Self, bit_index: u32) Error!bool {{\n", .{name_lower});
+                    try emitBitsetHasBitBuilder(w, info.offset, kind);
+                    try w.writeAll("    }\n\n");
+                }
             },
             .bytes => {
                 // Append payload and patch (off,len) in the header (offsets are payload-relative).
@@ -690,7 +665,7 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
                         try w.print("        try zbuf.patchU32(out.items, self.base + {d}, @as(u32, @intCast(values.len)));\n", .{info.offset + 4});
                         try w.writeAll("    }\n\n");
                     },
-                    .u64, .b64 => {
+                    .u64 => {
                         // Append u64 data and patch (index_off,count) in the header.
                         try w.print("    pub fn set{s}(self: *Self, values: []const u64) Error!void {{\n", .{name_camel});
                         try w.writeAll("        const out = self.bufMut();\n");
@@ -718,9 +693,10 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
             .bool => {
                 const bits_field = findFieldInfoById(infos, schema.boolFieldId(info.ty)) orelse
                     @compileError("Bool field references unknown backing field id");
+                const bits_kind = comptime schema.kindOf(bits_field.ty);
                 const bit_index: u16 = schema.boolBitIndex(info.ty);
                 try w.print("    pub fn set{s}(self: *Self, v: bool) Error!void {{\n", .{name_camel});
-                try emitBoolSetter(w, bits_field.offset, bit_index);
+                try emitBoolSetter(w, bits_field.offset, bit_index, bits_kind);
                 try w.writeAll("    }\n\n");
             },
             .enum_ => {
@@ -743,16 +719,7 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     inline for (infos) |info| {
         const name_camel = try schema.camelNameCapitalized(alloc, info.name);
         defer alloc.free(name_camel);
-        const name_lower = try schema.camelName(alloc, info.name);
-        defer alloc.free(name_lower);
-        switch (comptime schema.kindOf(info.ty)) {
-            .b64 => {
-                try w.print("        if (@hasField(Values, \"{s}\")) try self.{s}Set(@field(values, \"{s}\"));\n", .{ info.name, name_lower, info.name });
-            },
-            else => {
-                try w.print("        if (@hasField(Values, \"{s}\")) try self.set{s}(@field(values, \"{s}\"));\n", .{ info.name, name_camel, info.name });
-            },
-        }
+        try w.print("        if (@hasField(Values, \"{s}\")) try self.set{s}(@field(values, \"{s}\"));\n", .{ info.name, name_camel, info.name });
     }
     try w.writeAll("    }\n\n");
 
@@ -802,7 +769,6 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
             .u16 => try w.print("    {s}: u16 = 0,\n", .{info.name}),
             .u32 => try w.print("    {s}: u32 = 0,\n", .{info.name}),
             .u64 => try w.print("    {s}: u64 = 0,\n", .{info.name}),
-            .b64 => try w.print("    {s}: u64 = 0,\n", .{info.name}),
             .bool => try w.print("    {s}: bool = false,\n", .{info.name}),
             .enum_ => {
                 const enum_def = comptime schema.enumDefOf(info.ty);
@@ -816,7 +782,7 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
                 switch (child_kind) {
                     .u16 => try w.print("    {s}: []u16 = &.{{}},\n", .{info.name}),
                     .u32 => try w.print("    {s}: []u32 = &.{{}},\n", .{info.name}),
-                    .u64, .b64 => try w.print("    {s}: []u64 = &.{{}},\n", .{info.name}),
+                    .u64 => try w.print("    {s}: []u64 = &.{{}},\n", .{info.name}),
                     .table => {
                         const child_name = tableNameForType(child);
                         try w.print("    {s}: []{s}Struct = &.{{}},\n", .{ info.name, child_name });
@@ -840,7 +806,7 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
         const name_camel = try schema.camelName(alloc, info.name);
         defer alloc.free(name_camel);
         switch (comptime schema.kindOf(info.ty)) {
-            .u16, .u32, .u64, .b64, .bool, .enum_ => {
+            .u16, .u32, .u64, .bool, .enum_ => {
                 try w.print("            .{s} = r.{s}(),\n", .{ info.name, name_camel });
             },
             else => {},
@@ -863,7 +829,7 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
         }
     }
 
-    // Step 4: scalar array fields (u16/u32/u64 use ToSliceAlloc; b64 uses manual loop).
+    // Step 4: scalar array fields use ToSliceAlloc.
     inline for (infos) |info| {
         const name_camel = try schema.camelName(alloc, info.name);
         defer alloc.free(name_camel);
@@ -874,17 +840,6 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
                 switch (child_kind) {
                     .u16, .u32, .u64 => {
                         try w.print("        s.{s} = try r.{s}ToSliceAlloc(alloc);\n", .{ info.name, name_camel });
-                    },
-                    .b64 => {
-                        // No ToSliceAlloc for b64 arrays: use element-by-element loop.
-                        try w.writeAll("        {\n");
-                        try w.print("            const _cnt = r.{s}Len();\n", .{name_camel});
-                        try w.print("            s.{s} = try alloc.alloc(u64, @intCast(_cnt));\n", .{info.name});
-                        try w.writeAll("            var _i: u32 = 0;\n");
-                        try w.writeAll("            while (_i < _cnt) : (_i += 1) {\n");
-                        try w.print("                s.{s}[@intCast(_i)] = try r.{s}At(_i);\n", .{ info.name, name_camel });
-                        try w.writeAll("            }\n");
-                        try w.writeAll("        }\n");
                     },
                     .table => {}, // handled in step 5
                     else => @compileError("unsupported array child kind in struct fromReader"),
@@ -970,7 +925,7 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
                 const child = comptime schema.childOfArray(info.ty);
                 const child_kind = comptime schema.kindOf(child);
                 switch (child_kind) {
-                    .u16, .u32, .u64, .b64 => {
+                    .u16, .u32, .u64 => {
                         try w.print("        alloc.free(self.{s});\n", .{info.name});
                         try w.print("        self.{s} = &.{{}};\n", .{info.name});
                     },
@@ -1004,7 +959,7 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
     try w.print("        var s = {s}Struct{{\n", .{table_name});
     inline for (infos) |info| {
         switch (comptime schema.kindOf(info.ty)) {
-            .u16, .u32, .u64, .b64, .bool, .enum_ => {
+            .u16, .u32, .u64, .bool, .enum_ => {
                 try w.print("            .{s} = self.{s},\n", .{ info.name, info.name });
             },
             else => {},
@@ -1025,7 +980,7 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
         }
     }
 
-    // Step 4: scalar/b64 array fields — dupe the slice.
+    // Step 4: scalar array fields — dupe the slice.
     inline for (infos) |info| {
         switch (comptime schema.kindOf(info.ty)) {
             .array => {
@@ -1038,7 +993,7 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
                     .u32 => {
                         try w.print("        s.{s} = try alloc.dupe(u32, self.{s});\n", .{ info.name, info.name });
                     },
-                    .u64, .b64 => {
+                    .u64 => {
                         try w.print("        s.{s} = try alloc.dupe(u64, self.{s});\n", .{ info.name, info.name });
                     },
                     .table => {}, // handled in step 5
@@ -1099,14 +1054,9 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
     inline for (infos) |info| {
         const name_camel = try schema.camelNameCapitalized(alloc, info.name);
         defer alloc.free(name_camel);
-        const name_lower = try schema.camelName(alloc, info.name);
-        defer alloc.free(name_lower);
         switch (comptime schema.kindOf(info.ty)) {
             .u16, .u32, .u64, .bytes, .bool, .enum_ => {
                 try w.print("        try writer.set{s}(self.{s});\n", .{ name_camel, info.name });
-            },
-            .b64 => {
-                try w.print("        try writer.{s}Set(self.{s});\n", .{ name_lower, info.name });
             },
             .table => {
                 try w.print("        if (self.{s}) |child| {{\n", .{info.name});
@@ -1128,7 +1078,7 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
                         try w.print("            try writer.set{s}(offsets);\n", .{name_camel});
                         try w.writeAll("        }\n");
                     },
-                    .u16, .u32, .u64, .b64 => {
+                    .u16, .u32, .u64 => {
                         try w.print("        if (self.{s}.len > 0) try writer.set{s}(self.{s});\n", .{ info.name, name_camel, info.name });
                     },
                     else => @compileError("unsupported array child kind in struct marshalTo"),
@@ -1150,18 +1100,16 @@ fn emitScalarGetter(w: anytype, offset: u16, size: u16, comptime read_fn: []cons
     try w.print("        return zbuf.{s}(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{ read_fn, offset });
 }
 
-fn emitBitsetGetter(w: anytype, offset: u16) !void {
-    try w.print("        const slot_end = @as(u32, self.base) + {d};\n", .{offset + 8});
+fn emitBitsetHasBit(w: anytype, offset: u16, comptime kind: schema.Kind) !void {
+    const slot_bytes: u16 = switch (kind) { .u16 => 2, .u32 => 4, .u64 => 8, else => unreachable };
+    const width = boolBitWidthForKind(kind);
+    const read_fn = scalarReadFnForKind(kind);
+    try w.print("        const slot_end = @as(u32, self.base) + {d};\n", .{offset + slot_bytes});
     try w.writeAll("        const header_end = @as(u32, self.base) + self.size_bytes;\n");
-    try w.writeAll("        if (slot_end > header_end) return 0;\n");
-    try w.print("        return zbuf.readU64(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{offset});
-}
-
-fn emitBitsetHasBit(w: anytype, offset: u16) !void {
-    try w.writeAll("        if (bit_index >= 64) return false;\n");
-    try w.writeAll("        const bit = @as(u6, @intCast(bit_index % 64));\n");
-    try w.print("        const word = zbuf.readU64(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{offset});
-    try w.writeAll("        return ((word >> bit) & 1) == 1;\n");
+    try w.writeAll("        if (slot_end > header_end) return false;\n");
+    try w.print("        if (bit_index >= {d}) return false;\n", .{width});
+    try w.print("        const word = zbuf.{s}(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{ read_fn, offset });
+    try w.writeAll("        return ((word >> @intCast(bit_index)) & 1) == 1;\n");
 }
 
 fn emitBytesGetter(w: anytype, offset: u16) !void {
@@ -1174,64 +1122,65 @@ fn emitBytesGetter(w: anytype, offset: u16) !void {
     try w.writeAll("        return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};\n");
 }
 
-fn emitBoolGetter(w: anytype, bits_offset: u16, bit_index: u16) !void {
-    const word_index: u16 = bit_index / 64;
-    const bit_in_word: u16 = bit_index % 64;
-    try w.print("        const slot_end = @as(u32, self.base) + {d};\n", .{bits_offset + (word_index + 1) * 8});
+fn emitBoolGetter(w: anytype, bits_offset: u16, bit_index: u16, comptime kind: schema.Kind) !void {
+    const slot_bytes: u16 = switch (kind) { .u16 => 2, .u32 => 4, .u64 => 8, else => unreachable };
+    const read_fn = scalarReadFnForKind(kind);
+    try w.print("        const slot_end = @as(u32, self.base) + {d};\n", .{bits_offset + slot_bytes});
     try w.writeAll("        const header_end = @as(u32, self.base) + self.size_bytes;\n");
     try w.writeAll("        if (slot_end > header_end) return false;\n");
-    try w.print("        const word = zbuf.readU64(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{bits_offset + word_index * 8});
-    try w.print("        const bit = @as(u6, @intCast({d}));\n", .{bit_in_word});
-    try w.writeAll("        return ((word >> bit) & 1) == 1;\n");
+    try w.print("        const word = zbuf.{s}(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{ read_fn, bits_offset });
+    try w.print("        return ((word >> {d}) & 1) == 1;\n", .{bit_index});
 }
 
-fn emitBitsetSetter(w: anytype, offset: u16) !void {
+fn emitBitsetSetBit(w: anytype, offset: u16, comptime kind: schema.Kind) !void {
+    const width = boolBitWidthForKind(kind);
+    const read_fn = scalarReadFnForKind(kind);
+    const patch_fn = scalarPatchFnForKind(kind);
+    const ty_name = scalarTypeNameForKind(kind);
     try w.writeAll("        const out = self.bufMut();\n");
-    try w.print("        try zbuf.patchU64(out.items, self.base + {d}, v);\n", .{offset});
-}
-
-fn emitBitsetSetBit(w: anytype, offset: u16) !void {
-    try w.writeAll("        const out = self.bufMut();\n");
-    try w.writeAll("        if (bit_index >= 64) return zbuf.Error.OutOfBounds;\n");
-    try w.writeAll("        const bit = @as(u6, @intCast(bit_index % 64));\n");
+    try w.print("        if (bit_index >= {d}) return zbuf.Error.OutOfBounds;\n", .{width});
     try w.print("        const word_off = self.base + {d};\n", .{offset});
-    try w.writeAll("        var word = try zbuf.readU64(out.items, @as(usize, word_off));\n");
-    try w.writeAll("        word |= (@as(u64, 1) << bit);\n");
-    try w.writeAll("        try zbuf.patchU64(out.items, word_off, word);\n");
+    try w.print("        var word = try zbuf.{s}(out.items, @as(usize, word_off));\n", .{read_fn});
+    try w.print("        word |= (@as({s}, 1) << @intCast(bit_index));\n", .{ty_name});
+    try w.print("        try zbuf.{s}(out.items, word_off, word);\n", .{patch_fn});
 }
 
-fn emitBitsetClearBit(w: anytype, offset: u16) !void {
+fn emitBitsetClearBit(w: anytype, offset: u16, comptime kind: schema.Kind) !void {
+    const width = boolBitWidthForKind(kind);
+    const read_fn = scalarReadFnForKind(kind);
+    const patch_fn = scalarPatchFnForKind(kind);
+    const ty_name = scalarTypeNameForKind(kind);
     try w.writeAll("        const out = self.bufMut();\n");
-    try w.writeAll("        if (bit_index >= 64) return zbuf.Error.OutOfBounds;\n");
-    try w.writeAll("        const bit = @as(u6, @intCast(bit_index % 64));\n");
+    try w.print("        if (bit_index >= {d}) return zbuf.Error.OutOfBounds;\n", .{width});
     try w.print("        const word_off = self.base + {d};\n", .{offset});
-    try w.writeAll("        var word = try zbuf.readU64(out.items, @as(usize, word_off));\n");
-    try w.writeAll("        word &= ~(@as(u64, 1) << bit);\n");
-    try w.writeAll("        try zbuf.patchU64(out.items, word_off, word);\n");
+    try w.print("        var word = try zbuf.{s}(out.items, @as(usize, word_off));\n", .{read_fn});
+    try w.print("        word &= ~(@as({s}, 1) << @intCast(bit_index));\n", .{ty_name});
+    try w.print("        try zbuf.{s}(out.items, word_off, word);\n", .{patch_fn});
 }
 
-fn emitBitsetHasBitBuilder(w: anytype, offset: u16) !void {
+fn emitBitsetHasBitBuilder(w: anytype, offset: u16, comptime kind: schema.Kind) !void {
+    const width = boolBitWidthForKind(kind);
+    const read_fn = scalarReadFnForKind(kind);
     try w.writeAll("        const out = self.bufMut();\n");
-    try w.writeAll("        if (bit_index >= 64) return zbuf.Error.OutOfBounds;\n");
-    try w.writeAll("        const bit = @as(u6, @intCast(bit_index % 64));\n");
+    try w.print("        if (bit_index >= {d}) return zbuf.Error.OutOfBounds;\n", .{width});
     try w.print("        const word_off = self.base + {d};\n", .{offset});
-    try w.writeAll("        const word = try zbuf.readU64(out.items, @as(usize, word_off));\n");
-    try w.writeAll("        return ((word >> bit) & 1) == 1;\n");
+    try w.print("        const word = try zbuf.{s}(out.items, @as(usize, word_off));\n", .{read_fn});
+    try w.writeAll("        return ((word >> @intCast(bit_index)) & 1) == 1;\n");
 }
 
-fn emitBoolSetter(w: anytype, bits_offset: u16, bit_index: u16) !void {
-    const word_index: u16 = bit_index / 64;
-    const bit_in_word: u16 = bit_index % 64;
+fn emitBoolSetter(w: anytype, bits_offset: u16, bit_index: u16, comptime kind: schema.Kind) !void {
+    const read_fn = scalarReadFnForKind(kind);
+    const patch_fn = scalarPatchFnForKind(kind);
+    const ty_name = scalarTypeNameForKind(kind);
     try w.writeAll("        const out = self.bufMut();\n");
-    try w.print("        const word_off = self.base + {d};\n", .{bits_offset + word_index * 8});
-    try w.writeAll("        var word = try zbuf.readU64(out.items, @as(usize, word_off));\n");
-    try w.print("        const bit = @as(u6, @intCast({d}));\n", .{bit_in_word});
+    try w.print("        const word_off = self.base + {d};\n", .{bits_offset});
+    try w.print("        var word = try zbuf.{s}(out.items, @as(usize, word_off));\n", .{read_fn});
     try w.writeAll("        if (v) {\n");
-    try w.writeAll("            word |= (@as(u64, 1) << bit);\n");
+    try w.print("            word |= (@as({s}, 1) << {d});\n", .{ ty_name, bit_index });
     try w.writeAll("        } else {\n");
-    try w.writeAll("            word &= ~(@as(u64, 1) << bit);\n");
+    try w.print("            word &= ~(@as({s}, 1) << {d});\n", .{ ty_name, bit_index });
     try w.writeAll("        }\n");
-    try w.writeAll("        try zbuf.patchU64(out.items, word_off, word);\n");
+    try w.print("        try zbuf.{s}(out.items, word_off, word);\n", .{patch_fn});
 }
 
 fn emitEnumGetter(w: anytype, offset: u16) !void {
@@ -1245,37 +1194,6 @@ fn emitEnumGetter(w: anytype, offset: u16) !void {
 fn emitEnumSetter(w: anytype, offset: u16) !void {
     try w.writeAll("        const out = self.bufMut();\n");
     try w.print("        try zbuf.patchU8(out.items, self.base + {d}, @intFromEnum(v));\n", .{offset});
-}
-
-fn emitArrayLenGetter(w: anytype, offset: u16, elem_size: u16) !void {
-    try w.print("        const slot_end = @as(u32, self.base) + {d};\n", .{offset + 8});
-    try w.writeAll("        const header_end = @as(u32, self.base) + self.size_bytes;\n");
-    try w.writeAll("        if (slot_end > header_end) return 0;\n");
-    try w.print("        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{offset});
-    try w.print("        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{offset + 4});
-    try w.writeAll("        if (elem_count == 0) return 0;\n");
-    try w.print("        const end = @as(usize, index_off) + @as(usize, elem_count) * {d};\n", .{elem_size});
-    try w.writeAll("        if (end > self.buf.len) return 0;\n");
-    try w.writeAll("        return elem_count;\n");
-}
-
-fn emitArrayAtGetterScalar(
-    w: anytype,
-    offset: u16,
-    elem_size: u16,
-    read_fn: []const u8,
-) !void {
-    try w.print("        const slot_end = @as(u32, self.base) + {d};\n", .{offset + 8});
-    try w.writeAll("        const header_end = @as(u32, self.base) + self.size_bytes;\n");
-    try w.writeAll("        if (slot_end > header_end) return zbuf.Error.OutOfBounds;\n");
-    try w.print("        const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + {d}));\n", .{offset});
-    try w.print("        const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + {d}));\n", .{offset + 4});
-    try w.writeAll("        if (i >= elem_count) return zbuf.Error.OutOfBounds;\n");
-    try w.writeAll("        if (elem_count == 0) return zbuf.Error.OutOfBounds;\n");
-    try w.print("        const index_end = @as(usize, index_off) + @as(usize, elem_count) * {d};\n", .{elem_size});
-    try w.writeAll("        if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;\n");
-    try w.print("        const entry_off = @as(usize, index_off) + @as(usize, i) * {d};\n", .{elem_size});
-    try w.print("        return try zbuf.{s}(self.buf, entry_off);\n", .{read_fn});
 }
 
 // emitScalarArraySliceGetter emits *Slice() []const u8 — validates the backing byte region

@@ -50,7 +50,7 @@ pub const CellStruct = struct {
     cell_hot: bool = false,
     tag: u32 = 0,
     data: []const u8 = &.{},
-    cell_flags: u64 = 0,
+    cell_flags: u16 = 0,
 
     fn fromReaderValue(alloc: std.mem.Allocator, r: CellReader) Error!CellStruct {
         var s = CellStruct{
@@ -103,7 +103,7 @@ pub const CellStruct = struct {
         try writer.setCellHot(self.cell_hot);
         try writer.setTag(self.tag);
         try writer.setData(self.data);
-        try writer.cellFlagsSet(self.cell_flags);
+        try writer.setCellFlags(self.cell_flags);
         const result = try writer.finish();
         return result.offset;
     }
@@ -116,7 +116,7 @@ pub const CellReader = struct {
     size_bytes: u16,
 
     pub const TABLE_ID: u16 = 1;
-    pub const SIZE_BYTES: u16 = 22;
+    pub const SIZE_BYTES: u16 = 16;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -133,12 +133,11 @@ pub const CellReader = struct {
     }
 
     pub fn cellHot(self: Self) bool {
-        const slot_end = @as(u32, self.base) + 22;
+        const slot_end = @as(u32, self.base) + 16;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return false;
-        const word = zbuf.readU64(self.buf, @as(usize, self.base + 14)) catch 0;
-        const bit = @as(u6, @intCast(0));
-        return ((word >> bit) & 1) == 1;
+        const word = zbuf.readU16(self.buf, @as(usize, self.base + 14)) catch 0;
+        return ((word >> 0) & 1) == 1;
     }
 
     pub fn tag(self: Self) u32 {
@@ -158,18 +157,20 @@ pub const CellReader = struct {
         return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
     }
 
-    pub fn cellFlags(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 22;
+    pub fn cellFlags(self: Self) u16 {
+        const slot_end = @as(u32, self.base) + 16;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 14)) catch 0;
+        return zbuf.readU16(self.buf, @as(usize, self.base + 14)) catch 0;
     }
 
     pub fn cellFlagsHasBit(self: Self, bit_index: u32) bool {
-        if (bit_index >= 64) return false;
-        const bit = @as(u6, @intCast(bit_index % 64));
-        const word = zbuf.readU64(self.buf, @as(usize, self.base + 14)) catch 0;
-        return ((word >> bit) & 1) == 1;
+        const slot_end = @as(u32, self.base) + 16;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return false;
+        if (bit_index >= 16) return false;
+        const word = zbuf.readU16(self.buf, @as(usize, self.base + 14)) catch 0;
+        return ((word >> @intCast(bit_index)) & 1) == 1;
     }
 
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
@@ -177,7 +178,7 @@ pub const CellReader = struct {
         try writer.setCellHot(self.cellHot());
         try writer.setTag(self.tag());
         try writer.setData(self.data());
-        try writer.cellFlagsSet(self.cellFlags());
+        try writer.setCellFlags(self.cellFlags());
         const result = try writer.finish();
         return result.offset;
     }
@@ -231,7 +232,7 @@ pub const CellWriter = struct {
     base: u32,
 
     pub const TABLE_ID: u16 = 1;
-    pub const SIZE_BYTES: u16 = 22;
+    pub const SIZE_BYTES: u16 = 16;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -255,14 +256,13 @@ pub const CellWriter = struct {
     pub fn setCellHot(self: *Self, v: bool) Error!void {
         const out = self.bufMut();
         const word_off = self.base + 14;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        const bit = @as(u6, @intCast(0));
+        var word = try zbuf.readU16(out.items, @as(usize, word_off));
         if (v) {
-            word |= (@as(u64, 1) << bit);
+            word |= (@as(u16, 1) << 0);
         } else {
-            word &= ~(@as(u64, 1) << bit);
+            word &= ~(@as(u16, 1) << 0);
         }
-        try zbuf.patchU64(out.items, word_off, word);
+        try zbuf.patchU16(out.items, word_off, word);
     }
 
     pub fn setTag(self: *Self, v: u32) Error!void {
@@ -283,38 +283,35 @@ pub const CellWriter = struct {
         try zbuf.patchU32(out.items, self.base + 10, @as(u32, @intCast(data.len)));
     }
 
-    pub fn cellFlagsSet(self: *Self, v: u64) Error!void {
+    pub fn setCellFlags(self: *Self, v: u16) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 14, v);
+        try zbuf.patchU16(out.items, self.base + 14, v);
     }
 
     pub fn cellFlagsSetBit(self: *Self, bit_index: u32) Error!void {
         const out = self.bufMut();
-        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
-        const bit = @as(u6, @intCast(bit_index % 64));
+        if (bit_index >= 16) return zbuf.Error.OutOfBounds;
         const word_off = self.base + 14;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        word |= (@as(u64, 1) << bit);
-        try zbuf.patchU64(out.items, word_off, word);
+        var word = try zbuf.readU16(out.items, @as(usize, word_off));
+        word |= (@as(u16, 1) << @intCast(bit_index));
+        try zbuf.patchU16(out.items, word_off, word);
     }
 
     pub fn cellFlagsClearBit(self: *Self, bit_index: u32) Error!void {
         const out = self.bufMut();
-        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
-        const bit = @as(u6, @intCast(bit_index % 64));
+        if (bit_index >= 16) return zbuf.Error.OutOfBounds;
         const word_off = self.base + 14;
-        var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        word &= ~(@as(u64, 1) << bit);
-        try zbuf.patchU64(out.items, word_off, word);
+        var word = try zbuf.readU16(out.items, @as(usize, word_off));
+        word &= ~(@as(u16, 1) << @intCast(bit_index));
+        try zbuf.patchU16(out.items, word_off, word);
     }
 
     pub fn cellFlagsHasBit(self: *Self, bit_index: u32) Error!bool {
         const out = self.bufMut();
-        if (bit_index >= 64) return zbuf.Error.OutOfBounds;
-        const bit = @as(u6, @intCast(bit_index % 64));
+        if (bit_index >= 16) return zbuf.Error.OutOfBounds;
         const word_off = self.base + 14;
-        const word = try zbuf.readU64(out.items, @as(usize, word_off));
-        return ((word >> bit) & 1) == 1;
+        const word = try zbuf.readU16(out.items, @as(usize, word_off));
+        return ((word >> @intCast(bit_index)) & 1) == 1;
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -325,7 +322,7 @@ pub const CellWriter = struct {
         if (@hasField(Values, "cell_hot")) try self.setCellHot(@field(values, "cell_hot"));
         if (@hasField(Values, "tag")) try self.setTag(@field(values, "tag"));
         if (@hasField(Values, "data")) try self.setData(@field(values, "data"));
-        if (@hasField(Values, "cell_flags")) try self.cellFlagsSet(@field(values, "cell_flags"));
+        if (@hasField(Values, "cell_flags")) try self.setCellFlags(@field(values, "cell_flags"));
     }
 
     pub fn finish(self: *Self) Error!CellBuffer {
@@ -477,7 +474,7 @@ pub const RowStruct = struct {
             const child_off = try child.marshalTo(alloc, out);
             try writer.setRowCell(child_off);
         }
-        try writer.flagsSet(self.flags);
+        try writer.setFlags(self.flags);
         try writer.setLifecycle(self.lifecycle);
         if (self.u32_values.len > 0) try writer.setU32Values(self.u32_values);
         if (self.u64_values.len > 0) try writer.setU64Values(self.u64_values);
@@ -514,8 +511,7 @@ pub const RowReader = struct {
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return false;
         const word = zbuf.readU64(self.buf, @as(usize, self.base + 30)) catch 0;
-        const bit = @as(u6, @intCast(0));
-        return ((word >> bit) & 1) == 1;
+        return ((word >> 0) & 1) == 1;
     }
 
     pub fn isDeleted(self: Self) bool {
@@ -523,8 +519,7 @@ pub const RowReader = struct {
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return false;
         const word = zbuf.readU64(self.buf, @as(usize, self.base + 30)) catch 0;
-        const bit = @as(u6, @intCast(1));
-        return ((word >> bit) & 1) == 1;
+        return ((word >> 1) & 1) == 1;
     }
 
     pub fn name(self: Self) []const u8 {
@@ -585,10 +580,12 @@ pub const RowReader = struct {
     }
 
     pub fn flagsHasBit(self: Self, bit_index: u32) bool {
+        const slot_end = @as(u32, self.base) + 38;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return false;
         if (bit_index >= 64) return false;
-        const bit = @as(u6, @intCast(bit_index % 64));
         const word = zbuf.readU64(self.buf, @as(usize, self.base + 30)) catch 0;
-        return ((word >> bit) & 1) == 1;
+        return ((word >> @intCast(bit_index)) & 1) == 1;
     }
 
     pub fn lifecycle(self: Self) LifecycleEnum {
@@ -688,7 +685,7 @@ pub const RowReader = struct {
             const child_off = try child.cloneInto(alloc, out);
             try writer.setRowCell(child_off);
         }
-        try writer.flagsSet(self.flags());
+        try writer.setFlags(self.flags());
         try writer.setLifecycle(self.lifecycle());
         const values_u32Values = try self.u32ValuesToSliceAlloc(alloc);
         defer alloc.free(values_u32Values);
@@ -812,11 +809,10 @@ pub const RowWriter = struct {
         const out = self.bufMut();
         const word_off = self.base + 30;
         var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        const bit = @as(u6, @intCast(0));
         if (v) {
-            word |= (@as(u64, 1) << bit);
+            word |= (@as(u64, 1) << 0);
         } else {
-            word &= ~(@as(u64, 1) << bit);
+            word &= ~(@as(u64, 1) << 0);
         }
         try zbuf.patchU64(out.items, word_off, word);
     }
@@ -825,11 +821,10 @@ pub const RowWriter = struct {
         const out = self.bufMut();
         const word_off = self.base + 30;
         var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        const bit = @as(u6, @intCast(1));
         if (v) {
-            word |= (@as(u64, 1) << bit);
+            word |= (@as(u64, 1) << 1);
         } else {
-            word &= ~(@as(u64, 1) << bit);
+            word &= ~(@as(u64, 1) << 1);
         }
         try zbuf.patchU64(out.items, word_off, word);
     }
@@ -870,7 +865,7 @@ pub const RowWriter = struct {
         try zbuf.patchU32(out.items, self.base + 26, child_off);
     }
 
-    pub fn flagsSet(self: *Self, v: u64) Error!void {
+    pub fn setFlags(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
         try zbuf.patchU64(out.items, self.base + 30, v);
     }
@@ -878,30 +873,27 @@ pub const RowWriter = struct {
     pub fn flagsSetBit(self: *Self, bit_index: u32) Error!void {
         const out = self.bufMut();
         if (bit_index >= 64) return zbuf.Error.OutOfBounds;
-        const bit = @as(u6, @intCast(bit_index % 64));
         const word_off = self.base + 30;
         var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        word |= (@as(u64, 1) << bit);
+        word |= (@as(u64, 1) << @intCast(bit_index));
         try zbuf.patchU64(out.items, word_off, word);
     }
 
     pub fn flagsClearBit(self: *Self, bit_index: u32) Error!void {
         const out = self.bufMut();
         if (bit_index >= 64) return zbuf.Error.OutOfBounds;
-        const bit = @as(u6, @intCast(bit_index % 64));
         const word_off = self.base + 30;
         var word = try zbuf.readU64(out.items, @as(usize, word_off));
-        word &= ~(@as(u64, 1) << bit);
+        word &= ~(@as(u64, 1) << @intCast(bit_index));
         try zbuf.patchU64(out.items, word_off, word);
     }
 
     pub fn flagsHasBit(self: *Self, bit_index: u32) Error!bool {
         const out = self.bufMut();
         if (bit_index >= 64) return zbuf.Error.OutOfBounds;
-        const bit = @as(u6, @intCast(bit_index % 64));
         const word_off = self.base + 30;
         const word = try zbuf.readU64(out.items, @as(usize, word_off));
-        return ((word >> bit) & 1) == 1;
+        return ((word >> @intCast(bit_index)) & 1) == 1;
     }
 
     pub fn setLifecycle(self: *Self, v: LifecycleEnum) Error!void {
@@ -946,7 +938,7 @@ pub const RowWriter = struct {
         if (@hasField(Values, "value")) try self.setValue(@field(values, "value"));
         if (@hasField(Values, "cells")) try self.setCells(@field(values, "cells"));
         if (@hasField(Values, "row_cell")) try self.setRowCell(@field(values, "row_cell"));
-        if (@hasField(Values, "flags")) try self.flagsSet(@field(values, "flags"));
+        if (@hasField(Values, "flags")) try self.setFlags(@field(values, "flags"));
         if (@hasField(Values, "lifecycle")) try self.setLifecycle(@field(values, "lifecycle"));
         if (@hasField(Values, "u32_values")) try self.setU32Values(@field(values, "u32_values"));
         if (@hasField(Values, "u64_values")) try self.setU64Values(@field(values, "u64_values"));

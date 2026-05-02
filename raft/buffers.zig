@@ -81,7 +81,7 @@ pub const RequestVote = schema.Table(.{
     .{ .id = 3, .name = "last_log_index", .ty = schema.U64 },
     .{ .id = 4, .name = "last_log_term", .ty = schema.U64 },
 
-    .{ .id = 5, .name = "status", .ty = schema.B64 },
+    .{ .id = 5, .name = "status", .ty = schema.U16 },
     .{ .name = "is_prevote", .ty = schema.Bool(.{ .field_id = 5, .bit = 0 }) },
 });
 
@@ -89,7 +89,7 @@ pub const RequestVoteReply = schema.Table(.{
     .{ .id = 1, .name = "term", .ty = schema.U64 },
     .{ .id = 2, .name = "from", .ty = schema.U64 },
 
-    .{ .id = 3, .name = "status", .ty = schema.B64 },
+    .{ .id = 3, .name = "status", .ty = schema.U16 },
     .{ .name = "is_prevote", .ty = schema.Bool(.{ .field_id = 3, .bit = 0 }) },
     .{ .name = "vote_granted", .ty = schema.Bool(.{ .field_id = 3, .bit = 1 }) },
 });
@@ -105,7 +105,7 @@ pub const AppendEntries = schema.Table(.{
 
 pub const AppendEntriesReply = schema.Table(.{
     .{ .id = 1, .name = "term", .ty = schema.U64 },
-    .{ .id = 2, .name = "status", .ty = schema.B64 },
+    .{ .id = 2, .name = "status", .ty = schema.U16 },
     .{ .name = "success", .ty = schema.Bool(.{ .field_id = 2, .bit = 0 }) },
     .{ .id = 3, .name = "from", .ty = schema.U64 },
     .{ .id = 4, .name = "last_index", .ty = schema.U64 },
@@ -125,7 +125,7 @@ pub const JoinRequest = schema.Table(.{
 });
 
 pub const JoinResponse = schema.Table(.{
-    .{ .id = 1, .name = "status", .ty = schema.B64 },
+    .{ .id = 1, .name = "status", .ty = schema.U16 },
     .{ .name = "accepted", .ty = schema.Bool(.{ .field_id = 1, .bit = 0 }) },
     .{ .id = 2, .name = "leader_id", .ty = schema.U64 },
     .{ .id = 3, .name = "reason_code", .ty = schema.U32 },
