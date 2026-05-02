@@ -1245,18 +1245,10 @@ pub const Node = struct {
 
                 const entry_off =
                     try entry_reader.cloneInto(self.allocator, &entry_bytes);
-                try zen.addTail(
-                    self.allocator,
-                    &entry_bytes,
-                    zen.LogEntryReader,
-                    entry_off,
-                );
+                try zen.addTail(self.allocator, &entry_bytes, zen.LogEntryReader, entry_off);
                 const owned = try entry_bytes.toOwnedSlice(self.allocator);
-                const entry = try zen.LogEntryBuffer.initWithTail(
-                    self.allocator,
-                    owned,
-                    .owned,
-                );
+
+                const entry = try zen.LogEntryBuffer.initWithTail(self.allocator, owned, .owned);
                 try entries_to_append.append(self.allocator, entry);
             }
             if (entries_to_append.items.len > 0) {

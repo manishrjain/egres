@@ -351,11 +351,6 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
                         try w.writeAll("        const child_off = zbuf.readU32(s, off) catch unreachable;\n");
                         try w.print("        return {s}Reader.init(self.buf, child_off);\n", .{child_name});
                         try w.writeAll("    }\n\n");
-                        // Note: there is no *AtClone helper. To clone a table out of a
-                        // parent buffer, callers do `cloneInto` into a fresh ArrayList
-                        // and then explicitly `addTail` if they want a tail-wrapped
-                        // message. Keeping tail addition user-triggered avoids hiding
-                        // wire-format details inside accessors.
                     },
                     .u8, .u16, .u32, .u64 => {
                         // Scalar arrays: validate backing region once via *Slice(), then delegate.
