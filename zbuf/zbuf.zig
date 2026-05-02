@@ -68,19 +68,19 @@ pub fn hash(payload: []const u8) u64 {
 /// header) and verify it with one hash pass — no magic number / separate
 /// length file needed.
 ///
-/// All four items below (prefix_size, write, append, read) operate on the
+/// All four items below (hdr_size, write, append, read) operate on the
 /// same wire format; they're co-located so a future format tweak only
 /// needs to touch one block.
 pub const Frame = struct {
     pub const hdr_size: u16 = 12;
 
     /// In-place writer: place the [hash | len | payload] frame at the
-    /// start of `dest`. `dest` must be at least `prefix_size + payload.len`
+    /// start of `dest`. `dest` must be at least `hdr_size + payload.len`
     /// bytes long. Bytes after the payload are left untouched, so callers
     /// using a fixed-size region should @memset the region first.
     ///
     /// Zero-copy fast path: if `payload` already aliases the destination
-    /// slot (e.g. the caller wrapped `dest[prefix_size..]` as an ArrayList
+    /// slot (e.g. the caller wrapped `dest[hdr_size..]` as an ArrayList
     /// build buffer and wrote the payload into it directly), the copy is
     /// skipped. One API serves both "build elsewhere, copy in" and "build
     /// in place, just stamp the prefix" callers.

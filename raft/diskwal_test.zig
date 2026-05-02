@@ -6,7 +6,6 @@ const zbuf = @import("zbuf").zbuf;
 const zen = raft.buffers;
 const u = raft.utils;
 
-
 fn makeTempWalDir(alloc: std.mem.Allocator) ![]u8 {
     var path_buf: [160]u8 = undefined;
     const ts = std.time.nanoTimestamp();
@@ -792,17 +791,17 @@ test "diskwal CRC corruption truncates at corrupt entry" {
         defer file.close();
 
         // Read past the first two entries to find the 3rd entry's payload.
-        const prefix_size: usize = zbuf.Frame.hdr_size;
+        const hdr_size: usize = zbuf.Frame.hdr_size;
         var offset: u64 = diskwal.log_file_offset;
         var hdr_buf: [zbuf.Frame.hdr_size]u8 = undefined;
         for (0..2) |_| {
             _ = try file.preadAll(&hdr_buf, offset);
             // u32 length lives at byte 8 of the prefix (after the u64 hash).
             const payload_len = std.mem.readInt(u32, hdr_buf[8..12], .little);
-            offset += prefix_size + payload_len;
+            offset += hdr_size + payload_len;
         }
         // Now offset points at the 3rd entry. Corrupt a byte in its payload.
-        const corrupt_offset = offset + prefix_size + 1; // +1 to hit inside the payload
+        const corrupt_offset = offset + hdr_size + 1; // +1 to hit inside the payload
         var byte: [1]u8 = undefined;
         _ = try file.preadAll(&byte, corrupt_offset);
         byte[0] ^= 0xFF; // flip all bits
