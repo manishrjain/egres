@@ -67,17 +67,15 @@ fn writeInt(comptime T: type, buf: []u8, value: T, endian: std.builtin.Endian) v
 // mmap generally handles process crash safety well enough for default mode.
 // If hard sync is enabled, call msync/fdatasync after writes.
 
-// 1 MiB header / 37 bytes-per-slot ≈ 28,339 max slots; round down to 25k
-// to leave margin for the file header and any future schema growth
-// (zbuf's size_bytes lets us add fields without breaking older WAL files).
+// 1 MiB header / 41 bytes-per-slot (37-byte WalSlot + 4-byte offset entry
+// in the WalHeader's slots array) ≈ 25,500 max slots; round down to 25k
+// to leave margin for the WalHeader struct, the frame prefix, and any
+// future schema growth (zbuf's size_bytes lets us add fields without
+// breaking older WAL files).
 pub const max_num_entries: usize = 25_000;
 pub const log_file_offset: usize = 1 << 20;
 pub const log_file_size: usize = 256 << 20;
-pub const entry_size: usize = zen.WalSlotReader.SIZE_BYTES;
 pub const log_suffix = ".wal";
-pub const log_header_magic: u32 = 0x57414C32; // "WAL2"
-pub const log_header_version: u32 = 1;
-pub const log_header_size: usize = 24;
 pub const first_data_slot: usize = 1;
 
 pub const Error = error{
@@ -118,24 +116,14 @@ pub const logFile = struct {
         return std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_path, name });
     }
 
-    /// Open a rotated <fid>.wal file. Reads header to populate in-memory slots.
-    pub fn openRotated(
-        vfs_inst: *const vfs_mod.VFS,
+    /// Inverse of writeHeader. Reads the 1 MiB header region from `handle`,
+    /// peels back the [crc32c | len] frame, parses the WalHeader zbuf
+    /// message, and returns a slots list (slots[0] = base, slots[1..] =
+    /// data entries). Caller owns the returned list.
+    pub fn readHeader(
         alloc: std.mem.Allocator,
-        dir_path: []const u8,
-        fid: u64,
-    ) !logFile {
-        var name_buf: [32]u8 = undefined;
-        const name = try fname(fid, &name_buf);
-        const path = try fullPath(alloc, dir_path, name);
-        defer alloc.free(path);
-
-        var handle = try vfs_inst.openFile(alloc, path, .{
-            .mode = .default,
-            .flags = .{ .writable = true, .dsync = true },
-        });
-        errdefer handle.close();
-
+        handle: vfs_mod.FileHandle,
+    ) !std.ArrayList(entry) {
         // Read the entire 1 MiB header region in one shot.
         const hdr_result = try handle.readAligned(alloc, 0, log_file_offset, .p0);
         defer hdr_result.free();
@@ -168,6 +156,30 @@ pub const logFile = struct {
             const srv = try zen.WalSlotStruct.fromReaderValue(alloc, sr);
             try slots_list.append(alloc, srv);
         }
+
+        return slots_list;
+    }
+
+    /// Open a rotated <fid>.wal file. Reads header to populate in-memory slots.
+    pub fn openRotated(
+        vfs_inst: *const vfs_mod.VFS,
+        alloc: std.mem.Allocator,
+        dir_path: []const u8,
+        fid: u64,
+    ) !logFile {
+        var name_buf: [32]u8 = undefined;
+        const name = try fname(fid, &name_buf);
+        const path = try fullPath(alloc, dir_path, name);
+        defer alloc.free(path);
+
+        var handle = try vfs_inst.openFile(alloc, path, .{
+            .mode = .default,
+            .flags = .{ .writable = true, .dsync = true },
+        });
+        errdefer handle.close();
+
+        var slots_list = try readHeader(alloc, handle);
+        errdefer slots_list.deinit(alloc);
 
         var wo: u64 = log_file_offset;
         if (slots_list.items.len > 1) {
@@ -230,31 +242,35 @@ pub const logFile = struct {
         defer result.free();
         const data = result.data;
 
-        // Scan CRC-framed records in the buffer.
+        // Scan zbuf-framed records in the buffer. Each call to readFrame
+        // verifies CRC and slices out the payload in one shot.
         var pos: usize = 0;
-        while (pos + record_header_size <= data.len) {
-            const stored_crc = readInt(u32, data[pos .. pos + 4], .little);
-            const payload_len = readInt(u32, data[pos + 4 .. pos + 8], .little);
-            if (payload_len == 0) break;
-            if (pos + record_header_size + payload_len > data.len) break;
-
-            const payload = data[pos + record_header_size .. pos + record_header_size + payload_len];
-            if (computeCrc(payload) != stored_crc) {
-                // CRC mismatch — truncate file here.
-                handle.truncate(log_file_offset + pos) catch {};
-                break;
-            }
+        while (pos < data.len) {
+            const payload = zbuf.readFrame(data[pos..]) catch |err| switch (err) {
+                // Truncated tail (final frame extends past file or fewer
+                // than 8 prefix bytes left) — leave the file alone, just stop.
+                zbuf.Error.OutOfBounds => break,
+                // CRC mismatch — drop this frame and everything after it.
+                zbuf.Error.Invalid => {
+                    handle.truncate(log_file_offset + pos) catch {};
+                    break;
+                },
+            };
+            // Empty payload = zero-filled prefix in the pre-zeroed region,
+            // i.e. end of real data. Real entries always carry a non-empty
+            // LogEntry zbuf message.
+            if (payload.len == 0) break;
 
             const reader = zen.LogEntryReader.parseRoot(payload) catch break;
             try slots_list.append(alloc, .{
                 .term = reader.term(),
                 .index = reader.index(),
                 .data_offset = @intCast(log_file_offset + pos),
-                .data_len = payload_len,
+                .data_len = @intCast(payload.len),
                 .entry_type = reader.entryType(),
             });
 
-            pos += record_header_size + payload_len;
+            pos += zbuf.frame_prefix_size + payload.len;
         }
 
         return .{
@@ -279,32 +295,35 @@ pub const logFile = struct {
         const path = try fullPath(alloc, dir_path, try fname(fid, &name_buf));
         defer alloc.free(path);
 
-        var handle = try vfs_inst.createFile(path, .{
+        const handle = try vfs_inst.createFile(path, .{
             .mode = .default,
             .flags = .{ .writable = true, .truncate = true, .dsync = true },
         });
-        errdefer handle.close();
 
-        // Write header with magic, version, and base entry. Slot region stays zeroed.
-        const hdr = try alloc.alloc(u8, log_file_offset);
-        defer alloc.free(hdr);
-        @memset(hdr, 0);
-        writeInt(u32, hdr[0..4], log_header_magic, .little);
-        writeInt(u32, hdr[4..8], log_header_version, .little);
-        writeInt(u64, hdr[8..16], base.index, .little);
-        writeInt(u64, hdr[16..24], base.term, .little);
-        try handle.write(hdr, 0, .p0);
-
-        var slots_list = std.ArrayList(entry).empty;
-        try slots_list.append(alloc, base);
-        return .{
+        // Build the logFile up front so a single deinit covers both the
+        // handle and the (initially empty) slots list. Struct construction
+        // is infallible, so no error path runs between this line and the
+        // errdefer below — there's no window where ownership is in limbo.
+        var lf = logFile{
             .fid = fid,
             .handle = handle,
             .allocator = alloc,
-            .slots = slots_list,
+            .slots = std.ArrayList(entry).empty,
             .write_offset = log_file_offset,
             .is_current = true,
         };
+        errdefer lf.deinit();
+
+        try lf.slots.append(alloc, base);
+
+        // Initialize the header region with a valid empty WalHeader (just
+        // base_slot, no data slots). If the process crashes before the
+        // first rotation, this file is reopened via openCurrent (which
+        // scans the data region and ignores the header). If it later ends
+        // up read by openRotated, the empty WalHeader still parses cleanly.
+        try lf.writeHeader();
+
+        return lf;
     }
 
     pub fn deinit(self: *logFile) void {
@@ -388,27 +407,17 @@ pub const logFile = struct {
         entry_bytes: []const u8,
         reader: zen.LogEntryReader,
     ) !void {
-        const payload_len: u32 = @intCast(entry_bytes.len);
-        const crc = computeCrc(entry_bytes);
-
-        // Append [crc32c][payload_len][payload_bytes] to buffer.
-        const needed = record_header_size + entry_bytes.len;
-        try buf.ensureUnusedCapacity(self.allocator, needed);
-        var hdr_buf: [record_header_size]u8 = undefined;
-        writeInt(u32, hdr_buf[0..4], crc, .little);
-        writeInt(u32, hdr_buf[4..8], payload_len, .little);
-        buf.appendSliceAssumeCapacity(&hdr_buf);
-        buf.appendSliceAssumeCapacity(entry_bytes);
+        try zbuf.appendFrame(buf, self.allocator, entry_bytes);
 
         // Update in-memory slot table.
         try self.slots.append(self.allocator, .{
             .term = reader.term(),
             .index = reader.index(),
             .data_offset = @intCast(self.write_offset),
-            .data_len = payload_len,
+            .data_len = @intCast(entry_bytes.len),
             .entry_type = reader.entryType(),
         });
-        self.write_offset += needed;
+        self.write_offset += zbuf.frame_prefix_size + entry_bytes.len;
     }
 
     /// Flush a write buffer to disk in one call.
@@ -447,9 +456,11 @@ pub const logFile = struct {
     /// (table_id + root offset) lets the reader validate the format with
     /// `WalHeaderReader.parseRoot`, replacing the legacy magic/version check.
     pub fn writeHeader(self: *logFile) !void {
-        var msg_buf: std.ArrayList(u8) = .empty;
-        defer msg_buf.deinit(self.allocator);
+        const hdr_region = try self.allocator.alloc(u8, log_file_offset);
+        defer self.allocator.free(hdr_region);
+        @memset(hdr_region, 0);
 
+        var msg_buf = std.ArrayList(u8).initBuffer(hdr_region[zbuf.frame_prefix_size..]);
         var hdr_writer = try zen.WalHeaderWriter.initWithBuf(self.allocator, &msg_buf);
 
         // Encode base_slot as a child first; capture its absolute offset
@@ -476,10 +487,6 @@ pub const logFile = struct {
         if (zbuf.frame_prefix_size + msg_buf.items.len > log_file_offset) {
             return error.InvalidLogHeader;
         }
-
-        const hdr_region = try self.allocator.alloc(u8, log_file_offset);
-        defer self.allocator.free(hdr_region);
-        @memset(hdr_region, 0);
 
         // Wrap the zbuf message in a [crc32c | len] frame so the read path
         // can find its end inside the zero-padded region and verify it.

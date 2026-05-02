@@ -54,7 +54,7 @@ pub const CellStruct = struct {
     data: []const u8 = &.{},
     cell_flags: u8 = 0,
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: CellReader) Error!CellStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: CellReader) Error!CellStruct {
         var s = CellStruct{
             .cell_hot = r.cellHot(),
             .tag = r.tag(),
@@ -373,7 +373,7 @@ pub const RowStruct = struct {
     u32_values: []u32 = &.{},
     u64_values: []u64 = &.{},
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: RowReader) Error!RowStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: RowReader) Error!RowStruct {
         var s = RowStruct{
             .is_pinned = r.isPinned(),
             .is_deleted = r.isDeleted(),
@@ -986,7 +986,7 @@ pub const TableStruct = struct {
     count: u32 = 0,
     table_row: ?RowStruct = null,
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: TableReader) Error!TableStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: TableReader) Error!TableStruct {
         var s = TableStruct{
             .count = r.count(),
         };
@@ -1346,7 +1346,7 @@ pub const TableWriter = struct {
 pub const U32ArrayOnlyStruct = struct {
     values: []u32 = &.{},
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: U32ArrayOnlyReader) Error!U32ArrayOnlyStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: U32ArrayOnlyReader) Error!U32ArrayOnlyStruct {
         var s = U32ArrayOnlyStruct{};
         errdefer s.deinit(alloc);
         s.values = try r.valuesToSliceAlloc(alloc);
@@ -1587,7 +1587,7 @@ pub const U32ArrayOnlyWriter = struct {
 pub const U64ArrayOnlyStruct = struct {
     values: []u64 = &.{},
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: U64ArrayOnlyReader) Error!U64ArrayOnlyStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: U64ArrayOnlyReader) Error!U64ArrayOnlyStruct {
         var s = U64ArrayOnlyStruct{};
         errdefer s.deinit(alloc);
         s.values = try r.valuesToSliceAlloc(alloc);
@@ -1828,7 +1828,7 @@ pub const U64ArrayOnlyWriter = struct {
 pub const U16ArrayOnlyStruct = struct {
     values: []u16 = &.{},
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: U16ArrayOnlyReader) Error!U16ArrayOnlyStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: U16ArrayOnlyReader) Error!U16ArrayOnlyStruct {
         var s = U16ArrayOnlyStruct{};
         errdefer s.deinit(alloc);
         s.values = try r.valuesToSliceAlloc(alloc);
@@ -2069,7 +2069,7 @@ pub const U16ArrayOnlyWriter = struct {
 pub const U8ArrayOnlyStruct = struct {
     values: []u8 = &.{},
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: U8ArrayOnlyReader) Error!U8ArrayOnlyStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: U8ArrayOnlyReader) Error!U8ArrayOnlyStruct {
         var s = U8ArrayOnlyStruct{};
         errdefer s.deinit(alloc);
         s.values = try r.valuesToSliceAlloc(alloc);

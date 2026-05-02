@@ -60,13 +60,20 @@ pub const frame_prefix_size: u16 = 8;
 /// of `dest`. `dest` must be at least `frame_prefix_size + payload.len`
 /// bytes long. Bytes after the payload are left untouched, so callers
 /// using a fixed-size region should @memset the region first.
+///
+/// Zero-copy fast path: if `payload` already aliases the destination slot
+/// (e.g. the caller wrapped `dest[frame_prefix_size..]` as an ArrayList
+/// build buffer and wrote the payload into it directly), the copy is
+/// skipped. One API serves both "build elsewhere, copy in" and "build in
+/// place, just stamp the prefix" callers.
 pub fn writeFrame(dest: []u8, payload: []const u8) !void {
     if (payload.len > std.math.maxInt(u32)) return Error.OutOfBounds;
     if (dest.len < @as(usize, frame_prefix_size) + payload.len) return Error.OutOfBounds;
     const crc = std.hash.crc.Crc32Iscsi.hash(payload);
     try writeU32At(dest, 0, crc);
     try writeU32At(dest, 4, @intCast(payload.len));
-    @memcpy(dest[frame_prefix_size .. frame_prefix_size + payload.len], payload);
+    const slot = dest[frame_prefix_size .. frame_prefix_size + payload.len];
+    if (payload.ptr != slot.ptr) @memcpy(slot, payload);
 }
 
 /// Streaming writer: append a framed payload onto an ArrayList. Mirrors

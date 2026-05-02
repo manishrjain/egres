@@ -86,7 +86,7 @@ pub const ConfChangeStruct = struct {
     node_id: u64 = 0,
     addr: []const u8 = &.{},
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: ConfChangeReader) Error!ConfChangeStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: ConfChangeReader) Error!ConfChangeStruct {
         var s = ConfChangeStruct{
             .change_type = r.changeType(),
             .node_id = r.nodeId(),
@@ -342,7 +342,7 @@ pub const LogEntryStruct = struct {
     entry_type: EntryTypeEnum = @enumFromInt(0),
     conf_change: ?ConfChangeStruct = null,
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: LogEntryReader) Error!LogEntryStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: LogEntryReader) Error!LogEntryStruct {
         var s = LogEntryStruct{
             .index = r.index(),
             .term = r.term(),
@@ -668,7 +668,7 @@ pub const RequestVoteStruct = struct {
     last_log_term: u64 = 0,
     status: u16 = 0,
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: RequestVoteReader) Error!RequestVoteStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: RequestVoteReader) Error!RequestVoteStruct {
         var s = RequestVoteStruct{
             .is_prevote = r.isPrevote(),
             .term = r.term(),
@@ -996,7 +996,7 @@ pub const RequestVoteReplyStruct = struct {
     from: u64 = 0,
     status: u16 = 0,
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: RequestVoteReplyReader) Error!RequestVoteReplyStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: RequestVoteReplyReader) Error!RequestVoteReplyStruct {
         var s = RequestVoteReplyStruct{
             .is_prevote = r.isPrevote(),
             .vote_granted = r.voteGranted(),
@@ -1316,7 +1316,7 @@ pub const AppendEntriesStruct = struct {
     prev_log_term: u64 = 0,
     entries: []LogEntryStruct = &.{},
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: AppendEntriesReader) Error!AppendEntriesStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: AppendEntriesReader) Error!AppendEntriesStruct {
         var s = AppendEntriesStruct{
             .term = r.term(),
             .leader_id = r.leaderId(),
@@ -1676,7 +1676,7 @@ pub const AppendEntriesReplyStruct = struct {
     conflict_term: u64 = 0,
     conflict_index: u64 = 0,
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: AppendEntriesReplyReader) Error!AppendEntriesReplyStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: AppendEntriesReplyReader) Error!AppendEntriesReplyStruct {
         var s = AppendEntriesReplyStruct{
             .success = r.success(),
             .term = r.term(),
@@ -2018,7 +2018,7 @@ pub const TransportHandshakeStruct = struct {
     cluster_id: u64 = 0,
     node_id: u64 = 0,
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: TransportHandshakeReader) Error!TransportHandshakeStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: TransportHandshakeReader) Error!TransportHandshakeStruct {
         var s = TransportHandshakeStruct{
             .cluster_id = r.clusterId(),
             .node_id = r.nodeId(),
@@ -2233,7 +2233,7 @@ pub const JoinRequestStruct = struct {
     node_id: u64 = 0,
     addr: []const u8 = &.{},
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: JoinRequestReader) Error!JoinRequestStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: JoinRequestReader) Error!JoinRequestStruct {
         var s = JoinRequestStruct{
             .cluster_id = r.clusterId(),
             .node_id = r.nodeId(),
@@ -2487,7 +2487,7 @@ pub const JoinResponseStruct = struct {
     reason_code: u32 = 0,
     leader_addr: []const u8 = &.{},
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: JoinResponseReader) Error!JoinResponseStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: JoinResponseReader) Error!JoinResponseStruct {
         var s = JoinResponseStruct{
             .accepted = r.accepted(),
             .status = r.status(),
@@ -2816,7 +2816,7 @@ pub const ConfStatePeerStruct = struct {
     addr: []const u8 = &.{},
     role: RoleEnum = @enumFromInt(0),
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: ConfStatePeerReader) Error!ConfStatePeerStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: ConfStatePeerReader) Error!ConfStatePeerStruct {
         var s = ConfStatePeerStruct{
             .id = r.id(),
             .role = r.role(),
@@ -3067,7 +3067,7 @@ pub const ConfStatePeerWriter = struct {
 pub const ConfStateStruct = struct {
     peers: []ConfStatePeerStruct = &.{},
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: ConfStateReader) Error!ConfStateStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: ConfStateReader) Error!ConfStateStruct {
         var s = ConfStateStruct{};
         errdefer s.deinit(alloc);
         {
@@ -3337,7 +3337,7 @@ pub const HardStateStruct = struct {
     raft_id: u64 = 0,
     checkpoint_index: u64 = 0,
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: HardStateReader) Error!HardStateStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: HardStateReader) Error!HardStateStruct {
         var s = HardStateStruct{
             .current_term = r.currentTerm(),
             .voted_for = r.votedFor(),
@@ -3587,7 +3587,7 @@ pub const SnapshotStruct = struct {
     data: []const u8 = &.{},
     conf_state: ?ConfStateStruct = null,
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: SnapshotReader) Error!SnapshotStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: SnapshotReader) Error!SnapshotStruct {
         var s = SnapshotStruct{
             .index = r.index(),
             .term = r.term(),
@@ -3879,7 +3879,7 @@ pub const WalSlotStruct = struct {
     flags: u16 = 0,
     entry_type: EntryTypeEnum = @enumFromInt(0),
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: WalSlotReader) Error!WalSlotStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: WalSlotReader) Error!WalSlotStruct {
         var s = WalSlotStruct{
             .term = r.term(),
             .index = r.index(),
@@ -4179,7 +4179,7 @@ pub const WalHeaderStruct = struct {
     base_slot: ?WalSlotStruct = null,
     slots: []WalSlotStruct = &.{},
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: WalHeaderReader) Error!WalHeaderStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: WalHeaderReader) Error!WalHeaderStruct {
         var s = WalHeaderStruct{};
         errdefer s.deinit(alloc);
         {

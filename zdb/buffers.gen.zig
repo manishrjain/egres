@@ -54,7 +54,7 @@ pub const BlockIndexStruct = struct {
     offset: u32 = 0,
     len: u32 = 0,
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: BlockIndexReader) Error!BlockIndexStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: BlockIndexReader) Error!BlockIndexStruct {
         var s = BlockIndexStruct{
             .offset = r.offset(),
             .len = r.len(),
@@ -312,7 +312,7 @@ pub const TableIndexStruct = struct {
     blocks: []BlockIndexStruct = &.{},
     binary_fuse: ?BinaryFuseFilterStruct = null,
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: TableIndexReader) Error!TableIndexStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: TableIndexReader) Error!TableIndexStruct {
         var s = TableIndexStruct{
             .max_version = r.maxVersion(),
             .key_count = r.keyCount(),
@@ -763,7 +763,7 @@ pub const BinaryFuseFilterStruct = struct {
     segment_count_length: u32 = 0,
     fingerprints: []u16 = &.{},
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: BinaryFuseFilterReader) Error!BinaryFuseFilterStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: BinaryFuseFilterReader) Error!BinaryFuseFilterStruct {
         var s = BinaryFuseFilterStruct{
             .seed = r.seed(),
             .segment_length = r.segmentLength(),
@@ -1095,7 +1095,7 @@ pub const TreeChangeStruct = struct {
     left_key: []const u8 = &.{},
     right_key: []const u8 = &.{},
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: TreeChangeReader) Error!TreeChangeStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: TreeChangeReader) Error!TreeChangeStruct {
         var s = TreeChangeStruct{
             .op = r.op(),
             .namespace_id = r.namespaceId(),
@@ -1405,7 +1405,7 @@ pub const TableChangeStruct = struct {
     checksum: u32 = 0,
     size: u64 = 0,
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: TableChangeReader) Error!TableChangeStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: TableChangeReader) Error!TableChangeStruct {
         var s = TableChangeStruct{
             .op = r.op(),
             .level = r.level(),
@@ -1689,7 +1689,7 @@ pub const ManifestChangeStruct = struct {
     cmd: u32 = 0,
     memtable_id: u64 = 0,
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: ManifestChangeReader) Error!ManifestChangeStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: ManifestChangeReader) Error!ManifestChangeStruct {
         var s = ManifestChangeStruct{
             .cmd = r.cmd(),
             .memtable_id = r.memtableId(),
@@ -2084,7 +2084,7 @@ pub const KeyValueStruct = struct {
     key: []const u8 = &.{},
     value: []const u8 = &.{},
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: KeyValueReader) Error!KeyValueStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: KeyValueReader) Error!KeyValueStruct {
         var s = KeyValueStruct{};
         errdefer s.deinit(alloc);
         s.key = try alloc.dupe(u8, r.key());
@@ -2337,7 +2337,7 @@ pub const MutationsStruct = struct {
     namespace: u32 = 0,
     kvs: []KeyValueStruct = &.{},
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: MutationsReader) Error!MutationsStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: MutationsReader) Error!MutationsStruct {
         var s = MutationsStruct{
             .namespace = r.namespace(),
         };

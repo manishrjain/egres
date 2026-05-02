@@ -815,8 +815,11 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
         }
     }
 
-    // fromReaderValue: decode reader into owned struct by value (internal, used by fromReader and parent structs).
-    try w.print("\n    fn fromReaderValue(alloc: std.mem.Allocator, r: {s}Reader) Error!{s}Struct {{\n", .{ table_name, table_name });
+    // fromReaderValue: decode reader into owned struct by value. Used by
+    // fromReader and parent structs internally; also exposed publicly so
+    // callers that want a value-form copy (no heap alloc) can avoid the
+    // pointer hop of fromReader. For scalar-only tables, deinit is a no-op.
+    try w.print("\n    pub fn fromReaderValue(alloc: std.mem.Allocator, r: {s}Reader) Error!{s}Struct {{\n", .{ table_name, table_name });
 
     // Step 1: inline-init scalars and bools (no allocation).
     try w.print("        var s = {s}Struct{{\n", .{table_name});
