@@ -128,6 +128,16 @@ pub fn appendU32Slice(list: *std.ArrayList(u8), alloc: std.mem.Allocator, values
     return off;
 }
 
+pub fn appendU8Slice(list: *std.ArrayList(u8), alloc: std.mem.Allocator, values: []const u8) !u32 {
+    const aligned = alignForward(list.items.len, payload_alignment);
+    if (aligned > list.items.len) {
+        try appendZeros(list, alloc, aligned - list.items.len);
+    }
+    const off = @as(u32, @intCast(list.items.len));
+    try list.appendSlice(alloc, values);
+    return off;
+}
+
 pub fn appendU16Slice(list: *std.ArrayList(u8), alloc: std.mem.Allocator, values: []const u16) !u32 {
     const aligned = alignForward(list.items.len, payload_alignment);
     if (aligned > list.items.len) {

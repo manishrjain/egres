@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const Kind = enum { u16, u32, u64, bytes, array, table, bool, enum_ };
+pub const Kind = enum { u8, u16, u32, u64, bytes, array, table, bool, enum_ };
 
 pub const Field = struct {
     id: u32,
@@ -12,6 +12,10 @@ pub const Field = struct {
 pub const Variant = struct {
     name: []const u8,
     tag: u8,
+};
+
+pub const U8 = struct {
+    pub const schema_kind: Kind = .u8;
 };
 
 pub const U16 = struct {
@@ -85,7 +89,7 @@ pub fn requireKind(comptime T: type, comptime want: Kind) void {
 
 pub fn isScalar(comptime T: type) bool {
     return switch (kindOf(T)) {
-        .u16, .u32, .u64 => true,
+        .u8, .u16, .u32, .u64 => true,
         else => false,
     };
 }
@@ -109,6 +113,7 @@ pub fn childOfArray(comptime T: type) type {
 
 pub fn slotSize(comptime T: type) u16 {
     return switch (kindOf(T)) {
+        .u8 => 1,
         .u16 => 2,
         .u32 => 4,
         .u64 => 8,

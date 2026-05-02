@@ -217,8 +217,21 @@ test "enum unknown tag falls into catch-all" {
     try std.testing.expect(!named);
 }
 
-test "array toSliceAlloc for u16/u32/u64" {
+test "array toSliceAlloc for u8/u16/u32/u64" {
     const alloc = std.testing.allocator;
+
+    {
+        var buf: std.ArrayList(u8) = .{};
+        defer buf.deinit(alloc);
+        var w = try gen.U8ArrayOnlyWriter.initWithBuf(alloc, &buf);
+        const vals = [_]u8{ 0, 127, 255 };
+        try w.setValues(&vals);
+        const res = try w.finish();
+        const r = try gen.U8ArrayOnlyReader.init(buf.items, res.offset);
+        const got = try r.valuesToSliceAlloc(alloc);
+        defer alloc.free(got);
+        try std.testing.expectEqualSlices(u8, &vals, got);
+    }
 
     {
         var buf: std.ArrayList(u8) = .{};
@@ -509,7 +522,7 @@ test "clone of simple scalar-only struct" {
 
     try std.testing.expectEqual(@as(u32, 42), cloned.tag);
     try std.testing.expect(cloned.cell_hot);
-    try std.testing.expectEqual(@as(u16, 0xFF), cloned.cell_flags);
+    try std.testing.expectEqual(@as(u8, 0xFF), cloned.cell_flags);
     try std.testing.expectEqualSlices(u8, &.{}, cloned.data);
 }
 
