@@ -2,6 +2,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const raft = @import("raft");
 const zio = @import("zio");
+const zbuf = @import("zbuf").zbuf;
 const zen = raft.buffers;
 const u = raft.utils;
 
@@ -781,9 +782,8 @@ test "diskwal CRC corruption truncates at corrupt entry" {
     }
 
     // Corrupt the 3rd entry's payload by flipping a byte.
-    // Entries start at log_file_offset (1 MiB). Each entry is:
-    //   [4 bytes CRC][4 bytes len][payload]
-    // We need to find the offset of the 3rd entry and corrupt its payload.
+    // Entries start at log_file_offset (1 MiB). Each entry is framed as
+    // `[u64 hash | u32 len | payload]` — see zbuf.frame_prefix_size.
     {
         // The current file is 00001.wal (no rotation happened).
         const current_path = try std.fmt.allocPrint(alloc, "{s}/00001.wal", .{wal_dir});
@@ -792,18 +792,17 @@ test "diskwal CRC corruption truncates at corrupt entry" {
         defer file.close();
 
         // Read past the first two entries to find the 3rd entry's payload.
-        // Each entry has: 8 byte header + variable payload.
-        // Scan to find offsets.
+        const prefix_size: usize = zbuf.frame_prefix_size;
         var offset: u64 = diskwal.log_file_offset;
-        var hdr_buf: [8]u8 = undefined;
+        var hdr_buf: [zbuf.frame_prefix_size]u8 = undefined;
         for (0..2) |_| {
             _ = try file.preadAll(&hdr_buf, offset);
-            const payload_len = std.mem.readInt(u32, hdr_buf[4..8], .little);
-            offset += 8 + payload_len;
+            // u32 length lives at byte 8 of the prefix (after the u64 hash).
+            const payload_len = std.mem.readInt(u32, hdr_buf[8..12], .little);
+            offset += prefix_size + payload_len;
         }
         // Now offset points at the 3rd entry. Corrupt a byte in its payload.
-        // Skip the 8-byte record header to hit the payload.
-        const corrupt_offset = offset + 8 + 1; // +1 to hit inside the payload
+        const corrupt_offset = offset + prefix_size + 1; // +1 to hit inside the payload
         var byte: [1]u8 = undefined;
         _ = try file.preadAll(&byte, corrupt_offset);
         byte[0] ^= 0xFF; // flip all bits

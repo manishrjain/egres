@@ -440,6 +440,7 @@ fn addDiskwalTestRun(
     test_artifact.root_module.addImport("raft", raft_mod);
     test_artifact.root_module.addImport("vfs", raft_mod.import_table.get("vfs").?);
     test_artifact.root_module.addImport("zio", raft_mod.import_table.get("zio").?);
+    test_artifact.root_module.addImport("zbuf", raft_mod.import_table.get("zbuf").?);
     test_artifact.root_module.addImport("build_options", build_options_mod);
     test_artifact.step.dependOn(regen_buffers_step);
     return &b.addRunArtifact(test_artifact).step;
@@ -750,18 +751,15 @@ fn addBenchCrc(
     optimize: std.builtin.OptimizeMode,
 ) void {
     _ = optimize;
-    const zbuf_mod = makeModule(b, target, .ReleaseFast, "zbuf.zig");
-
     const bench_exe = b.addExecutable(.{
         .name = "crc-bench",
-        // Always ReleaseFast — Debug bounds checks dominate the CRC inner
+        // Always ReleaseFast — Debug bounds checks dominate the inner
         // loop and would make the throughput numbers meaningless.
         .root_module = makeModule(b, target, .ReleaseFast, "benchmarks/crc_bench.zig"),
     });
-    bench_exe.root_module.addImport("zbuf", zbuf_mod);
 
     const run_bench = b.addRunArtifact(bench_exe);
-    const bench_step = b.step("bench-crc", "Run CRC32C software vs. hardware throughput benchmark");
+    const bench_step = b.step("bench-crc", "Run hash throughput benchmark (CRC32C vs xxhash3)");
     bench_step.dependOn(&run_bench.step);
 }
 

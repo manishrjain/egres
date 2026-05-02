@@ -559,32 +559,47 @@ test "clone roundtrip matches marshal" {
     try std.testing.expectEqualSlices(u8, out_orig.items, out_clone.items);
 }
 
-test "crc32c hardware path matches software at every length" {
-    // The SSE4.2 implementation processes 8 bytes at a time via crc32q
-    // and the unaligned tail (0–7 bytes) via crc32b. Sweeping every
-    // length 0..=64 covers all (chunk-count × tail-length) combinations
-    // up to 8 full chunks, which is the only way these loops can
-    // disagree if the wiring is off.
+test "frame round-trip preserves payload across writeFrame/readFrame" {
+    // Verifies the [u64 hash | u32 len | payload] frame layout:
+    // writeFrame must produce bytes that readFrame can recover unchanged.
+    // Sweeps lengths 0..=64 to cover every alignment relative to the
+    // 12-byte prefix, plus a few larger and odd-modulo sizes.
+    const alloc = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xCAFEBABE);
-    var buf: [4096]u8 = undefined;
-    prng.random().bytes(&buf);
+    var src: [4096]u8 = undefined;
+    prng.random().bytes(&src);
 
-    var len: usize = 0;
-    while (len <= 64) : (len += 1) {
-        const slice = buf[0..len];
-        const sw = std.hash.crc.Crc32Iscsi.hash(slice);
-        const hw = zbuf.crc32c(slice);
-        try std.testing.expectEqual(sw, hw);
-    }
+    const dest = try alloc.alloc(u8, 4096 + zbuf.frame_prefix_size);
+    defer alloc.free(dest);
 
-    // A few mid-range and odd-modulo sizes to exercise the chunk loop
-    // with non-trivial tails and longer dependency chains.
-    const sizes = [_]usize{ 99, 100, 511, 512, 513, 1023, 1024, 1025, 4095, 4096 };
+    const sizes = blk: {
+        var s: [75]usize = undefined;
+        for (0..65) |i| s[i] = i;
+        const tail = [_]usize{ 99, 100, 511, 512, 513, 1023, 1024, 1025, 4095, 4096 };
+        for (tail, 0..) |v, i| s[65 + i] = v;
+        break :blk s;
+    };
+
     for (sizes) |size| {
-        const slice = buf[0..size];
-        try std.testing.expectEqual(
-            std.hash.crc.Crc32Iscsi.hash(slice),
-            zbuf.crc32c(slice),
-        );
+        const payload = src[0..size];
+        try zbuf.writeFrame(dest, payload);
+        const got = try zbuf.readFrame(dest[0 .. zbuf.frame_prefix_size + size]);
+        try std.testing.expectEqualSlices(u8, payload, got);
     }
+}
+
+test "frame readFrame rejects corrupt payload" {
+    // Flip a single byte in a written frame and confirm readFrame catches
+    // it. xxhash3 with full u64 output gives ~2⁻⁶⁴ false-negative odds;
+    // a single-byte flip is overwhelmingly likely to be detected.
+    const alloc = std.testing.allocator;
+    const payload = "hello, framed world";
+    const dest = try alloc.alloc(u8, zbuf.frame_prefix_size + payload.len);
+    defer alloc.free(dest);
+
+    try zbuf.writeFrame(dest, payload);
+
+    // Corrupt one payload byte.
+    dest[zbuf.frame_prefix_size + 5] ^= 0x01;
+    try std.testing.expectError(zbuf.Error.Invalid, zbuf.readFrame(dest));
 }
