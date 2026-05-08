@@ -22,14 +22,16 @@ pub const Options = struct {
     compression: utils.compression.Codec = .lz4,
     num_compactors: u8 = 2,
 
-    // Level sizes
-    num_level_zero_tables: u32 = 5,
-    base_level_size: i64 = 800 * 1024 * 1024,
+    // Level sizes. Lmax target is derived from `tree_split_size`; upper
+    // levels cascade by dividing by `level_size_multiplier`. There is no
+    // separate base-level-size knob — every tree caps at the split size.
     level_size_multiplier: i64 = 5,
     max_levels: u8 = 4,
 
-    // Table sizes
-    base_table_size: i64 = 32 * 1024 * 1024,
+    // Per-level SST file size. L0 inherits the memtable size. L1 uses
+    // `l1_table_size`; each level below ramps by `table_size_multiplier`
+    // up to `max_table_size`.
+    l1_table_size: i64 = 32 * 1024 * 1024,
     table_size_multiplier: i64 = 2,
     max_table_size: i64 = 128 * 1024 * 1024,
 
@@ -40,27 +42,26 @@ pub const Options = struct {
     tree_split_size: i64 = 5 * 1024 * 1024 * 1024, // 5 GiB
 
     // L0 backpressure (RocksDB-style write slowdown). When a tree's L0
-    // table count exceeds `l0_slowdown_table_count`, mutations sleep
-    // `(excess) * l0_slowdown_step_us` microseconds before proposing,
-    // capped at `l0_slowdown_max_us`. The intent is to give flush +
+    // table count exceeds `l0_backpressure_start_count`, mutations sleep
+    // `(excess) * l0_backpressure_step_us` microseconds before proposing,
+    // capped at `l0_backpressure_max_us`. The intent is to give flush +
     // compaction a chance to drain L0 instead of letting it grow into
-    // 10s-of-GiB monolithic compaction targets. With defaults, a tree at
-    // 8 L0 tables imposes 0 ms; at 18 tables, ~10 ms; at 108+ tables, the
-    // cap of 100 ms. Set `l0_slowdown_table_count = 0` to disable.
-    l0_slowdown_table_count: u32 = 8,
-    l0_slowdown_step_us: u32 = 1000,
-    l0_slowdown_max_us: u32 = 100_000,
+    // 10s-of-GiB monolithic compaction targets. This is a *trigger*, not
+    // a cap — L0 may still grow past it; writes just slow down. With
+    // defaults, a tree at the trigger imposes 0 ms; +10 tables ~10 ms;
+    // +100 tables hits the cap of 100 ms. Set
+    // `l0_backpressure_start_count = 0` to disable backpressure entirely.
+    l0_backpressure_start_count: u32 = 8,
+    l0_backpressure_step_us: u32 = 1000,
+    l0_backpressure_max_us: u32 = 100_000,
 
-    // Cap on the number of L0 tables consumed by a single compaction.
-    // L0 → Lbase compaction picks the OLDEST `max_l0_compaction_tables`
-    // L0 tables and merges them with the overlapping Lbase tables.
-    // Without a cap, a single compaction can consume 100+ L0 tables (10+
-    // GiB) in one shot, blocking the compaction loop for minutes while
-    // L0 keeps growing. RocksDB amortizes equivalent work across
-    // subcompactions + parallel workers; we don't have those yet, so we
-    // bound the per-compaction work instead. Many small compactions also
-    // give backpressure room to react before L0 explodes.
-    max_l0_compaction_tables: u32 = 8,
+    // Per-compaction cap on L0 input tables: the L0→L1 picker takes the
+    // OLDEST `l0_tables_per_compaction` and merges them with the
+    // overlapping L1 tables. Backpressure normally keeps L0 short, so
+    // this only matters as a safety bound — without it, a backlog of L0
+    // tables (e.g., during a flush burst) would land in one giant
+    // compaction that blocks the loop for minutes while L0 keeps growing.
+    l0_tables_per_compaction: u32 = 8,
 
     pub fn validate(self: Options) Error!void {
         // Badger semantics: exactly one compactor causes pathological level behavior.

@@ -855,16 +855,16 @@ pub const ZdbServer = struct {
     /// out-running flush + compaction so L0 doesn't grow into a 10s-of-GiB
     /// monolithic compaction target. Per-namespace (not global) so a hot
     /// namespace doesn't stall writes to other namespaces on the same node.
-    /// See `Options.l0_slowdown_table_count` etc. for the curve.
+    /// See `Options.l0_backpressure_start_count` etc. for the curve.
     fn applyWriteBackpressure(self: *ZdbServer, ns: u32) void {
         const opts = self.forest.opts;
-        if (opts.l0_slowdown_table_count == 0) return;
+        if (opts.l0_backpressure_start_count == 0) return;
         const l0 = self.forest.maxL0TableCountForNs(ns);
-        if (l0 <= opts.l0_slowdown_table_count) return;
-        const excess: u64 = l0 - opts.l0_slowdown_table_count;
+        if (l0 <= opts.l0_backpressure_start_count) return;
+        const excess: u64 = l0 - opts.l0_backpressure_start_count;
         const delay_us: u64 = @min(
-            excess * opts.l0_slowdown_step_us,
-            @as(u64, opts.l0_slowdown_max_us),
+            excess * opts.l0_backpressure_step_us,
+            @as(u64, opts.l0_backpressure_max_us),
         );
         if (delay_us == 0) return;
         zio.sleep(zio.Duration.fromMicroseconds(delay_us)) catch {};

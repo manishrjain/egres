@@ -397,7 +397,6 @@ test "levels: pick compact level" {
     const opts = options_mod.Options{
         .dir = dir_path,
         .tree_split_size = 1,
-        .num_level_zero_tables = 5,
     };
 
     var cache = TableCache.init(alloc, opts.dir);

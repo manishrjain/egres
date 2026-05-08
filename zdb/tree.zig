@@ -396,8 +396,7 @@ pub const Tree = struct {
         //
         // Why FIXED instead of derived from current data: dynamic targets
         // (RocksDB-style) have a chicken-and-egg problem — early in a
-        // tree's life, intermediate levels accumulate because Lmax is
-        // empty so its target floors at base_level_size and cascading
+        // tree's life, Lmax is empty, so cascading from current sizes
         // produces big upper-level targets. Stepwise compaction then
         // can't drain those intermediates. Fixed targets sized to the
         // tree's eventual capacity sidestep this entirely. If Lmax
@@ -417,9 +416,9 @@ pub const Tree = struct {
         }
 
         // Per-level file sizes: L0 inherits the memtable size; L1 uses
-        // `base_table_size`; each level below ramps by
+        // `l1_table_size`; each level below ramps by
         // `table_size_multiplier` up to `max_table_size`.
-        var tsz: i64 = self.opts.base_table_size;
+        var tsz: i64 = self.opts.l1_table_size;
         file_sz[0] = @intCast(self.opts.memtable_size);
         for (1..n) |j| {
             if (j <= base_level) {
@@ -581,7 +580,7 @@ pub const Tree = struct {
         if (dest >= self.opts.max_levels) return .{};
 
         // --- collect src entries ---
-        // L0: take the OLDEST `max_l0_compaction_tables` (insertion order
+        // L0: take the OLDEST `l0_tables_per_compaction` (insertion order
         // = oldest first). Newer L0 tables stay put and continue to
         // shadow the compacted versions on read — correctness preserved.
         // L≥1: take the first table; overlap-with-dest is what bounds
@@ -594,7 +593,7 @@ pub const Tree = struct {
             if (items.len == 0) return .{};
 
             const take = if (src_level == 0)
-                items[0..@min(items.len, self.opts.max_l0_compaction_tables)]
+                items[0..@min(items.len, self.opts.l0_tables_per_compaction)]
             else
                 items[0..1];
             break :blk try self.allocator.dupe(TableEntry, take);
@@ -651,16 +650,21 @@ pub const Tree = struct {
             flush_handles.deinit(self.allocator);
         }
 
-        // Diagnostic: count items pulled from the merge iterator vs items
-        // accepted by the builder. Pre-fix expectation (no tombstones, no
-        // shadowing because the bench writes each primary at most once):
-        // these two should be EQUAL, AND should equal the sum of
-        // `index.key_count` across all input tables.
+        // Diagnostic: count items + bytes pulled from the merge iterator vs
+        // items + bytes accepted by the builder. Pre-fix expectation (no
+        // tombstones, no shadowing because the bench writes each primary at
+        // most once): in/out should be EQUAL on both axes, AND keys should
+        // equal the sum of `index.key_count` across all input tables.
+        // `bytes_*` count user data only (key.primary + value), not the
+        // 16-byte ns/tid/ts framing.
         var keys_in: u64 = 0;
         var keys_out: u64 = 0;
+        var bytes_in: u64 = 0;
+        var bytes_out: u64 = 0;
 
         while (merge.itemRef()) |item| {
             keys_in += 1;
+            bytes_in += item.key.primary.len + item.value.len;
             if (bld.table_bytes.items.len >= file_sz) {
                 // We are not going to break up a primary key across tables. All the versions for
                 // this key should live in the same table. This avoids a scenario where a table with
@@ -675,34 +679,45 @@ pub const Tree = struct {
             }
             try bld.add(item.key, item.value);
             keys_out += 1;
+            bytes_out += item.key.primary.len + item.value.len;
             try merge.next();
         }
 
         // Flush any remaining data.
         try self.flushBuilderOutput(&bld, &flush_handles, next_file_id);
 
-        // Sum up input key counts from every src + bot SST's index for the
-        // "expected" number. If keys_in != expected, the merge iterator is
-        // dropping items. If keys_out != keys_in, the builder is dropping.
+        // Sum up input key counts + on-disk byte sizes from every src + bot
+        // SST's index for the "expected" baseline. If keys_in != expected,
+        // the merge iterator is dropping items. If keys_out != keys_in, the
+        // builder is dropping.
         var src_keys: u64 = 0;
+        var src_bytes_disk: u64 = 0;
         var src_min_ts: u64 = std.math.maxInt(u64);
         var src_max_ts: u64 = 0;
         for (src_entries_slice) |e| {
             src_keys += @intCast(e.table.index.key_count);
+            src_bytes_disk += e.table.fileSize();
             const mv = e.table.index.max_version;
             if (mv > src_max_ts) src_max_ts = mv;
             if (mv < src_min_ts) src_min_ts = mv;
         }
         var bot_keys: u64 = 0;
-        for (bot_entries_slice) |e| bot_keys += @intCast(e.table.index.key_count);
+        var bot_bytes_disk: u64 = 0;
+        for (bot_entries_slice) |e| {
+            bot_keys += @intCast(e.table.index.key_count);
+            bot_bytes_disk += e.table.fileSize();
+        }
         const expected_in = src_keys + bot_keys;
+        const expected_bytes_disk = src_bytes_disk + bot_bytes_disk;
         log.info(
-            "compact tree={d} L{d}->L{d} src_tables={d} src_keys={d} bot_tables={d} bot_keys={d} expected_in={d} keys_in={d} keys_out={d} dropped_in_iter={d} dropped_in_builder={d}",
+            "compact tree={d} L{d}->L{d} src_tables={d} src_keys={d} src_bytes_disk={d} bot_tables={d} bot_keys={d} bot_bytes_disk={d} expected_in={d} expected_bytes_disk={d} keys_in={d} keys_out={d} bytes_in={d} bytes_out={d} dropped_in_iter={d} dropped_in_builder={d}",
             .{
                 self.tree_id,          src,                    dest,
-                src_entries_slice.len, src_keys,               bot_entries_slice.len,
-                bot_keys,              expected_in,            keys_in,
-                keys_out,              expected_in -| keys_in, keys_in -| keys_out,
+                src_entries_slice.len, src_keys,               src_bytes_disk,
+                bot_entries_slice.len, bot_keys,               bot_bytes_disk,
+                expected_in,           expected_bytes_disk,    keys_in,
+                keys_out,              bytes_in,               bytes_out,
+                expected_in -| keys_in, keys_in -| keys_out,
             },
         );
 
