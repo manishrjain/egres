@@ -18,7 +18,7 @@ pub const Options = struct {
     memtable_size: usize = 64 * 1024 * 1024,
     num_memtables: u32 = 15,
 
-    block_size: usize = 8 * 1024,
+    block_size: usize = 64 * 1024,
     compression: utils.compression.Codec = .lz4,
     num_compactors: u8 = 2,
 
@@ -26,7 +26,7 @@ pub const Options = struct {
     num_level_zero_tables: u32 = 5,
     base_level_size: i64 = 800 * 1024 * 1024,
     level_size_multiplier: i64 = 5,
-    max_levels: u8 = 5,
+    max_levels: u8 = 4,
 
     // Table sizes
     base_table_size: i64 = 32 * 1024 * 1024,

@@ -391,10 +391,12 @@ test "levels: pick compact level" {
     var ms = manifest.ForestState.init(alloc);
     defer ms.deinit();
 
-    // Use a very small base_level_size so one table in L1 exceeds the target.
+    // Targets cascade from `tree_split_size`; setting it to a single byte
+    // makes every level's target tiny so one table in L1 exceeds it and
+    // becomes the compaction candidate.
     const opts = options_mod.Options{
         .dir = dir_path,
-        .base_level_size = 1, // 1 byte → any data exceeds it
+        .tree_split_size = 1,
         .num_level_zero_tables = 5,
     };
 

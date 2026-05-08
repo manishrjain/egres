@@ -382,28 +382,43 @@ pub const Tree = struct {
         @memset(target_sz, 0);
         @memset(file_sz, 0);
 
-        // Compaction routing is now strictly stepwise: L0→L1, L1→L2, …, so
-        // every intermediate level has well-defined target sizes (no
-        // skipping straight to Lmax). `base_level` is always 1, kept in the
-        // struct so the existing adjusted-score loop in
-        // updateCompactCandidate (which iterates `base_level..n`) continues
-        // to start from L1 — the correct upper bound for an L0→L1 model.
+        // Compaction routing is strictly stepwise: L0→L1, L1→L2, … —
+        // `base_level` is always 1.
         const base_level: u8 = 1;
 
-        // Target sizes anchored at Lmax's actual data, scaled down by
-        // `level_size_multiplier` per step toward L1, and floored at
-        // `base_level_size` (so a near-empty Lmax doesn't make every upper
-        // level a single-table target).
-        var db_size: i64 = self.levels[n - 1].getTotalSize();
-        var i: usize = n - 1;
-        while (i > 0) : (i -= 1) {
-            target_sz[i] = @max(db_size, self.opts.base_level_size);
-            db_size = @divTrunc(db_size, self.opts.level_size_multiplier);
+        // Target sizes are FIXED per tree, derived from `tree_split_size`:
+        // each tree splits when its bottom level outgrows that cap, so
+        // the bottom level's target should be slightly under it (we use
+        // 4/5 = 0.8x to leave headroom; once the actual bottom-level size
+        // hits ~1.25x target it triggers a split, well within the cap).
+        // Levels above cascade up by dividing by `level_size_multiplier`,
+        // floored at 1 byte so the size/target score is well-defined.
+        //
+        // Why FIXED instead of derived from current data: dynamic targets
+        // (RocksDB-style) have a chicken-and-egg problem — early in a
+        // tree's life, intermediate levels accumulate because Lmax is
+        // empty so its target floors at base_level_size and cascading
+        // produces big upper-level targets. Stepwise compaction then
+        // can't drain those intermediates. Fixed targets sized to the
+        // tree's eventual capacity sidestep this entirely. If Lmax
+        // briefly exceeds its target before the split kicks in, that's
+        // fine — we don't crash, the split will eventually fire.
+        const lmax_idx: usize = n - 1;
+        target_sz[lmax_idx] = @divTrunc(self.opts.tree_split_size * 4, 5);
+        var t: i64 = target_sz[lmax_idx];
+        {
+            var i: usize = lmax_idx;
+            while (i > 1) {
+                i -= 1;
+                t = @divTrunc(t, self.opts.level_size_multiplier);
+                if (t < 1) t = 1;
+                target_sz[i] = t;
+            }
         }
 
-        // Per-level file sizes: L0 inherits the memtable size; L1 (the
-        // base level for stepwise compaction) uses `base_table_size`; each
-        // level below ramps by `table_size_multiplier` up to `max_table_size`.
+        // Per-level file sizes: L0 inherits the memtable size; L1 uses
+        // `base_table_size`; each level below ramps by
+        // `table_size_multiplier` up to `max_table_size`.
         var tsz: i64 = self.opts.base_table_size;
         file_sz[0] = @intCast(self.opts.memtable_size);
         for (1..n) |j| {
