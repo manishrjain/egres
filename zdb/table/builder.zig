@@ -277,9 +277,25 @@ pub const Builder = struct {
         const index_len: u32 = @intCast(index_bytes.items.len);
         const index_checksum = zbuf.hash(index_bytes.items);
 
+        // Pad with zeros between the data blocks and the index so the final
+        // file size is a multiple of `vfs.page_size`. The reader locates the
+        // index via the trailer's `index_len` (offset = file_end - trailer
+        // - index_len), so padding before the index is invisible to it.
+        // Page-aligned files dodge any O_DIRECT / iomap edge case where an
+        // unaligned-tail write could be silently dropped on some kernels;
+        // the cost is at most page_size-1 zero bytes per SST.
+        const trailer_size: usize = 4 + 8;
+        const tail_size = index_bytes.items.len + trailer_size;
+        const total_unpadded = self.table_bytes.items.len + tail_size;
+        const remainder = total_unpadded % vfs.page_size;
+        const pad_bytes = if (remainder == 0) 0 else vfs.page_size - remainder;
+        if (pad_bytes > 0) try self.table_bytes.appendNTimes(self.allocator, 0, pad_bytes);
+
         try self.table_bytes.appendSlice(self.allocator, index_bytes.items);
         try appendU32(&self.table_bytes, self.allocator, index_len);
         try appendU64(&self.table_bytes, self.allocator, index_checksum);
+
+        std.debug.assert(self.table_bytes.items.len % vfs.page_size == 0);
 
         const bytes = try self.table_bytes.toOwnedSlice(self.allocator);
         self.table_bytes = .empty;

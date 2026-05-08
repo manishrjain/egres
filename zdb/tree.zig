@@ -20,6 +20,8 @@ const ConcatIterator = table_mod.merge_iterator.ConcatIterator;
 const Iterator = table_mod.merge_iterator.Iterator;
 const Builder = table_mod.builder.Builder;
 
+const log = std.log.scoped(.zdb_tree);
+
 // ---------------------------------------------------------------------------
 // Internal types
 // ---------------------------------------------------------------------------
@@ -444,6 +446,13 @@ pub const Tree = struct {
         // non-empty level for diagnostic legibility (`stats forest`).
         const linfo = self.lowestLevelSize();
         if (linfo.size > self.opts.tree_split_size) {
+            // Log every split-trigger so we can spot mis-sized splits (e.g.
+            // tree_split_size mistakenly compared against an upper-level
+            // size instead of Lmax). Format: tree=<id> deepest_level=<L>
+            // size=<bytes> > threshold=<bytes>.
+            log.info("split-trigger tree={d} deepest_level={d} size={d} > threshold={d}", .{
+                self.tree_id, linfo.level, linfo.size, self.opts.tree_split_size,
+            });
             self.compact_candidate = .{
                 .level = @intCast(linfo.level),
                 .score = split_priority_score,
@@ -751,7 +760,7 @@ pub const Tree = struct {
         const path = try options.sstPath(self.allocator, self.opts.dir, id);
         errdefer self.allocator.free(path);
 
-        const wh = try vfs.g().createFile(path, .{});
+        const wh = try vfs.g().createFile(path, .{ .mode = .direct });
         try wh.write(tb.bytes, 0, bld.cfg.priority);
 
         // Sync in a fiber; data is in page cache after write.

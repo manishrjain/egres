@@ -108,28 +108,22 @@ pub const ConfCmd = struct {
     };
 };
 
-/// Read one text command from the buffered reader. Returns null on EOF.
-/// Blank lines are skipped silently — common in line-based protocols
-/// where intermediate tools (nc, terminal, etc.) sometimes inject a
-/// trailing empty line on EOF.
-pub fn readCommand(r: *std.Io.Reader, line_buf: []u8) !?Command {
-    while (true) {
-        const line = readLine(r, line_buf) catch |err| switch (err) {
-            error.EndOfStream => return null,
-            else => return err,
-        };
-        if (line.len == 0) continue;
-        return try parseLine(line);
-    }
-}
-
-fn readLine(r: *std.Io.Reader, buf: []u8) ![]const u8 {
+/// Read one '\n'-delimited line into `buf` (without the trailing CR/LF).
+/// Errors:
+///   - `error.EndOfStream` — peer closed; treat as clean EOF.
+///   - `error.LineTooLong` — line exceeded `buf`; the stream is mid-line
+///     so the byte cursor is at an unknown offset; caller must close.
+///   - other I/O errors — propagate; caller should close.
+/// Stream is at a known boundary (just past '\n') only on success. Pair
+/// with `parseLine` so command-level parse errors can be recovered without
+/// closing the connection.
+pub fn readLine(r: *std.Io.Reader, buf: []u8) ![]const u8 {
     // takeDelimiterInclusive returns the bytes up to AND INCLUDING the
     // '\n' so the cursor advances past the delimiter. The Exclusive
     // variant leaves the '\n' in the buffer, which makes the next read
-    // return an empty slice — readCommand's blank-line skip then loops
-    // forever on the same byte. Strip the trailing '\n' (and an optional
-    // '\r' before it) before copying into the caller's buffer.
+    // return an empty slice and would loop forever. Strip the trailing
+    // '\n' (and an optional '\r' before it) before copying into the
+    // caller's buffer.
     const line = try r.takeDelimiterInclusive('\n');
     var end = line.len - 1; // drop '\n'
     if (end > 0 and line[end - 1] == '\r') end -= 1;
@@ -280,7 +274,7 @@ pub fn readToken(r: *std.Io.Reader, buf: *std.ArrayList(u8)) !void {
     }
 }
 
-fn parseLine(line: []const u8) !Command {
+pub fn parseLine(line: []const u8) !Command {
     var it = std.mem.splitScalar(u8, line, ' ');
     const cmd = it.next() orelse return error.EmptyCommand;
 

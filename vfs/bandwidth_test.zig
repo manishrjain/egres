@@ -140,6 +140,52 @@ test "exact byte fulfillment for non-aligned requests" {
     try testing.expectEqual(@as(usize, 7_777), g3);
 }
 
+// Regression: a write spinner whose limiter has fewer cost-units than
+// `write_cost` left in the bucket must NOT return 0 from acquireBytes
+// while bytes are still pending. Pre-fix bug: acquireFromLimiter could
+// return 7 cost-units (with write_cost=8), the integer divide by wm
+// flooring to 0 actual pages, and the spinner returned 0 — vfs.write
+// interpreted that as "done" and silently dropped the unwritten tail.
+// Symptom in production: SST files truncated to a multiple of page_size,
+// no write error, manifest references the bad file, apply later trips
+// CorruptTable on Table.open.
+//
+// The fix makes `acquireFromLimiter` quantize its grant to a multiple of
+// `factor` (== write_cost for writes), so divide-by-factor is exact AND
+// we don't drain the bucket beyond what we can actually use.
+test "write spinner under bucket pressure never returns 0 while bytes remain" {
+    // Bucket holds 11 cost-units total (intentionally NOT a multiple of
+    // write_cost=8). After a P0 write of 1 page (8 cost-units), the
+    // bucket has 3 cost-units left — less than write_cost — which is
+    // the regression-trigger condition for a P1 follower.
+    var limiter = Limiter.init(.{ .bytes_per_sec = 11 * page_size, .write_cost = 8, .timeout_ms = 50 });
+
+    // Drain to the trigger condition: 1 P0 page-write costs 8 of 11 -> 3 left.
+    _ = acquireAll(&limiter, .p0, page_size, .write);
+    try testing.expectEqual(@as(u64, 3), limiter.pages.load(.monotonic));
+
+    // Now a P1 write that wants 4 pages. Pre-fix this would short-write
+    // and the for-loop in vfs.write would treat the 0 return as success.
+    // Post-fix: spinner waits for refill (or timeout fallback) until the
+    // bucket can grant a multiple of write_cost, then returns the full
+    // 4 pages eventually. Each chunk MUST be page-aligned (cost-unit
+    // grants quantized to a multiple of write_cost ⇒ pages quantized to
+    // whole pages).
+    var s = limiter.spinner(.p1, 4 * page_size, .write);
+    defer s.deinit();
+    var total: usize = 0;
+    var chunks: u32 = 0;
+    while (true) {
+        const chunk = s.acquireBytes();
+        if (chunk == 0) break;
+        try testing.expect(chunk % page_size == 0); // factor invariant
+        total += chunk;
+        chunks += 1;
+    }
+    try testing.expectEqual(@as(usize, 4 * page_size), total);
+    try testing.expect(chunks >= 1);
+}
+
 // ── 10. Spinner returns 0 when done ─────────────────────────────────
 
 test "spinner returns 0 when done" {

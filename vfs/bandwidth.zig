@@ -28,12 +28,18 @@ pub const Spinner = struct {
 
     /// Returns next chunk of granted bytes.
     /// Blocks until pages are available for this priority.
-    /// Returns 0 when remaining is fully satisfied — spinner is done.
+    /// Returns 0 ONLY when remaining is fully satisfied — spinner is done.
     pub fn acquireBytes(self: *Spinner) usize {
         if (self.rem_bytes == 0) return 0;
 
         const wm: u64 = if (self.kind == .write) self.limiter.conf.write_cost else 1;
-        const granted_pages = self.acquireFromLimiter(self.rem_pages * wm) / wm;
+        // Pass `wm` as `factor` so the limiter only grants a multiple of
+        // it. Two reasons: (a) divide-by-wm below is exact — no fractional
+        // cost-units that get floored to 0 actual pages (the silent
+        // truncation footgun); (b) we don't drain the bucket beyond what
+        // we'll actually use (granting 9 cost-units to write 1 page means
+        // 1 cost-unit was wasted).
+        const granted_pages = self.acquireFromLimiter(self.rem_pages * wm, wm) / wm;
         self.deductPages(granted_pages);
 
         const granted_bytes = granted_pages * vfs.page_size;
@@ -53,8 +59,21 @@ pub const Spinner = struct {
     }
 
     /// Acquire raw pages (in cost units). Handles priority, blocking, timeout.
-    /// Caller is responsible for cost/page conversion.
-    fn acquireFromLimiter(self: *Spinner, pages: u64) u64 {
+    /// Caller is responsible for cost/page conversion. The returned grant
+    /// is always a multiple of `factor` and at least `factor` itself.
+    /// `pages` (the request) MUST already be a multiple of `factor` — the
+    /// caller has paid that price by quantizing its own request.
+    ///
+    /// Why a factor (not just a min): callers convert cost-units back to
+    /// real pages via `granted / factor`. A non-multiple grant has dead
+    /// cost-units that flooring throws away, depleting the bucket without
+    /// doing more I/O for the caller. Worse, before this change a grant of
+    /// `< factor` floored to 0 pages, the spinner reported "done", and
+    /// `vfs.write` silently truncated the file.
+    fn acquireFromLimiter(self: *Spinner, pages: u64, factor: u64) u64 {
+        std.debug.assert(factor >= 1);
+        std.debug.assert(pages % factor == 0); // caller's responsibility
+
         const limiter = self.limiter;
         const start = std.time.milliTimestamp();
 
@@ -69,19 +88,27 @@ pub const Spinner = struct {
                 .p2 => cur -| limiter.demand_p1.load(.monotonic),
             };
 
-            if (available == 0 and self.priority != .p0) {
-                // No pages available — sleep and retry, or timeout.
+            // Quantize down to a multiple of `factor` — this is the actual
+            // grant we'd hand back. If quantizing yields 0 the bucket
+            // can't satisfy a single unit of caller-useful work; sleep and
+            // retry until it can (or timeout).
+            const raw_want = @min(pages, available);
+            const want = (raw_want / factor) * factor;
+
+            if (want == 0 and self.priority != .p0) {
                 if (std.time.milliTimestamp() - start >= @as(i64, @intCast(limiter.conf.timeout_ms))) {
-                    return limiter.min_alloc_pages;
+                    // Timeout fallback: round min_alloc_pages up to the
+                    // factor so the result is still a usable multiple.
+                    const fallback = limiter.min_alloc_pages;
+                    return ((fallback + factor - 1) / factor) * factor;
                 }
                 zio.sleep(.fromMilliseconds(2)) catch {};
                 continue;
             }
 
-            // Try to deduct pages via CAS.
-            const want = @min(pages, available);
             if (self.priority == .p0) {
-                // P0: saturating subtract, always succeeds.
+                // P0: saturating subtract, always succeeds. `want` already
+                // == pages here (which is a multiple of factor by precondition).
                 atomicSaturatingSub(&limiter.pages, want);
                 return want;
             }

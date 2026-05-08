@@ -494,7 +494,7 @@ pub const Forest = struct {
         var mtb = tb;
         defer mtb.deinit();
 
-        const wh = vfs.g().createFile(path, .{}) catch |err| {
+        const wh = vfs.g().createFile(path, .{ .mode = .direct }) catch |err| {
             err_out.set(err);
             return null;
         };
@@ -1027,7 +1027,7 @@ pub const Forest = struct {
         }
 
         if (!size_matches) {
-            const fh = vfs.g().createFile(path, .{ .flags = .{ .truncate = true } }) catch |err| {
+            const fh = vfs.g().createFile(path, .{ .mode = .direct, .flags = .{ .truncate = true } }) catch |err| {
                 log.err("writeFile: createFile failed for {d}: {s}", .{ file_id, @errorName(err) });
                 return;
             };

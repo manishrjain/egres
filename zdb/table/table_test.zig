@@ -80,6 +80,33 @@ fn buildTestTable(
 // Existing tests (updated for itemRef / blocksAt)
 // ---------------------------------------------------------------------------
 
+// Builder.finish() pads the bytes so the total file size is a multiple of
+// vfs.page_size. Verifies the math across several payload sizes that span
+// page-boundary wraparound.
+test "builder.finish output is page-aligned for any payload size" {
+    const allocator = std.testing.allocator;
+    const sizes = [_]usize{ 1, 32, 100, 1000, 4095, 4096, 4097, 9000 };
+    for (sizes) |n| {
+        var b = Builder.init(allocator, .{ .target_block_size = 4 * 1024 });
+        defer b.deinit();
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            var key_buf: [32]u8 = undefined;
+            const k = try std.fmt.bufPrint(&key_buf, "k{d:0>10}", .{i});
+            try b.add(.{ .primary = k }, "v");
+        }
+        var tb = try b.finish();
+        defer tb.deinit();
+        const remainder = tb.bytes.len % zdb.vfs.page_size;
+        std.testing.expectEqual(@as(usize, 0), remainder) catch |err| {
+            std.log.warn("payload n={d}: bytes.len={d}, page_size={d}, remainder={d}", .{
+                n, tb.bytes.len, zdb.vfs.page_size, remainder,
+            });
+            return err;
+        };
+    }
+}
+
 test "table builder/reader roundtrip and seek" {
     var b = Builder.init(std.testing.allocator, .{ .target_block_size = 256 });
     defer b.deinit();

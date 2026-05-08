@@ -248,6 +248,12 @@ pub const FileHandle = struct {
             }
             written += chunk_len;
         }
+        // Defensive: the spinner accounts what we ASKED to grant, so a
+        // return of 0 means "fully granted". If for any reason `written`
+        // doesn't match `data.len` the caller has been silently lied to —
+        // surface as `error.ShortWrite` so the file isn't installed in the
+        // manifest as if it were complete.
+        if (written != data.len) return error.ShortWrite;
     }
 
     pub fn sync(self: FileHandle) !void {

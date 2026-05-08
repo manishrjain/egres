@@ -102,6 +102,72 @@ test "readAligned alignment math" {
     try testing.expectEqual(@as(usize, 12), r.data.len);
 }
 
+// ── 5a. O_DIRECT honors unaligned writes (regression guard) ─────────
+//
+// We had a working hypothesis that vfs.write under O_DIRECT was silently
+// truncating unaligned-length tails (after observing an SST file with size
+// = exact multiple of page_size, missing its trailer). This test proves
+// the hypothesis WRONG on the platforms we care about: ext4 + iomap_dio_rw
+// on modern Linux honours unaligned addresses, lengths, and offsets — every
+// byte lands on disk intact, including the unaligned tail.
+//
+// The test puts a known checksum in the last 4 bytes (which would be lost
+// to silent truncation), writes the whole buffer with O_DIRECT, then reads
+// the file back and verifies BOTH size AND that the checksum still matches
+// the content. A pure size check would miss the case where the kernel
+// pads the tail with zeros or stale data.
+//
+// Needs a real disk-backed filesystem (tmpfs falls back to non-direct).
+// Uses /data/egres/ which the project pins to ext4.
+test "O_DIRECT write honors unaligned address + length + offset (content verified)" {
+    const dir = "/data/egres";
+    std.fs.accessAbsolute(dir, .{}) catch return error.SkipZigTest;
+
+    const path = dir ++ "/vfs_test_direct_unaligned";
+    defer std.fs.deleteFileAbsolute(path) catch {};
+    std.fs.deleteFileAbsolute(path) catch {};
+
+    // 16 MB + 1 page + 3 bytes — matches the size class where corruption
+    // was observed (~16 MB SST). Length is odd at every plausible device
+    // block size (512 / 4096).
+    const len: usize = 16 * 1024 * 1024 + vfs.page_size + 3;
+    // Slice 7 bytes into a page-aligned arena so the buffer ADDRESS isn't
+    // aligned either.
+    const raw = try testing.allocator.alignedAlloc(u8, vfs.page_alignment, len + 64);
+    defer testing.allocator.free(raw);
+    const data = raw[7..][0..len];
+
+    // Fill body with a deterministic pattern, then plant a u32 checksum of
+    // the body in the LAST 4 bytes — those land in the unaligned tail and
+    // would be the casualty of any silent truncation.
+    var prng = std.Random.DefaultPrng.init(0xc0ffee);
+    prng.fill(data[0 .. len - 4]);
+    const expected_checksum = std.hash.XxHash32.hash(0, data[0 .. len - 4]);
+    std.mem.writeInt(u32, data[len - 4 ..][0..4], expected_checksum, .little);
+
+    const v = vfs.g().*;
+    const wh = try v.createFile(path, .{ .mode = .direct });
+    try wh.write(data, 0, .p0);
+    wh.close();
+
+    // Read the file back through a plain (non-O_DIRECT) handle so we
+    // observe what's actually on disk, not whatever caches we skipped.
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    try testing.expectEqual(@as(u64, len), try file.getEndPos());
+
+    const back = try testing.allocator.alloc(u8, len);
+    defer testing.allocator.free(back);
+    const n = try file.readAll(back);
+    try testing.expectEqual(len, n);
+
+    // Tail must survive: checksum bytes intact AND match the body.
+    const stored_checksum = std.mem.readInt(u32, back[len - 4 ..][0..4], .little);
+    try testing.expectEqual(expected_checksum, stored_checksum);
+    const actual_checksum = std.hash.XxHash32.hash(0, back[0 .. len - 4]);
+    try testing.expectEqual(expected_checksum, actual_checksum);
+}
+
 // ── 5. O_DIRECT fallback on tmpfs ────────────────────────────────────
 
 test "O_DIRECT fallback on tmpfs" {

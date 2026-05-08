@@ -607,6 +607,20 @@ pub const ZdbServer = struct {
         defer arena.deinit();
         const mc = try self.forest.buildSplit(arena.allocator(), tree_id) orelse return;
 
+        // Diagnostic: dump the split's TC layout so we can correlate the
+        // trigger size (logged by Tree.updateCompactCandidate) with what
+        // the split actually proposes — table count, new tree id, etc.
+        var n_create: usize = 0;
+        var n_delete: usize = 0;
+        for (mc.table_changes) |tc| switch (tc.op) {
+            .create => n_create += 1,
+            .delete => n_delete += 1,
+            else => {},
+        };
+        log.info("proposeSplit tree={d} table_changes={d} (create={d} delete={d}) tree_changes={d}", .{
+            tree_id, mc.table_changes.len, n_create, n_delete, mc.tree_changes.len,
+        });
+
         const payload = try encodeManifestChange(
             self.allocator,
             mc.cmd,
@@ -644,17 +658,27 @@ pub const ZdbServer = struct {
         const r = &reader.interface;
 
         while (!self.node.isShuttingDown()) {
-            const cmd = proto.readCommand(r, line_buf) catch |err| {
-                // A parse error leaves the byte stream in an unknown state
-                // (mid-line, oversized line, etc.) — continuing the loop
-                // here would spam ERR until the client gives up. Close
-                // instead; the client can reconnect with a fresh stream.
-                log.warn("client parse error after {d} ops: {s} — closing", .{ ops, @errorName(err) });
-                proto.writeErr(stream, @errorName(err)) catch {};
-                return;
-            } orelse {
-                log.info("client disconnected after {d} ops (EOF)", .{ops});
-                return;
+            // Step 1: pull a line. Stream-level errors (LineTooLong, I/O)
+            // close the connection — byte stream is at an unknown offset.
+            const line = proto.readLine(r, line_buf) catch |err| switch (err) {
+                error.EndOfStream => {
+                    log.info("client disconnected after {d} ops (EOF)", .{ops});
+                    return;
+                },
+                else => {
+                    log.warn("client stream error after {d} ops: {s} — closing", .{ ops, @errorName(err) });
+                    proto.writeErr(stream, @errorName(err)) catch {};
+                    return;
+                },
+            };
+            if (line.len == 0) continue; // blank line — common from interactive clients
+            // Step 2: parse the line. Parse errors are RECOVERABLE — the
+            // line is fully consumed, the stream is at a clean boundary,
+            // so we send ERR and keep the connection open. Common in
+            // interactive use (typo a command, fix and retry).
+            const cmd = proto.parseLine(line) catch |err| {
+                proto.writeErr(stream, @errorName(err)) catch return;
+                continue;
             };
             ops += 1;
             switch (cmd) {
