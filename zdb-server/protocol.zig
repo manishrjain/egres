@@ -35,6 +35,8 @@ pub const help_text =
     \\  zdb tree=<id>                   forest summary scoped to one tree
     \\  zdb namespace=<id>              forest summary for trees in one namespace
     \\  raft                            cluster topology + per-peer log progress
+    \\  raft entry <N>                  dump WAL entry N (one human-readable line)
+    \\  raft entry <lo> <hi>            dump WAL entries [lo, hi], one per line
     \\
 ;
 
@@ -54,10 +56,17 @@ pub const ZdbCmd = struct {
     pub const Filter = enum { prom, forest, tree, namespace };
 };
 
-/// `raft` → cluster topology + per-peer raft progress as the queried
-/// node sees it. Best-effort snapshot — races against conf changes are
-/// possible but tolerated; this is an admin endpoint, not a hot path.
-pub const RaftCmd = struct {};
+/// `raft`            → cluster topology + per-peer raft progress
+/// `raft entry <N>`  → human-readable dump of WAL entry N
+/// `raft entry <lo> <hi>` → dump entries in [lo, hi] (inclusive), one line each
+pub const RaftCmd = struct {
+    sub: SubCmd = .topology,
+    /// `entry`: single index when hi==lo; range [lo, hi] otherwise.
+    lo: u64 = 0,
+    hi: u64 = 0,
+
+    pub const SubCmd = enum { topology, entry };
+};
 
 pub const SetCmd = struct {
     ns: u32,
@@ -358,7 +367,16 @@ fn parseLine(line: []const u8) !Command {
         }
         return error.InvalidZdbFilter;
     } else if (std.mem.eql(u8, cmd, "raft")) {
-        return .{ .raft = .{} };
+        const sub = it.next() orelse return .{ .raft = .{} };
+        if (!std.mem.eql(u8, sub, "entry")) return error.UnknownCommand;
+        const lo_str = it.next() orelse return error.MissingArg;
+        const lo = std.fmt.parseInt(u64, lo_str, 10) catch return error.InvalidArg;
+        const hi: u64 = if (it.next()) |hi_str|
+            (std.fmt.parseInt(u64, hi_str, 10) catch return error.InvalidArg)
+        else
+            lo;
+        if (hi < lo) return error.InvalidArg;
+        return .{ .raft = .{ .sub = .entry, .lo = lo, .hi = hi } };
     } else if (std.mem.eql(u8, cmd, "help")) {
         return .{ .help = .{} };
     } else {

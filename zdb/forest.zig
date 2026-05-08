@@ -494,7 +494,7 @@ pub const Forest = struct {
         var mtb = tb;
         defer mtb.deinit();
 
-        const wh = vfs.g().createFile(path, .{ .mode = .direct }) catch |err| {
+        const wh = vfs.g().createFile(path, .{}) catch |err| {
             err_out.set(err);
             return null;
         };
@@ -720,6 +720,17 @@ pub const Forest = struct {
         self.mu.lockShared();
         defer self.mu.unlockShared();
         return self.trees.get(tree_id);
+    }
+
+    /// True iff the namespace has been created (its route table exists).
+    /// Used by the leader to reject mutations destined for unknown
+    /// namespaces — those would otherwise pile up in immutable memtables
+    /// since `buildFlush` silently drops items whose namespace has no
+    /// route.
+    pub fn hasNamespace(self: *Forest, namespace_id: u32) bool {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        return self.ns_routes.contains(namespace_id);
     }
 
     /// Compact finds the tree with the highest compaction score and runs one
@@ -1016,7 +1027,7 @@ pub const Forest = struct {
         }
 
         if (!size_matches) {
-            const fh = vfs.g().createFile(path, .{ .mode = .direct, .flags = .{ .truncate = true } }) catch |err| {
+            const fh = vfs.g().createFile(path, .{ .flags = .{ .truncate = true } }) catch |err| {
                 log.err("writeFile: createFile failed for {d}: {s}", .{ file_id, @errorName(err) });
                 return;
             };

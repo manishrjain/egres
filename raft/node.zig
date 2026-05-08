@@ -129,14 +129,19 @@ pub const Node = struct {
     /// this (e.g. with forest/applier) and sets node.state_machine.
     pub const StateMachine = struct {
         ctx: *anyopaque,
-        applyFn: *const fn (*anyopaque, Entry, []const u8) void,
+        /// Apply an entry to the state machine. Returning an error parks the
+        /// raft apply loop on this entry: `applyCommits` will sleep briefly
+        /// (still polling shutdown) and retry until apply succeeds. The
+        /// state machine must NOT loop on transient errors itself — it would
+        /// block the raft fiber from observing shutdown.
+        applyFn: *const fn (*anyopaque, Entry, []const u8) anyerror!void,
         writeFileFn: ?*const fn (*anyopaque, u64, []const u8) void = null,
         readFileFn: ?*const fn (*anyopaque, std.mem.Allocator, u64) ?[]const u8 = null,
         hasFileFn: ?*const fn (*anyopaque, u64) bool = null,
         preAppendFn: ?*const fn (*anyopaque, *Node, []const zen.LogEntryBuffer) void = null,
 
-        pub fn apply(self: *StateMachine, entry: Entry, data: []const u8) void {
-            self.applyFn(self.ctx, entry, data);
+        pub fn apply(self: *StateMachine, entry: Entry, data: []const u8) anyerror!void {
+            try self.applyFn(self.ctx, entry, data);
         }
         pub fn writeFile(self: *StateMachine, file_id: u64, data: []const u8) void {
             (self.writeFileFn orelse @panic("StateMachine.writeFile not implemented"))(self.ctx, file_id, data);
@@ -1397,7 +1402,7 @@ pub const Node = struct {
         defer buf.deinit(self.allocator);
         const off = try snap.marshalTo(self.allocator, &buf);
         try zbuf.appendMessageTail(&buf, self.allocator, zen.SnapshotReader.TABLE_ID, off);
-        try self.proposeAndWait(buf.items, .snapshot);
+        try self.proposeAndWaitForApply(buf.items, .snapshot);
     }
 
     /// Propose a data change (normal mutation) through the raft proposal queue.
@@ -1410,12 +1415,21 @@ pub const Node = struct {
         return self.proposeWithCallback(data, cb, ctx, .data);
     }
 
-    /// Synchronous propose-and-block-until-commit wrapper. The wait doubles
-    /// as a rate-limit: the caller fiber stays parked until commit, so it
-    /// can't pile up more than one in-flight proposal. `proposal_type`
+    /// Synchronous propose-and-block-until-applied wrapper. The wait doubles
+    /// as a rate-limit: the caller fiber stays parked until commit + apply,
+    /// so it can't pile up more than one in-flight proposal. `proposal_type`
     /// becomes the wire-level `entry_type`, which lets the snapshot builder
     /// filter manifest entries via `entriesRange(.ty = .manifest)`.
-    pub fn proposeAndWait(self: *Node, data: []const u8, proposal_type: ProposalType) RaftError!void {
+    ///
+    /// Apply-not-just-commit matters for control-plane proposals: e.g. a
+    /// memtable flush proposal's apply pops the immutable from the queue,
+    /// and the next iteration of the flush loop must observe that. Returning
+    /// at commit instead let the loop see the same memtable still queued and
+    /// re-flush it, producing two L0 SSTs with identical (primary, ts) data
+    /// → MergeIterator yields duplicates → builder rejects → KeyOrderViolation.
+    /// User-facing writes go through `proposeDataChange` (callback fires on
+    /// commit) and are unaffected.
+    pub fn proposeAndWaitForApply(self: *Node, data: []const u8, proposal_type: ProposalType) RaftError!void {
         std.debug.assert(proposal_type != .any);
         var ctx = WaitCtx{ .status = .committed };
         ctx.wg.init();
@@ -1423,16 +1437,31 @@ pub const Node = struct {
         try self.proposeWithCallback(data, &onWaitCommit, @ptrCast(&ctx), proposal_type);
         ctx.wg.wait() catch return error.CommitFailed;
         if (ctx.status != .committed) return error.NotCommitted;
+        // Wait for apply_ts to catch up to this entry's timestamp. Use the
+        // two-phase asyncWait pattern so we don't lose a broadcast that
+        // fires between the load and the suspend (apply_ts_notify is
+        // stateless — see callbackLoop comment).
+        while (self.apply_ts.load(.acquire) < ctx.entry_ts) {
+            var w: zio.Waiter = .init();
+            _ = self.apply_ts_notify.asyncWait(&w);
+            if (self.apply_ts.load(.acquire) >= ctx.entry_ts) {
+                _ = self.apply_ts_notify.asyncCancelWait(&w);
+                break;
+            }
+            w.wait(1, .allow_cancel) catch return error.CommitFailed;
+        }
     }
 
     const WaitCtx = struct {
         wg: utils.WaitGroup = .{},
         status: CommitStatus,
+        entry_ts: u64 = 0,
     };
 
-    fn onWaitCommit(ctx_raw: *anyopaque, _: Entry, status: CommitStatus) void {
+    fn onWaitCommit(ctx_raw: *anyopaque, entry: Entry, status: CommitStatus) void {
         const ctx: *WaitCtx = @ptrCast(@alignCast(ctx_raw));
         ctx.status = status;
+        ctx.entry_ts = entry.timestamp;
         ctx.wg.done();
     }
 
@@ -1677,11 +1706,14 @@ pub const Node = struct {
     /// log-index order (populated by `appendProposalsToLeaderLog`), so a
     /// peek/receive loop is sufficient — no map/scan needed.
     ///
-    /// Re-check before wait: commit_notify is edge-triggered, so a broadcast
-    /// that fires while we're inside the drain loop is lost. Snapshot
-    /// commit_index at the start, drain against it, then load again before
-    /// waiting — if it advanced, loop without waiting so we never miss
-    /// callbacks.
+    /// commit_notify is stateless — `broadcast()` against an empty wait queue
+    /// is dropped. Naively `check_state(); if (idle) notify.wait();` loses
+    /// any broadcast that fires between the check and `wait()`'s queue push.
+    /// The two-phase `asyncWait` / `Waiter.wait` pattern fixes that: register
+    /// FIRST, then re-check. Once we're queued, any subsequent broadcast WILL
+    /// signal us. Either the recheck sees the new state (we unsubscribe and
+    /// loop) or we suspend on the queued waiter and wake on the next
+    /// broadcast. See `raft/notify_pattern_test.zig`.
     pub fn callbackLoop(self: *Node) void {
         while (!self.isShuttingDown()) {
             const ci_seen = self.commit_index.load(.acquire);
@@ -1691,22 +1723,30 @@ pub const Node = struct {
                 const ready = self.apply_callbacks.tryReceive() catch break;
                 ready.cb(ready.ctx, ready.entry, .committed);
             }
-            if (self.commit_index.load(.acquire) > ci_seen) continue;
-            self.commit_notify.wait() catch return;
+            var w: zio.Waiter = .init();
+            _ = self.commit_notify.asyncWait(&w);
+            if (self.commit_index.load(.acquire) > ci_seen) {
+                _ = self.commit_notify.asyncCancelWait(&w);
+                continue;
+            }
+            w.wait(1, .allow_cancel) catch return;
         }
     }
 
-    /// Re-check before wait for the same lost-wakeup reason as callbackLoop:
-    /// applyCommits captures commit_index at entry and stops there, so any
-    /// commits that landed during the apply loop need a fresh re-check.
+    /// Same lost-wakeup pattern as `callbackLoop` — see comment there.
     pub fn applyLoop(self: *Node) void {
         // TODO: Use this loop to replay all the logs from last snapshot.
         // Actually, if we just set the apply index to the last snapshot index, then this would
         // automatically apply all the pending entries anyway. We just need to trigger it.
         while (!self.isShuttingDown()) {
             self.applyCommits();
-            if (self.apply_index.load(.acquire) < self.commit_index.load(.acquire)) continue;
-            self.commit_notify.wait() catch return;
+            var w: zio.Waiter = .init();
+            _ = self.commit_notify.asyncWait(&w);
+            if (self.apply_index.load(.acquire) < self.commit_index.load(.acquire)) {
+                _ = self.commit_notify.asyncCancelWait(&w);
+                continue;
+            }
+            w.wait(1, .allow_cancel) catch return;
         }
     }
 
@@ -1740,11 +1780,34 @@ pub const Node = struct {
                         // the apply path is the bottleneck when commit
                         // outpaces apply.
                         const t_apply = std.time.microTimestamp();
-                        s.apply(.{
+                        const sm_entry = Entry{
                             .index = entry.index,
                             .term = entry.term,
                             .timestamp = reader.timestamp(),
-                        }, reader.data());
+                        };
+                        // Retry on apply failure with a 1 ms backoff so the
+                        // raft fiber stays responsive to shutdown. The state
+                        // machine must NOT do its own retry loop — it would
+                        // wedge shutdown.
+                        //
+                        // Logging policy: hard errors fire on every retry
+                        // (loud signal that something's wrong). The expected
+                        // transient `error.RecoveryInProgress` would spam
+                        // ~1000 lines/sec during normal startup, so it goes
+                        // through `utils.logEvery` (5 s).
+                        while (true) {
+                            s.apply(sm_entry, reader.data()) catch |err| {
+                                if (err == error.RecoveryInProgress) {
+                                    utils.logEvery(5, "apply idx={d}: recovery in progress, retrying", .{entry.index});
+                                } else {
+                                    raft_log.err("apply idx={d}: {s}, retrying in 1ms", .{ entry.index, @errorName(err) });
+                                }
+                                if (self.isShuttingDown()) return;
+                                zio.sleep(zio.Duration.fromMilliseconds(1)) catch return;
+                                continue;
+                            };
+                            break;
+                        }
                         metrics.g().observePhase("apply", t_apply);
                     }
                 } else if (ety == .snapshot and reader.data().len > 0) {
@@ -1801,7 +1864,7 @@ pub const Node = struct {
             const wall_sec: u32 = @intCast(std.time.timestamp());
             if (wall_sec <= last_ts.seconds) continue;
 
-            self.proposeAndWait(&.{}, .data) catch |err| {
+            self.proposeAndWaitForApply(&.{}, .data) catch |err| {
                 raft_log.warn("clock tick propose failed: {s}", .{@errorName(err)});
             };
         }

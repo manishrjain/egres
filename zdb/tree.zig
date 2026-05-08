@@ -751,7 +751,7 @@ pub const Tree = struct {
         const path = try options.sstPath(self.allocator, self.opts.dir, id);
         errdefer self.allocator.free(path);
 
-        const wh = try vfs.g().createFile(path, .{ .mode = .direct });
+        const wh = try vfs.g().createFile(path, .{});
         try wh.write(tb.bytes, 0, bld.cfg.priority);
 
         // Sync in a fiber; data is in page cache after write.

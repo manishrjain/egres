@@ -62,7 +62,7 @@ pub const StorageImpl = struct {
         };
     }
 
-    fn applyEntry(ctx: *anyopaque, entry: raft.Entry, data: []const u8) void {
+    fn applyEntry(ctx: *anyopaque, entry: raft.Entry, data: []const u8) anyerror!void {
         // Empty-data entries (clock ticks) have no state machine work — the
         // raft node still advances `apply_ts` after we return, so the tick's
         // timestamp becomes visible to blocked readers.
@@ -71,20 +71,12 @@ pub const StorageImpl = struct {
 
         // Recovery barrier: if `runRecovery` is still fetching SSTs and
         // installing the snapshot manifest, applies would fail (missing
-        // trees/files). Park until the barrier flips.
-        while (!self.recovery_done.load(.acquire)) {
-            if (self.node.isShuttingDown()) return;
-            zio.sleep(zio.Duration.fromMilliseconds(50)) catch return;
-        }
+        // trees/files). Surface as `error.RecoveryInProgress` so the raft
+        // apply loop retries (with shutdown polling) instead of us busy-
+        // looping here.
+        if (!self.recovery_done.load(.acquire)) return error.RecoveryInProgress;
 
-        while (true) {
-            self.applyEntryInner(entry, data) catch |err| {
-                log.err("on_apply: failed at index={d}: {s}, retrying", .{ entry.index, @errorName(err) });
-                zio.sleep(zio.Duration.fromMilliseconds(100)) catch return;
-                continue;
-            };
-            return;
-        }
+        return self.applyEntryInner(entry, data);
     }
 
     fn applyEntryInner(self: *StorageImpl, entry: raft.Entry, data: []const u8) !void {
@@ -576,7 +568,7 @@ pub const ZdbServer = struct {
         const new_id = self.forest.next_file_id.fetchAdd(1, .monotonic);
         const payload = try encodeManifestChange(self.allocator, 1, &.{}, &.{}, new_id);
         defer self.allocator.free(payload);
-        try self.node.proposeAndWait(payload, .manifest);
+        try self.node.proposeAndWaitForApply(payload, .manifest);
     }
 
     fn proposeFlush(self: *ZdbServer) !void {
@@ -589,7 +581,7 @@ pub const ZdbServer = struct {
 
         const payload = try encodeManifestChange(self.allocator, 2, changes.items, &.{}, result.memtable_id);
         defer self.allocator.free(payload);
-        try self.node.proposeAndWait(payload, .manifest);
+        try self.node.proposeAndWaitForApply(payload, .manifest);
     }
 
     fn proposeCompaction(self: *ZdbServer, target: Forest.CompactionTarget) !void {
@@ -601,7 +593,7 @@ pub const ZdbServer = struct {
 
         const payload = try encodeManifestChange(self.allocator, 3, changes.items, &.{}, 0);
         defer self.allocator.free(payload);
-        try self.node.proposeAndWait(payload, .manifest);
+        try self.node.proposeAndWaitForApply(payload, .manifest);
     }
 
     fn proposeSplit(self: *ZdbServer, tree_id: u64) !void {
@@ -623,7 +615,7 @@ pub const ZdbServer = struct {
             0,
         );
         defer self.allocator.free(payload);
-        try self.node.proposeAndWait(payload, .manifest);
+        try self.node.proposeAndWaitForApply(payload, .manifest);
     }
 
     /// Send new SST files to peers and wait for quorum acks.
@@ -696,8 +688,8 @@ pub const ZdbServer = struct {
                 .zdb => |req| {
                     self.handleZdb(stream, req) catch return;
                 },
-                .raft => |_| {
-                    self.handleRaft(stream) catch return;
+                .raft => |req| {
+                    self.handleRaft(stream, req) catch return;
                 },
                 .help => |_| {
                     proto.writeHelp(stream) catch return;
@@ -708,6 +700,14 @@ pub const ZdbServer = struct {
     }
 
     fn handleSet(self: *ZdbServer, stream: zio.net.Stream, req: proto.SetCmd) !void {
+        // Reject up-front if the destination namespace has no route table.
+        // Otherwise the mutation is durably committed through Raft but
+        // `buildFlush` will silently drop it (no tree to route to), and the
+        // immutable memtable never gets popped — RAM grows without bound.
+        if (!self.forest.hasNamespace(req.ns)) {
+            try writeUnknownNamespace(stream, req.ns);
+            return;
+        }
         // Encode as a single-item Mutations batch — the wire format is the
         // same regardless of batch size, so the apply path doesn't need to
         // know whether this write came from a `set` or a `set_batch`.
@@ -763,6 +763,10 @@ pub const ZdbServer = struct {
     /// propose once. Each token is hex-decoded if prefixed with `0x`,
     /// literal otherwise.
     fn handleSetBatch(self: *ZdbServer, stream: zio.net.Stream, batch: proto.ParsedBatch) !void {
+        if (!self.forest.hasNamespace(batch.ns)) {
+            try writeUnknownNamespace(stream, batch.ns);
+            return;
+        }
         const proposal_bytes = try encodeMutations(self.allocator, batch.ns, batch.kvs);
         defer self.allocator.free(proposal_bytes);
 
@@ -865,7 +869,8 @@ pub const ZdbServer = struct {
         }
     }
 
-    fn handleRaft(self: *ZdbServer, stream: zio.net.Stream) !void {
+    fn handleRaft(self: *ZdbServer, stream: zio.net.Stream, req: proto.RaftCmd) !void {
+        if (req.sub == .entry) return self.handleRaftEntry(stream, req.lo, req.hi);
         // Best-effort snapshot of node + peer state. Races against an
         // in-flight conf change are possible (peers map mutated by
         // mainLoop's applyConfChange); accepted because this is an admin
@@ -936,6 +941,33 @@ pub const ZdbServer = struct {
         try stream.writeAll(body.writer.buffered(), .none);
     }
 
+    /// Dump WAL entries [lo, hi] (inclusive) as one human-readable line each.
+    /// Used for poking at the raft log when an apply error wedges progress
+    /// at a known index. Out-of-range or missing entries become an error
+    /// line so the caller can tell missing-vs-empty apart.
+    fn handleRaftEntry(self: *ZdbServer, stream: zio.net.Stream, lo: u64, hi: u64) !void {
+        var body: std.Io.Writer.Allocating = .init(self.allocator);
+        defer body.deinit();
+        const w = &body.writer;
+
+        var i: u64 = lo;
+        while (i <= hi) : (i += 1) {
+            var result = self.node.log.entriesRange(.{ .lo = i, .hi = i + 1 }) catch |err| {
+                try w.print("idx={d} err={s}\n", .{ i, @errorName(err) });
+                continue;
+            };
+            defer result.deinit();
+            if (result.entries.len == 0) {
+                try w.print("idx={d} <missing>\n", .{i});
+                continue;
+            }
+            const stored = result.entries[0];
+            try formatEntry(self.allocator, w, stored);
+        }
+        try w.writeByte('\n');
+        try stream.writeAll(body.writer.buffered(), .none);
+    }
+
     fn handleZdb(self: *ZdbServer, stream: zio.net.Stream, req: proto.ZdbCmd) !void {
         // Snapshot into a buffer so we write in a single syscall. Clients
         // read until '\n\n' so we always terminate the body with a blank line.
@@ -986,7 +1018,7 @@ pub const ZdbServer = struct {
         };
         defer self.allocator.free(payload);
 
-        self.node.proposeAndWait(payload, .manifest) catch |err| {
+        self.node.proposeAndWaitForApply(payload, .manifest) catch |err| {
             log.err("ns create propose failed: {s}", .{@errorName(err)});
             try proto.writeErr(stream, @errorName(err));
             return;
@@ -1007,6 +1039,76 @@ fn onCommit(ctx_raw: *anyopaque, entry: raft.Entry, status: raft.CommitStatus) v
     ctx.status = status;
     ctx.commit_ts = entry.timestamp;
     ctx.wg.done();
+}
+
+fn writeUnknownNamespace(stream: zio.net.Stream, ns: u32) !void {
+    var buf: [64]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "unknown namespace {d}", .{ns}) catch unreachable;
+    try proto.writeErr(stream, msg);
+}
+
+/// Render one StoredEntry as a single-line human-readable summary.
+/// Format: `idx=I term=T ts=TS type=X bytes=B detail=...`
+fn formatEntry(alloc: std.mem.Allocator, w: *std.Io.Writer, stored: raft.StoredEntry) !void {
+    const reader = raft.buffers.LogEntryReader.parseRoot(stored.bytes) catch |err| {
+        try w.print("idx={d} term={d} bytes={d} parse_err={s}\n", .{ stored.index, stored.term, stored.bytes.len, @errorName(err) });
+        return;
+    };
+    const ety = reader.entryType();
+    const ts = reader.timestamp();
+    const data = reader.data();
+    try w.print("idx={d} term={d} ts={d} type={s} data_bytes={d}", .{
+        stored.index, stored.term, ts, @tagName(ety), data.len,
+    });
+    if (data.len == 0) {
+        try w.print(" detail=tick\n", .{});
+        return;
+    }
+    switch (ety) {
+        .data, .manifest => {
+            const parsed = zdb_bufs.parseMessageWithTail(data) catch |err| {
+                try w.print(" detail=parse_err({s})\n", .{@errorName(err)});
+                return;
+            };
+            switch (parsed) {
+                .Mutations => |ms| {
+                    const count = ms.kvsLen();
+                    try w.print(" detail=Mutations ns={d} count={d}", .{ ms.namespace(), count });
+                    if (count > 0) {
+                        const kv = ms.kvsAt(0) catch {
+                            try w.writeByte('\n');
+                            return;
+                        };
+                        try w.print(" first_key={x}", .{kv.key()});
+                    }
+                    try w.writeByte('\n');
+                },
+                .ManifestChange => |mc| {
+                    const mcs = mc.toStruct(alloc) catch |err| {
+                        try w.print(" detail=ManifestChange err={s}\n", .{@errorName(err)});
+                        return;
+                    };
+                    defer {
+                        mcs.deinit(alloc);
+                        alloc.destroy(mcs);
+                    }
+                    try w.print(" detail=ManifestChange cmd={d} memtable_id={d} table_changes={d} tree_changes={d}", .{
+                        mcs.cmd, mcs.memtable_id, mcs.table_changes.len, mcs.tree_changes.len,
+                    });
+                    try w.writeByte('\n');
+                    for (mcs.table_changes, 0..) |tc, idx| {
+                        try w.print("  tc[{d}]=(op={s} fid={d} tree={d} lvl={d})\n", .{
+                            idx, @tagName(tc.op), tc.table_id, tc.tree_id, tc.level,
+                        });
+                    }
+                },
+                else => try w.print(" detail=Other({s})\n", .{@tagName(parsed)}),
+            }
+        },
+        .conf => try w.print(" detail=ConfChange\n", .{}),
+        .snapshot => try w.print(" detail=Snapshot\n", .{}),
+        else => try w.print(" detail=unknown\n", .{}),
+    }
 }
 
 /// Encode a ManifestChange into a zbuf-serialized payload for proposeDataChange.

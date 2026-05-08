@@ -17,6 +17,7 @@ pub const diskwal = @import("diskwal.zig");
 pub const DiskWAL = @import("diskwal.zig").DiskWAL;
 pub const HardState = @import("raftwal.zig").HardState;
 pub const Snapshot = @import("raftwal.zig").Snapshot;
+pub const StoredEntry = @import("raftwal.zig").StoredEntry;
 pub const buffers = @import("buffers_gen");
 pub const runtime = @import("runtime.zig");
 pub const RaftRuntime = runtime.RaftRuntime;

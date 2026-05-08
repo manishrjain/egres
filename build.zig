@@ -520,6 +520,19 @@ fn addZdbServer(
     const install = b.addInstallArtifact(exe, .{});
     const zdb_server_step = b.step("zdb-server", "Build zdb server binary");
     zdb_server_step.dependOn(&install.step);
+
+    // sst-verify reuses zdb_mod so we don't double-compile zdb sources.
+    const verify_exe = b.addExecutable(.{
+        .name = "sst-verify",
+        .root_module = makeModule(b, target, optimize, "scripts/sst_verify.zig"),
+    });
+    addVendoredCompressionSources(b, verify_exe);
+    verify_exe.root_module.addImport("zdb", zdb_mod);
+    verify_exe.step.dependOn(regen_buffers_step);
+    b.installArtifact(verify_exe);
+    const verify_install = b.addInstallArtifact(verify_exe, .{});
+    const verify_step = b.step("sst-verify", "Build the standalone SST file verifier");
+    verify_step.dependOn(&verify_install.step);
 }
 
 fn addZdbBench(
