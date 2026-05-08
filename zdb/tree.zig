@@ -583,8 +583,10 @@ pub const Tree = struct {
         // L0: take the OLDEST `l0_tables_per_compaction` (insertion order
         // = oldest first). Newer L0 tables stay put and continue to
         // shadow the compacted versions on read — correctness preserved.
-        // L≥1: take the first table; overlap-with-dest is what bounds
-        // the compaction's work there.
+        // L≥1: pick a RANDOM single table. Always picking items[0] (the
+        // smallest-key table) starves higher key ranges and biases write
+        // amplification toward the left edge of the keyspace; random
+        // picks spread compaction load uniformly across the level.
         const src_entries_slice = blk: {
             self.levels[src].mu.lockShared();
             defer self.levels[src].mu.unlockShared();
@@ -594,8 +596,10 @@ pub const Tree = struct {
 
             const take = if (src_level == 0)
                 items[0..@min(items.len, self.opts.l0_tables_per_compaction)]
-            else
-                items[0..1];
+            else tk: {
+                const idx = std.crypto.random.uintLessThan(usize, items.len);
+                break :tk items[idx .. idx + 1];
+            };
             break :blk try self.allocator.dupe(TableEntry, take);
         };
         defer self.allocator.free(src_entries_slice);
