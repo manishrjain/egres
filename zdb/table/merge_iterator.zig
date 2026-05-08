@@ -83,6 +83,7 @@ pub const MergeIterator = struct {
 pub const ConcatIterator = struct {
     iters: []table.TableIterator, // caller-owned slice; sorted by smallest key
     current: usize, // == iters.len when exhausted
+    end: Key = .{}, // upper bound carried over from `seekRange` for lazy seeking
 
     pub fn init(iters: []table.TableIterator) ConcatIterator {
         return .{ .iters = iters, .current = 0 };
@@ -92,28 +93,26 @@ pub const ConcatIterator = struct {
         for (self.iters) |*it| it.deinit();
     }
 
+    /// Seek the FIRST relevant iter only — subsequent iters get seeked
+    /// lazily by `next()` as it advances `current`. Avoids paying the
+    /// per-table `setBlock` + decompress cost for tables we may never
+    /// reach (e.g., when the merge upstream stops early).
     pub fn seekRange(self: *ConcatIterator, start: Key, end: Key) !void {
+        self.end = end;
         if (self.iters.len == 0) return;
 
         if (start.len() == 0) {
             self.current = 0;
-            try self.iters[0].seekRange(.{}, end);
-            return;
+        } else {
+            // First table whose biggest key >= start.
+            self.current = utils.search(table.TableIterator, self.iters, start, struct {
+                fn f(sk: Key, it: table.TableIterator) bool {
+                    return it.table.biggest.order(sk) != .lt;
+                }
+            }.f);
+            if (self.current >= self.iters.len) return;
         }
-
-        // First table whose biggest key >= start.
-        const idx = utils.search(table.TableIterator, self.iters, start, struct {
-            fn f(sk: Key, it: table.TableIterator) bool {
-                return it.table.biggest.order(sk) != .lt;
-            }
-        }.f);
-        self.current = idx;
-        if (self.current >= self.iters.len) return;
-
         try self.iters[self.current].seekRange(start, end);
-        for (self.iters[self.current + 1 ..]) |*itr| {
-            try itr.seekRange(.{}, end);
-        }
     }
 
     pub fn itemRef(self: *const ConcatIterator) ?table.Item {
@@ -123,14 +122,15 @@ pub const ConcatIterator = struct {
 
     pub fn next(self: *ConcatIterator) Error!void {
         if (self.current >= self.iters.len) return;
-
-        // Advance
         try self.iters[self.current].next();
-
-        // This loop can skip over empty iterators, even though we don't expect them.
+        // When the current iter exhausts, advance and lazy-seek the next.
+        // The handoff key is empty: every subsequent iter is by
+        // definition entirely above the current iter's range, so there's
+        // no lower bound to apply — only the upper bound from `end`.
         while (self.iters[self.current].itemRef() == null) {
             self.current += 1;
             if (self.current >= self.iters.len) return;
+            try self.iters[self.current].seekRange(.{}, self.end);
         }
     }
 };

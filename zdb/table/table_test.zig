@@ -706,4 +706,19 @@ test "seekRange: ConcatIterator across multiple tables" {
         try concat.next();
     }
     try std.testing.expectEqual(@as(usize, 10), count);
+
+    // Regression: empty start AND empty end must walk every key across
+    // every sub-iter. The previous implementation only seeked iters[0]
+    // up-front; once `next()` exhausted iters[0] and advanced to
+    // iters[1], `itemRef()` returned null (never seeked) and the
+    // ConcatIterator declared itself done after just the first table.
+    try concat.seekRange(.{}, .{});
+    count = 0;
+    while (concat.itemRef()) |entry| : (count += 1) {
+        var buf: [32]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&buf, "k{d:0>4}", .{count});
+        try std.testing.expectEqualStrings(expected, entry.key.primary);
+        try concat.next();
+    }
+    try std.testing.expectEqual(@as(usize, 300), count);
 }
