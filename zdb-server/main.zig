@@ -230,7 +230,6 @@ pub fn main() !void {
         .forest = forest,
         .allocator = allocator,
         .node = node,
-        .snapshot_cfg = live_snapshot,
     };
     var sm = storage_impl.asStateMachine();
     node.state_machine = &sm;
@@ -252,6 +251,7 @@ pub fn main() !void {
         forest,
         node,
         &storage_impl,
+        live_snapshot,
         args.client_addr,
     );
     defer deinitWithLog("zdb_srv", &zdb_srv);
@@ -260,7 +260,7 @@ pub fn main() !void {
 
     // appMain(&raft_rt, &zdb_srv, node, &args);
     // // Entry point: spawn appMain on the raft pool. It orchestrates everything.
-    var handle = try pool.get(.raft).spawn(appMain, .{ &raft_rt, &zdb_srv, &storage_impl, node, &args });
+    var handle = try pool.get(.raft).spawn(appMain, .{ &raft_rt, &zdb_srv, node, &args });
     handle.join();
 
     log.info("shutting down...", .{});
@@ -269,7 +269,7 @@ pub fn main() !void {
 /// Runs on the raft pool. Spawns raft runtime, client server (on query pool
 /// via runtime.pool() singleton), compaction loop (on background pool),
 /// and waits for SIGINT or SIGTERM to shut down.
-fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, storage: *zdb_server.StorageImpl, node: *raft.Node, args: *const Args) void {
+fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, node: *raft.Node, args: *const Args) void {
     log.info("inside appMain", .{});
     var group = zio.group();
     defer group.cancel();
@@ -295,7 +295,7 @@ fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, storage: 
     // becoming known (via AppendEntries from leader, or via the join
     // response) so `fetchFiles` can locate the source for missing SSTs.
     log.info("appMain: spawning recovery on background pool", .{});
-    group.spawn(runRecovery, .{storage}) catch return;
+    group.spawn(runRecovery, .{zdb_srv}) catch return;
 
     log.info("appMain: spawning client server on query pool", .{});
     group.spawn(runServer, .{zdb_srv}) catch return;
@@ -304,7 +304,7 @@ fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, storage: 
     group.spawn(runCompaction, .{zdb_srv}) catch return;
 
     log.info("appMain: spawning snapshot loop on background pool", .{});
-    group.spawn(runSnapshot, .{storage}) catch return;
+    group.spawn(runSnapshot, .{zdb_srv}) catch return;
 
     log.info("appMain: waiting for SIGINT/SIGTERM to shutdown", .{});
     var sigint = zio.Signal.init(.interrupt) catch return;
@@ -350,9 +350,9 @@ fn runServer(s: *zdb_server.ZdbServer) void {
 /// One-shot recovery: install the manifest from the latest snapshot, fetching
 /// any missing SST files from the leader along the way. Returns once the
 /// manifest is online (or on shutdown). Apply loop retries during this window.
-fn runRecovery(s: *zdb_server.StorageImpl) void {
+fn runRecovery(s: *zdb_server.ZdbServer) void {
     var handle = runtime.pool().get(.background).spawn(
-        zdb_server.StorageImpl.recoverFromSnapshot,
+        zdb_server.ZdbServer.recoverFromSnapshot,
         .{s},
     ) catch |err| {
         log.err("runRecovery err: {}", .{err});
@@ -366,9 +366,9 @@ fn runRecovery(s: *zdb_server.StorageImpl) void {
 /// Spawn the snapshot loop on the background runtime pool. Leader-only loop
 /// that polls WAL size/age and proposes snapshots through Raft.
 /// Must be called from a zio coroutine. Blocks until cancelled.
-fn runSnapshot(s: *zdb_server.StorageImpl) void {
+fn runSnapshot(s: *zdb_server.ZdbServer) void {
     var handle = runtime.pool().get(.background).spawn(
-        zdb_server.StorageImpl.runSnapshotLoop,
+        zdb_server.ZdbServer.runSnapshotLoop,
         .{s},
     ) catch |err| {
         log.err("runSnapshot err: {}", .{err});

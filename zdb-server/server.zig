@@ -37,12 +37,12 @@ pub const StorageImpl = struct {
     forest: *Forest,
     allocator: std.mem.Allocator,
     node: *raft.Node,
-    snapshot_cfg: *flags.Live(SnapshotCfg),
-    /// Gate the apply path until `recoverFromSnapshot` finishes. Until then
-    /// trees, route tables, and SST files referenced by the snapshot may not
-    /// be in place, and apply would error-retry-spin. Set to true via defer
-    /// at the top of `recoverFromSnapshot`, so the no-snapshot fast path
-    /// also flips it (no permanent block).
+    /// Gate the apply path until recovery finishes. Until then trees, route
+    /// tables, and SST files referenced by the snapshot may not be in
+    /// place, and apply would error-retry-spin. Flipped (along with
+    /// `oldest_memtable_index`) by `markRecovered`, which the ZdbServer's
+    /// recovery routine calls — even on the no-snapshot fast path so the
+    /// gate doesn't wedge the apply loop forever.
     recovery_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Skip Mutations whose log index is strictly less than this during
     /// recovery replay — the corresponding data is in SSTs that the replay
@@ -59,7 +59,7 @@ pub const StorageImpl = struct {
             .readFileFn = &readFile,
             .hasFileFn = &hasFile,
             .preAppendFn = &preAppend,
-            .isReadyFn = &isReadyVtable,
+            .isReadyFn = &isReady,
         };
     }
 
@@ -68,13 +68,9 @@ pub const StorageImpl = struct {
     /// polls this in `Node.proposeDataChange`; without the memtable gate, a
     /// write that races startup would land in the placeholder and be dropped
     /// by the first `swapCurrentOut`.
-    pub fn isReady(self: *StorageImpl) bool {
-        return self.recovery_done.load(.acquire) and self.forest.memtables.currentId() != 0;
-    }
-
-    fn isReadyVtable(ctx: *anyopaque) bool {
+    fn isReady(ctx: *anyopaque) bool {
         const self: *StorageImpl = @ptrCast(@alignCast(ctx));
-        return self.isReady();
+        return self.recovery_done.load(.acquire) and self.forest.memtables.currentId() != 0;
     }
 
     fn applyEntry(ctx: *anyopaque, entry: raft.Entry, data: []const u8) anyerror!void {
@@ -195,6 +191,188 @@ pub const StorageImpl = struct {
         return self.forest.hasFile(file_id);
     }
 
+    /// Publish the result of recovery to the apply path: install the
+    /// snapshot's `oldest_memtable_index` floor and flip the apply-loop
+    /// barrier. Must be called exactly once, even on no-snapshot/error
+    /// paths, so applies don't stall forever. The release-store pairs
+    /// with `applyEntry`'s acquire-load so `oldest_memtable_index` is
+    /// visible by the time apply reads it.
+    pub fn markRecovered(self: *StorageImpl, oldest_memtable_index: u64) void {
+        self.oldest_memtable_index = oldest_memtable_index;
+        self.recovery_done.store(true, .release);
+    }
+
+    /// Ensure all SST files referenced by ManifestChange entries are on disk
+    /// before the WAL append. Fetches missing files from the leader.
+    fn preAppend(ctx: *anyopaque, node: *raft.Node, entries: []const raft.buffers.LogEntryBuffer) void {
+        const self: *StorageImpl = @ptrCast(@alignCast(ctx));
+
+        // Collect missing file IDs across all entries.
+        var missing = std.ArrayList(u64).empty;
+        defer missing.deinit(self.allocator);
+
+        for (entries) |entry| {
+            const reader = entry.initReader() catch continue;
+            if (reader.entryType() != .manifest) continue;
+            const data = reader.data();
+            if (data.len == 0) continue;
+
+            const mc = zdb_bufs.ManifestChangeReader.parseRoot(data) catch continue;
+            const tc_len = mc.tableChangesLen();
+            for (0..tc_len) |i| {
+                const tc = mc.tableChangesAt(@intCast(i)) catch continue;
+                if (tc.op() == .create and !self.forest.hasFile(tc.tableId())) {
+                    missing.append(self.allocator, tc.tableId()) catch continue;
+                }
+            }
+        }
+
+        if (missing.items.len == 0) return;
+
+        log.info("preAppend: fetching {d} missing files from leader", .{missing.items.len});
+        while (true) {
+            node.fetchFiles(missing.items) catch |err| {
+                log.err("preAppend: fetchFiles failed: {s}, retrying", .{@errorName(err)});
+                zio.sleep(zio.Duration.fromMilliseconds(100)) catch return;
+                continue;
+            };
+            break;
+        }
+        log.info("preAppend: received {d} files from leader", .{missing.items.len});
+    }
+};
+
+/// Snapshot of work the compaction/flush loops are currently building.
+/// Lives only between the moment we start writing SSTs / building changes
+/// and the moment the resulting manifest entry is appended via
+/// `proposeAndWaitForApply`. Surfaced through `zdb forest` so an operator
+/// can tell whether a "compactions wanted" entry is genuinely starved or
+/// just waiting on an in-flight build to finish.
+pub const InFlight = struct {
+    pub const Kind = enum { flush, compaction, split, new_memtable };
+    kind: Kind,
+    tree_id: u64,
+    src_level: u8 = 0,
+    dest_level: u8 = 0,
+    src_tables: u32 = 0,
+    started_at_us: i64,
+};
+
+pub const ZdbServer = struct {
+    allocator: std.mem.Allocator,
+    forest: *Forest,
+    node: *raft.Node,
+    /// Shared with the apply path. Loops/handlers gate on
+    /// `storage.recovery_done` (and, for data mutations, on the forest also
+    /// having a real memtable) so the SM is in a valid shape before any
+    /// proposal goes through Raft.
+    storage: *StorageImpl,
+    snapshot_cfg: *flags.Live(SnapshotCfg),
+    listen_addr: zio.net.IpAddress,
+    in_flight_mu: std.Thread.Mutex = .{},
+    in_flight: std.ArrayList(InFlight) = .empty,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        forest: *Forest,
+        node: *raft.Node,
+        storage: *StorageImpl,
+        snapshot_cfg: *flags.Live(SnapshotCfg),
+        client_addr: []const u8,
+    ) !ZdbServer {
+        const addr = try zio.net.IpAddress.parseIpAndPort(client_addr);
+        return .{
+            .allocator = allocator,
+            .forest = forest,
+            .node = node,
+            .storage = storage,
+            .snapshot_cfg = snapshot_cfg,
+            .listen_addr = addr,
+        };
+    }
+
+    pub fn deinit(self: *ZdbServer) void {
+        self.in_flight_mu.lock();
+        defer self.in_flight_mu.unlock();
+        self.in_flight.deinit(self.allocator);
+    }
+
+    /// Add an in-flight record. Returns the slice index for `removeInFlight`.
+    /// Caller is responsible for pairing exactly one `remove` per `add`,
+    /// typically via `defer`.
+    fn addInFlight(self: *ZdbServer, entry: InFlight) void {
+        self.in_flight_mu.lock();
+        defer self.in_flight_mu.unlock();
+        self.in_flight.append(self.allocator, entry) catch {};
+    }
+
+    fn removeInFlight(self: *ZdbServer, kind: InFlight.Kind, tree_id: u64, src_level: u8) void {
+        self.in_flight_mu.lock();
+        defer self.in_flight_mu.unlock();
+        // Match on (kind, tree_id, src_level) — multiple in-flight entries
+        // with the same key would mean two concurrent compactions on the
+        // same level of the same tree, which we don't currently spawn.
+        for (self.in_flight.items, 0..) |it, i| {
+            if (it.kind == kind and it.tree_id == tree_id and it.src_level == src_level) {
+                _ = self.in_flight.orderedRemove(i);
+                return;
+            }
+        }
+    }
+
+    pub fn runClientLoop(self: *ZdbServer) void {
+        log.info("inside runClientLoop", .{});
+        defer log.info("client loop exiting (shutdown)", .{});
+
+        const listener = self.listen_addr.listen(.{ .reuse_address = true }) catch |err| {
+            log.err("failed to listen on client addr: {}", .{err});
+            return;
+        };
+        defer listener.close();
+
+        log.info("client TCP listener started, accepting connections", .{});
+
+        var group = zio.group();
+        defer group.cancel();
+
+        var conn_id: u64 = 0;
+        while (!self.node.isShuttingDown()) {
+            const stream = listener.accept() catch |err| {
+                log.err("runClientLoop: accept failed: {}", .{err});
+                return;
+            };
+            stream.socket.setNoDelay(true) catch {};
+            conn_id += 1;
+            log.info("accepted client connection #{d}", .{conn_id});
+            group.spawn(handleClient, .{ self, stream }) catch {
+                log.err("failed to spawn handler for connection #{d}", .{conn_id});
+                stream.close();
+            };
+        }
+    }
+
+    pub fn runCompactionLoop(self: *ZdbServer) void {
+        log.info("compaction loops started", .{});
+        var group = zio.group();
+        group.spawn(runMemtableLoop, .{self}) catch return;
+        group.spawn(runFlushLoop, .{self}) catch return;
+        group.spawn(runLevelsLoop, .{self}) catch return;
+        group.wait() catch {};
+        log.info("compaction loops exiting (shutdown)", .{});
+    }
+
+    /// Block until `recoverFromSnapshot` has finished. Background loops
+    /// gate on this so they don't try to propose against a half-installed
+    /// state machine — applies would just error with `RecoveryInProgress`
+    /// and the loop would spin in raft's retry path.
+    fn waitForRecovery(self: *ZdbServer) void {
+        const interval = zio.Duration.fromMilliseconds(50);
+        while (!self.node.isShuttingDown()) {
+            if (self.storage.recovery_done.load(.acquire)) return;
+            zio.sleep(interval) catch return;
+        }
+    }
+
     /// Restore the manifest from `wal.snapshot().data` and bring the in-memory
     /// trees online. If any SST files referenced by the manifest are missing
     /// from disk, fetch them from the leader (retry until success or shutdown).
@@ -204,24 +382,20 @@ pub const StorageImpl = struct {
     /// transport, and AFTER raft has started so a leader is reachable
     /// (followers learn `leader_id` via AppendEntries; nodes that joined via
     /// seeds learn it via the join response). The apply loop tolerates a brief
-    /// window where this hasn't completed: `applyEntryInner` errors retry
-    /// until the manifest is in place.
-    pub fn recoverFromSnapshot(self: *StorageImpl) !void {
-        // Flip the apply-loop barrier no matter what — the no-snapshot fast
-        // path must also unblock applies. Errors mid-recovery still flip the
-        // flag (they would otherwise wedge the apply loop forever); the
-        // caller logs the error.
-        defer self.recovery_done.store(true, .release);
+    /// window where this hasn't completed: `applyEntry` errors retry until
+    /// the manifest is in place.
+    pub fn recoverFromSnapshot(self: *ZdbServer) !void {
+        // Always publish a result — even on the no-snapshot fast path or
+        // mid-recovery failure — so the apply gate doesn't wedge forever.
+        var oldest_idx: u64 = 0;
+        defer self.storage.markRecovered(oldest_idx);
 
         const snap = self.node.log.snapshot();
         if (snap.index == 0 or snap.data.len == 0) return;
 
         log.info("recovery: restoring manifest from snapshot index={d} bytes={d}", .{ snap.index, snap.data.len });
         try self.forest.ms.restoreFrom(snap.data);
-        // Set BEFORE recovery_done flips: the apply gate's release pairs
-        // with applyEntry's acquire-load, so the floor is visible by the
-        // time apply dispatches its first mutation.
-        self.oldest_memtable_index = snap.oldest_memtable_index;
+        oldest_idx = snap.oldest_memtable_index;
 
         // Fetch any missing SSTs from the leader. Retry until empty or
         // shutdown — fetchFiles errors when leader_id is unknown, which
@@ -236,7 +410,6 @@ pub const StorageImpl = struct {
                 zio.sleep(zio.Duration.fromMilliseconds(200)) catch return;
                 continue;
             };
-            // Loop body re-checks; further iterations should find none missing.
         }
 
         try self.forest.openTablesFromManifest();
@@ -247,16 +420,8 @@ pub const StorageImpl = struct {
     /// and invokes `maybeProposeSnapshot`, which is a no-op until the WAL
     /// crosses the size or age threshold. Runs concurrently with `applyLoop` —
     /// DiskWAL/Forest are designed for concurrent reads.
-    pub fn runSnapshotLoop(self: *StorageImpl) void {
-        // Don't propose snapshots until the manifest is installed —
-        // `maybeProposeSnapshot` would race with `recoverFromSnapshot`'s
-        // forest writes.
-        const recovery_poll = zio.Duration.fromMilliseconds(50);
-        while (!self.node.isShuttingDown()) {
-            if (self.recovery_done.load(.acquire)) break;
-            zio.sleep(recovery_poll) catch return;
-        }
-
+    pub fn runSnapshotLoop(self: *ZdbServer) void {
+        self.waitForRecovery();
         while (!self.node.isShuttingDown()) {
             const cfg = self.snapshot_cfg.snapshot();
             zio.sleep(zio.Duration.fromSeconds(cfg.poll_interval_seconds)) catch return;
@@ -328,7 +493,7 @@ pub const StorageImpl = struct {
     /// momentarily unreachable on the follower. After 160, all good.
     /// This is normal Raft follower-catchup eventual consistency, not
     /// data loss.
-    fn maybeProposeSnapshot(self: *StorageImpl) !void {
+    fn maybeProposeSnapshot(self: *ZdbServer) !void {
         const oldest = self.forest.memtables.oldestInMemoryLogIndex();
         if (oldest == 0) return; // no real memtable yet — nothing pinned
 
@@ -429,174 +594,6 @@ pub const StorageImpl = struct {
             .oldest_memtable_index = oldest,
         });
         log.info("snapshot proposed: index={d} term={d} bytes={d}", .{ target, target_term, data.len });
-    }
-
-    /// Ensure all SST files referenced by ManifestChange entries are on disk
-    /// before the WAL append. Fetches missing files from the leader.
-    fn preAppend(ctx: *anyopaque, node: *raft.Node, entries: []const raft.buffers.LogEntryBuffer) void {
-        const self: *StorageImpl = @ptrCast(@alignCast(ctx));
-
-        // Collect missing file IDs across all entries.
-        var missing = std.ArrayList(u64).empty;
-        defer missing.deinit(self.allocator);
-
-        for (entries) |entry| {
-            const reader = entry.initReader() catch continue;
-            if (reader.entryType() != .manifest) continue;
-            const data = reader.data();
-            if (data.len == 0) continue;
-
-            const mc = zdb_bufs.ManifestChangeReader.parseRoot(data) catch continue;
-            const tc_len = mc.tableChangesLen();
-            for (0..tc_len) |i| {
-                const tc = mc.tableChangesAt(@intCast(i)) catch continue;
-                if (tc.op() == .create and !self.forest.hasFile(tc.tableId())) {
-                    missing.append(self.allocator, tc.tableId()) catch continue;
-                }
-            }
-        }
-
-        if (missing.items.len == 0) return;
-
-        log.info("preAppend: fetching {d} missing files from leader", .{missing.items.len});
-        while (true) {
-            node.fetchFiles(missing.items) catch |err| {
-                log.err("preAppend: fetchFiles failed: {s}, retrying", .{@errorName(err)});
-                zio.sleep(zio.Duration.fromMilliseconds(100)) catch return;
-                continue;
-            };
-            break;
-        }
-        log.info("preAppend: received {d} files from leader", .{missing.items.len});
-    }
-};
-
-/// Snapshot of work the compaction/flush loops are currently building.
-/// Lives only between the moment we start writing SSTs / building changes
-/// and the moment the resulting manifest entry is appended via
-/// `proposeAndWaitForApply`. Surfaced through `zdb forest` so an operator
-/// can tell whether a "compactions wanted" entry is genuinely starved or
-/// just waiting on an in-flight build to finish.
-pub const InFlight = struct {
-    pub const Kind = enum { flush, compaction, split, new_memtable };
-    kind: Kind,
-    tree_id: u64,
-    src_level: u8 = 0,
-    dest_level: u8 = 0,
-    src_tables: u32 = 0,
-    started_at_us: i64,
-};
-
-pub const ZdbServer = struct {
-    allocator: std.mem.Allocator,
-    forest: *Forest,
-    node: *raft.Node,
-    /// Shared with the apply path. Loops/handlers gate on
-    /// `storage.recovery_done` (and, for data mutations, on the forest also
-    /// having a real memtable) so the SM is in a valid shape before any
-    /// proposal goes through Raft.
-    storage: *StorageImpl,
-    listen_addr: zio.net.IpAddress,
-    in_flight_mu: std.Thread.Mutex = .{},
-    in_flight: std.ArrayList(InFlight) = .empty,
-
-    pub fn init(
-        allocator: std.mem.Allocator,
-        forest: *Forest,
-        node: *raft.Node,
-        storage: *StorageImpl,
-        client_addr: []const u8,
-    ) !ZdbServer {
-        const addr = try zio.net.IpAddress.parseIpAndPort(client_addr);
-        return .{
-            .allocator = allocator,
-            .forest = forest,
-            .node = node,
-            .storage = storage,
-            .listen_addr = addr,
-        };
-    }
-
-    pub fn deinit(self: *ZdbServer) void {
-        self.in_flight_mu.lock();
-        defer self.in_flight_mu.unlock();
-        self.in_flight.deinit(self.allocator);
-    }
-
-    /// Add an in-flight record. Returns the slice index for `removeInFlight`.
-    /// Caller is responsible for pairing exactly one `remove` per `add`,
-    /// typically via `defer`.
-    fn addInFlight(self: *ZdbServer, entry: InFlight) void {
-        self.in_flight_mu.lock();
-        defer self.in_flight_mu.unlock();
-        self.in_flight.append(self.allocator, entry) catch {};
-    }
-
-    fn removeInFlight(self: *ZdbServer, kind: InFlight.Kind, tree_id: u64, src_level: u8) void {
-        self.in_flight_mu.lock();
-        defer self.in_flight_mu.unlock();
-        // Match on (kind, tree_id, src_level) — multiple in-flight entries
-        // with the same key would mean two concurrent compactions on the
-        // same level of the same tree, which we don't currently spawn.
-        for (self.in_flight.items, 0..) |it, i| {
-            if (it.kind == kind and it.tree_id == tree_id and it.src_level == src_level) {
-                _ = self.in_flight.orderedRemove(i);
-                return;
-            }
-        }
-    }
-
-    pub fn runClientLoop(self: *ZdbServer) void {
-        log.info("inside runClientLoop", .{});
-        defer log.info("client loop exiting (shutdown)", .{});
-
-        const listener = self.listen_addr.listen(.{ .reuse_address = true }) catch |err| {
-            log.err("failed to listen on client addr: {}", .{err});
-            return;
-        };
-        defer listener.close();
-
-        log.info("client TCP listener started, accepting connections", .{});
-
-        var group = zio.group();
-        defer group.cancel();
-
-        var conn_id: u64 = 0;
-        while (!self.node.isShuttingDown()) {
-            const stream = listener.accept() catch |err| {
-                log.err("runClientLoop: accept failed: {}", .{err});
-                return;
-            };
-            stream.socket.setNoDelay(true) catch {};
-            conn_id += 1;
-            log.info("accepted client connection #{d}", .{conn_id});
-            group.spawn(handleClient, .{ self, stream }) catch {
-                log.err("failed to spawn handler for connection #{d}", .{conn_id});
-                stream.close();
-            };
-        }
-    }
-
-    pub fn runCompactionLoop(self: *ZdbServer) void {
-        log.info("compaction loops started", .{});
-        var group = zio.group();
-        group.spawn(runMemtableLoop, .{self}) catch return;
-        group.spawn(runFlushLoop, .{self}) catch return;
-        group.spawn(runLevelsLoop, .{self}) catch return;
-        group.wait() catch {};
-        log.info("compaction loops exiting (shutdown)", .{});
-    }
-
-    /// Block until `recoverFromSnapshot` has finished. Background loops
-    /// gate on this so they don't try to propose against a half-installed
-    /// state machine — applies would just error with `RecoveryInProgress`
-    /// and the loop would spin in raft's retry path.
-    fn waitForRecovery(self: *ZdbServer) void {
-        const interval = zio.Duration.fromMilliseconds(50);
-        while (!self.node.isShuttingDown()) {
-            if (self.storage.recovery_done.load(.acquire)) return;
-            zio.sleep(interval) catch return;
-        }
     }
 
     /// Single-purpose loop: when leader, propose a `newMemtable` whenever
