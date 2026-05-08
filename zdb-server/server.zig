@@ -339,15 +339,23 @@ pub const StorageImpl = struct {
             try draft.restoreFrom(prev_snap.data);
         }
 
+        // TODO: fix the bulk-read path in diskwal.zig:entriesRange so that
+        // type-filtered queries (.ty != .any) correctly slice each matching
+        // entry out of the shared bulk buffer when there are gaps from
+        // skipped non-matching entries. Currently passing .ty=.manifest
+        // here causes ~10-20% of returned entries to fail `parseRoot` with
+        // OutOfBounds — likely a `disk_first_offset` math mismatch. As a
+        // workaround we ask for ALL entries in the range and filter by
+        // `reader.entryType()` in user space; correct, just heavier I/O.
         var result = try wal.entriesRange(.{
             .lo = prev_snap.index + 1,
             .hi = target + 1,
-            .ty = .manifest,
+            .ty = .any,
             .max_bytes = std.math.maxInt(u64),
         });
         defer result.deinit();
         if (!result.eof) {
-            log.warn("maybeProposeSnapshot: manifest entries truncated by max_bytes — aborting", .{});
+            log.warn("maybeProposeSnapshot: entries truncated by max_bytes — aborting", .{});
             return;
         }
 
@@ -356,6 +364,7 @@ pub const StorageImpl = struct {
                 log.warn("maybeProposeSnapshot: parseRoot at index={d}: {s}", .{ stored.index, @errorName(err) });
                 continue;
             };
+            if (reader.entryType() != .manifest) continue;
             const payload = reader.data();
             if (payload.len == 0) continue;
             const parsed = zdb_bufs.parseMessageWithTail(payload) catch |err| {
@@ -438,11 +447,29 @@ pub const StorageImpl = struct {
     }
 };
 
+/// Snapshot of work the compaction/flush loops are currently building.
+/// Lives only between the moment we start writing SSTs / building changes
+/// and the moment the resulting manifest entry is appended via
+/// `proposeAndWaitForApply`. Surfaced through `zdb forest` so an operator
+/// can tell whether a "compactions wanted" entry is genuinely starved or
+/// just waiting on an in-flight build to finish.
+pub const InFlight = struct {
+    pub const Kind = enum { flush, compaction, split, new_memtable };
+    kind: Kind,
+    tree_id: u64,
+    src_level: u8 = 0,
+    dest_level: u8 = 0,
+    src_tables: u32 = 0,
+    started_at_us: i64,
+};
+
 pub const ZdbServer = struct {
     allocator: std.mem.Allocator,
     forest: *Forest,
     node: *raft.Node,
     listen_addr: zio.net.IpAddress,
+    in_flight_mu: std.Thread.Mutex = .{},
+    in_flight: std.ArrayList(InFlight) = .empty,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -460,7 +487,32 @@ pub const ZdbServer = struct {
     }
 
     pub fn deinit(self: *ZdbServer) void {
-        _ = self;
+        self.in_flight_mu.lock();
+        defer self.in_flight_mu.unlock();
+        self.in_flight.deinit(self.allocator);
+    }
+
+    /// Add an in-flight record. Returns the slice index for `removeInFlight`.
+    /// Caller is responsible for pairing exactly one `remove` per `add`,
+    /// typically via `defer`.
+    fn addInFlight(self: *ZdbServer, entry: InFlight) void {
+        self.in_flight_mu.lock();
+        defer self.in_flight_mu.unlock();
+        self.in_flight.append(self.allocator, entry) catch {};
+    }
+
+    fn removeInFlight(self: *ZdbServer, kind: InFlight.Kind, tree_id: u64, src_level: u8) void {
+        self.in_flight_mu.lock();
+        defer self.in_flight_mu.unlock();
+        // Match on (kind, tree_id, src_level) — multiple in-flight entries
+        // with the same key would mean two concurrent compactions on the
+        // same level of the same tree, which we don't currently spawn.
+        for (self.in_flight.items, 0..) |it, i| {
+            if (it.kind == kind and it.tree_id == tree_id and it.src_level == src_level) {
+                _ = self.in_flight.orderedRemove(i);
+                return;
+            }
+        }
     }
 
     pub fn runClientLoop(self: *ZdbServer) void {
@@ -565,6 +617,8 @@ pub const ZdbServer = struct {
     }
 
     fn proposeNewMemtable(self: *ZdbServer) !void {
+        self.addInFlight(.{ .kind = .new_memtable, .tree_id = 0, .started_at_us = std.time.microTimestamp() });
+        defer self.removeInFlight(.new_memtable, 0, 0);
         const new_id = self.forest.next_file_id.fetchAdd(1, .monotonic);
         const payload = try encodeManifestChange(self.allocator, 1, &.{}, &.{}, new_id);
         defer self.allocator.free(payload);
@@ -572,6 +626,12 @@ pub const ZdbServer = struct {
     }
 
     fn proposeFlush(self: *ZdbServer) !void {
+        // Track the flush BUILD as in-flight (writing SSTs is the slow
+        // part). buildFlush iterates the oldest immutable memtable; we
+        // don't know the target tree(s) until changes return, so use
+        // tree_id=0 as a "global" marker.
+        self.addInFlight(.{ .kind = .flush, .tree_id = 0, .started_at_us = std.time.microTimestamp() });
+        defer self.removeInFlight(.flush, 0, 0);
         const result = try self.forest.buildFlush() orelse return;
         var changes = result.changes;
         defer changes.deinit(self.allocator);
@@ -585,6 +645,17 @@ pub const ZdbServer = struct {
     }
 
     fn proposeCompaction(self: *ZdbServer, target: Forest.CompactionTarget) !void {
+        // Track the compaction so `zdb forest` can show whether a
+        // "compactions wanted" entry is genuinely starved or just waiting
+        // on a build/sync that hasn't proposed yet.
+        self.addInFlight(.{
+            .kind = .compaction,
+            .tree_id = target.tree_id,
+            .src_level = @intCast(target.candidate.level),
+            .dest_level = @intCast(@as(usize, target.candidate.level) + 1),
+            .started_at_us = std.time.microTimestamp(),
+        });
+        defer self.removeInFlight(.compaction, target.tree_id, @intCast(target.candidate.level));
         var changes = try target.tree.buildCompaction(target.candidate.level, &self.forest.next_file_id);
         defer changes.deinit(self.allocator);
         if (changes.items.len == 0) return;
@@ -597,6 +668,8 @@ pub const ZdbServer = struct {
     }
 
     fn proposeSplit(self: *ZdbServer, tree_id: u64) !void {
+        self.addInFlight(.{ .kind = .split, .tree_id = tree_id, .started_at_us = std.time.microTimestamp() });
+        defer self.removeInFlight(.split, tree_id, 0);
         // buildSplit allocates table_changes / tree_changes on the arena;
         // encodeManifestChange copies the bytes into a self-owned payload,
         // so the arena can be torn down right after encode. No new SST
@@ -723,6 +796,26 @@ pub const ZdbServer = struct {
         log.info("client handler exiting after {d} ops (shutdown)", .{ops});
     }
 
+    /// L0 backpressure: sleep proportional to how many L0 tables the
+    /// destination namespace's worst tree currently has. Bound writes from
+    /// out-running flush + compaction so L0 doesn't grow into a 10s-of-GiB
+    /// monolithic compaction target. Per-namespace (not global) so a hot
+    /// namespace doesn't stall writes to other namespaces on the same node.
+    /// See `Options.l0_slowdown_table_count` etc. for the curve.
+    fn applyWriteBackpressure(self: *ZdbServer, ns: u32) void {
+        const opts = self.forest.opts;
+        if (opts.l0_slowdown_table_count == 0) return;
+        const l0 = self.forest.maxL0TableCountForNs(ns);
+        if (l0 <= opts.l0_slowdown_table_count) return;
+        const excess: u64 = l0 - opts.l0_slowdown_table_count;
+        const delay_us: u64 = @min(
+            excess * opts.l0_slowdown_step_us,
+            @as(u64, opts.l0_slowdown_max_us),
+        );
+        if (delay_us == 0) return;
+        zio.sleep(zio.Duration.fromMicroseconds(delay_us)) catch {};
+    }
+
     fn handleSet(self: *ZdbServer, stream: zio.net.Stream, req: proto.SetCmd) !void {
         // Reject up-front if the destination namespace has no route table.
         // Otherwise the mutation is durably committed through Raft but
@@ -732,6 +825,7 @@ pub const ZdbServer = struct {
             try writeUnknownNamespace(stream, req.ns);
             return;
         }
+        self.applyWriteBackpressure(req.ns);
         // Encode as a single-item Mutations batch — the wire format is the
         // same regardless of batch size, so the apply path doesn't need to
         // know whether this write came from a `set` or a `set_batch`.
@@ -791,6 +885,7 @@ pub const ZdbServer = struct {
             try writeUnknownNamespace(stream, batch.ns);
             return;
         }
+        self.applyWriteBackpressure(batch.ns);
         const proposal_bytes = try encodeMutations(self.allocator, batch.ns, batch.kvs);
         defer self.allocator.free(proposal_bytes);
 
@@ -1004,12 +1099,44 @@ pub const ZdbServer = struct {
                 try m.write(zdb.metrics.g(), &body.writer);
                 try m.write(raft.metrics.g(), &body.writer);
             },
-            .forest => try self.forest.writeStats(&body.writer, .{ .scope = .forest }),
+            .forest => {
+                try self.forest.writeStats(&body.writer, .{ .scope = .forest });
+                try self.writeInFlight(&body.writer);
+            },
             .tree => try self.forest.writeStats(&body.writer, .{ .scope = .{ .tree = req.tree_id } }),
             .namespace => try self.forest.writeStats(&body.writer, .{ .scope = .{ .namespace = req.ns_id } }),
         }
         try body.writer.writeByte('\n');
         try stream.writeAll(body.writer.buffered(), .none);
+    }
+
+    /// Append a section listing in-flight flush/compaction/split builds —
+    /// work that's started writing SSTs or computing manifest changes but
+    /// hasn't yet appended the resulting Raft entry. A `compactions wanted`
+    /// row in the forest stats with no matching in-flight row means the
+    /// compaction loop is starved (not picking up the candidate); a row
+    /// that's been "in flight" for many seconds means a build is slow.
+    fn writeInFlight(self: *ZdbServer, w: *std.Io.Writer) !void {
+        self.in_flight_mu.lock();
+        defer self.in_flight_mu.unlock();
+        if (self.in_flight.items.len == 0) {
+            try w.print("\n  in-flight: (none)\n", .{});
+            return;
+        }
+        const now = std.time.microTimestamp();
+        try w.print("\n  in-flight:\n", .{});
+        for (self.in_flight.items) |it| {
+            const age_ms = @divTrunc(now - it.started_at_us, 1000);
+            switch (it.kind) {
+                .compaction => try w.print(
+                    "    compaction tree={d} L{d}->L{d} age_ms={d}\n",
+                    .{ it.tree_id, it.src_level, it.dest_level, age_ms },
+                ),
+                .flush => try w.print("    flush age_ms={d}\n", .{age_ms}),
+                .split => try w.print("    split tree={d} age_ms={d}\n", .{ it.tree_id, age_ms }),
+                .new_memtable => try w.print("    new_memtable age_ms={d}\n", .{age_ms}),
+            }
+        }
     }
 
     fn handleNsCreate(self: *ZdbServer, stream: zio.net.Stream, req: proto.NsCreateCmd) !void {

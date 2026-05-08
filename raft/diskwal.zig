@@ -922,6 +922,15 @@ pub const wal = struct {
                 if (ent.index == 0) continue;
                 if (opts.ty != .any and ent.entry_type != opts.ty) continue;
 
+                // TODO: type-filtered (.ty != .any) reads via the bulk
+                // buffer return wrong bytes for some entries — manifests in
+                // particular fail `LogEntryReader.parseRoot` ~10-20% of
+                // the time with OutOfBounds. Probable cause is the
+                // `disk_first_offset` / `disk_end_offset` math in
+                // `planRange` not accounting for gaps left by skipped
+                // non-matching entries, so per-entry slicing here lands at
+                // the wrong offset. zdb-server's `maybeProposeSnapshot`
+                // workaround: ask for `.ty = .any` and filter user-side.
                 // Re-check budget (rounding safety).
                 if (out.items.len > 0 and opts.max_bytes > 0 and total_size + ent.data_len > opts.max_bytes) {
                     eof = false;

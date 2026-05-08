@@ -177,8 +177,8 @@ pub fn main() !void {
         raft_cfg.id, raft_cfg.cluster_id, raft_addr, client_addr, data_cfg.dir, wal_dir, raft_cfg.tick_ms, seeds.len,
     });
 
-    // Initialize VFS with 500 MB/s bandwidth limit.
-    zdb.vfs.VFS.initGlobal(.{ .bytes_per_sec = 500 * 1024 * 1024 });
+    // Initialize VFS with bandwidth limit.
+    zdb.vfs.VFS.initGlobal(.{ .bytes_per_sec = 1024 * 1024 * 1024 });
 
     // Initialize global metrics before anything that might increment them.
     // zdb owns storage-layer metrics; raft owns its own propose-phase

@@ -167,17 +167,23 @@ pub const Table = struct {
         _ = self.ref.fetchAdd(1, .monotonic);
     }
 
-    /// Decrement the reference count. When it reaches zero the table's resources are freed
-    /// and, for file-backed tables, the SST file is deleted from disk.
+    /// Decrement the reference count. When it reaches zero the table's
+    /// resources are freed.
+    ///
+    /// FILE DELETION DISABLED: prior behavior was to also `unlink` the SST
+    /// file when refcount hit zero, but the in-memory refcount doesn't
+    /// reflect "still needed by an older Raft snapshot" or "still listed
+    /// by another in-flight compaction's view of the level". A live
+    /// compaction was hitting `FileNotFound` because an input SST had
+    /// been unlinked from under it. Until file lifetime is properly
+    /// coordinated with snapshot retention (TODO), leaving orphan SSTs
+    /// on disk is the safer of the two failure modes — disk usage grows
+    /// but nothing breaks.
     pub fn decrRef(self: *Table) void {
         const prev = self.ref.fetchSub(1, .acq_rel);
         std.debug.assert(prev > 0);
         if (prev == 1) {
             if (self.claimPath()) |p| {
-                // TODO: We should be deleting this file only after we are sure that the Raft WAL
-                // snapshot no longer needs this file to be present for a replay. Because, now the
-                // LSM tree manifest is also essentially an extension of the Raft Snapshot.
-                std.fs.deleteFileAbsolute(p) catch {};
                 self.allocator.free(p);
             }
             self.deinit();

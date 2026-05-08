@@ -760,6 +760,25 @@ pub const Forest = struct {
     }
 
     /// Check if the current memtable should be frozen.
+    /// Largest L0 table count among the trees that own data for this
+    /// namespace. Used by the write-path backpressure in zdb-server so a
+    /// hot namespace's bloated L0 throttles only its own writers, not
+    /// every namespace on the node. After a tree split, a namespace can
+    /// own multiple trees; we take the worst of them. Returns 0 if the
+    /// namespace doesn't exist (caller already rejected the write).
+    pub fn maxL0TableCountForNs(self: *Forest, ns: u32) u32 {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        const route = self.ns_routes.get(ns) orelse return 0;
+        var max_count: u32 = 0;
+        for (route.entries.items) |e| {
+            const tree = self.trees.get(e.tree_id) orelse continue;
+            const n: u32 = @intCast(tree.levels[0].numTables());
+            if (n > max_count) max_count = n;
+        }
+        return max_count;
+    }
+
     pub fn shouldFreeze(self: *Forest) bool {
         return self.memtables.memoryUsage() >= self.opts.memtable_size;
     }
