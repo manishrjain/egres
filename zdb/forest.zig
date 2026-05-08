@@ -146,6 +146,15 @@ pub const Memtables = struct {
         return self.current.memoryUsage();
     }
 
+    /// id of the current memtable. 0 means the initial placeholder is still
+    /// in place — no `newMemtable` has been applied yet, and any writes that
+    /// land in `current` will be discarded by the first `swapCurrentOut`.
+    pub fn currentId(self: *Memtables) u64 {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        return self.current.id;
+    }
+
     /// Aggregate sizes for the active + immutable memtables, taken under
     /// one lock. Used by the stats dump so we don't have to chain three
     /// separate lookups (each of which would re-acquire the lock).

@@ -59,7 +59,22 @@ pub const StorageImpl = struct {
             .readFileFn = &readFile,
             .hasFileFn = &hasFile,
             .preAppendFn = &preAppend,
+            .isReadyFn = &isReadyVtable,
         };
+    }
+
+    /// Cheap check: SM is ready for a data proposal once `recoverFromSnapshot`
+    /// has finished AND a real memtable (id != 0) is current. The leader
+    /// polls this in `Node.proposeDataChange`; without the memtable gate, a
+    /// write that races startup would land in the placeholder and be dropped
+    /// by the first `swapCurrentOut`.
+    pub fn isReady(self: *StorageImpl) bool {
+        return self.recovery_done.load(.acquire) and self.forest.memtables.currentId() != 0;
+    }
+
+    fn isReadyVtable(ctx: *anyopaque) bool {
+        const self: *StorageImpl = @ptrCast(@alignCast(ctx));
+        return self.isReady();
     }
 
     fn applyEntry(ctx: *anyopaque, entry: raft.Entry, data: []const u8) anyerror!void {
@@ -233,6 +248,15 @@ pub const StorageImpl = struct {
     /// crosses the size or age threshold. Runs concurrently with `applyLoop` —
     /// DiskWAL/Forest are designed for concurrent reads.
     pub fn runSnapshotLoop(self: *StorageImpl) void {
+        // Don't propose snapshots until the manifest is installed —
+        // `maybeProposeSnapshot` would race with `recoverFromSnapshot`'s
+        // forest writes.
+        const recovery_poll = zio.Duration.fromMilliseconds(50);
+        while (!self.node.isShuttingDown()) {
+            if (self.recovery_done.load(.acquire)) break;
+            zio.sleep(recovery_poll) catch return;
+        }
+
         while (!self.node.isShuttingDown()) {
             const cfg = self.snapshot_cfg.snapshot();
             zio.sleep(zio.Duration.fromSeconds(cfg.poll_interval_seconds)) catch return;
@@ -467,6 +491,11 @@ pub const ZdbServer = struct {
     allocator: std.mem.Allocator,
     forest: *Forest,
     node: *raft.Node,
+    /// Shared with the apply path. Loops/handlers gate on
+    /// `storage.recovery_done` (and, for data mutations, on the forest also
+    /// having a real memtable) so the SM is in a valid shape before any
+    /// proposal goes through Raft.
+    storage: *StorageImpl,
     listen_addr: zio.net.IpAddress,
     in_flight_mu: std.Thread.Mutex = .{},
     in_flight: std.ArrayList(InFlight) = .empty,
@@ -475,6 +504,7 @@ pub const ZdbServer = struct {
         allocator: std.mem.Allocator,
         forest: *Forest,
         node: *raft.Node,
+        storage: *StorageImpl,
         client_addr: []const u8,
     ) !ZdbServer {
         const addr = try zio.net.IpAddress.parseIpAndPort(client_addr);
@@ -482,6 +512,7 @@ pub const ZdbServer = struct {
             .allocator = allocator,
             .forest = forest,
             .node = node,
+            .storage = storage,
             .listen_addr = addr,
         };
     }
@@ -556,20 +587,44 @@ pub const ZdbServer = struct {
         log.info("compaction loops exiting (shutdown)", .{});
     }
 
+    /// Block until `recoverFromSnapshot` has finished. Background loops
+    /// gate on this so they don't try to propose against a half-installed
+    /// state machine — applies would just error with `RecoveryInProgress`
+    /// and the loop would spin in raft's retry path.
+    fn waitForRecovery(self: *ZdbServer) void {
+        const interval = zio.Duration.fromMilliseconds(50);
+        while (!self.node.isShuttingDown()) {
+            if (self.storage.recovery_done.load(.acquire)) return;
+            zio.sleep(interval) catch return;
+        }
+    }
+
+    /// Single-purpose loop: when leader, propose a `newMemtable` whenever
+    /// either (a) the placeholder is still current (id == 0) or (b) the
+    /// active memtable has hit `memtable_size`. Bootstrap and steady-state
+    /// freeze fall out of the same condition, so there's no separate
+    /// startup phase.
     fn runMemtableLoop(self: *ZdbServer) void {
+        self.waitForRecovery();
+
         const interval = zio.Duration.fromMilliseconds(100);
         while (!self.node.isShuttingDown()) {
-            if (!self.node.isLeader() or !self.forest.shouldFreeze()) {
+            const needs = self.node.isLeader() and
+                (self.forest.memtables.currentId() == 0 or self.forest.shouldFreeze());
+            if (!needs) {
                 zio.sleep(interval) catch return;
                 continue;
             }
             self.proposeNewMemtable() catch |err| {
                 log.err("proposeNewMemtable failed: {s}", .{@errorName(err)});
+                zio.sleep(interval) catch return;
             };
         }
     }
 
     fn runFlushLoop(self: *ZdbServer) void {
+        self.waitForRecovery();
+
         const interval = zio.Duration.fromMilliseconds(200);
         while (!self.node.isShuttingDown()) {
             if (!self.node.isLeader() or !self.forest.hasFrozenMemtables()) {
@@ -589,6 +644,8 @@ pub const ZdbServer = struct {
     // results before proposing, so we should be fine.
     // For now, leader is the one doing the compaction.
     fn runLevelsLoop(self: *ZdbServer) void {
+        self.waitForRecovery();
+
         const interval = zio.Duration.fromMilliseconds(500);
         while (!self.node.isShuttingDown()) {
             if (!self.node.isLeader()) {

@@ -65,6 +65,7 @@ pub const RaftError = error{
     QueueFull,
     CommitFailed,
     NotCommitted,
+    NotReady,
 } || RaftLogError || zen.Error;
 
 pub const Peer = struct {
@@ -139,6 +140,11 @@ pub const Node = struct {
         readFileFn: ?*const fn (*anyopaque, std.mem.Allocator, u64) ?[]const u8 = null,
         hasFileFn: ?*const fn (*anyopaque, u64) bool = null,
         preAppendFn: ?*const fn (*anyopaque, *Node, []const zen.LogEntryBuffer) void = null,
+        /// Cheap predicate the leader checks in `proposeDataChange` before
+        /// queuing a `.data` proposal — typically "recovery done AND a real
+        /// memtable exists". Must be non-blocking. When null, the gate is
+        /// treated as always-ready.
+        isReadyFn: ?*const fn (*anyopaque) bool = null,
 
         pub fn apply(self: *StateMachine, entry: Entry, data: []const u8) anyerror!void {
             try self.applyFn(self.ctx, entry, data);
@@ -154,6 +160,10 @@ pub const Node = struct {
         }
         pub fn preAppend(self: *StateMachine, node: *Node, entries: []const zen.LogEntryBuffer) void {
             if (self.preAppendFn) |f| f(self.ctx, node, entries);
+        }
+        pub fn isReady(self: *StateMachine) bool {
+            if (self.isReadyFn) |f| return f(self.ctx);
+            return true;
         }
     };
 
@@ -1465,7 +1475,7 @@ pub const Node = struct {
         ctx.wg.done();
     }
 
-    fn proposeWithCallback(
+    pub fn proposeWithCallback(
         self: *Node,
         data: []const u8,
         cb: ApplyCallback,
@@ -1473,6 +1483,21 @@ pub const Node = struct {
         proposal_type: ProposalType,
     ) RaftError!void {
         if (self.isShuttingDown()) return error.QueueClosed;
+
+        // How long proposeWithCallback polls `StateMachine.isReady` before
+        // returning `error.NotReady`. Long enough to absorb startup (recovery +
+        // the leader's bootstrap `newMemtable` round-trip), short enough that a
+        // client doesn't sit forever if the SM is genuinely stuck.
+        if (self.state_machine) |sm| {
+            if (proposal_type == .data and !sm.isReady()) {
+                const deadline = std.time.milliTimestamp() + 1000; // 1s
+                while (!sm.isReady()) {
+                    if (std.time.milliTimestamp() >= deadline) return error.NotReady;
+                    zio.sleep(zio.Duration.fromMilliseconds(10)) catch return error.QueueClosed;
+                }
+            }
+        }
+
         const owned = try self.allocator.dupe(u8, data);
         errdefer self.allocator.free(owned);
         self.proposal_ch.trySend(.{

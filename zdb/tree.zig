@@ -477,9 +477,8 @@ pub const Tree = struct {
         const prios = try self.allocator.alloc(LevelPriority, n);
         defer self.allocator.free(prios);
 
-        // L0: count-based score.
-        const l0_score = @as(f64, @floatFromInt(self.levels[0].numTables())) /
-            @as(f64, @floatFromInt(self.opts.num_level_zero_tables));
+        // L0: count-based score -- score = number of L0 tables.
+        const l0_score = @as(f64, @floatFromInt(self.levels[0].numTables()));
         prios[0] = .{ .level = 0, .score = l0_score, .adjusted = l0_score };
 
         // If L0 needs compaction, execute it. We don't want to block writes because lower
@@ -652,7 +651,16 @@ pub const Tree = struct {
             flush_handles.deinit(self.allocator);
         }
 
+        // Diagnostic: count items pulled from the merge iterator vs items
+        // accepted by the builder. Pre-fix expectation (no tombstones, no
+        // shadowing because the bench writes each primary at most once):
+        // these two should be EQUAL, AND should equal the sum of
+        // `index.key_count` across all input tables.
+        var keys_in: u64 = 0;
+        var keys_out: u64 = 0;
+
         while (merge.itemRef()) |item| {
+            keys_in += 1;
             if (bld.table_bytes.items.len >= file_sz) {
                 // We are not going to break up a primary key across tables. All the versions for
                 // this key should live in the same table. This avoids a scenario where a table with
@@ -666,11 +674,37 @@ pub const Tree = struct {
                 }
             }
             try bld.add(item.key, item.value);
+            keys_out += 1;
             try merge.next();
         }
 
         // Flush any remaining data.
         try self.flushBuilderOutput(&bld, &flush_handles, next_file_id);
+
+        // Sum up input key counts from every src + bot SST's index for the
+        // "expected" number. If keys_in != expected, the merge iterator is
+        // dropping items. If keys_out != keys_in, the builder is dropping.
+        var src_keys: u64 = 0;
+        var src_min_ts: u64 = std.math.maxInt(u64);
+        var src_max_ts: u64 = 0;
+        for (src_entries_slice) |e| {
+            src_keys += @intCast(e.table.index.key_count);
+            const mv = e.table.index.max_version;
+            if (mv > src_max_ts) src_max_ts = mv;
+            if (mv < src_min_ts) src_min_ts = mv;
+        }
+        var bot_keys: u64 = 0;
+        for (bot_entries_slice) |e| bot_keys += @intCast(e.table.index.key_count);
+        const expected_in = src_keys + bot_keys;
+        log.info(
+            "compact tree={d} L{d}->L{d} src_tables={d} src_keys={d} bot_tables={d} bot_keys={d} expected_in={d} keys_in={d} keys_out={d} dropped_in_iter={d} dropped_in_builder={d}",
+            .{
+                self.tree_id,          src,                    dest,
+                src_entries_slice.len, src_keys,               bot_entries_slice.len,
+                bot_keys,              expected_in,            keys_in,
+                keys_out,              expected_in -| keys_in, keys_in -| keys_out,
+            },
+        );
 
         // Start dir sync while we're waiting for file syncs to be done. We can do dir sync here
         // because files have already been created and written. So, dir should have everything it

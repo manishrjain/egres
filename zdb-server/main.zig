@@ -251,6 +251,7 @@ pub fn main() !void {
         allocator,
         forest,
         node,
+        &storage_impl,
         args.client_addr,
     );
     defer deinitWithLog("zdb_srv", &zdb_srv);
