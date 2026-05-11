@@ -16,7 +16,7 @@ pub const SkipList = struct {
     const branch_probability = 4;
     const max_arena_size = 64 * 1024 * 1024;
 
-    const Node = struct {
+    pub const Node = struct {
         key: []const u8,
         value: []const u8,
         next: []Atomic(?*Node),
@@ -202,50 +202,62 @@ pub const SkipList = struct {
         return self.arena.queryCapacity();
     }
 
-    pub const Iterator = struct {
-        skiplist: *Self,
-        current: ?*Node,
-
-        pub fn init(skiplist: *Self) Iterator {
-            skiplist.acquire();
-            return .{
-                .skiplist = skiplist,
-                .current = skiplist.head.next[0].load(.acquire),
-            };
-        }
-
-        pub fn deinit(self: *Iterator) void {
-            self.skiplist.release();
-        }
-
-        pub fn next(self: *Iterator) ?Item {
-            if (self.current) |node| {
-                const result = Item{
-                    .key = Key.init(node.key),
-                    .value = node.value,
-                };
-                self.current = node.next[0].load(.acquire);
-                return result;
-            }
-            return null;
-        }
-
-        pub fn seek(self: *Iterator, target: Key) ?Item {
-            const find_result = self.skiplist.findNode(target, null);
-            if (find_result.node) |node| {
-                const result = Item{
-                    .key = Key.init(node.key),
-                    .value = node.value,
-                };
-                self.current = node.next[0].load(.acquire);
-                return result;
-            }
-            self.current = null;
-            return null;
-        }
-    };
-
     pub fn iterator(self: *Self) Iterator {
         return Iterator.init(self);
+    }
+};
+
+/// Forward iterator over a SkipList with a peek/advance API matching the
+/// merge iterator (see zdb/table/merge_iterator.zig). `acquire`s the
+/// underlying skiplist on init; `release`s on deinit. Safe to hand
+/// across the lifetime of a flush completion: as long as the iterator
+/// holds a ref, the arena stays mapped even after the immutable's
+/// owning slot in `Memtables` is popped.
+pub const Iterator = struct {
+    skiplist: *SkipList,
+    current: ?*SkipList.Node,
+    end_key: Key = .{},
+
+    pub fn init(skiplist: *SkipList) Iterator {
+        skiplist.acquire();
+        return .{
+            .skiplist = skiplist,
+            .current = skiplist.head.next[0].load(.acquire),
+        };
+    }
+
+    pub fn deinit(self: *Iterator) void {
+        self.skiplist.release();
+    }
+
+    /// Position at the first entry with key >= `start` (inclusive).
+    /// Empty `start.primary` means "first node." `end` is an
+    /// exclusive upper bound; empty means "no upper bound."
+    pub fn seekRange(self: *Iterator, start: Key, end: Key) !void {
+        self.end_key = end;
+        if (start.primary.len == 0) {
+            self.current = self.skiplist.head.next[0].load(.acquire);
+        } else {
+            const find_result = self.skiplist.findNode(start, null);
+            self.current = find_result.node;
+        }
+        self.checkEnd();
+    }
+
+    pub fn itemRef(self: *const Iterator) ?Item {
+        const node = self.current orelse return null;
+        return .{ .key = Key.init(node.key), .value = node.value };
+    }
+
+    pub fn next(self: *Iterator) !void {
+        const node = self.current orelse return;
+        self.current = node.next[0].load(.acquire);
+        self.checkEnd();
+    }
+
+    fn checkEnd(self: *Iterator) void {
+        if (self.end_key.primary.len == 0) return;
+        const node = self.current orelse return;
+        if (Key.init(node.key).order(self.end_key) != .lt) self.current = null;
     }
 };

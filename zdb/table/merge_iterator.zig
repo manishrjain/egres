@@ -1,15 +1,19 @@
 const std = @import("std");
 const table = @import("table.zig");
 const Key = @import("../key.zig").Key;
+const skl = @import("../skl/skiplist.zig");
 const utils = @import("utils");
 
 pub const Error = table.Error;
 
-/// Iterator is a tagged union that lets MergeIterator accept both a single
-/// TableIterator and a ConcatIterator (for non-overlapping sorted tables).
+/// Iterator is a tagged union that lets MergeIterator accept a TableIterator
+/// (single SST), ConcatIterator (multiple non-overlapping SSTs), or a
+/// memtable scan (`skl.Iterator`). All three expose the same
+/// `seekRange` / `itemRef` / `next` / `deinit` shape.
 pub const Iterator = union(enum) {
     table: table.TableIterator,
     concat: ConcatIterator,
+    skiplist: skl.Iterator,
 
     pub fn seekRange(self: *Iterator, start: Key, end: Key) !void {
         switch (self.*) {

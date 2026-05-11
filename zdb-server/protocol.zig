@@ -5,6 +5,7 @@ pub const Command = union(enum) {
     set: SetCmd,
     set_batch: SetBatchCmd,
     get: GetCmd,
+    scan: ScanCmd,
     conf: ConfCmd,
     ns_create: NsCreateCmd,
     zdb: ZdbCmd,
@@ -27,6 +28,13 @@ pub const help_text =
     \\                                  tokens prefixed with 0x are hex-decoded
     \\  get <ns> <key> [<read_ts>]      read; optional read_ts blocks until
     \\                                  this node's apply_ts >= read_ts
+    \\  scan <ns> <start_key> <end_key> <max_count> [keys|kv|sizes]
+    \\                                  forward range scan over [start_key,
+    \\                                  end_key). Pass `_` for either bound
+    \\                                  to leave it open. One ITEM per
+    \\                                  line, hex-encoded key + value.
+    \\                                  END <count> terminates. Default
+    \\                                  mode kv.
     \\  conf <action> <node_id> [<addr>] cluster membership change
     \\                                  actions: add, to_voter, to_learner, remove, addr
     \\  ns create <ns>                  create a namespace
@@ -92,6 +100,23 @@ pub const GetCmd = struct {
     /// reached read_ts (with a timeout) so the returned view includes every
     /// mutation up to read_ts.
     read_ts: u64 = 0,
+};
+
+/// `scan <ns> <start_key> <end_key> <max_count> [keys|kv|sizes]` —
+/// forward range scan over [start_key, end_key) on the tree owning
+/// `start_key`. The literal token `_` in either bound means "open"
+/// (no lower / no upper bound). Returns up to `max_count` `ITEM`
+/// lines, then a single `END <emitted>` line.
+pub const ScanCmd = struct {
+    ns: u32,
+    start_key: []const u8,
+    /// Empty slice means "no upper bound" — either explicitly via the
+    /// `_` token or implicitly because the caller wants to scan to EOF.
+    end_key: []const u8,
+    max_count: u64,
+    mode: Mode = .kv,
+
+    pub const Mode = enum { keys, kv, sizes };
 };
 
 pub const ConfCmd = struct {
@@ -310,6 +335,29 @@ pub fn parseLine(line: []const u8) !Command {
             .key = key,
             .read_ts = read_ts,
         } };
+    } else if (std.mem.eql(u8, cmd, "scan")) {
+        const ns_str = it.next() orelse return error.MissingNamespace;
+        const start_tok = it.next() orelse return error.MissingKey;
+        const end_tok = it.next() orelse return error.MissingKey;
+        const count_str = it.next() orelse return error.MissingCount;
+        const mode: ScanCmd.Mode = if (it.next()) |m_str| blk: {
+            if (std.mem.eql(u8, m_str, "keys")) break :blk .keys;
+            if (std.mem.eql(u8, m_str, "kv")) break :blk .kv;
+            if (std.mem.eql(u8, m_str, "sizes")) break :blk .sizes;
+            return error.InvalidArg;
+        } else .kv;
+        // `_` is the open-bound sentinel (a literal underscore would need
+        // to be sent hex-encoded — not currently supported by the scan
+        // parser, which takes raw text tokens like `get`).
+        const start_key: []const u8 = if (std.mem.eql(u8, start_tok, "_")) "" else start_tok;
+        const end_key: []const u8 = if (std.mem.eql(u8, end_tok, "_")) "" else end_tok;
+        return .{ .scan = .{
+            .ns = std.fmt.parseInt(u32, ns_str, 10) catch return error.InvalidNamespace,
+            .start_key = start_key,
+            .end_key = end_key,
+            .max_count = std.fmt.parseInt(u64, count_str, 10) catch return error.InvalidCount,
+            .mode = mode,
+        } };
     } else if (std.mem.eql(u8, cmd, "conf")) {
         const action_str = it.next() orelse return error.MissingAction;
         const node_id_str = it.next() orelse return error.MissingNodeId;
@@ -426,4 +474,47 @@ pub fn writeFound(stream: zio.net.Stream, ts: u64, value: []const u8) !void {
 /// Write a get-not-found response: "NOT_FOUND\n"
 pub fn writeNotFound(stream: zio.net.Stream) !void {
     try stream.writeAll("NOT_FOUND\n", .none);
+}
+
+/// Write a single scan ITEM line through a buffered `std.Io.Writer`.
+/// Hex-encodes both key and value so the frame is text-only (one per
+/// `\n`-terminated line).
+///   .kv     → "ITEM <ts> <hex_key> <hex_value>\n"
+///   .keys   → "ITEM <ts> <hex_key>\n"
+///   .sizes  → "ITEM <ts> <hex_key> <vlen>\n"
+/// The caller owns the writer's buffer + flushes after the final ITEM
+/// (or END). Per-byte hex appends pass through the buffer, so the hot
+/// path is a `memcpy` into the writer's scratch — no syscalls until the
+/// buffer fills.
+pub fn writeScanItem(
+    w: *std.Io.Writer,
+    mode: ScanCmd.Mode,
+    ts: u64,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    try w.print("ITEM {d} ", .{ts});
+    try writeHex(w, key);
+    switch (mode) {
+        .keys => {},
+        .sizes => try w.print(" {d}", .{value.len}),
+        .kv => {
+            try w.writeByte(' ');
+            try writeHex(w, value);
+        },
+    }
+    try w.writeByte('\n');
+}
+
+/// Write the scan terminator: "END <emitted_count>\n".
+pub fn writeScanEnd(w: *std.Io.Writer, count: u64) !void {
+    try w.print("END {d}\n", .{count});
+}
+
+fn writeHex(w: *std.Io.Writer, bytes: []const u8) !void {
+    const hex = "0123456789abcdef";
+    for (bytes) |b| {
+        try w.writeByte(hex[b >> 4]);
+        try w.writeByte(hex[b & 0xf]);
+    }
 }

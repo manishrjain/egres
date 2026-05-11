@@ -2,7 +2,7 @@ const std = @import("std");
 const log = std.log.scoped(.forest);
 const zio = @import("zio");
 const utils = @import("utils");
-const options = @import("options.zig");
+const config = @import("config.zig");
 const manifest = @import("manifest.zig");
 const level = @import("level.zig");
 const table_mod = @import("table.zig");
@@ -19,6 +19,7 @@ const Table = table_mod.Table;
 const Item = table_mod.table.Item;
 const SkipList = skl.SkipList;
 const Builder = table_mod.builder.Builder;
+const merge_iterator = table_mod.merge_iterator;
 
 // ---------------------------------------------------------------------------
 // RouteTable
@@ -144,6 +145,26 @@ pub const Memtables = struct {
         self.mu.lockShared();
         defer self.mu.unlockShared();
         return self.current.memoryUsage();
+    }
+
+    /// Get iterators across the active memtable + every immutable
+    /// for use in a scan merge. Each `skl.Iterator.init` acquires the
+    /// underlying skiplist — release happens via `deinit` on the
+    /// returned iterator (transitively from `MergeIterator.deinit`).
+    /// Doing the acquires under our shared lock guarantees that even if
+    /// a concurrent flush + `popOldestIfMatches` releases the original
+    /// ref a moment later, the skiplist stays alive until the iterator
+    /// drops its ref. Caller frees the slice itself.
+    pub fn getIterators(self: *Memtables, allocator: std.mem.Allocator) ![]merge_iterator.Iterator {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        const total = self.immutables.items.len + 1;
+        const out = try allocator.alloc(merge_iterator.Iterator, total);
+        out[0] = .{ .skiplist = skl.Iterator.init(self.current) };
+        for (self.immutables.items, 0..) |imm, i| {
+            out[i + 1] = .{ .skiplist = skl.Iterator.init(imm) };
+        }
+        return out;
     }
 
     /// id of the current memtable. 0 means the initial placeholder is still
@@ -291,7 +312,7 @@ pub const Memtables = struct {
 
 pub const Forest = struct {
     allocator: std.mem.Allocator,
-    opts: options.Options,
+    opts: config.Config,
     ms: manifest.ForestState,
     next_tree_id: std.atomic.Value(u64),
     next_file_id: std.atomic.Value(u64),
@@ -304,7 +325,7 @@ pub const Forest = struct {
     /// Open a forest with empty in-memory state. Persistent state is restored
     /// later via `installManifest` (called by recovery if a Raft snapshot is
     /// present); fresh starts go straight to `createTree` / Raft replay.
-    pub fn open(allocator: std.mem.Allocator, opts: options.Options) !*Forest {
+    pub fn open(allocator: std.mem.Allocator, opts: config.Config) !*Forest {
         var ms = manifest.ForestState.init(allocator);
         errdefer ms.deinit();
 
@@ -425,12 +446,18 @@ pub const Forest = struct {
         };
 
         // Route each key to a tree and add to the appropriate builder.
-        while (iter.next()) |item| {
+        while (iter.itemRef()) |item| {
             const tree_id = blk: {
                 self.mu.lockShared();
                 defer self.mu.unlockShared();
-                const rt = self.ns_routes.get(item.key.namespace) orelse continue;
-                break :blk rt.lookup(item.key) orelse continue;
+                const rt = self.ns_routes.get(item.key.namespace) orelse {
+                    try iter.next();
+                    continue;
+                };
+                break :blk rt.lookup(item.key) orelse {
+                    try iter.next();
+                    continue;
+                };
             };
 
             const bld = if (builders.get(tree_id)) |b| b else blk: {
@@ -440,6 +467,7 @@ pub const Forest = struct {
                 break :blk b;
             };
             try bld.add(item.key, item.value);
+            try iter.next();
         }
 
         // Flush all builders to SST files. writeAndSyncTable handles the full
@@ -464,7 +492,7 @@ pub const Forest = struct {
             }
 
             const file_id = self.next_file_id.fetchAdd(1, .monotonic);
-            const path = try options.sstPath(self.allocator, self.opts.dir, file_id);
+            const path = try config.sstPath(self.allocator, self.opts.dir, file_id);
 
             try handles.append(self.allocator, try zio.spawn(writeAndSyncTable, .{
                 self.allocator, tb, path, file_id, tree_id, &flush_err,
@@ -1020,7 +1048,7 @@ pub const Forest = struct {
 
     /// Check if an SST file exists on disk.
     pub fn hasFile(self: *Forest, file_id: u64) bool {
-        const path = options.sstPath(self.allocator, self.opts.dir, file_id) catch return false;
+        const path = config.sstPath(self.allocator, self.opts.dir, file_id) catch return false;
         defer self.allocator.free(path);
         std.fs.cwd().access(path, .{}) catch return false;
         return true;
@@ -1038,7 +1066,7 @@ pub const Forest = struct {
             return;
         }
 
-        const path = options.sstPath(self.allocator, self.opts.dir, file_id) catch return;
+        const path = config.sstPath(self.allocator, self.opts.dir, file_id) catch return;
         defer self.allocator.free(path);
 
         // Probe existence + size via vfs (no allocation, just open + getEndPos).
@@ -1083,7 +1111,7 @@ pub const Forest = struct {
 
     /// Read an SST file from disk. Caller owns the returned slice.
     pub fn readFile(self: *Forest, allocator: std.mem.Allocator, file_id: u64) ?[]const u8 {
-        const path = options.sstPath(self.allocator, self.opts.dir, file_id) catch return null;
+        const path = config.sstPath(self.allocator, self.opts.dir, file_id) catch return null;
         defer self.allocator.free(path);
         const handle = vfs.g().openFile(allocator, path, .{}) catch return null;
         defer handle.close();

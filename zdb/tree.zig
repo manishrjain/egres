@@ -1,7 +1,7 @@
 const std = @import("std");
 const zio = @import("zio");
 const utils = @import("utils");
-const options = @import("options.zig");
+const config = @import("config.zig");
 const manifest = @import("manifest.zig");
 const level_handler = @import("level.zig");
 const table_mod = @import("table.zig");
@@ -28,7 +28,6 @@ const log = std.log.scoped(.zdb_tree);
 
 const Targets = struct {
     allocator: std.mem.Allocator,
-    base_level: u8,
     target_sz: []i64,
     file_sz: []i64,
 
@@ -181,7 +180,7 @@ pub const TableCache = struct {
         // Phase B: open the SST file WITHOUT holding the lock.
         // Table.open may yield the fiber (async I/O); holding the lock here
         // would deadlock cooperative fibers on the same OS thread (EDEADLK).
-        const path = options.sstPath(self.allocator, self.dir, need.id) catch |err| {
+        const path = config.sstPath(self.allocator, self.dir, need.id) catch |err| {
             tse.set(err);
             return;
         };
@@ -244,7 +243,7 @@ pub const split_priority_score: f64 = 100.0;
 
 pub const Tree = struct {
     allocator: std.mem.Allocator,
-    opts: options.Options,
+    opts: config.Config,
     tree_id: u64,
     ms: *manifest.ForestState,
     cache: *TableCache,
@@ -255,7 +254,7 @@ pub const Tree = struct {
     /// open builds a Tree from an existing manifest state.
     /// Tables are loaded via cache, which opens SST files concurrently for misses
     /// and reuses already-open *Table objects for cache hits.
-    pub fn open(allocator: std.mem.Allocator, opts: options.Options, tree_id: u64, ms: *manifest.ForestState, cache: *TableCache) !Tree {
+    pub fn open(allocator: std.mem.Allocator, opts: config.Config, tree_id: u64, ms: *manifest.ForestState, cache: *TableCache) !Tree {
         const levels = try allocator.alloc(Level, opts.max_levels);
         errdefer allocator.free(levels);
         for (levels, 0..) |*l, i| {
@@ -323,6 +322,85 @@ pub const Tree = struct {
         return null;
     }
 
+    pub const ScanCallback = *const fn (ctx: *anyopaque, item: Item) anyerror!bool;
+
+    /// Forward scan over `range` ([range.left, range.right) — empty bound
+    /// on either side means "open") across this tree's on-disk levels
+    /// plus any caller-supplied `extras` (typically memtable iterators).
+    ///
+    /// Sources fed into the merge:
+    ///   - `extras` — passed through verbatim
+    ///   - L0    — one `TableIterator` per overlapping table (overlapping
+    ///             ranges, so each needs its own merge slot)
+    ///   - L≥1  — one `ConcatIterator` per level (tables are disjoint so
+    ///             they can be walked sequentially)
+    ///
+    /// The merge takes ownership of every iterator we hand it — `extras`
+    /// included — so its `deinit` releases every underlying handle.
+    /// All slice/array bookkeeping for the merge lives in a per-call
+    /// arena; the arena only owns wiring memory, never the iterators'
+    /// own block buffers / skiplist refs (those go through each
+    /// iterator's deinit).
+    ///
+    /// `cb` runs synchronously per item; the Item it sees borrows into
+    /// block or arena memory and becomes invalid as soon as cb returns.
+    pub fn scan(
+        self: *Tree,
+        allocator: std.mem.Allocator,
+        range: KeyRange,
+        max_count: u64,
+        priority: vfs.Priority,
+        extras: []const Iterator,
+        ctx: *anyopaque,
+        cb: ScanCallback,
+    ) !u64 {
+        if (max_count == 0) {
+            // Honor the ownership promise to `extras` even on early-out.
+            for (extras) |e| {
+                var c = e;
+                c.deinit();
+            }
+            return 0;
+        }
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var iters: std.ArrayList(Iterator) = .empty;
+        try iters.appendSlice(a, extras);
+
+        for (self.levels, 0..) |*lv, level_idx| {
+            const overlapping = try lv.overlappingTables(a, range);
+            if (overlapping.len == 0) continue;
+
+            if (level_idx == 0) {
+                for (overlapping) |e| {
+                    try iters.append(a, .{ .table = TableIterator.init(a, e.table, priority) });
+                }
+            } else {
+                const subs = try a.alloc(TableIterator, overlapping.len);
+                for (overlapping, 0..) |e, j| subs[j] = TableIterator.init(a, e.table, priority);
+                try iters.append(a, .{ .concat = ConcatIterator.init(subs) });
+            }
+        }
+        if (iters.items.len == 0) return 0;
+
+        var merge = MergeIterator.init(a, iters.items);
+        defer merge.deinit();
+        try merge.seekRange(range.left, range.right);
+
+        var emitted: u64 = 0;
+        while (emitted < max_count) {
+            const item = merge.itemRef() orelse break;
+            const cont = try cb(ctx, item);
+            emitted += 1;
+            if (!cont) break;
+            try merge.next();
+        }
+        return emitted;
+    }
+
     pub fn totalSize(self: *Tree) i64 {
         var total: i64 = 0;
         for (self.levels) |*l| total += l.getTotalSize();
@@ -382,10 +460,6 @@ pub const Tree = struct {
         @memset(target_sz, 0);
         @memset(file_sz, 0);
 
-        // Compaction routing is strictly stepwise: L0→L1, L1→L2, … —
-        // `base_level` is always 1.
-        const base_level: u8 = 1;
-
         // Target sizes are FIXED per tree, derived from `tree_split_size`:
         // each tree splits when its bottom level outgrows that cap, so
         // the bottom level's target should be slightly under it (we use
@@ -417,11 +491,13 @@ pub const Tree = struct {
 
         // Per-level file sizes: L0 inherits the memtable size; L1 uses
         // `l1_table_size`; each level below ramps by
-        // `table_size_multiplier` up to `max_table_size`.
+        // `table_size_multiplier` up to `max_table_size`. Compaction is
+        // strictly stepwise (L0→L1, L1→L2, …) so there's no separate
+        // base-level concept — L1 is always the destination of L0.
         var tsz: i64 = self.opts.l1_table_size;
         file_sz[0] = @intCast(self.opts.memtable_size);
         for (1..n) |j| {
-            if (j <= base_level) {
+            if (j == 1) {
                 file_sz[j] = tsz;
             } else {
                 tsz = @min(tsz * self.opts.table_size_multiplier, self.opts.max_table_size);
@@ -431,7 +507,6 @@ pub const Tree = struct {
 
         return .{
             .allocator = self.allocator,
-            .base_level = base_level,
             .target_sz = target_sz,
             .file_sz = file_sz,
         };
@@ -476,17 +551,22 @@ pub const Tree = struct {
         const prios = try self.allocator.alloc(LevelPriority, n);
         defer self.allocator.free(prios);
 
-        // L0: count-based score -- score = number of L0 tables.
-        const l0_score = @as(f64, @floatFromInt(self.levels[0].numTables()));
+        // L0: count-based score, scaled so it competes on the same axis
+        // as L1+ size scores. Score reaches 1.0 at HALF the backpressure
+        // start count — early enough that compaction usually catches up
+        // before backpressure kicks in. Without this scaling (or with
+        // the old "if score >= 2.5, compact L0 immediately" shortcut),
+        // L0 starves L1→L2/L3 work and lower levels go unmaintained.
+        // Backpressure (`l0_backpressure_start_count`) is what protects
+        // writes from a temporarily-out-of-shape L0; the scoring loop
+        // is for steady-state level shape.
+        const l0_tables = self.levels[0].numTables();
+        const l0_score = if (self.opts.l0_backpressure_start_count == 0)
+            @as(f64, @floatFromInt(l0_tables))
+        else
+            @as(f64, @floatFromInt(l0_tables * 2)) /
+                @as(f64, @floatFromInt(self.opts.l0_backpressure_start_count));
         prios[0] = .{ .level = 0, .score = l0_score, .adjusted = l0_score };
-
-        // If L0 needs compaction, execute it. We don't want to block writes because lower
-        // levels are out of shape. Lower levels being out of shape is not as bad as blocking
-        // user facing writes.
-        if (l0_score >= 2.5) {
-            self.compact_candidate = .{ .level = 0, .score = l0_score };
-            return;
-        }
 
         // L≥1: size-based score.
         for (1..n) |j| {
@@ -500,11 +580,11 @@ pub const Tree = struct {
         }
 
         // Adjusted scores: mirrors Badger/PebbleDB's priority dampening.
-        // upperLevel starts at 0; for each level from base_level downward, if
+        // upperLevel starts at 0; for each level from L1 downward, if
         // prios[upperLevel].adjusted >= 1.0, divide it by the current level's
         // adjusted score (floored at 0.01).
         var upper_level: usize = 0;
-        for (@as(usize, t.base_level)..n) |cur_level| {
+        for (1..n) |cur_level| {
             if (prios[upper_level].adjusted >= 1.0) {
                 // If current level's adjusted score (= score, initially) is < 1.0, then it would
                 // boost the uppper level's adjusted score AS. If it's > 1.0, then it would dampen
@@ -526,23 +606,33 @@ pub const Tree = struct {
         for (prios[0 .. n - 1]) |p| {
             if (p.score >= 1.0) try filtered.append(self.allocator, p);
         }
-        if (filtered.items.len == 0) {
-            self.compact_candidate = null;
-            return;
-        }
 
-        // Sort descending by adjusted score.
+        // Sort descending by adjusted score; pick the top.
         std.mem.sort(LevelPriority, filtered.items, {}, struct {
             fn gt(_: void, a: LevelPriority, b: LevelPriority) bool {
                 return a.adjusted > b.adjusted;
             }
         }.gt);
+        const winner: ?LevelPriority = if (filtered.items.len > 0 and filtered.items[0].adjusted > 1.0)
+            filtered.items[0]
+        else
+            null;
 
-        const winner = filtered.items[0];
-        if (winner.adjusted <= 1.0) {
-            self.compact_candidate = null;
+        if (winner) |w| {
+            self.compact_candidate = .{ .level = @intCast(w.level), .score = w.adjusted };
+            return;
+        }
+
+        // Idle fallback: nothing scored above 1.0, but if L0 has any tables,
+        // drain it. Without this, a few stragglers (e.g. 2 L0 tables, score
+        // 0.5) would sit forever, paying read amplification until enough
+        // flushes pushed L0 over the start_count threshold. Lower levels by
+        // definition need no work when nothing scored ≥ 1.0, so L0 is always
+        // the right idle pick.
+        if (self.levels[0].numTables() > 0) {
+            self.compact_candidate = .{ .level = 0, .score = prios[0].score };
         } else {
-            self.compact_candidate = .{ .level = @intCast(winner.level), .score = winner.adjusted };
+            self.compact_candidate = null;
         }
     }
 
@@ -580,27 +670,49 @@ pub const Tree = struct {
         if (dest >= self.opts.max_levels) return .{};
 
         // --- collect src entries ---
-        // L0: take the OLDEST `l0_tables_per_compaction` (insertion order
-        // = oldest first). Newer L0 tables stay put and continue to
-        // shadow the compacted versions on read — correctness preserved.
         // L≥1: pick a RANDOM single table. Always picking items[0] (the
         // smallest-key table) starves higher key ranges and biases write
-        // amplification toward the left edge of the keyspace; random
-        // picks spread compaction load uniformly across the level.
+        // amplification toward the left edge of the keyspace.
+        // L0: take the oldest-first prefix that brings total compaction
+        // input bytes (selected L0 + their L1 overlap) up to
+        // `l0_compaction_max_bytes`. The table that crosses the budget
+        // is included; we stop afterwards. Newer L0 tables stay put and
+        // continue to shadow the compacted versions on read.
         const src_entries_slice = blk: {
-            self.levels[src].mu.lockShared();
-            defer self.levels[src].mu.unlockShared();
-
-            const items = self.levels[src].tables.items;
-            if (items.len == 0) return .{};
-
-            const take = if (src_level == 0)
-                items[0..@min(items.len, self.opts.l0_tables_per_compaction)]
-            else tk: {
-                const idx = std.crypto.random.uintLessThan(usize, items.len);
-                break :tk items[idx .. idx + 1];
+            // Snapshot the src table list under its own lock so the
+            // per-iteration L1-overlap queries don't hold the src lock.
+            const src_snapshot = ss: {
+                self.levels[src].mu.lockShared();
+                defer self.levels[src].mu.unlockShared();
+                const items = self.levels[src].tables.items;
+                if (items.len == 0) return .{};
+                break :ss try self.allocator.dupe(TableEntry, items);
             };
-            break :blk try self.allocator.dupe(TableEntry, take);
+            defer self.allocator.free(src_snapshot);
+
+            if (src_level != 0) {
+                // Pick any table at random.
+                const idx = std.crypto.random.uintLessThan(usize, src_snapshot.len);
+                break :blk try self.allocator.dupe(TableEntry, src_snapshot[idx .. idx + 1]);
+            }
+
+            const budget = self.opts.l0_compaction_max_bytes;
+            var union_kr = KeyRange{};
+            var l0_bytes: u64 = 0;
+            var n: usize = 0;
+            while (n < src_snapshot.len) {
+                const e = src_snapshot[n];
+                union_kr.extend(.{ .left = e.table.smallest, .right = e.table.biggest });
+                l0_bytes += e.table.fileSize();
+                n += 1;
+
+                const overlap = try self.levels[dest].overlappingTables(self.allocator, union_kr);
+                defer self.allocator.free(overlap);
+                var bot_bytes: u64 = 0;
+                for (overlap) |oe| bot_bytes += oe.table.fileSize();
+                if (l0_bytes + bot_bytes >= budget) break;
+            }
+            break :blk try self.allocator.dupe(TableEntry, src_snapshot[0..n]);
         };
         defer self.allocator.free(src_entries_slice);
 
@@ -716,11 +828,11 @@ pub const Tree = struct {
         log.info(
             "compact tree={d} L{d}->L{d} src_tables={d} src_keys={d} src_bytes_disk={d} bot_tables={d} bot_keys={d} bot_bytes_disk={d} expected_in={d} expected_bytes_disk={d} keys_in={d} keys_out={d} bytes_in={d} bytes_out={d} dropped_in_iter={d} dropped_in_builder={d}",
             .{
-                self.tree_id,          src,                    dest,
-                src_entries_slice.len, src_keys,               src_bytes_disk,
-                bot_entries_slice.len, bot_keys,               bot_bytes_disk,
-                expected_in,           expected_bytes_disk,    keys_in,
-                keys_out,              bytes_in,               bytes_out,
+                self.tree_id,           src,                 dest,
+                src_entries_slice.len,  src_keys,            src_bytes_disk,
+                bot_entries_slice.len,  bot_keys,            bot_bytes_disk,
+                expected_in,            expected_bytes_disk, keys_in,
+                keys_out,               bytes_in,            bytes_out,
                 expected_in -| keys_in, keys_in -| keys_out,
             },
         );
@@ -832,7 +944,7 @@ pub const Tree = struct {
         if (tb.bytes.len == 0) return;
 
         const id = next_file_id.fetchAdd(1, .monotonic);
-        const path = try options.sstPath(self.allocator, self.opts.dir, id);
+        const path = try config.sstPath(self.allocator, self.opts.dir, id);
         errdefer self.allocator.free(path);
 
         const wh = try vfs.g().createFile(path, .{ .mode = .direct });

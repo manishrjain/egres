@@ -125,16 +125,18 @@ test "skiplist iterator ordering and seek" {
 
     const expected = [_][]const u8{ "1", "2", "3", "5", "8", "9" };
     for (expected) |k| {
-        const e = it.next().?;
+        const e = it.itemRef().?;
         try testing.expectEqualStrings(k, e.key.primary);
+        try it.next();
     }
-    try testing.expect(it.next() == null);
+    try testing.expect(it.itemRef() == null);
 
     var seek_it = sl.iterator();
     defer seek_it.deinit();
-    const seek_entry = seek_it.seek(.{ .primary = "4", .timestamp = 1 }).?;
-    try testing.expectEqualStrings("5", seek_entry.key.primary);
-    try testing.expectEqualStrings("8", seek_it.next().?.key.primary);
+    try seek_it.seekRange(.{ .primary = "4", .timestamp = 1 }, .{});
+    try testing.expectEqualStrings("5", seek_it.itemRef().?.key.primary);
+    try seek_it.next();
+    try testing.expectEqualStrings("8", seek_it.itemRef().?.key.primary);
 }
 
 test "skiplist refcount usage with explicit acquire/release" {
@@ -210,7 +212,7 @@ test "skiplist grows beyond 64 MiB up to 256 MiB and validates full iteration" {
 
     var idx: usize = 0;
     while (idx < inserted) : (idx += 1) {
-        const entry = it.next() orelse return error.TestUnexpectedResult;
+        const entry = it.itemRef() orelse return error.TestUnexpectedResult;
 
         var expected_key_buf: [32]u8 = undefined;
         const expected_key = try writeKey(&expected_key_buf, idx);
@@ -218,8 +220,9 @@ test "skiplist grows beyond 64 MiB up to 256 MiB and validates full iteration" {
 
         const expected_value = expected_values.items[idx];
         try testing.expectEqualSlices(u8, expected_value, entry.value);
+        try it.next();
     }
-    try testing.expect(it.next() == null);
+    try testing.expect(it.itemRef() == null);
     const verify_elapsed_ns: i128 = std.time.nanoTimestamp() - verify_start_ns;
     u.testPrint(
         "[zdb.skl] verification complete keys={d} verify_elapsed_ms={d}\n",

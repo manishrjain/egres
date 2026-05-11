@@ -21,7 +21,7 @@ const KeyRange = level_mod.KeyRange;
 const Tree = zdb.tree.Tree;
 const TableCache = zdb.tree.TableCache;
 
-const options_mod = zdb.options;
+const config = zdb.config;
 
 
 // ---------------------------------------------------------------------------
@@ -360,7 +360,7 @@ test "levels: open" {
         createTableChange(2, test_tree_id, 1),
     }, &.{});
 
-    const opts = options_mod.Options{ .dir = dir_path };
+    const opts = config.Config{ .dir = dir_path };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
     var tree = try Tree.open(alloc, opts, test_tree_id, &ms, &cache);
@@ -394,7 +394,7 @@ test "levels: pick compact level" {
     // Targets cascade from `tree_split_size`; setting it to a single byte
     // makes every level's target tiny so one table in L1 exceeds it and
     // becomes the compaction candidate.
-    const opts = options_mod.Options{
+    const opts = config.Config{
         .dir = dir_path,
         .tree_split_size = 1,
     };
@@ -446,7 +446,7 @@ test "levels: doCompact L0 L1" {
     for (l0_data) |d| {
         var tb = try buildTable(alloc, &.{.{ .key = d.key, .ts = 0, .val = d.val }});
         defer tb.deinit();
-        const path = try options_mod.sstPath(alloc, dir_path, d.id);
+        const path = try config.sstPath(alloc, dir_path, d.id);
         defer alloc.free(path);
         const f = try std.fs.createFileAbsolute(path, .{});
         defer f.close();
@@ -460,7 +460,7 @@ test "levels: doCompact L0 L1" {
     }, &.{});
 
     // Use max_levels=2 so base_level=1 and doCompact(0) goes L0→L1.
-    const opts = options_mod.Options{ .dir = dir_path, .max_levels = 2 };
+    const opts = config.Config{ .dir = dir_path, .max_levels = 2 };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
     var tree = try Tree.open(alloc, opts, test_tree_id, &ms, &cache);
@@ -546,7 +546,7 @@ test "levels: doCompact L0 L1 with dest overlap" {
     }, &.{});
 
     // max_levels=2: L0 compacts directly to L1 (base_level=1).
-    const opts = options_mod.Options{ .dir = dir_path, .max_levels = 2 };
+    const opts = config.Config{ .dir = dir_path, .max_levels = 2 };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
     var tree = try Tree.open(alloc, opts, test_tree_id, &ms, &cache);
@@ -625,7 +625,7 @@ test "levels: doCompact L1 L2" {
     }, &.{});
 
     // max_levels=3: doCompact(1) goes L1→L2 (dest = src + 1 = 2).
-    const opts = options_mod.Options{ .dir = dir_path, .max_levels = 3 };
+    const opts = config.Config{ .dir = dir_path, .max_levels = 3 };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
     var tree = try Tree.open(alloc, opts, test_tree_id, &ms, &cache);
@@ -673,7 +673,7 @@ test "levels: get L0 shadows L1" {
     var ms = manifest.ForestState.init(alloc);
     defer ms.deinit();
 
-    const opts = options_mod.Options{ .dir = dir_path };
+    const opts = config.Config{ .dir = dir_path };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
     var tree = try Tree.open(alloc, opts, test_tree_id, &ms, &cache);

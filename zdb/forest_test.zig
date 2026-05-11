@@ -15,7 +15,7 @@ const forest_mod = zdb.forest;
 const Forest = forest_mod.Forest;
 const RouteTable = forest_mod.RouteTable;
 
-const options_mod = zdb.options;
+const config = zdb.config;
 
 
 // ---------------------------------------------------------------------------
@@ -148,7 +148,7 @@ test "forest: split tree" {
 
     const table_keys = [_][]const u8{ "aaa", "mmm", "zzz" };
     for (table_keys, 1..) |key, tbl_id| {
-        const path = try options_mod.sstPath(alloc, dir_path, tbl_id);
+        const path = try config.sstPath(alloc, dir_path, tbl_id);
         defer alloc.free(path);
         try buildAndWriteTable(alloc, path, key);
     }
@@ -226,7 +226,7 @@ test "forest: snapshot manifest round-trip" {
         _ = try src.createTree(43, .{ .inf = true });
 
         // Drop one SST into tree 1's L1, both on disk and in the manifest.
-        const sst_path = try options_mod.sstPath(alloc, dir_path, 1);
+        const sst_path = try config.sstPath(alloc, dir_path, 1);
         defer alloc.free(sst_path);
         try buildAndWriteTable(alloc, sst_path, "ccc");
 
@@ -338,6 +338,61 @@ test "forest: popOldestIfMatches multi phantom no match" {
     mts.popOldestIfMatches(7);
     try std.testing.expectEqual(@as(usize, 0), mts.immutables.items.len);
     try std.testing.expectEqual(@as(u64, 10), mts.current.id);
+}
+
+test "forest: getIterators outlives a concurrent flush+pop" {
+    // The race we're guarding against: a scan calls
+    // `Memtables.getIterators` and then drops the lock; before the
+    // scan is done iterating, a flush completes and `popOldestIfMatches`
+    // calls `release()` on the immutable memtable. If the iterator
+    // hadn't already bumped the refcount, the SkipList's arena would
+    // be freed mid-iteration and the next .next() would UAF.
+    const alloc = std.testing.allocator;
+
+    // Build immutables=[5], current=10, then put a key into M_5 so we
+    // can read it after the pop.
+    var mts = try buildMemtables(alloc, &.{ 5, 10 });
+    defer mts.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mts.immutables.items.len);
+    const m5 = mts.immutables.items[0];
+    try m5.put(.{ .namespace = 1, .primary = "alpha", .timestamp = 100 }, "v1");
+
+    // Snapshot under the lock — each skl.Iterator.init bumps
+    // refcount before getIterators returns.
+    const iters = try mts.getIterators(alloc);
+
+    // Simulate flush completion: drop M_5 from immutables (release fires
+    // inside popOldestIfMatches). M_5's refcount goes from 2 → 1
+    // because the snapshot iterator still holds a ref.
+    mts.popOldestIfMatches(5);
+    try std.testing.expectEqual(@as(usize, 0), mts.immutables.items.len);
+
+    // Iterate AFTER the pop; the snapshotted iterator for M_5 should
+    // still see the key. Use ts=maxInt because same-primary keys sort
+    // newest-first (timestamp is reverse-ordered) — seeking with ts=0
+    // would land on the *next* primary, missing alpha.
+    var found: ?[]const u8 = null;
+    for (iters) |*it| {
+        var copy = it.*;
+        try copy.seekRange(.{
+            .namespace = 1,
+            .primary = "alpha",
+            .timestamp = std.math.maxInt(u64),
+        }, .{});
+        if (copy.itemRef()) |item| {
+            if (std.mem.eql(u8, item.key.primary, "alpha")) {
+                found = item.value;
+            }
+        }
+    }
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualStrings("v1", found.?);
+
+    // Final release: deinit each iterator (mirroring what
+    // MergeIterator.deinit would do), then free the slice. Without
+    // this, M_5's last ref leaks and the arena is never freed.
+    for (iters) |*it| it.deinit();
+    alloc.free(iters);
 }
 
 test "forest: routes to correct tree" {

@@ -203,11 +203,18 @@ pub const Level = struct {
                 }
             }.f);
             // First table where kr.right < smallest (no longer overlapping).
-            const right = utils.search(TableEntry, items, kr.right, struct {
-                fn f(right_key: Key, e: TableEntry) bool {
-                    return right_key.order(e.table.smallest) == .lt;
-                }
-            }.f);
+            // An empty kr.right means "no upper bound" — sweep to end.
+            // Without this, the binary search would treat the empty primary
+            // as smaller than every table's smallest key and return 0,
+            // making the slice empty even when the left bound is well-formed.
+            const right = if (kr.right.primary.len == 0)
+                items.len
+            else
+                utils.search(TableEntry, items, kr.right, struct {
+                    fn f(right_key: Key, e: TableEntry) bool {
+                        return right_key.order(e.table.smallest) == .lt;
+                    }
+                }.f);
             break :blk items[left..right];
         };
 

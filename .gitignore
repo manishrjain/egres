@@ -1,0 +1,9 @@
+# Auto-generated test root assembled by build.zig from collectTestFiles().
+.test_root.zig
+
+# Zig build outputs.
+.zig-cache/
+zig-out/
+
+# Claude Code's per-project settings and session state.
+.claude/

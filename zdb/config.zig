@@ -10,7 +10,7 @@ pub const Error = error{
     InvalidDirForInMemory,
 };
 
-pub const Options = struct {
+pub const Config = struct {
     dir: []const u8 = "",
     in_memory: bool = false,
     read_only: bool = false,
@@ -55,15 +55,16 @@ pub const Options = struct {
     l0_backpressure_step_us: u32 = 1000,
     l0_backpressure_max_us: u32 = 100_000,
 
-    // Per-compaction cap on L0 input tables: the L0→L1 picker takes the
-    // OLDEST `l0_tables_per_compaction` and merges them with the
-    // overlapping L1 tables. Backpressure normally keeps L0 short, so
-    // this only matters as a safety bound — without it, a backlog of L0
-    // tables (e.g., during a flush burst) would land in one giant
-    // compaction that blocks the loop for minutes while L0 keeps growing.
-    l0_tables_per_compaction: u32 = 8,
+    // Per-compaction byte budget for L0→L1: the picker walks L0 oldest-
+    // first and stops once the total input bytes (sum of selected L0
+    // file sizes + their cumulative L1 overlap file sizes) would exceed
+    // this. Always picks at least one L0 table so a single oversized
+    // input still makes progress. Backpressure normally keeps L0 small;
+    // this is the safety bound that prevents a flush burst from landing
+    // in one multi-GiB compaction that blocks the loop for minutes.
+    l0_compaction_max_bytes: u64 = 1 << 30, // 1 GiB
 
-    pub fn validate(self: Options) Error!void {
+    pub fn validate(self: Config) Error!void {
         // Badger semantics: exactly one compactor causes pathological level behavior.
         if (self.num_compactors == 1) return error.InvalidNumCompactors;
         if (self.memtable_size == 0) return error.InvalidMemtableSize;

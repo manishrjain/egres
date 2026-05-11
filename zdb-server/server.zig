@@ -828,6 +828,12 @@ pub const ZdbServer = struct {
                     log.debug("GET ns={d} key={s} read_ts={d}", .{ req.ns, req.key, req.read_ts });
                     self.handleGet(stream, req) catch return;
                 },
+                .scan => |req| {
+                    log.debug("SCAN ns={d} start_key={s} max={d} mode={s}", .{
+                        req.ns, req.start_key, req.max_count, @tagName(req.mode),
+                    });
+                    self.handleScan(stream, req) catch return;
+                },
                 .conf => |req| {
                     log.info("CONF {s} node={d}", .{ @tagName(req.action), req.node_id });
                     self.handleConf(stream, req) catch return;
@@ -994,6 +1000,102 @@ pub const ZdbServer = struct {
             log.debug("GET miss", .{});
             try proto.writeNotFound(stream);
         }
+    }
+
+    fn handleScan(self: *ZdbServer, stream: zio.net.Stream, req: proto.ScanCmd) !void {
+        // Scan range = [start, end). Both bounds use ts=maxInt so the
+        // primary-key compare comes first and same-primary versions sort
+        // newest-first inside the bound. An empty primary on either side
+        // means "open" and propagates as `.{}` to the merge.
+        const start = Key{
+            .namespace = req.ns,
+            .primary = req.start_key,
+            .timestamp = std.math.maxInt(u64),
+        };
+        const end: Key = if (req.end_key.len == 0)
+            .{}
+        else
+            .{ .namespace = req.ns, .primary = req.end_key, .timestamp = std.math.maxInt(u64) };
+        // `inf=true` keeps `KeyRange.isEmpty()` false when BOTH primaries
+        // are empty (i.e., a fully-open scan). Without it,
+        // `Level.overlappingTables` short-circuits L≥1 tables to an
+        // empty slice and the scan only sees memtable/L0 contents.
+        const range = zdb.level.KeyRange{
+            .left = start,
+            .right = end,
+            .inf = req.start_key.len == 0 and req.end_key.len == 0,
+        };
+
+        // 4 KiB buffered writer — 1-2 items fit per drain at the bench's
+        // 4 KiB value size; smaller modes pack many items per drain.
+        var buf: [4096]u8 = undefined;
+        var sw = stream.writer(&buf);
+        const w = &sw.interface;
+
+        // Look up the tree owning the namespace + start_key. If nothing
+        // matches (no namespace, or start_key past the rightmost tree),
+        // return an empty result rather than an error.
+        const tree_opt: ?*zdb.tree.Tree = blk: {
+            self.forest.mu.lockShared();
+            defer self.forest.mu.unlockShared();
+            const rt = self.forest.ns_routes.get(req.ns) orelse break :blk null;
+            const tid = rt.lookup(start) orelse break :blk null;
+            break :blk self.forest.trees.get(tid);
+        };
+        if (tree_opt == null) {
+            try proto.writeScanEnd(w, 0);
+            try w.flush();
+            return;
+        }
+
+        // Snapshot memtable iterators (active + immutables). Tree.scan
+        // takes ownership of every entry — its merge will deinit each on
+        // teardown, so we must NOT release them ourselves.
+        const mem_iters = try self.forest.memtables.getIterators(self.allocator);
+        defer self.allocator.free(mem_iters);
+
+        const Ctx = struct {
+            w: *std.Io.Writer,
+            mode: proto.ScanCmd.Mode,
+            ns: u32,
+
+            fn emit(ctx_raw: *anyopaque, item: zdb.key.Item) anyerror!bool {
+                const c: *@This() = @ptrCast(@alignCast(ctx_raw));
+                // Drop items that crossed into another namespace — the
+                // tree is namespace-scoped via routing, but its merge
+                // sees raw keys; an L1 SST shared via split could in
+                // principle straddle. Cheap defensive check.
+                if (item.key.namespace != c.ns) return false;
+                try proto.writeScanItem(
+                    c.w,
+                    c.mode,
+                    item.key.timestamp,
+                    item.key.primary,
+                    item.value,
+                );
+                return true;
+            }
+        };
+        var ctx = Ctx{
+            .w = w,
+            .mode = req.mode,
+            .ns = req.ns,
+        };
+        const emitted = tree_opt.?.scan(
+            self.allocator,
+            range,
+            req.max_count,
+            .p0,
+            mem_iters,
+            @ptrCast(&ctx),
+            &Ctx.emit,
+        ) catch |err| {
+            log.err("tree.scan failed: {s}", .{@errorName(err)});
+            try proto.writeErr(stream, "scan failed");
+            return;
+        };
+        try proto.writeScanEnd(w, emitted);
+        try w.flush();
     }
 
     fn handleConf(self: *ZdbServer, stream: zio.net.Stream, req: proto.ConfCmd) !void {
