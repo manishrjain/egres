@@ -190,35 +190,20 @@ fn formatKey(buf: []u8, id: u64) []const u8 {
 }
 
 /// A pool of printable-ASCII bytes used as the source of every value the
-/// benchmark writes. Pre-filled once at startup (see `initValueBuffer`) and
-/// read-only thereafter — no per-value PRNG cost on the hot path.
-const value_buffer_size: usize = 4 * 1024 * 1024;
-var value_buffer: [value_buffer_size]u8 = undefined;
-
-fn initValueBuffer() void {
-    var prng = std.Random.DefaultPrng.init(0xc0ffee);
-    // 0x31..0x7E — printable ASCII excluding space (0x20), tab/CR/LF (< 0x21),
-    // and the digit '0' (0x30). This lets the batch protocol's whitespace
-    // tokenization work without hex-encoding, and guarantees no value ever
-    // starts with "0x" which would be mistaken for a hex token.
-    for (&value_buffer) |*b| {
-        b.* = 0x31 + prng.random().intRangeLessThan(u8, 0, 0x7E - 0x31 + 1);
-    }
-}
-
-/// Writes a deterministic byte pattern for key `id` into `buf`. The bytes are
-/// a window into the shared `value_buffer` starting at offset `id % size`,
-/// wrapping around the end if needed. Adjacent ids produce adjacent windows
-/// — good cache locality for the memcpy, and any reader that knows `id` can
-/// reconstruct the exact bytes for verification.
+/// Writes a deterministic byte pattern for key `id` into `buf`. Each id
+/// gets its own PRNG seeded by `id`, so the value bytes are statistically
+/// independent across keys and effectively incompressible (matches
+/// YCSB's RandomCharByteIterator semantics). Any reader that knows `id`
+/// reproduces the exact bytes for verification.
+///
+/// Alphabet is 0x31..0x7E — printable ASCII excluding space, control
+/// chars, and '0' — so the batch protocol's whitespace tokenization
+/// works without hex-encoding and no value can start with "0x".
 fn fillValue(buf: []u8, id: u64) void {
-    std.debug.assert(buf.len <= value_buffer_size);
-    const start: usize = @intCast(id % value_buffer_size);
-    const first = @min(buf.len, value_buffer_size - start);
-    @memcpy(buf[0..first], value_buffer[start .. start + first]);
-    if (first < buf.len) {
-        @memcpy(buf[first..], value_buffer[0 .. buf.len - first]);
-    }
+    var prng = std.Random.DefaultPrng.init(id);
+    const r = prng.random();
+    const span: u8 = 0x7E - 0x31 + 1;
+    for (buf) |*b| b.* = 0x31 + r.intRangeLessThan(u8, 0, span);
 }
 
 /// valueMatches returns true iff `got` equals the expected pattern for id.
@@ -754,9 +739,6 @@ pub fn main() !void {
 
 fn runBenchmark(allocator: std.mem.Allocator, args: *const Args) u64 {
     log.info("runBenchmark", .{});
-    // Fill the shared value pool once, before any fibers spawn — workers then
-    // only pay for memcpy, not per-byte PRNG.
-    initValueBuffer();
     const server_addr = zio.net.IpAddress.parseIpAndPort(args.addr) catch |err| {
         log.err("invalid address '{s}': {s}", .{ args.addr, @errorName(err) });
         return 0;

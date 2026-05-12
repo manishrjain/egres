@@ -333,7 +333,13 @@ test "diskwal drops malformed trailing wal files on reopen" {
     }
 }
 
-test "diskwal rejects snapshot-log firstIndex mismatch on reopen" {
+test "diskwal tolerates WAL firstIndex below snapshot+1 on reopen" {
+    // Crash recovery scenario: meta-store records a snapshot at index N,
+    // but WAL compaction (which deletes pre-snapshot files) hadn't
+    // completed before the kill. On reopen we should accept the WAL —
+    // the extra pre-snapshot entries are harmless because apply_index
+    // initializes to snap.index, skipping them. Only a true gap
+    // (firstIndex > snap.index+1, missing entries) is data loss.
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
@@ -349,10 +355,9 @@ test "diskwal rejects snapshot-log firstIndex mismatch on reopen" {
         try log.sync();
     }
 
-    try std.testing.expectError(
-        error.CorruptLogFile,
-        raft.DiskWAL.openPath(wal_dir, alloc, 1024),
-    );
+    // Used to error.CorruptLogFile; now succeeds.
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+    defer ds.deinit();
 }
 
 test "BIG: diskwal storage" {
@@ -800,8 +805,8 @@ test "diskwal writeHeader/readHeader round-trip" {
     // Drive writeHeader and readHeader directly (no DiskWAL wrapper, no
     // data-region records). Verifies that a logFile's in-memory slots
     // survive a serialize/deserialize cycle through the on-disk WalHeader,
-    // covering both the empty-slots case (just base) and the populated
-    // case (base + multiple data slots).
+    // covering both the empty-slots case (freshly created) and the
+    // populated case (multiple appended data slots).
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
@@ -812,22 +817,14 @@ test "diskwal writeHeader/readHeader round-trip" {
     const vfs = @import("vfs");
     const vfs_inst = vfs.g();
 
-    const base = raft.diskwal.entry{
-        .term = 5,
-        .index = 100,
-        .timestamp = 0xDEAD_BEEF,
-    };
-    var lf = try raft.diskwal.logFile.createCurrent(vfs_inst, alloc, wal_dir, 1, base);
+    var lf = try raft.diskwal.logFile.createCurrent(vfs_inst, alloc, wal_dir, 1);
     defer lf.deinit();
 
-    // Empty case: createCurrent writes a WalHeader with just the base slot.
+    // Empty case: createCurrent writes a WalHeader with no data slots.
     {
         var slots = try raft.diskwal.logFile.readHeader(alloc, lf.handle);
         defer slots.deinit(alloc);
-        try std.testing.expectEqual(@as(usize, 1), slots.items.len);
-        try std.testing.expectEqual(@as(u64, 5), slots.items[0].term);
-        try std.testing.expectEqual(@as(u64, 100), slots.items[0].index);
-        try std.testing.expectEqual(@as(u64, 0xDEAD_BEEF), slots.items[0].timestamp);
+        try std.testing.expectEqual(@as(usize, 0), slots.items.len);
     }
 
     // Populated case: append slot metadata and re-persist via writeHeader.
@@ -854,25 +851,21 @@ test "diskwal writeHeader/readHeader round-trip" {
     {
         var slots = try raft.diskwal.logFile.readHeader(alloc, lf.handle);
         defer slots.deinit(alloc);
-        try std.testing.expectEqual(@as(usize, 3), slots.items.len);
+        try std.testing.expectEqual(@as(usize, 2), slots.items.len);
 
         try std.testing.expectEqual(@as(u64, 5), slots.items[0].term);
-        try std.testing.expectEqual(@as(u64, 100), slots.items[0].index);
-        try std.testing.expectEqual(@as(u64, 0xDEAD_BEEF), slots.items[0].timestamp);
+        try std.testing.expectEqual(@as(u64, 101), slots.items[0].index);
+        try std.testing.expectEqual(@as(u64, 0xDEAD_BEF0), slots.items[0].timestamp);
+        try std.testing.expectEqual(@as(u32, 1 << 20), slots.items[0].data_offset);
+        try std.testing.expectEqual(@as(u32, 42), slots.items[0].data_len);
+        try std.testing.expectEqual(zen.EntryTypeEnum.data, slots.items[0].entry_type);
 
-        try std.testing.expectEqual(@as(u64, 5), slots.items[1].term);
-        try std.testing.expectEqual(@as(u64, 101), slots.items[1].index);
-        try std.testing.expectEqual(@as(u64, 0xDEAD_BEF0), slots.items[1].timestamp);
-        try std.testing.expectEqual(@as(u32, 1 << 20), slots.items[1].data_offset);
-        try std.testing.expectEqual(@as(u32, 42), slots.items[1].data_len);
-        try std.testing.expectEqual(zen.EntryTypeEnum.data, slots.items[1].entry_type);
-
-        try std.testing.expectEqual(@as(u64, 6), slots.items[2].term);
-        try std.testing.expectEqual(@as(u64, 102), slots.items[2].index);
-        try std.testing.expectEqual(@as(u64, 0xDEAD_BEF1), slots.items[2].timestamp);
-        try std.testing.expectEqual(@as(u32, (1 << 20) + 50), slots.items[2].data_offset);
-        try std.testing.expectEqual(@as(u32, 100), slots.items[2].data_len);
-        try std.testing.expectEqual(zen.EntryTypeEnum.conf, slots.items[2].entry_type);
+        try std.testing.expectEqual(@as(u64, 6), slots.items[1].term);
+        try std.testing.expectEqual(@as(u64, 102), slots.items[1].index);
+        try std.testing.expectEqual(@as(u64, 0xDEAD_BEF1), slots.items[1].timestamp);
+        try std.testing.expectEqual(@as(u32, (1 << 20) + 50), slots.items[1].data_offset);
+        try std.testing.expectEqual(@as(u32, 100), slots.items[1].data_len);
+        try std.testing.expectEqual(zen.EntryTypeEnum.conf, slots.items[1].entry_type);
     }
 }
 

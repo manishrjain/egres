@@ -309,7 +309,7 @@ pub const Node = struct {
             // Raise the HLC clock past the most recent log entry's timestamp,
             // so a newly-elected leader's future `next()` values are strictly
             // past every previously-committed one.
-            const seed_ts = node.lastLogTimestamp();
+            const seed_ts = node.log.lastTimestamp();
             if (seed_ts != 0) {
                 utils.hlc.g().seed(utils.hlc.HLC.fromU64(seed_ts));
             }
@@ -1441,16 +1441,24 @@ pub const Node = struct {
     /// commit) and are unaffected.
     pub fn proposeAndWaitForApply(self: *Node, data: []const u8, proposal_type: ProposalType) RaftError!void {
         std.debug.assert(proposal_type != .any);
+        const start_ms = std.time.milliTimestamp();
         var ctx = WaitCtx{ .status = .committed };
         ctx.wg.init();
         ctx.wg.add(1);
         try self.proposeWithCallback(data, &onWaitCommit, @ptrCast(&ctx), proposal_type);
         ctx.wg.wait() catch return error.CommitFailed;
+        const commit_ms = std.time.milliTimestamp();
+        if (commit_ms - start_ms > 5_000) {
+            raft_log.warn("proposeAndWaitForApply: commit phase slow type={s} ms={d}", .{
+                @tagName(proposal_type), commit_ms - start_ms,
+            });
+        }
         if (ctx.status != .committed) return error.NotCommitted;
         // Wait for apply_ts to catch up to this entry's timestamp. Use the
         // two-phase asyncWait pattern so we don't lose a broadcast that
         // fires between the load and the suspend (apply_ts_notify is
         // stateless — see callbackLoop comment).
+        var last_warn_ms = commit_ms;
         while (self.apply_ts.load(.acquire) < ctx.entry_ts) {
             var w: zio.Waiter = .init();
             _ = self.apply_ts_notify.asyncWait(&w);
@@ -1459,6 +1467,19 @@ pub const Node = struct {
                 break;
             }
             w.wait(1, .allow_cancel) catch return error.CommitFailed;
+            // Diagnostic: if the apply wait blocks for too long, log
+            // every 15s with the gap between our entry_ts and apply_ts
+            // so it's clear which side is stuck.
+            const now_ms = std.time.milliTimestamp();
+            if (now_ms - last_warn_ms >= 15_000) {
+                raft_log.warn("proposeAndWaitForApply: apply wait stuck type={s} entry_ts={d} apply_ts={d} elapsed_ms={d}", .{
+                    @tagName(proposal_type),
+                    ctx.entry_ts,
+                    self.apply_ts.load(.acquire),
+                    now_ms - start_ms,
+                });
+                last_warn_ms = now_ms;
+            }
         }
     }
 
@@ -1885,7 +1906,7 @@ pub const Node = struct {
         while (!self.isShuttingDown()) {
             zio.sleep(poll) catch return;
             if (!self.isLeader()) continue;
-            const last_ts = utils.hlc.HLC.fromU64(self.lastLogTimestamp());
+            const last_ts = utils.hlc.HLC.fromU64(self.log.lastTimestamp());
             const wall_sec: u32 = @intCast(std.time.timestamp());
             if (wall_sec <= last_ts.seconds) continue;
 
@@ -2371,20 +2392,6 @@ pub const Node = struct {
         while (self.apply_ts.load(.acquire) < target_ts) {
             try self.apply_ts_notify.timedWait(deadline);
         }
-    }
-
-    /// Timestamp of the last entry in the WAL (0 if empty). The clock-tick
-    /// fiber reads this to decide whether to propose a tick: if the wall
-    /// clock has ticked past this entry's second, a new tick is needed.
-    /// Source of truth is the WAL — no separate atomic to maintain.
-    pub fn lastLogTimestamp(self: *Node) u64 {
-        const last = self.log.lastIndex();
-        if (last == 0) return 0;
-        var result = self.log.entriesRange(.{ .lo = last, .hi = last + 1, .max_bytes = 4096 }) catch return 0;
-        defer result.deinit();
-        if (result.entries.len == 0) return 0;
-        const reader = zen.LogEntryReader.parseRoot(result.entries[0].bytes) catch return 0;
-        return reader.timestamp();
     }
 
     fn failAllPendingCallbacks(self: *Node, status: CommitStatus) void {

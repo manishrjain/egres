@@ -41,6 +41,11 @@ pub const Spinner = struct {
         // 1 cost-unit was wasted).
         const granted_pages = self.acquireFromLimiter(self.rem_pages * wm, wm) / wm;
         self.deductPages(granted_pages);
+        const counter = switch (self.kind) {
+            .read => &self.limiter.total_read_pages,
+            .write => &self.limiter.total_write_pages,
+        };
+        _ = counter.fetchAdd(granted_pages, .monotonic);
 
         const granted_bytes = granted_pages * vfs.page_size;
         // On the last chunk, rem_bytes may be less than granted_bytes.
@@ -132,9 +137,44 @@ pub const Limiter = struct {
     pages: std.atomic.Value(u64), // token bucket in page units
     last_refill: std.atomic.Value(i64), // monotonic millis
     demand_p1: std.atomic.Value(u64), // sum of all active P1 spinners' remaining (pages)
+    /// Cumulative pages ever granted across the process lifetime,
+    /// split by IOKind. Incremented at each spinner grant; never
+    /// decremented. Useful as a sanity check against the rate limit
+    /// and against the expected on-disk footprint.
+    total_read_pages: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    total_write_pages: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     pages_per_sec: u64,
     min_alloc_pages: u64,
     conf: Config,
+
+    /// Snapshot of the live limiter state, all counted in pages
+    /// (multiply by `vfs.page_size` for bytes). `available_p2` shows
+    /// what a P2 spinner would actually see right now after
+    /// subtracting P1 demand — if it's 0 while compaction is pending,
+    /// P1 demand is starving P2.
+    pub const Status = struct {
+        pages_per_sec: u64,
+        bucket: u64,
+        demand_p1: u64,
+        available_p1: u64,
+        available_p2: u64,
+        total_read_pages: u64,
+        total_write_pages: u64,
+    };
+
+    pub fn status(self: *const Limiter) Status {
+        const cur = self.pages.load(.monotonic);
+        const dp1 = self.demand_p1.load(.monotonic);
+        return .{
+            .pages_per_sec = self.pages_per_sec,
+            .bucket = cur,
+            .demand_p1 = dp1,
+            .available_p1 = cur,
+            .available_p2 = cur -| dp1,
+            .total_read_pages = self.total_read_pages.load(.monotonic),
+            .total_write_pages = self.total_write_pages.load(.monotonic),
+        };
+    }
 
     pub fn init(config: Config) Limiter {
         const pps = config.bytes_per_sec / vfs.page_size;

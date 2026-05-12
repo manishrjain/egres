@@ -141,14 +141,15 @@ test "table binary fuse contains keys" {
     var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
     defer b.deinit();
 
-    const entries = [_]struct { key: []const u8, ts: u64, val: []const u8 }{
-        .{ .key = "apple", .ts = 1, .val = "v1" },
-        .{ .key = "banana", .ts = 2, .val = "v2" },
-        .{ .key = "carrot", .ts = 3, .val = "v3" },
-    };
-
-    for (entries) |e| {
-        try b.add(.{ .primary = e.key, .timestamp = e.ts }, e.val);
+    // Builder skips BF construction below ~256 keys (the algorithm
+    // can fail to converge on small inputs — see builder.zig). Use
+    // enough keys to land safely above the threshold so the negative
+    // assertions below are meaningful.
+    const n: usize = 1024;
+    var key_buf: [16]u8 = undefined;
+    for (0..n) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "k{d:0>6}", .{i});
+        try b.add(.{ .primary = key, .timestamp = @intCast(i + 1) }, "v");
     }
 
     var tb = try b.finish();
@@ -157,13 +158,15 @@ test "table binary fuse contains keys" {
     const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
     defer destroyTable(t);
 
-    try std.testing.expect(t.containsKey(.{ .primary = "apple" }));
-    try std.testing.expect(t.containsKey(.{ .primary = "banana" }));
-    try std.testing.expect(t.containsKey(.{ .primary = "carrot" }));
+    // Sample present keys.
+    try std.testing.expect(t.containsKey(.{ .primary = "k000000" }));
+    try std.testing.expect(t.containsKey(.{ .primary = "k000500" }));
+    try std.testing.expect(t.containsKey(.{ .primary = "k001023" }));
 
-    try std.testing.expect(!t.containsKey(.{ .primary = "date" }));
-    try std.testing.expect(!t.containsKey(.{ .primary = "eggplant" }));
-    try std.testing.expect(!t.containsKey(.{ .primary = "fig" }));
+    // Absent keys — BF should reject (containsKey returns false).
+    try std.testing.expect(!t.containsKey(.{ .primary = "missing-1" }));
+    try std.testing.expect(!t.containsKey(.{ .primary = "missing-2" }));
+    try std.testing.expect(!t.containsKey(.{ .primary = "missing-3" }));
 }
 
 test "table binary fuse large keyset contains sampled keys" {

@@ -4172,11 +4172,8 @@ pub const WalSlotWriter = struct {
 };
 
 pub const WalHeaderStruct = struct {
-    base_slot: ?WalSlotStruct = null,
     slots: []WalSlotStruct = &.{},
     pub fn deinit(self: *WalHeaderStruct, alloc: std.mem.Allocator) void {
-        if (self.base_slot) |*_bf| _bf.deinit(alloc);
-        self.base_slot = null;
         for (self.slots) |*_b| _b.deinit(alloc);
         alloc.free(self.slots);
         self.slots = &.{};
@@ -4197,9 +4194,6 @@ pub const WalHeaderStruct = struct {
                 s.slots[_i] = try _child.cloneValue(alloc);
             }
         }
-        if (self.base_slot) |_child| {
-            s.base_slot = try _child.cloneValue(alloc);
-        }
         return s;
     }
 
@@ -4212,10 +4206,6 @@ pub const WalHeaderStruct = struct {
 
     pub fn marshalTo(self: WalHeaderStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try WalHeaderWriter.initWithBuf(alloc, out);
-        if (self.base_slot) |child| {
-            const child_off = try child.marshalTo(alloc, out);
-            try writer.setBaseSlot(child_off);
-        }
         if (self.slots.len > 0) {
             const offsets = try alloc.alloc(u32, self.slots.len);
             defer alloc.free(offsets);
@@ -4236,7 +4226,7 @@ pub const WalHeaderReader = struct {
     size_bytes: u16,
 
     pub const TABLE_ID: u16 = 42255;
-    pub const SIZE_BYTES: u16 = 14;
+    pub const SIZE_BYTES: u16 = 10;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -4252,21 +4242,12 @@ pub const WalHeaderReader = struct {
         return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
     }
 
-    pub fn baseSlot(self: Self) ?WalSlotReader {
-        const slot_end = @as(u32, self.base) + 6;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return null;
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 2)) catch 0;
-        if (off == zbuf.NullOffset) return null;
-        return WalSlotReader.init(self.buf, off) catch null;
-    }
-
     fn slotsSlice(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 14;
+        const slot_end = @as(u32, self.base) + 10;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return &.{};
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 6)) catch return &.{};
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 10)) catch return &.{};
+        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 2)) catch return &.{};
+        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 6)) catch return &.{};
         if (elem_count == 0) return &.{};
         const end = @as(usize, index_off) + @as(usize, elem_count) * 4;
         if (end > self.buf.len) return &.{};
@@ -4287,10 +4268,6 @@ pub const WalHeaderReader = struct {
 
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try WalHeaderWriter.initWithBuf(alloc, out);
-        if (self.baseSlot()) |child| {
-            const child_off = try child.cloneInto(alloc, out);
-            try writer.setBaseSlot(child_off);
-        }
         const count_slots: u32 = self.slotsLen();
         if (count_slots != 0) {
             var child_offsets_slots = try alloc.alloc(u32, @intCast(count_slots));
@@ -4309,13 +4286,10 @@ pub const WalHeaderReader = struct {
     pub fn verify(self: Self) Error!void {
         if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        if (self.baseSlot()) |child_view| {
-            try child_view.verify();
-        }
-        const slot_end_arr_6 = @as(u32, self.base) + 14;
-        if (slot_end_arr_6 <= header_end) {
-            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 6));
-            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 10));
+        const slot_end_arr_2 = @as(u32, self.base) + 10;
+        if (slot_end_arr_2 <= header_end) {
+            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 2));
+            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 6));
             if (elem_count > 0) {
                 const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
                 if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
@@ -4339,9 +4313,6 @@ pub const WalHeaderReader = struct {
                 const _child = try self.slotsAt(@intCast(_i));
                 s.slots[_i] = try _child.toStructValue(alloc);
             }
-        }
-        if (self.baseSlot()) |_child| {
-            s.base_slot = try _child.toStructValue(alloc);
         }
         return s;
     }
@@ -4388,7 +4359,7 @@ pub const WalHeaderWriter = struct {
     base: u32,
 
     pub const TABLE_ID: u16 = 42255;
-    pub const SIZE_BYTES: u16 = 14;
+    pub const SIZE_BYTES: u16 = 10;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -4397,7 +4368,6 @@ pub const WalHeaderWriter = struct {
     pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {
         const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);
         try zbuf.writeU16At(buf.items, @as(usize, base), SIZE_BYTES);
-        try zbuf.patchU32(buf.items, base + 2, zbuf.NullOffset);
         return .{ .buf = buf, .owns_buf = false, .alloc = alloc, .base = base };
     }
 
@@ -4407,26 +4377,20 @@ pub const WalHeaderWriter = struct {
         errdefer alloc.destroy(owned);
         const base = try zbuf.reserveHeader(owned, alloc, SIZE_BYTES);
         try zbuf.writeU16At(owned.items, @as(usize, base), SIZE_BYTES);
-        try zbuf.patchU32(owned.items, base + 2, zbuf.NullOffset);
         return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
-    }
-
-    pub fn setBaseSlot(self: *Self, child_off: u32) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 2, child_off);
     }
 
     pub fn setSlots(self: *Self, values: []const u32) Error!void {
         const out = self.bufMut();
         if (values.len == 0) {
+            try zbuf.patchU32(out.items, self.base + 2, 0);
             try zbuf.patchU32(out.items, self.base + 6, 0);
-            try zbuf.patchU32(out.items, self.base + 10, 0);
             return;
         }
         const abs_index_off = try zbuf.appendU32Slice(out, self.alloc, values);
         const index_off = abs_index_off;
-        try zbuf.patchU32(out.items, self.base + 6, index_off);
-        try zbuf.patchU32(out.items, self.base + 10, @as(u32, @intCast(values.len)));
+        try zbuf.patchU32(out.items, self.base + 2, index_off);
+        try zbuf.patchU32(out.items, self.base + 6, @as(u32, @intCast(values.len)));
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -4434,7 +4398,6 @@ pub const WalHeaderWriter = struct {
         if (@typeInfo(Values) != .@"struct") {
             @compileError("set() expects a struct literal like .{ .field = value }");
         }
-        if (@hasField(Values, "base_slot")) try self.setBaseSlot(@field(values, "base_slot"));
         if (@hasField(Values, "slots")) try self.setSlots(@field(values, "slots"));
     }
 

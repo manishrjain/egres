@@ -104,8 +104,7 @@ pub const WalSlot = schema.Table(.{
 });
 
 pub const WalHeader = schema.Table(.{
-    .{ .id = 1, .name = "base_slot", .ty = WalSlot },
-    .{ .id = 2, .name = "slots", .ty = schema.Array(WalSlot) },
+    .{ .id = 1, .name = "slots", .ty = schema.Array(WalSlot) },
 });
 
 pub const LogEntry = schema.Table(.{

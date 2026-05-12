@@ -10,8 +10,11 @@ pub const Command = union(enum) {
     ns_create: NsCreateCmd,
     zdb: ZdbCmd,
     raft: RaftCmd,
+    vfs: VfsCmd,
     help: HelpCmd,
 };
+
+pub const VfsCmd = struct {};
 
 pub const HelpCmd = struct {};
 
@@ -45,6 +48,7 @@ pub const help_text =
     \\  raft                            cluster topology + per-peer log progress
     \\  raft entry <N>                  dump WAL entry N (one human-readable line)
     \\  raft entry <lo> <hi>            dump WAL entries [lo, hi], one per line
+    \\  vfs                             VFS bandwidth limiter snapshot
     \\
 ;
 
@@ -419,6 +423,8 @@ pub fn parseLine(line: []const u8) !Command {
             lo;
         if (hi < lo) return error.InvalidArg;
         return .{ .raft = .{ .sub = .entry, .lo = lo, .hi = hi } };
+    } else if (std.mem.eql(u8, cmd, "vfs")) {
+        return .{ .vfs = .{} };
     } else if (std.mem.eql(u8, cmd, "help")) {
         return .{ .help = .{} };
     } else {

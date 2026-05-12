@@ -6,7 +6,8 @@ const runtime = @import("runtime");
 const proto = @import("protocol.zig");
 const m = @import("metrics");
 const flags = @import("flags");
-const WaitGroup = @import("raft").utils.WaitGroup;
+const utils = @import("raft").utils;
+const WaitGroup = utils.WaitGroup;
 
 /// `--snapshot` — Raft snapshot triggers and polling cadence. The leader's
 /// snapshot loop reads these every iteration so operators can tune at
@@ -271,6 +272,18 @@ pub const ZdbServer = struct {
     listen_addr: zio.net.IpAddress,
     in_flight_mu: std.Thread.Mutex = .{},
     in_flight: std.ArrayList(InFlight) = .empty,
+    /// Monotonic per-call ID for proposeCompaction so we can grep its
+    /// per-phase log lines (start/build_done/distribute_done/done) out
+    /// of a noisy log without picking up unrelated compactions. Wraps
+    /// at u64 — we'll never wrap in practice.
+    next_compaction_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
+
+    /// Set of trees currently being compacted/split by some compactor
+    /// fiber. Each fiber reserves its tree before starting work so
+    /// two fibers never pick the same tree. Allocated lazily on init;
+    /// the deinit code below frees it.
+    compacting_mu: std.Thread.Mutex = .{},
+    compacting_trees: std.AutoHashMap(u64, void) = undefined,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -288,13 +301,36 @@ pub const ZdbServer = struct {
             .storage = storage,
             .snapshot_cfg = snapshot_cfg,
             .listen_addr = addr,
+            .compacting_trees = std.AutoHashMap(u64, void).init(allocator),
         };
     }
 
     pub fn deinit(self: *ZdbServer) void {
         self.in_flight_mu.lock();
-        defer self.in_flight_mu.unlock();
         self.in_flight.deinit(self.allocator);
+        self.in_flight_mu.unlock();
+        self.compacting_mu.lock();
+        self.compacting_trees.deinit();
+        self.compacting_mu.unlock();
+    }
+
+    /// Try to claim a compaction target; returns null if every eligible
+    /// tree is already being compacted by another fiber. The reservation
+    /// stays in place until `releaseCompactingTree` runs (typically via
+    /// `defer` in the caller). Race-safe because the candidate selection
+    /// and the reservation insert happen under the same mutex.
+    fn pickAndReserveCompactionTarget(self: *ZdbServer) ?Forest.CompactionTarget {
+        self.compacting_mu.lock();
+        defer self.compacting_mu.unlock();
+        const target = self.forest.bestCompactionCandidateExcluding(&self.compacting_trees) orelse return null;
+        self.compacting_trees.put(target.tree_id, {}) catch return null;
+        return target;
+    }
+
+    fn releaseCompactingTree(self: *ZdbServer, tree_id: u64) void {
+        self.compacting_mu.lock();
+        defer self.compacting_mu.unlock();
+        _ = self.compacting_trees.remove(tree_id);
     }
 
     /// Add an in-flight record. Returns the slice index for `removeInFlight`.
@@ -352,13 +388,45 @@ pub const ZdbServer = struct {
     }
 
     pub fn runCompactionLoop(self: *ZdbServer) void {
-        log.info("compaction loops started", .{});
+        const n_compactors = self.forest.opts.num_compactors;
+        log.info("compaction loops started: num_compactors={d}", .{n_compactors});
         var group = zio.group();
         group.spawn(runMemtableLoop, .{self}) catch return;
         group.spawn(runFlushLoop, .{self}) catch return;
-        group.spawn(runLevelsLoop, .{self}) catch return;
+        // Each levels-loop fiber claims one tree at a time via
+        // `pickAndReserveCompactionTarget`; with N fibers we get N
+        // tree-parallel compactions. Single-tree workloads degenerate
+        // to one effective compactor (others spin idle), which is
+        // exactly the right behavior — multiple compactors on one
+        // tree would race on level mutexes.
+        for (0..n_compactors) |_| {
+            group.spawn(runLevelsLoop, .{self}) catch return;
+        }
+        group.spawn(runInFlightWatchdog, .{self}) catch return;
         group.wait() catch {};
         log.info("compaction loops exiting (shutdown)", .{});
+    }
+
+    /// Diagnostic loop: every 15s, scan the in_flight table and warn
+    /// about any entry older than the configured threshold. Catches
+    /// stuck compactions, flushes, splits, and newMemtable proposals
+    /// generically — wherever the wedge is, the entry stops aging out.
+    fn runInFlightWatchdog(self: *ZdbServer) void {
+        const poll = zio.Duration.fromSeconds(15);
+        const stuck_threshold_ms: i64 = 30_000;
+        while (!self.node.isShuttingDown()) {
+            zio.sleep(poll) catch return;
+            const now_us = std.time.microTimestamp();
+            self.in_flight_mu.lock();
+            defer self.in_flight_mu.unlock();
+            for (self.in_flight.items) |it| {
+                const age_ms = @divTrunc(now_us - it.started_at_us, 1000);
+                if (age_ms < stuck_threshold_ms) continue;
+                log.warn("in-flight stuck: kind={s} tree={d} src_level={d} dest_level={d} age_ms={d}", .{
+                    @tagName(it.kind), it.tree_id, it.src_level, it.dest_level, age_ms,
+                });
+            }
+        }
     }
 
     /// Block until `recoverFromSnapshot` has finished. Background loops
@@ -640,6 +708,11 @@ pub const ZdbServer = struct {
     // that tree, so the follower's results would be valid. The leader would check
     // results before proposing, so we should be fine.
     // For now, leader is the one doing the compaction.
+    //
+    // Multiple instances of this loop run in parallel — one per
+    // `num_compactors`. `pickAndReserveCompactionTarget` ensures no
+    // two fibers ever pick the same tree concurrently (each tree
+    // gets at most one in-flight compaction/split).
     fn runLevelsLoop(self: *ZdbServer) void {
         self.waitForRecovery();
 
@@ -649,23 +722,24 @@ pub const ZdbServer = struct {
                 zio.sleep(interval) catch return;
                 continue;
             }
-            if (self.forest.bestCompactionCandidate()) |target| {
-                // The candidate carries `needs_split=true` when the tree's
-                // Lmax has outgrown the split threshold. updateCompactCandidate
-                // sets this in the apply path (after every compaction/flush),
-                // so the dispatch here always reflects the latest applied
-                // state — no separate polling for splits is needed.
-                if (target.candidate.needs_split) {
-                    self.proposeSplit(target.tree_id) catch |err| {
-                        log.err("proposeSplit failed for tree {d}: {s}", .{ target.tree_id, @errorName(err) });
-                    };
-                } else {
-                    self.proposeCompaction(target) catch |err| {
-                        log.err("proposeCompaction failed: {s}", .{@errorName(err)});
-                    };
-                }
-            } else {
+            const target = self.pickAndReserveCompactionTarget() orelse {
                 zio.sleep(interval) catch return;
+                continue;
+            };
+            defer self.releaseCompactingTree(target.tree_id);
+            // The candidate carries `needs_split=true` when the tree's
+            // Lmax has outgrown the split threshold. updateCompactCandidate
+            // sets this in the apply path (after every compaction/flush),
+            // so the dispatch here always reflects the latest applied
+            // state — no separate polling for splits is needed.
+            if (target.candidate.needs_split) {
+                self.proposeSplit(target.tree_id) catch |err| {
+                    log.err("proposeSplit failed for tree {d}: {s}", .{ target.tree_id, @errorName(err) });
+                };
+            } else {
+                self.proposeCompaction(target) catch |err| {
+                    log.err("proposeCompaction failed: {s}", .{@errorName(err)});
+                };
             }
         }
     }
@@ -710,15 +784,34 @@ pub const ZdbServer = struct {
             .started_at_us = std.time.microTimestamp(),
         });
         defer self.removeInFlight(.compaction, target.tree_id, @intCast(target.candidate.level));
-        var changes = try target.tree.buildCompaction(target.candidate.level, &self.forest.next_file_id);
+
+        // Per-call ID so we can grep all phase-lines for one compaction
+        // out of a noisy multi-loop log: every line below carries
+        // `cid=<id>`. The `cid_` prefix is unique enough to tail+grep.
+        const cid = self.next_compaction_id.fetchAdd(1, .monotonic);
+        const src = target.candidate.level;
+        const dst: usize = @as(usize, src) + 1;
+        const t0 = std.time.milliTimestamp();
+        log.info("compact cid={d} start tree={d} L{d}->L{d}", .{ cid, target.tree_id, src, dst });
+
+        var changes = try target.tree.buildCompaction(src, &self.forest.next_file_id);
         defer changes.deinit(self.allocator);
-        if (changes.items.len == 0) return;
+        if (changes.items.len == 0) {
+            log.info("compact cid={d} build_done changes=0 (no-op)", .{cid});
+            return;
+        }
+        const t1 = std.time.milliTimestamp();
+        log.info("compact cid={d} build_done changes={d} build_ms={d}", .{ cid, changes.items.len, t1 - t0 });
 
         try self.distributeNewFiles(changes.items);
+        const t2 = std.time.milliTimestamp();
+        log.info("compact cid={d} distribute_done distribute_ms={d}", .{ cid, t2 - t1 });
 
         const payload = try encodeManifestChange(self.allocator, 3, changes.items, &.{}, 0);
         defer self.allocator.free(payload);
         try self.node.proposeAndWaitForApply(payload, .manifest);
+        const t3 = std.time.milliTimestamp();
+        log.info("compact cid={d} done propose_ms={d} total_ms={d}", .{ cid, t3 - t2, t3 - t0 });
     }
 
     fn proposeSplit(self: *ZdbServer, tree_id: u64) !void {
@@ -732,7 +825,17 @@ pub const ZdbServer = struct {
         // through applyManifestChange to applySplit on every node.
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const mc = try self.forest.buildSplit(arena.allocator(), tree_id) orelse return;
+        const mc = try self.forest.buildSplit(arena.allocator(), tree_id) orelse {
+            // No split key (Lmax has < 2 tables). The candidate that sent
+            // us here was stale — refresh it so the next levels-loop
+            // iteration picks a different (real) candidate instead of
+            // hammering this tree forever. Without this, the loop spins
+            // on the same `needs_split=true` tree and starves every
+            // other tree's pending compactions.
+            if (self.forest.trees.get(tree_id)) |t| t.updateCompactCandidate() catch {};
+            log.warn("proposeSplit tree={d} skipped: no split key (refreshed candidate)", .{tree_id});
+            return;
+        };
 
         // Diagnostic: dump the split's TC layout so we can correlate the
         // trigger size (logged by Tree.updateCompactCandidate) with what
@@ -847,6 +950,9 @@ pub const ZdbServer = struct {
                 },
                 .raft => |req| {
                     self.handleRaft(stream, req) catch return;
+                },
+                .vfs => |_| {
+                    self.handleVfs(stream) catch return;
                 },
                 .help => |_| {
                     proto.writeHelp(stream) catch return;
@@ -1004,25 +1110,22 @@ pub const ZdbServer = struct {
 
     fn handleScan(self: *ZdbServer, stream: zio.net.Stream, req: proto.ScanCmd) !void {
         // Scan range = [start, end). Both bounds use ts=maxInt so the
-        // primary-key compare comes first and same-primary versions sort
-        // newest-first inside the bound. An empty primary on either side
-        // means "open" and propagates as `.{}` to the merge.
-        const start = Key{
+        // primary-key compare comes first and same-primary versions
+        // sort newest-first inside the bound. An empty primary on
+        // either side means "open."
+        const scan_start = Key{
             .namespace = req.ns,
             .primary = req.start_key,
             .timestamp = std.math.maxInt(u64),
         };
-        const end: Key = if (req.end_key.len == 0)
-            .{}
-        else
-            .{ .namespace = req.ns, .primary = req.end_key, .timestamp = std.math.maxInt(u64) };
-        // `inf=true` keeps `KeyRange.isEmpty()` false when BOTH primaries
-        // are empty (i.e., a fully-open scan). Without it,
-        // `Level.overlappingTables` short-circuits L≥1 tables to an
-        // empty slice and the scan only sees memtable/L0 contents.
-        const range = zdb.level.KeyRange{
-            .left = start,
-            .right = end,
+        const scan_end: Key = if (req.end_key.len == 0) .{} else .{
+            .namespace = req.ns,
+            .primary = req.end_key,
+            .timestamp = std.math.maxInt(u64),
+        };
+        const scan_range = zdb.level.KeyRange{
+            .left = scan_start,
+            .right = scan_end,
             .inf = req.start_key.len == 0 and req.end_key.len == 0,
         };
 
@@ -1032,28 +1135,6 @@ pub const ZdbServer = struct {
         var sw = stream.writer(&buf);
         const w = &sw.interface;
 
-        // Look up the tree owning the namespace + start_key. If nothing
-        // matches (no namespace, or start_key past the rightmost tree),
-        // return an empty result rather than an error.
-        const tree_opt: ?*zdb.tree.Tree = blk: {
-            self.forest.mu.lockShared();
-            defer self.forest.mu.unlockShared();
-            const rt = self.forest.ns_routes.get(req.ns) orelse break :blk null;
-            const tid = rt.lookup(start) orelse break :blk null;
-            break :blk self.forest.trees.get(tid);
-        };
-        if (tree_opt == null) {
-            try proto.writeScanEnd(w, 0);
-            try w.flush();
-            return;
-        }
-
-        // Snapshot memtable iterators (active + immutables). Tree.scan
-        // takes ownership of every entry — its merge will deinit each on
-        // teardown, so we must NOT release them ourselves.
-        const mem_iters = try self.forest.memtables.getIterators(self.allocator);
-        defer self.allocator.free(mem_iters);
-
         const Ctx = struct {
             w: *std.Io.Writer,
             mode: proto.ScanCmd.Mode,
@@ -1061,10 +1142,8 @@ pub const ZdbServer = struct {
 
             fn emit(ctx_raw: *anyopaque, item: zdb.key.Item) anyerror!bool {
                 const c: *@This() = @ptrCast(@alignCast(ctx_raw));
-                // Drop items that crossed into another namespace — the
-                // tree is namespace-scoped via routing, but its merge
-                // sees raw keys; an L1 SST shared via split could in
-                // principle straddle. Cheap defensive check.
+                // Memtables are forest-wide; an item with a different
+                // namespace means we've walked off the end of ours.
                 if (item.key.namespace != c.ns) return false;
                 try proto.writeScanItem(
                     c.w,
@@ -1076,25 +1155,46 @@ pub const ZdbServer = struct {
                 return true;
             }
         };
-        var ctx = Ctx{
-            .w = w,
-            .mode = req.mode,
-            .ns = req.ns,
-        };
-        const emitted = tree_opt.?.scan(
+        var cctx = Ctx{ .w = w, .mode = req.mode, .ns = req.ns };
+
+        const emitted = self.forest.scan(
             self.allocator,
-            range,
+            req.ns,
+            scan_range,
             req.max_count,
             .p0,
-            mem_iters,
-            @ptrCast(&ctx),
+            @ptrCast(&cctx),
             &Ctx.emit,
         ) catch |err| {
-            log.err("tree.scan failed: {s}", .{@errorName(err)});
+            log.err("forest.scan failed: {s}", .{@errorName(err)});
             try proto.writeErr(stream, "scan failed");
             return;
         };
         try proto.writeScanEnd(w, emitted);
+        try w.flush();
+    }
+
+    fn handleVfs(self: *ZdbServer, stream: zio.net.Stream) !void {
+        _ = self;
+        // Pretty-printed snapshot of the global VFS bandwidth limiter,
+        // counted in pages (multiply by VFS page size for bytes). P0
+        // always wins (saturating subtract — never blocks); P1 sees the
+        // full bucket; P2 sees `bucket - demand_p1`. If `available_p2`
+        // is 0 while compaction work is pending, P1 demand is starving
+        // P2 — a likely culprit for L≥1 compaction wedges.
+        var buf: [4096]u8 = undefined;
+        var sw = stream.writer(&buf);
+        const w = &sw.interface;
+        const s = vfs.g().bw.status();
+        try w.print("vfs bandwidth (pages):\n", .{});
+        try w.print("  rate:          {d} pages/s\n", .{s.pages_per_sec});
+        try w.print("  bucket:        {d}\n", .{s.bucket});
+        try w.print("  demand_p1:     {d}\n", .{s.demand_p1});
+        try w.print("  available_p1:  {d}\n", .{s.available_p1});
+        try w.print("  available_p2:  {d}   (bucket - demand_p1)\n", .{s.available_p2});
+        try w.print("  total_read:    {d}\n", .{s.total_read_pages});
+        try w.print("  total_write:   {d}\n", .{s.total_write_pages});
+        try w.print("  note: p0 is unbounded (saturating subtract)\n", .{});
         try w.flush();
     }
 
@@ -1355,17 +1455,19 @@ fn writeUnknownNamespace(stream: zio.net.Stream, ns: u32) !void {
 }
 
 /// Render one StoredEntry as a single-line human-readable summary.
-/// Format: `idx=I term=T ts=TS type=X bytes=B detail=...`
+/// Format: `idx=I term=T ts=SECS.LOGICAL type=X bytes=B detail=...`
+/// HLC is split into <unix_seconds>.<logical> so log times are visually
+/// scannable instead of a giant u64.
 fn formatEntry(alloc: std.mem.Allocator, w: *std.Io.Writer, stored: raft.StoredEntry) !void {
     const reader = raft.buffers.LogEntryReader.parseRoot(stored.bytes) catch |err| {
         try w.print("idx={d} term={d} bytes={d} parse_err={s}\n", .{ stored.index, stored.term, stored.bytes.len, @errorName(err) });
         return;
     };
     const ety = reader.entryType();
-    const ts = reader.timestamp();
+    const hlc = utils.hlc.HLC.fromU64(reader.timestamp());
     const data = reader.data();
-    try w.print("idx={d} term={d} ts={d} type={s} data_bytes={d}", .{
-        stored.index, stored.term, ts, @tagName(ety), data.len,
+    try w.print("idx={d} term={d} ts={d}.{d} type={s} data_bytes={d}", .{
+        stored.index, stored.term, hlc.seconds, hlc.logical, @tagName(ety), data.len,
     });
     if (data.len == 0) {
         try w.print(" detail=tick\n", .{});

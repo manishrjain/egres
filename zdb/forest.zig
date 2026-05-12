@@ -87,7 +87,10 @@ pub const RouteTable = struct {
         }.lt);
     }
 
-    /// Find the tree_id that owns this key, or null if none.
+    /// Find the tree_id that owns this key, or null if none. Callers
+    /// that also need the tree's key range can read it directly from
+    /// `Tree.key_range` after looking up the tree (kept in sync by
+    /// `applySplit`); the route table is just for routing.
     pub fn lookup(self: *const RouteTable, search_key: Key) ?u64 {
         if (self.entries.items.len == 1) return self.entries.items[0].tree_id;
         if (self.entries.items.len == 0) return null;
@@ -621,6 +624,103 @@ pub const Forest = struct {
         return tree.get(search_key, priority);
     }
 
+    pub const ScanCallback = *const fn (ctx: *anyopaque, item: Item) anyerror!bool;
+
+    /// Forward scan over `[scan_range.left, scan_range.right)` within
+    /// namespace `ns`, spanning every tree that overlaps the request.
+    ///
+    /// One tree at a time: look up the tree owning `current_left`,
+    /// snapshot its range, open a cursor (with a fresh memtable iter
+    /// snapshot), drain to the cursor's end (or max_count), then
+    /// advance `current_left` past the snapshotted right boundary and
+    /// re-look-up. Re-looking-up after each tree means the scan is
+    /// safe against splits firing mid-scan: we always pick whichever
+    /// tree currently covers the next key. Per-cursor memtable
+    /// snapshots also pick up any newly-flushed data.
+    pub fn scan(
+        self: *Forest,
+        allocator: std.mem.Allocator,
+        ns: u32,
+        scan_range: KeyRange,
+        max_count: u64,
+        priority: vfs.Priority,
+        ctx: *anyopaque,
+        cb: ScanCallback,
+    ) !u64 {
+        if (max_count == 0) return 0;
+
+        // Per-call arena — used to dupe each visited tree's
+        // right-boundary key so it stays alive across iterations
+        // (we drop the forest read lock between cursor hops).
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var emitted: u64 = 0;
+        var current_left = scan_range.left;
+
+        while (emitted < max_count) {
+            // Find the tree owning current_left + snapshot its range
+            // (tree.key_range stays in sync with the manifest via
+            // applySplit). Re-doing the lookup per hop keeps the scan
+            // safe against splits firing between hops — we always
+            // pick whichever tree currently covers the next key.
+            var tree: *Tree = undefined;
+            var tree_range = KeyRange{};
+            {
+                self.mu.lockShared();
+                defer self.mu.unlockShared();
+                const rt = self.ns_routes.get(ns) orelse return emitted;
+                const tid = blk: {
+                    if (current_left.primary.len == 0) {
+                        if (rt.entries.items.len == 0) break :blk null;
+                        break :blk rt.entries.items[0].tree_id;
+                    }
+                    break :blk rt.lookup(current_left) orelse null;
+                };
+                if (tid == null) return emitted;
+                tree = self.trees.get(tid.?) orelse return emitted;
+                tree_range = try tree.key_range.dupe(a);
+            }
+
+            // Restrict to the requested scan window. If the intersection
+            // is empty the scan has run off the end → done.
+            const remaining = KeyRange{ .left = current_left, .right = scan_range.right };
+            const visit_range = remaining.intersect(tree_range);
+
+            // Fresh memtable iters per tree — Tree.openMerge owns them.
+            const mem_iters = try self.memtables.getIterators(allocator);
+            var cursor = tree.openMerge(allocator, visit_range, priority, mem_iters) catch |err| {
+                allocator.free(mem_iters);
+                return err;
+            };
+            allocator.free(mem_iters);
+
+            // Drain (or hit max_count). Use a labeled block so the
+            // cursor.deinit fires on every exit path before we either
+            // return or hop to the next tree.
+            const stop_early = drain: {
+                while (emitted < max_count) {
+                    const item = cursor.itemRef() orelse break :drain false;
+                    const cont = try cb(ctx, item);
+                    emitted += 1;
+                    if (!cont) break :drain true;
+                    try cursor.next();
+                }
+                break :drain false;
+            };
+            cursor.deinit();
+            if (stop_early) return emitted;
+
+            // Advance to next tree by jumping past the snapshotted
+            // right edge. Empty primary = unbounded right (rightmost
+            // tree) → done.
+            if (tree_range.right.primary.len == 0) break;
+            current_left = tree_range.right;
+        }
+        return emitted;
+    }
+
     /// installTree opens an empty in-memory Tree for the given id and registers
     /// the namespace route. Caller must have already committed the TreeChange to
     /// manifest and must hold the forest write lock.
@@ -781,16 +881,28 @@ pub const Forest = struct {
 
     /// Find the best tree/level to compact without performing compaction.
     pub fn bestCompactionCandidate(self: *Forest) ?CompactionTarget {
+        return self.bestCompactionCandidateExcluding(null);
+    }
+
+    /// Same as `bestCompactionCandidate` but skips any tree whose id is
+    /// in `skip` (used by parallel compactors so two fibers don't pick
+    /// the same tree). `skip == null` means "no exclusions".
+    pub fn bestCompactionCandidateExcluding(
+        self: *Forest,
+        skip: ?*const std.AutoHashMap(u64, void),
+    ) ?CompactionTarget {
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
         var best: ?CompactionTarget = null;
         var it = self.trees.iterator();
         while (it.next()) |kv| {
+            const tree_id = kv.key_ptr.*;
+            if (skip) |s| if (s.contains(tree_id)) continue;
             const tree = kv.value_ptr.*;
             const candidate = tree.compact_candidate orelse continue;
             if (best == null or candidate.score > best.?.candidate.score) {
-                best = .{ .tree = tree, .tree_id = kv.key_ptr.*, .candidate = candidate };
+                best = .{ .tree = tree, .tree_id = tree_id, .candidate = candidate };
             }
         }
         return best;

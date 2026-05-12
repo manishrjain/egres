@@ -152,22 +152,48 @@ pub const TableCache = struct {
         }
         if (misses.items.len == 0) return;
 
-        // Phase 2: open misses concurrently. Each fiber writes to need.table.
+        // Phase 2: open misses concurrently. Each fiber writes to need.table
+        // and bumps `completed` on return; the watchdog uses that to log
+        // periodic progress if the group hangs.
         var tse: utils.ThreadSafeError = .{};
+        var completed = std.atomic.Value(usize).init(0);
+        const total = misses.items.len;
         var group = zio.group();
         defer group.cancel();
+        group.spawn(loadTablesWatchdog, .{ total, &completed }) catch {};
         for (misses.items) |n| {
-            try group.spawn(openFiber, .{ self, n, &tse });
+            try group.spawn(openFiber, .{ self, n, &tse, &completed });
         }
         group.wait() catch {};
         if (tse.get()) |err| return err;
+    }
+
+    /// Sibling of the `openFiber` spawns: poll the completed counter
+    /// every 500 ms and log every 15 s while we're still short. Exits
+    /// as soon as all opens are accounted for, so it doesn't hold the
+    /// group's `wait()` open.
+    fn loadTablesWatchdog(total: usize, completed: *std.atomic.Value(usize)) void {
+        const start = std.time.milliTimestamp();
+        var last_warn = start;
+        while (completed.load(.acquire) < total) {
+            zio.sleep(zio.Duration.fromMilliseconds(500)) catch return;
+            const now = std.time.milliTimestamp();
+            if (now - last_warn >= 15_000) {
+                log.warn("loadTables watchdog: {d}/{d} opens completed after {d}ms", .{
+                    completed.load(.acquire), total, now - start,
+                });
+                last_warn = now;
+            }
+        }
     }
 
     fn openFiber(
         self: *TableCache,
         need: *TableNeed,
         tse: *utils.ThreadSafeError,
+        completed: *std.atomic.Value(usize),
     ) void {
+        defer _ = completed.fetchAdd(1, .release);
         // Phase A: check under write lock (brief — no I/O).
         self.mu.lock();
         if (self.tables.get(need.id)) |t| {
@@ -322,52 +348,66 @@ pub const Tree = struct {
         return null;
     }
 
-    pub const ScanCallback = *const fn (ctx: *anyopaque, item: Item) anyerror!bool;
+    /// A live merge iterator over one tree's data, plus any extras the
+    /// caller wired in (typically memtable iterators). Owns its arena
+    /// and the underlying merge — caller drives via `itemRef`/`next`,
+    /// frees via `deinit`. The walk loop lives in `Forest.scan`, which
+    /// can compose multiple cursors back-to-back to span trees.
+    pub const ScanCursor = struct {
+        arena: std.heap.ArenaAllocator,
+        merge: MergeIterator,
 
-    /// Forward scan over `range` ([range.left, range.right) — empty bound
-    /// on either side means "open") across this tree's on-disk levels
-    /// plus any caller-supplied `extras` (typically memtable iterators).
+        pub fn deinit(self: *ScanCursor) void {
+            self.merge.deinit();
+            self.arena.deinit();
+        }
+
+        pub fn itemRef(self: *ScanCursor) ?Item {
+            return self.merge.itemRef();
+        }
+
+        pub fn next(self: *ScanCursor) !void {
+            return self.merge.next();
+        }
+    };
+
+    /// Build a merge iterator over this tree's L≥1 data restricted to
+    /// `range`, plus the caller-supplied `extras`.
     ///
     /// Sources fed into the merge:
-    ///   - `extras` — passed through verbatim
+    ///   - `extras` — passed through verbatim (typically memtable iters)
     ///   - L0    — one `TableIterator` per overlapping table (overlapping
     ///             ranges, so each needs its own merge slot)
     ///   - L≥1  — one `ConcatIterator` per level (tables are disjoint so
     ///             they can be walked sequentially)
     ///
-    /// The merge takes ownership of every iterator we hand it — `extras`
-    /// included — so its `deinit` releases every underlying handle.
-    /// All slice/array bookkeeping for the merge lives in a per-call
-    /// arena; the arena only owns wiring memory, never the iterators'
-    /// own block buffers / skiplist refs (those go through each
-    /// iterator's deinit).
-    ///
-    /// `cb` runs synchronously per item; the Item it sees borrows into
-    /// block or arena memory and becomes invalid as soon as cb returns.
-    pub fn scan(
+    /// The cursor takes ownership of every iterator wired in (extras
+    /// included). On success: `cursor.deinit()` releases everything.
+    /// On error (before merge is built): we deinit `extras` ourselves
+    /// so refs don't leak. All wiring memory (slices, sub-arrays) lives
+    /// in the cursor's arena.
+    pub fn openMerge(
         self: *Tree,
         allocator: std.mem.Allocator,
         range: KeyRange,
-        max_count: u64,
         priority: vfs.Priority,
         extras: []const Iterator,
-        ctx: *anyopaque,
-        cb: ScanCallback,
-    ) !u64 {
-        if (max_count == 0) {
-            // Honor the ownership promise to `extras` even on early-out.
-            for (extras) |e| {
-                var c = e;
-                c.deinit();
-            }
-            return 0;
-        }
-
+    ) !ScanCursor {
         var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
         const a = arena.allocator();
 
+        // Build iters into a list. Until we hand them off to merge,
+        // each iter we created here owns a Table/SkipList ref — on
+        // failure we must deinit them all to release those refs.
         var iters: std.ArrayList(Iterator) = .empty;
+        var transferred = false;
+        errdefer {
+            if (!transferred) {
+                for (iters.items) |*it| it.deinit();
+                arena.deinit();
+            }
+        }
+
         try iters.appendSlice(a, extras);
 
         for (self.levels, 0..) |*lv, level_idx| {
@@ -384,21 +424,16 @@ pub const Tree = struct {
                 try iters.append(a, .{ .concat = ConcatIterator.init(subs) });
             }
         }
-        if (iters.items.len == 0) return 0;
 
         var merge = MergeIterator.init(a, iters.items);
-        defer merge.deinit();
+        transferred = true; // merge.deinit now owns iter cleanup
+        errdefer {
+            merge.deinit();
+            arena.deinit();
+        }
         try merge.seekRange(range.left, range.right);
 
-        var emitted: u64 = 0;
-        while (emitted < max_count) {
-            const item = merge.itemRef() orelse break;
-            const cont = try cb(ctx, item);
-            emitted += 1;
-            if (!cont) break;
-            try merge.next();
-        }
-        return emitted;
+        return .{ .arena = arena, .merge = merge };
     }
 
     pub fn totalSize(self: *Tree) i64 {
@@ -420,28 +455,99 @@ pub const Tree = struct {
         return .{ .level = 0, .size = 0 };
     }
 
+    /// Minimum number of Lmax tables required before we'll consider a
+    /// split. Below this, the keyspace coverage in Lmax is too coarse
+    /// for an honest balance — the split would either leave one side
+    /// nearly empty or land on a key that puts most of the upper-level
+    /// data on one side. Wait for Lmax to fill out via compactions.
+    const min_lmax_tables_for_split: usize = 10;
+
+    /// Pick a split key that minimizes `|left_bytes − right_bytes|`
+    /// across all L≥1 tables, drawn ONLY from the smallest-key
+    /// boundaries of Lmax tables. This guarantees no L3 table gets
+    /// split in half (which would force an L3→L3 compaction); the
+    /// chosen key always cleanly partitions Lmax into "tables[0..i]"
+    /// left and "tables[i..]" right.
+    ///
+    /// Candidates are only valid when Lmax has ≥ `min_lmax_tables_for_split`
+    /// tables. Below that, return empty (no split this round; the
+    /// caller refreshes the candidate and tries again later).
+    ///
+    /// For the balance score, we ignore tables that STRADDLE the
+    /// candidate K — they go to BOTH children in `buildSplit`, so
+    /// they cost the same on each side and don't differentiate
+    /// candidates. Only strict-left and strict-right bytes count.
     pub fn findSplitKey(self: *Tree, allocator: std.mem.Allocator) !Key {
-        const linfo = self.lowestLevelSize();
-        if (linfo.level == 0) {
-            return .{};
-        }
-        const level = &self.levels[linfo.level];
+        // Use a per-call arena for keys we collect under each level's
+        // read lock — once the lock drops, the source Table could be
+        // freed by a concurrent delete, so we must not keep raw
+        // pointers into table memory.
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
 
-        level.mu.lockShared();
-        defer level.mu.unlockShared();
-
-        const items = level.tables.items;
-        if (items.len < 2) {
-            return .{};
+        // Step 1: snapshot Lmax candidate keys (smallest-of-table for
+        // each table, skipping items[0] whose smallest is the level's
+        // left boundary — using it would put nothing on the old side).
+        // Bail if Lmax doesn't have enough tables for a meaningful split.
+        const lmax_idx = self.opts.max_levels - 1;
+        var cand_keys: std.ArrayList(Key) = .empty;
+        {
+            const lv = &self.levels[lmax_idx];
+            lv.mu.lockShared();
+            defer lv.mu.unlockShared();
+            if (lv.tables.items.len < min_lmax_tables_for_split) return .{};
+            for (lv.tables.items[1..]) |tbe| {
+                try cand_keys.append(a, try tbe.table.smallest.dupe(a));
+            }
         }
-        const mid = items.len / 2;
-        var key = try items[mid].table.smallest.dupe(allocator);
+
+        // Step 2: snapshot all L≥1 tables (smallest, biggest, size)
+        // across every level so we can score each candidate by its
+        // L≥1-wide balance, not just within Lmax.
+        const Entry = struct { smallest: Key, biggest: Key, size: u64 };
+        var all_entries: std.ArrayList(Entry) = .empty;
+        for (self.levels[1..]) |*lv| {
+            lv.mu.lockShared();
+            defer lv.mu.unlockShared();
+            for (lv.tables.items) |tbe| {
+                try all_entries.append(a, .{
+                    .smallest = try tbe.table.smallest.dupe(a),
+                    .biggest = try tbe.table.biggest.dupe(a),
+                    .size = tbe.table.fileSize(),
+                });
+            }
+        }
+
+        // Step 3: for each candidate K, count strict-left and
+        // strict-right bytes; pick the K with smallest difference.
+        var best_key: ?Key = null;
+        var best_score: u64 = std.math.maxInt(u64);
+        for (cand_keys.items) |k| {
+            var left: u64 = 0;
+            var right: u64 = 0;
+            for (all_entries.items) |e| {
+                if (e.biggest.order(k) == .lt) {
+                    left += e.size;
+                } else if (e.smallest.order(k) != .lt) {
+                    right += e.size;
+                }
+                // else: straddles K → goes to BOTH children → skip.
+            }
+            const score = if (left > right) left - right else right - left;
+            if (score < best_score) {
+                best_score = score;
+                best_key = k;
+            }
+        }
+
+        const chosen = best_key orelse return .{};
+        // Re-dupe into the caller's allocator (arena dies on return).
+        // Bump timestamp so every (primary, ts) version of the chosen
+        // key sorts AFTER the split key — they all go to the right
+        // tree, no primary gets split across trees.
+        var key = try chosen.dupe(allocator);
         std.debug.assert(key.len() > 0);
-
-        // This is the smallest key in the table. We do not want that any primary key gets split
-        // across trees. So, we'd take the absolutely max possible timestamp in the split key. That
-        // way, all the timestamps would fall to the right of this key, and fully belong to the
-        // newly split tree on the right.
         key.timestamp = std.math.maxInt(u64);
         return key;
     }
@@ -520,21 +626,22 @@ pub const Tree = struct {
     /// stores the result in self.compact_candidate. Called after open and after
     /// every doCompact so the candidate is always fresh.
     pub fn updateCompactCandidate(self: *Tree) !void {
-        // Split check overrides compaction. If Lmax has outgrown the split
-        // threshold, schedule a split ahead of any compaction work — the
-        // split is manifest-only (cheap) and shrinks the tree before the
-        // next compaction merges into an even larger Lmax. The score is
-        // bumped to `split_priority_score` so this tree wins over normal
-        // compaction candidates in the forest. Set `level` to the lowest
-        // non-empty level for diagnostic legibility (`stats forest`).
+        // Split check overrides compaction. We compare TOTAL tree size
+        // (L0+L1+…+Lmax) against `tree_split_size`, not just Lmax. If
+        // compactions can't keep up the data piles up across the upper
+        // levels and Lmax stays under threshold even when the tree as a
+        // whole is several times oversized — exactly the wedged shape
+        // we just observed. Splitting on total size lets each tree get
+        // its own future compactor and divides the catch-up work.
+        // The score is bumped to `split_priority_score` so this tree
+        // wins over normal compaction candidates in the forest. Set
+        // `level` to the lowest non-empty level for diagnostic
+        // legibility (`stats forest`).
         const linfo = self.lowestLevelSize();
-        if (linfo.size > self.opts.tree_split_size) {
-            // Log every split-trigger so we can spot mis-sized splits (e.g.
-            // tree_split_size mistakenly compared against an upper-level
-            // size instead of Lmax). Format: tree=<id> deepest_level=<L>
-            // size=<bytes> > threshold=<bytes>.
-            log.info("split-trigger tree={d} deepest_level={d} size={d} > threshold={d}", .{
-                self.tree_id, linfo.level, linfo.size, self.opts.tree_split_size,
+        const total = self.totalSize();
+        if (total > self.opts.tree_split_size) {
+            log.info("split-trigger tree={d} total={d} deepest_level={d} lmax_size={d} > threshold={d}", .{
+                self.tree_id, total, linfo.level, linfo.size, self.opts.tree_split_size,
             });
             self.compact_candidate = .{
                 .level = @intCast(linfo.level),

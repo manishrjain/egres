@@ -240,7 +240,16 @@ pub const Builder = struct {
         }
 
         var binary_fuse_off: ?u32 = null;
-        if (self.bf_hashes.items.len > 0) {
+        // Binary-fuse construction is flaky for tiny keysets — its
+        // population algorithm can fail to converge with KeysLikelyNotUnique
+        // on small inputs (the original fastfilter docs flag <~125 keys
+        // as unsafe). After tree splits, a single memtable's keys may
+        // route to a builder with only a handful of items, so this
+        // happens in practice. Skip the filter under the threshold;
+        // lookups still work via the block index, just without the
+        // negative-lookup early-out.
+        const min_bf_keys: usize = 256;
+        if (self.bf_hashes.items.len >= min_bf_keys) {
             var filter = try binaryfuse.BinaryFuse(u16).init(self.allocator, self.bf_hashes.items.len);
             defer filter.deinit(self.allocator);
             try filter.populate(self.allocator, self.bf_hashes.items);
