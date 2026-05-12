@@ -388,6 +388,19 @@ pub const ZdbServer = struct {
     }
 
     pub fn runCompactionLoop(self: *ZdbServer) void {
+        // Block until we're leader and have proposed + applied a no-op
+        // entry. That commits the prior-term WAL tail (Raft's prior-term
+        // commitment rule), so by the time the compactor fibers spawn
+        // and start fetchAdd-ing `next_file_id` for new SSTs, every
+        // flush/compaction id in the log has already been observed by
+        // the apply path. Without this, a compactor could claim an id
+        // that an unapplied tail entry already used (PathAlreadyExists
+        // when both try to create the same SST file).
+        self.node.waitForQuorum() catch |err| {
+            log.err("runCompactionLoop: waitForQuorum: {s}", .{@errorName(err)});
+            return;
+        };
+
         const n_compactors = self.forest.opts.num_compactors;
         log.info("compaction loops started: num_compactors={d}", .{n_compactors});
         var group = zio.group();
@@ -426,18 +439,6 @@ pub const ZdbServer = struct {
                     @tagName(it.kind), it.tree_id, it.src_level, it.dest_level, age_ms,
                 });
             }
-        }
-    }
-
-    /// Block until `recoverFromSnapshot` has finished. Background loops
-    /// gate on this so they don't try to propose against a half-installed
-    /// state machine — applies would just error with `RecoveryInProgress`
-    /// and the loop would spin in raft's retry path.
-    fn waitForRecovery(self: *ZdbServer) void {
-        const interval = zio.Duration.fromMilliseconds(50);
-        while (!self.node.isShuttingDown()) {
-            if (self.storage.recovery_done.load(.acquire)) return;
-            zio.sleep(interval) catch return;
         }
     }
 
@@ -489,7 +490,13 @@ pub const ZdbServer = struct {
     /// crosses the size or age threshold. Runs concurrently with `applyLoop` —
     /// DiskWAL/Forest are designed for concurrent reads.
     pub fn runSnapshotLoop(self: *ZdbServer) void {
-        self.waitForRecovery();
+        // Same barrier as runCompactionLoop — snapshot proposal would
+        // race the WAL-tail replay otherwise (it builds from the
+        // manifest, which is mid-update during replay).
+        self.node.waitForQuorum() catch |err| {
+            log.err("runSnapshotLoop: waitForQuorum: {s}", .{@errorName(err)});
+            return;
+        };
         while (!self.node.isShuttingDown()) {
             const cfg = self.snapshot_cfg.snapshot();
             zio.sleep(zio.Duration.fromSeconds(cfg.poll_interval_seconds)) catch return;
@@ -670,8 +677,6 @@ pub const ZdbServer = struct {
     /// freeze fall out of the same condition, so there's no separate
     /// startup phase.
     fn runMemtableLoop(self: *ZdbServer) void {
-        self.waitForRecovery();
-
         const interval = zio.Duration.fromMilliseconds(100);
         while (!self.node.isShuttingDown()) {
             const needs = self.node.isLeader() and
@@ -688,8 +693,6 @@ pub const ZdbServer = struct {
     }
 
     fn runFlushLoop(self: *ZdbServer) void {
-        self.waitForRecovery();
-
         const interval = zio.Duration.fromMilliseconds(200);
         while (!self.node.isShuttingDown()) {
             if (!self.node.isLeader() or !self.forest.hasFrozenMemtables()) {
@@ -714,8 +717,6 @@ pub const ZdbServer = struct {
     // two fibers ever pick the same tree concurrently (each tree
     // gets at most one in-flight compaction/split).
     fn runLevelsLoop(self: *ZdbServer) void {
-        self.waitForRecovery();
-
         const interval = zio.Duration.fromMilliseconds(500);
         while (!self.node.isShuttingDown()) {
             if (!self.node.isLeader()) {
@@ -1325,19 +1326,26 @@ pub const ZdbServer = struct {
         defer body.deinit();
         const w = &body.writer;
 
-        var i: u64 = lo;
-        while (i <= hi) : (i += 1) {
-            var result = self.node.log.entriesRange(.{ .lo = i, .hi = i + 1 }) catch |err| {
-                try w.print("idx={d} err={s}\n", .{ i, @errorName(err) });
-                continue;
-            };
-            defer result.deinit();
-            if (result.entries.len == 0) {
-                try w.print("idx={d} <missing>\n", .{i});
-                continue;
+        var result = self.node.log.entriesRange(.{ .lo = lo, .hi = hi + 1 }) catch |err| {
+            try w.print("err={s}\n", .{@errorName(err)});
+            try w.writeByte('\n');
+            try stream.writeAll(body.writer.buffered(), .none);
+            return;
+        };
+        defer result.deinit();
+
+        // Walk the requested range and report any indices the WAL didn't
+        // return (gap before, between, or after entries).
+        var expected: u64 = lo;
+        for (result.entries) |stored| {
+            while (expected < stored.index) : (expected += 1) {
+                try w.print("idx={d} <missing>\n", .{expected});
             }
-            const stored = result.entries[0];
             try formatEntry(self.allocator, w, stored);
+            expected = stored.index + 1;
+        }
+        while (expected <= hi) : (expected += 1) {
+            try w.print("idx={d} <missing>\n", .{expected});
         }
         try w.writeByte('\n');
         try stream.writeAll(body.writer.buffered(), .none);

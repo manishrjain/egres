@@ -318,13 +318,37 @@ pub const Node = struct {
         // If a snapshot is on disk, resume apply from snapshot.index+1.
         // The storage layer's `recoverFromSnapshot` (in zdb-server) handles
         // installing the snapshot's manifest + fetching missing SSTs before
-        // the apply gate opens. commit_index is safe to seed here too: the
-        // snapshot was built strictly from committed entries.
+        // the apply gate opens. apply_index is safe to seed at snap_idx: the
+        // snapshot was built strictly from applied entries.
         const snap_idx = node.log.snapshot().index;
         if (snap_idx > 0) {
             node.apply_index.store(snap_idx, .release);
-            node.commit_index.store(snap_idx, .release);
             raft_log.info("node {d}: post-snapshot startup, apply_index={d}", .{ node.id, snap_idx });
+        }
+
+        // commit_index = max(snap.index, min(persisted_ci, lastIndex)).
+        //
+        // - persisted_ci is written periodically by `commitPersistLoop`, so
+        //   restart can resume apply without first waiting for a new
+        //   current-term commit (Raft's prior-term commitment rule). Safe
+        //   per the Leader Completeness Property — committed entries stay
+        //   committed across restarts.
+        // - Cap by lastIndex: if the WAL was truncated during opening
+        //   (e.g. tail discarded by chain check), persisted_ci could
+        //   reference entries that no longer exist on disk; never advance
+        //   commit_index past what we actually have.
+        // - Floor by snap.index: snapshots are built strictly from
+        //   committed entries, so commit_index is at least snap.index.
+        const persisted_ci = node.log.hardState().commit_index;
+        const last_idx = node.log.lastIndex();
+        const initial_ci = @max(snap_idx, @min(persisted_ci, last_idx));
+        if (initial_ci > 0) {
+            node.commit_index.store(initial_ci, .release);
+            if (persisted_ci > snap_idx) {
+                raft_log.info("node {d}: restored commit_index={d} (snap={d} persisted={d} last={d})", .{
+                    node.id, initial_ci, snap_idx, persisted_ci, last_idx,
+                });
+            }
         }
 
         dbg(
@@ -824,6 +848,19 @@ pub const Node = struct {
         self.log.compactUntil(snap_ptr.index) catch |err| {
             raft_log.warn("compactUntil({d}): {s}", .{ snap_ptr.index, @errorName(err) });
         };
+        // Force-persist commit_index = snap.index. Without this, restart
+        // immediately after snapshot install (before the lazy
+        // commitPersistLoop fires) could leave persisted_ci < snap.index <
+        // oldest_memtable_index, deadlocking the replay-caught-up gate
+        // since apply_index can't pass commit_index without a fresh
+        // current-term commit. One extra HardState write per snapshot is
+        // negligible (snapshots fire every ~10 min / 1 GiB of WAL).
+        const ci = self.commit_index.load(.acquire);
+        if (ci > self.log.hardState().commit_index) {
+            self.log.setHardState(.{ .commit_index = ci }) catch |err| {
+                raft_log.warn("post-snapshot setHardState: {s}", .{@errorName(err)});
+            };
+        }
         raft_log.info("snapshot installed: index={d} term={d} bytes={d}", .{
             snap_ptr.index, snap_ptr.term, snap_ptr.data.len,
         });
@@ -1739,6 +1776,7 @@ pub const Node = struct {
         try group.spawn(applyLoop, .{self});
         try group.spawn(callbackLoop, .{self});
         try group.spawn(clockTickLoop, .{self});
+        try group.spawn(commitPersistLoop, .{self});
 
         group.wait() catch {};
     }
@@ -1810,6 +1848,7 @@ pub const Node = struct {
         );
 
         while (ai < ci) {
+            utils.logEvery(1, "applyCommits progress: ai={d} ci={d} remaining={d}", .{ ai, ci, ci - ai });
             var result = self.log.entriesRange(.{ .lo = ai + 1, .hi = ci + 1, .max_bytes = max_apply_bytes }) catch return;
             defer result.deinit();
             if (result.entries.len == 0) return;
@@ -2029,18 +2068,61 @@ pub const Node = struct {
         return @intCast(self.peers.count() + 1);
     }
 
+    /// Block until we're the leader, then propose a no-op .manifest
+    /// entry and wait for it to apply. By Raft's prior-term commitment
+    /// rule, the no-op (a current-term entry) commits + applies every
+    /// prior entry in the WAL. Callers that need a fully-applied state
+    /// machine before they start working — e.g. compactors that
+    /// fetchAdd `next_file_id` for new SSTs — call this first to avoid
+    /// claiming an id that an unapplied WAL-tail entry already used.
+    ///
+    /// Empty payload (`data.len == 0`) is recognised by the apply path
+    /// as a no-op (no state-machine call), so this barrier doesn't do
+    /// any redundant manifest work itself.
+    pub fn waitForQuorum(self: *Node) RaftError!void {
+        const interval = zio.Duration.fromMilliseconds(50);
+        while (!self.isShuttingDown()) {
+            if (self.isLeader()) break;
+            zio.sleep(interval) catch return;
+        }
+        if (self.isShuttingDown()) return;
+        try self.proposeAndWaitForApply(&.{}, .manifest);
+    }
+
     pub fn persistHardState(self: *Node) RaftError!void {
+        // Only the fields the raft mainLoop owns. commit_index is updated
+        // by `commitPersistLoop`; raft_id by no one after init. The merge
+        // happens atomically inside DiskWAL.setHardState, so concurrent
+        // commit_index persists won't be clobbered.
         try self.log.setHardState(.{
             .current_term = self.current_term,
             .voted_for = self.voted_for orelse 0,
             // raft_id pins the metadata to this node so a misplaced data
             // dir can't be silently picked up by a different node id.
             .raft_id = self.id,
-            // checkpoint_index gets wired when snapshot/compaction starts
-            // bumping it; for now MetaStore writes it as 0.
-            .checkpoint_index = 0,
         });
         try self.log.sync();
+    }
+
+    /// Periodic background loop. Every 1 s, persists `commit_index` to
+    /// HardState if it has advanced by at least `min_advance` entries
+    /// since the last persisted value. Lets a clean restart skip the
+    /// "wait for first current-term commit" delay before the WAL tail
+    /// can replay (Raft's prior-term commitment rule). On crash, the
+    /// staleness is bounded by ~1 s of entries; the rest is re-derived.
+    pub fn commitPersistLoop(self: *Node) void {
+        const interval = zio.Duration.fromSeconds(1);
+        const min_advance: u64 = 100;
+        while (!self.isShuttingDown()) {
+            zio.sleep(interval) catch return;
+            const ci = self.commit_index.load(.acquire);
+            const persisted = self.log.hardState().commit_index;
+            if (ci < persisted + min_advance) continue;
+            self.log.setHardState(.{ .commit_index = ci }) catch |err| {
+                raft_log.warn("commitPersistLoop: setHardState failed: {s}", .{@errorName(err)});
+                continue;
+            };
+        }
     }
 
     pub fn persistLog(self: *Node, entries: []const zen.LogEntryBuffer) RaftError!void {

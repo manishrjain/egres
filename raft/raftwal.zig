@@ -16,6 +16,21 @@ pub const ConfChange = struct {
 };
 pub const LogEntryBuffer = zen.LogEntryBuffer;
 pub const HardState = zen.HardStateStruct;
+
+/// Field-set update for HardState. Callers pass only the fields they want
+/// to change; the WAL reads the current HardState, merges, and writes
+/// atomically under its own write lock — eliminating the read-modify-write
+/// race that would exist if multiple writers (e.g. raft mainLoop bumping
+/// term/vote vs. commitPersistLoop bumping commit_index) each constructed
+/// a full HardState from a stale read.
+pub const HardStateUpdate = struct {
+    current_term: ?u64 = null,
+    voted_for: ?u64 = null,
+    raft_id: ?u64 = null,
+    checkpoint_index: ?u64 = null,
+    commit_index: ?u64 = null,
+};
+
 pub const Snapshot = zen.SnapshotStruct;
 pub const ConfState = zen.ConfStateStruct;
 pub const ConfStatePeer = zen.ConfStatePeerStruct;

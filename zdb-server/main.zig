@@ -288,14 +288,24 @@ fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, node: *ra
         runJoin(args, raft_rt);
     }
 
+    // Sequenced startup, before any raft / compaction / snapshot loop runs:
+    //   1. Install the snapshot manifest. Forest is now in a valid state.
+    //   2. Synchronously apply every committed WAL entry on disk
+    //      (apply_index → commit_index). next_file_id is fully advanced
+    //      from every flush/compaction entry in the tail before any
+    //      proposer can claim a new id.
+    // This eliminates the race where the compaction loop would propose
+    // new SST ids that collide with ids replay is about to install
+    // (PathAlreadyExists). TODO: for multi-voter joins with missing
+    // SSTs, recovery needs raft running to fetch from the leader; that
+    // path would need a different sequencing.
+    log.info("appMain: synchronous recovery", .{});
+    runRecovery(zdb_srv);
+    log.info("appMain: synchronous applyCommits", .{});
+    node.applyCommits();
+
     log.info("appMain: spawning raft runtime on raft pool", .{});
     group.spawn(runRaft, .{raft_rt}) catch return;
-
-    // Recovery runs alongside the raft loop: it depends on `leader_id`
-    // becoming known (via AppendEntries from leader, or via the join
-    // response) so `fetchFiles` can locate the source for missing SSTs.
-    log.info("appMain: spawning recovery on background pool", .{});
-    group.spawn(runRecovery, .{zdb_srv}) catch return;
 
     log.info("appMain: spawning client server on query pool", .{});
     group.spawn(runServer, .{zdb_srv}) catch return;

@@ -658,8 +658,13 @@ pub const Forest = struct {
 
         var emitted: u64 = 0;
         var current_left = scan_range.left;
+        var hop: u32 = 0;
+        log.info("scan: enter ns={d} max={d}", .{ ns, max_count });
+        defer log.info("scan: exit ns={d} hops={d} emitted={d}", .{ ns, hop, emitted });
 
         while (emitted < max_count) {
+            hop += 1;
+            log.info("scan: hop={d} ns={d} acquiring forest.mu.shared", .{ hop, ns });
             // Find the tree owning current_left + snapshot its range
             // (tree.key_range stays in sync with the manifest via
             // applySplit). Re-doing the lookup per hop keeps the scan
@@ -670,6 +675,7 @@ pub const Forest = struct {
             {
                 self.mu.lockShared();
                 defer self.mu.unlockShared();
+                log.info("scan: hop={d} got forest.mu.shared", .{hop});
                 const rt = self.ns_routes.get(ns) orelse return emitted;
                 const tid = blk: {
                     if (current_left.primary.len == 0) {
@@ -681,6 +687,7 @@ pub const Forest = struct {
                 if (tid == null) return emitted;
                 tree = self.trees.get(tid.?) orelse return emitted;
                 tree_range = try tree.key_range.dupe(a);
+                log.info("scan: hop={d} picked tree={d}", .{ hop, tid.? });
             }
 
             // Restrict to the requested scan window. If the intersection
@@ -688,14 +695,17 @@ pub const Forest = struct {
             const remaining = KeyRange{ .left = current_left, .right = scan_range.right };
             const visit_range = remaining.intersect(tree_range);
 
+            log.info("scan: hop={d} getting memtable iters", .{hop});
             // Fresh memtable iters per tree — Tree.openMerge owns them.
             const mem_iters = try self.memtables.getIterators(allocator);
+            log.info("scan: hop={d} opening merge cursor", .{hop});
             var cursor = tree.openMerge(allocator, visit_range, priority, mem_iters) catch |err| {
                 allocator.free(mem_iters);
                 return err;
             };
             allocator.free(mem_iters);
 
+            log.info("scan: hop={d} draining", .{hop});
             // Drain (or hit max_count). Use a labeled block so the
             // cursor.deinit fires on every exit path before we either
             // return or hop to the next tree.
@@ -710,6 +720,7 @@ pub const Forest = struct {
                 break :drain false;
             };
             cursor.deinit();
+            log.info("scan: hop={d} drained emitted={d} stop_early={}", .{ hop, emitted, stop_early });
             if (stop_early) return emitted;
 
             // Advance to next tree by jumping past the snapshotted
@@ -821,8 +832,19 @@ pub const Forest = struct {
     /// carrying an infinite range (empty left+right). No state mutates beyond
     /// next_tree_id, so a failed propose only burns one id. Caller owns the
     /// returned slice.
+    ///
+    /// Errors with `NamespaceAlreadyExists` if a route table already exists
+    /// for `namespace_id`. Without this guard, a duplicate `ns create N`
+    /// would silently install a second tree with infinite range, polluting
+    /// the route table and breaking the scan path (the empty-left tree
+    /// sorts to entries[0] and gets picked for "scan from start").
     pub fn buildNamespaceCreate(self: *Forest, alloc: std.mem.Allocator, namespace_id: u32) !manifest.ManifestChange {
         std.debug.assert(namespace_id > 0);
+        {
+            self.mu.lockShared();
+            defer self.mu.unlockShared();
+            if (self.ns_routes.contains(namespace_id)) return error.NamespaceAlreadyExists;
+        }
         const tree_id = self.next_tree_id.fetchAdd(1, .monotonic);
 
         const tree_changes = try alloc.alloc(manifest.TreeChange, 1);
@@ -839,12 +861,26 @@ pub const Forest = struct {
     /// applyNamespaceCreate is Phase B: commits each TreeChange to the manifest
     /// and installs the in-memory Tree + namespace route. Called on all nodes
     /// after Raft commit (cmd=5).
+    ///
+    /// Idempotent: skips any TreeChange whose namespace already has a route
+    /// table. Without this guard, a duplicate ns-create entry that slipped
+    /// past `buildNamespaceCreate`'s check (e.g. old-leader proposal racing
+    /// a new leader's check; or replay of an older-version log that
+    /// predates the build-time guard) would install a second inf-range
+    /// tree and break the route table — the empty-left tree sorts to
+    /// entries[0] and gets picked for "scan from start". Returning an
+    /// error here would wedge the raft apply loop's retry path; logging
+    /// and skipping is both safe and forward-compatible.
     pub fn applyNamespaceCreate(self: *Forest, mc: manifest.ManifestChange) !void {
         self.mu.lock();
         defer self.mu.unlock();
 
         for (mc.tree_changes) |tc| {
             if (tc.op != .create) continue; // only CREATE for ns_create
+            if (self.ns_routes.contains(tc.namespace_id)) {
+                std.log.warn("applyNamespaceCreate: ns={d} already exists, skipping tree_id={d}", .{ tc.namespace_id, tc.tree_id });
+                continue;
+            }
             self.advanceTreeId(tc.tree_id);
             try self.ms.commit(&.{}, &.{tc});
             // Empty left/right encodes the infinite range.

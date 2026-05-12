@@ -4,7 +4,7 @@ const vfs = @import("vfs.zig");
 
 pub const Config = struct {
     bytes_per_sec: u64, // bytes per second
-    write_cost: u8 = 8, // write multiplier - each write costs k * read cost.
+    write_cost: u8 = 4, // write multiplier - each write costs k * read cost.
     timeout_ms: u64 = 100, // After this timeout, provide min_alloc.
     min_alloc_bytes: u64 = 8 * vfs.page_size, // default: write_cost (8) * page_size
 };

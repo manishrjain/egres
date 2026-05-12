@@ -52,6 +52,15 @@ pub const HardState = schema.Table(.{
     // Highest log index covered by the most recent durable snapshot. Lets
     // recovery short-circuit replay below this index. 0 = no snapshot yet.
     .{ .id = 5, .name = "checkpoint_index", .ty = schema.U64 },
+    // Persisted Raft commit_index. Per the Raft paper this is volatile and
+    // re-derived via replication, but persisting it (lazily — see
+    // `commitPersistLoop`) lets restart skip the "wait for first
+    // current-term commit before old entries can apply" delay. Safe due to
+    // the Leader Completeness Property: once committed, an entry stays
+    // committed across restarts and leader changes. Staleness is bounded
+    // by the persist cadence; on crash recovery we just re-derive the
+    // tail through normal raft.
+    .{ .id = 6, .name = "commit_index", .ty = schema.U64 },
 });
 
 pub const Snapshot = schema.Table(.{

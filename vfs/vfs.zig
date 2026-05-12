@@ -225,8 +225,6 @@ pub const FileHandle = struct {
         }
     }
 
-    const default_write_chunk: usize = 256 * page_size; // 1 MB
-
     pub fn write(
         self: FileHandle,
         data: []const u8,

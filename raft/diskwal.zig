@@ -1187,10 +1187,21 @@ pub const DiskWAL = struct {
         return self.meta.hardState();
     }
 
-    pub fn setHardState(self: *DiskWAL, hs: raftlog.HardState) raftlog.RaftLogError!void {
+    /// Atomic field-set update. The merge of `update` over the current
+    /// HardState happens under `self.mu`, which also serializes with
+    /// every other DiskWAL writer, so concurrent calls (e.g. raft
+    /// mainLoop persisting term/vote, commitPersistLoop persisting
+    /// commit_index) can't race-clobber each other's fields.
+    pub fn setHardState(self: *DiskWAL, update: raftlog.HardStateUpdate) raftlog.RaftLogError!void {
         try self.mu.lock();
         defer self.mu.unlock();
-        self.meta.setHardState(hs) catch |err| return mapToRaftLogError(err);
+        var next = self.meta.hardState().*;
+        if (update.current_term) |v| next.current_term = v;
+        if (update.voted_for) |v| next.voted_for = v;
+        if (update.raft_id) |v| next.raft_id = v;
+        if (update.checkpoint_index) |v| next.checkpoint_index = v;
+        if (update.commit_index) |v| next.commit_index = v;
+        self.meta.setHardState(next) catch |err| return mapToRaftLogError(err);
     }
 
     pub fn snapshot(self: *DiskWAL) *const raftlog.Snapshot {
