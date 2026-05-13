@@ -353,24 +353,6 @@ pub const Tree = struct {
     /// and the underlying merge — caller drives via `itemRef`/`next`,
     /// frees via `deinit`. The walk loop lives in `Forest.scan`, which
     /// can compose multiple cursors back-to-back to span trees.
-    pub const ScanCursor = struct {
-        arena: std.heap.ArenaAllocator,
-        merge: MergeIterator,
-
-        pub fn deinit(self: *ScanCursor) void {
-            self.merge.deinit();
-            self.arena.deinit();
-        }
-
-        pub fn itemRef(self: *ScanCursor) ?Item {
-            return self.merge.itemRef();
-        }
-
-        pub fn next(self: *ScanCursor) !void {
-            return self.merge.next();
-        }
-    };
-
     /// Build a merge iterator over this tree's L≥1 data restricted to
     /// `range`, plus the caller-supplied `extras`.
     ///
@@ -386,54 +368,50 @@ pub const Tree = struct {
     /// On error (before merge is built): we deinit `extras` ourselves
     /// so refs don't leak. All wiring memory (slices, sub-arrays) lives
     /// in the cursor's arena.
+    /// `allocator` is the caller's per-call arena. Every allocation made
+    /// here — overlapping-table slices, iter slots, the merge's internal
+    /// heap, plus the iters' own scratch (key_buf etc.) — comes from it.
+    /// The caller keeps the arena alive for the merge's lifetime and frees
+    /// it at end-of-scope; `merge.deinit()` only releases table refs.
     pub fn openMerge(
         self: *Tree,
         allocator: std.mem.Allocator,
         range: KeyRange,
         priority: vfs.Priority,
         extras: []const Iterator,
-    ) !ScanCursor {
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        const a = arena.allocator();
-
+    ) !MergeIterator {
         // Build iters into a list. Until we hand them off to merge,
         // each iter we created here owns a Table/SkipList ref — on
         // failure we must deinit them all to release those refs.
         var iters: std.ArrayList(Iterator) = .empty;
         var transferred = false;
         errdefer {
-            if (!transferred) {
-                for (iters.items) |*it| it.deinit();
-                arena.deinit();
-            }
+            if (!transferred) for (iters.items) |*it| it.deinit();
         }
 
-        try iters.appendSlice(a, extras);
+        try iters.appendSlice(allocator, extras);
 
         for (self.levels, 0..) |*lv, level_idx| {
-            const overlapping = try lv.overlappingTables(a, range);
+            const overlapping = try lv.overlappingTables(allocator, range);
             if (overlapping.len == 0) continue;
 
             if (level_idx == 0) {
                 for (overlapping) |e| {
-                    try iters.append(a, .{ .table = TableIterator.init(a, e.table, priority) });
+                    try iters.append(allocator, .{ .table = TableIterator.init(allocator, e.table, priority) });
                 }
             } else {
-                const subs = try a.alloc(TableIterator, overlapping.len);
-                for (overlapping, 0..) |e, j| subs[j] = TableIterator.init(a, e.table, priority);
-                try iters.append(a, .{ .concat = ConcatIterator.init(subs) });
+                const subs = try allocator.alloc(TableIterator, overlapping.len);
+                for (overlapping, 0..) |e, j| subs[j] = TableIterator.init(allocator, e.table, priority);
+                try iters.append(allocator, .{ .concat = ConcatIterator.init(subs) });
             }
         }
 
-        var merge = MergeIterator.init(a, iters.items);
+        var merge = MergeIterator.init(allocator, iters.items);
         transferred = true; // merge.deinit now owns iter cleanup
-        errdefer {
-            merge.deinit();
-            arena.deinit();
-        }
+        errdefer merge.deinit();
         try merge.seekRange(range.left, range.right);
 
-        return .{ .arena = arena, .merge = merge };
+        return merge;
     }
 
     pub fn totalSize(self: *Tree) i64 {
@@ -640,7 +618,7 @@ pub const Tree = struct {
         const linfo = self.lowestLevelSize();
         const total = self.totalSize();
         if (total > self.opts.tree_split_size) {
-            log.info("split-trigger tree={d} total={d} deepest_level={d} lmax_size={d} > threshold={d}", .{
+            log.debug("split-trigger tree={d} total={d} deepest_level={d} lmax_size={d} > threshold={d}", .{
                 self.tree_id, total, linfo.level, linfo.size, self.opts.tree_split_size,
             });
             self.compact_candidate = .{

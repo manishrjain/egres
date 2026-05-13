@@ -696,30 +696,29 @@ pub const Forest = struct {
             const visit_range = remaining.intersect(tree_range);
 
             log.info("scan: hop={d} getting memtable iters", .{hop});
-            // Fresh memtable iters per tree — Tree.openMerge owns them.
-            const mem_iters = try self.memtables.getIterators(allocator);
-            log.info("scan: hop={d} opening merge cursor", .{hop});
-            var cursor = tree.openMerge(allocator, visit_range, priority, mem_iters) catch |err| {
-                allocator.free(mem_iters);
-                return err;
-            };
-            allocator.free(mem_iters);
+            // Allocate memtable iters from the per-call arena so they
+            // live exactly as long as the merge. (Memtables.getIterators
+            // returns a fresh slice; freeing it through the arena at
+            // end-of-scope is fine.)
+            const mem_iters = try self.memtables.getIterators(a);
+            log.info("scan: hop={d} opening merge", .{hop});
+            var merge = try tree.openMerge(a, visit_range, priority, mem_iters);
 
             log.info("scan: hop={d} draining", .{hop});
-            // Drain (or hit max_count). Use a labeled block so the
-            // cursor.deinit fires on every exit path before we either
-            // return or hop to the next tree.
+            // Drain (or hit max_count). Use a labeled block so merge.deinit
+            // fires on every exit path before we either return or hop to
+            // the next tree.
             const stop_early = drain: {
                 while (emitted < max_count) {
-                    const item = cursor.itemRef() orelse break :drain false;
+                    const item = merge.itemRef() orelse break :drain false;
                     const cont = try cb(ctx, item);
                     emitted += 1;
                     if (!cont) break :drain true;
-                    try cursor.next();
+                    try merge.next();
                 }
                 break :drain false;
             };
-            cursor.deinit();
+            merge.deinit();
             log.info("scan: hop={d} drained emitted={d} stop_early={}", .{ hop, emitted, stop_early });
             if (stop_early) return emitted;
 
@@ -772,8 +771,13 @@ pub const Forest = struct {
     /// already names every tree and table, but the in-memory Tree objects and
     /// route table need to be rebuilt from it.
     pub fn openTablesFromManifest(self: *Forest) !void {
+        log.info("openTablesFromManifest: acquiring forest.mu.write", .{});
         self.mu.lock();
-        defer self.mu.unlock();
+        defer {
+            log.info("openTablesFromManifest: releasing forest.mu.write", .{});
+            self.mu.unlock();
+        }
+        log.info("openTablesFromManifest: got forest.mu.write", .{});
 
         var max_tree_id: u64 = 0;
         var max_file_id: u64 = 0;
@@ -872,8 +876,13 @@ pub const Forest = struct {
     /// error here would wedge the raft apply loop's retry path; logging
     /// and skipping is both safe and forward-compatible.
     pub fn applyNamespaceCreate(self: *Forest, mc: manifest.ManifestChange) !void {
+        log.info("applyNamespaceCreate: acquiring forest.mu.write", .{});
         self.mu.lock();
-        defer self.mu.unlock();
+        defer {
+            log.info("applyNamespaceCreate: releasing forest.mu.write", .{});
+            self.mu.unlock();
+        }
+        log.info("applyNamespaceCreate: got forest.mu.write tree_changes={d}", .{mc.tree_changes.len});
 
         for (mc.tree_changes) |tc| {
             if (tc.op != .create) continue; // only CREATE for ns_create
