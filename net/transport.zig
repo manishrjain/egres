@@ -62,7 +62,7 @@ pub const Transport = struct {
     allocator: Allocator,
     cfg: Config,
     listen_addr: zio.net.IpAddress,
-    mu: zio.Mutex,
+    mu: utils.TrackedMutex,
     peers: std.AutoHashMap(u64, *PeerSlot),
     group: zio.Group,
     listener: ?zio.net.Server,
@@ -76,7 +76,7 @@ pub const Transport = struct {
             .allocator = allocator,
             .cfg = cfg,
             .listen_addr = listen_addr,
-            .mu = .init,
+            .mu = .{},
             .peers = peers,
             .group = zio.group(),
             .listener = null,
@@ -90,7 +90,7 @@ pub const Transport = struct {
         // Close all connections so reader/writer loops exit.
         var num_closed: u32 = 0;
         {
-            self.mu.lock() catch {};
+            self.mu.lock(@src()) catch {};
             defer self.mu.unlock();
             var it = self.peers.valueIterator();
             while (it.next()) |slot_ptr| {
@@ -114,12 +114,13 @@ pub const Transport = struct {
             slot_ptr.*.deinit(self.allocator);
         }
         self.peers.deinit();
+        self.mu.deinit();
     }
 
     /// Add a peer dynamically and start dialing it.
     /// Safe to call while the server is running.
     pub fn addPeer(self: *Transport, id: u64, addr: []const u8) !void {
-        self.mu.lock() catch return error.Cancelled;
+        self.mu.lock(@src()) catch return error.Cancelled;
         defer self.mu.unlock();
         log.debug("addPeer for {d} {s}\n", .{ id, addr });
 
@@ -165,7 +166,7 @@ pub const Transport = struct {
     }
 
     pub fn removePeer(self: *Transport, id: u64) void {
-        self.mu.lock() catch return;
+        self.mu.lock(@src()) catch return;
         defer self.mu.unlock();
 
         const slot = self.peers.get(id) orelse return;
@@ -200,7 +201,7 @@ pub const Transport = struct {
 
     /// Get Serial connection for a peer at given priority. Returns null if not connected.
     pub fn getPeerConn(self: *Transport, peer_id: u64, priority: Priority) ?*Serial {
-        self.mu.lock() catch return null;
+        self.mu.lock(@src()) catch return null;
         defer self.mu.unlock();
         const slot = self.peers.get(peer_id) orelse return null;
         return slot.conn[@intFromEnum(priority)];
@@ -208,7 +209,7 @@ pub const Transport = struct {
 
     /// Set drop_messages on all connections for a specific peer.
     pub fn setDropForPeer(self: *Transport, peer_id: u64, drop: bool) void {
-        self.mu.lock() catch return;
+        self.mu.lock(@src()) catch return;
         defer self.mu.unlock();
         const slot = self.peers.get(peer_id) orelse return;
         for (&slot.conn) |c| {
@@ -218,7 +219,7 @@ pub const Transport = struct {
 
     /// Set drop_messages on all connections for all peers.
     pub fn setDropAll(self: *Transport, drop: bool) void {
-        self.mu.lock() catch return;
+        self.mu.lock(@src()) catch return;
         defer self.mu.unlock();
         var it = self.peers.valueIterator();
         while (it.next()) |slot_ptr| {
@@ -334,14 +335,14 @@ pub const Transport = struct {
         const pri_idx = @intFromEnum(priority);
 
         {
-            self.mu.lock() catch return;
+            self.mu.lock(@src()) catch return;
             defer self.mu.unlock();
             if (self.peers.get(peer_id)) |slot| {
                 _ = slot.dial_loops.fetchAdd(1, .acq_rel);
             }
         }
         defer {
-            self.mu.lock() catch {};
+            self.mu.lock(@src()) catch {};
             defer self.mu.unlock();
             if (self.peers.get(peer_id)) |slot| {
                 _ = slot.dial_loops.fetchSub(1, .acq_rel);
@@ -355,7 +356,7 @@ pub const Transport = struct {
         var backoff_ms: u64 = 250;
         while (!self.shutting_down.load(.acquire)) {
             const state = blk: {
-                self.mu.lock() catch return;
+                self.mu.lock(@src()) catch return;
                 defer self.mu.unlock();
                 const slot = self.peers.get(peer_id) orelse return;
                 break :blk .{
@@ -449,7 +450,7 @@ pub const Transport = struct {
             }
 
             {
-                self.mu.lock() catch return;
+                self.mu.lock(@src()) catch return;
                 defer self.mu.unlock();
 
                 const now = std.time.milliTimestamp();
@@ -485,7 +486,7 @@ pub const Transport = struct {
 
     /// Get or create a PeerSlot for a peer (no address, inbound-only).
     fn getOrCreateSlot(self: *Transport, peer_id: u64) !void {
-        self.mu.lock() catch return error.Cancelled;
+        self.mu.lock(@src()) catch return error.Cancelled;
         defer self.mu.unlock();
 
         if (self.peers.contains(peer_id)) return;
@@ -498,7 +499,7 @@ pub const Transport = struct {
     fn installConn(self: *Transport, peer_id: u64, priority: Priority, s: *Serial) *Serial {
         const pri_idx = @intFromEnum(priority);
 
-        self.mu.lock() catch return s;
+        self.mu.lock(@src()) catch return s;
         defer self.mu.unlock();
 
         const slot = self.peers.get(peer_id) orelse return s;
@@ -521,7 +522,7 @@ pub const Transport = struct {
     fn removeConn(self: *Transport, peer_id: u64, priority: Priority, s: *Serial) void {
         const pri_idx = @intFromEnum(priority);
 
-        self.mu.lock() catch {
+        self.mu.lock(@src()) catch {
             s.deinit();
             return;
         };

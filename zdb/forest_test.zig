@@ -163,7 +163,7 @@ test "forest: split tree" {
 
     // splitTreeForTests requires the write lock.
     {
-        f.mu.lock();
+        f.mu.lockUncancelable(@src());
         defer f.mu.unlock();
         try f.splitTreeForTests(1);
     }
@@ -410,7 +410,7 @@ test "forest: routes to correct tree" {
 
     // Both namespaces should have a route table.
     {
-        f.mu.lockShared();
+        f.mu.lockSharedUncancelable(@src());
         defer f.mu.unlockShared();
         try std.testing.expect(f.ns_routes.contains(1));
         try std.testing.expect(f.ns_routes.contains(2));

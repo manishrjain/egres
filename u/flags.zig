@@ -1,4 +1,5 @@
 const std = @import("std");
+const zio = @import("zio");
 
 pub const Error = error{
     MissingValue,
@@ -271,7 +272,7 @@ pub fn Live(comptime T: type) type {
 
         allocator: std.mem.Allocator,
         arena: std.heap.ArenaAllocator,
-        mu: std.Thread.RwLock = .{},
+        mu: zio.RwLock = .init,
         current: T = .{},
         version_val: u64 = 0,
 
@@ -304,7 +305,7 @@ pub fn Live(comptime T: type) type {
             var kv = try parseFlagString(self.allocator, input);
             defer freeKvMap(self.allocator, &kv);
 
-            self.mu.lock();
+            self.mu.lockUncancelable();
             defer self.mu.unlock();
 
             var next: T = self.current;
@@ -317,13 +318,13 @@ pub fn Live(comptime T: type) type {
         }
 
         pub fn version(self: *Self) u64 {
-            self.mu.lockShared();
+            self.mu.lockSharedUncancelable();
             defer self.mu.unlockShared();
             return self.version_val;
         }
 
         pub fn snapshot(self: *Self) T {
-            self.mu.lockShared();
+            self.mu.lockSharedUncancelable();
             defer self.mu.unlockShared();
             return self.current;
         }
@@ -417,7 +418,7 @@ const Entry = struct {
 
 pub const Registry = struct {
     allocator: std.mem.Allocator,
-    mu: std.Thread.Mutex = .{},
+    mu: zio.Mutex = .init,
     entries: std.StringHashMap(Entry),
 
     pub fn init(allocator: std.mem.Allocator) Registry {
@@ -470,7 +471,7 @@ pub const Registry = struct {
         const key = try normalizeKeyAlloc(self.allocator, name);
         errdefer self.allocator.free(key);
 
-        self.mu.lock();
+        self.mu.lockUncancelable();
         defer self.mu.unlock();
         if (self.entries.contains(key)) return error.DuplicateModule;
 
@@ -488,7 +489,7 @@ pub const Registry = struct {
         if (name.len > name_buf.len) return error.UnknownModule;
         const key = normalizeKeyInto(name, &name_buf);
 
-        self.mu.lock();
+        self.mu.lockUncancelable();
         const entry = self.entries.get(key) orelse {
             self.mu.unlock();
             return error.UnknownModule;
@@ -560,7 +561,7 @@ pub const Registry = struct {
         // the hashmap and invalidate the iterator. help_fn is stateless (comptime-
         // derived from T), so we needn't hold any lock across the per-module render
         // — and dropping it first keeps the registry responsive during a long write.
-        self.mu.lock();
+        self.mu.lockUncancelable();
         var names = std.ArrayList([]const u8).empty;
         defer names.deinit(self.allocator);
         var it = self.entries.keyIterator();

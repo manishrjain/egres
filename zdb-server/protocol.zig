@@ -11,10 +11,13 @@ pub const Command = union(enum) {
     zdb: ZdbCmd,
     raft: RaftCmd,
     vfs: VfsCmd,
+    locks: LocksCmd,
     help: HelpCmd,
 };
 
 pub const VfsCmd = struct {};
+
+pub const LocksCmd = struct {};
 
 pub const HelpCmd = struct {};
 
@@ -49,6 +52,8 @@ pub const help_text =
     \\  raft entry <N>                  dump WAL entry N (one human-readable line)
     \\  raft entry <lo> <hi>            dump WAL entries [lo, hi], one per line
     \\  vfs                             VFS bandwidth limiter snapshot
+    \\  locks                           dump every tracked mutex: holder src,
+    \\                                  waiter count, last-waiter src
     \\
 ;
 
@@ -425,6 +430,8 @@ pub fn parseLine(line: []const u8) !Command {
         return .{ .raft = .{ .sub = .entry, .lo = lo, .hi = hi } };
     } else if (std.mem.eql(u8, cmd, "vfs")) {
         return .{ .vfs = .{} };
+    } else if (std.mem.eql(u8, cmd, "locks")) {
+        return .{ .locks = .{} };
     } else if (std.mem.eql(u8, cmd, "help")) {
         return .{ .help = .{} };
     } else {

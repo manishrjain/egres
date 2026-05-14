@@ -1,5 +1,6 @@
 const std = @import("std");
 const zio = @import("zio");
+const utils = @import("utils");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.mux);
 
@@ -110,13 +111,13 @@ pub const Mux = struct {
 
     allocator: Allocator,
     tcp_stream: zio.net.Stream,
-    writer_mu: zio.Mutex,
+    writer_mu: utils.TrackedMutex,
     streams: std.AutoHashMap(u32, *Stream),
     next_stream_id: std.atomic.Value(u32),
     on_stream: *const fn (*Stream) void,
     group: zio.Group,
     closed: bool,
-    mu: zio.Mutex,
+    mu: utils.TrackedMutex,
 
     pub fn init(
         allocator: Allocator,
@@ -128,13 +129,13 @@ pub const Mux = struct {
         self.* = .{
             .allocator = allocator,
             .tcp_stream = tcp_stream,
-            .writer_mu = .init,
+            .writer_mu = .{},
             .streams = std.AutoHashMap(u32, *Stream).init(allocator),
             .next_stream_id = std.atomic.Value(u32).init(initial_stream_id),
             .on_stream = on_stream,
             .group = zio.group(),
             .closed = false,
-            .mu = .init,
+            .mu = .{},
         };
         return self;
     }
@@ -151,12 +152,14 @@ pub const Mux = struct {
         log.info("Mux.deinit. group wait done", .{});
         self.destroyStreams();
         self.streams.deinit();
+        self.mu.deinit();
+        self.writer_mu.deinit();
         self.allocator.destroy(self);
         log.info("Mux.deinit OK", .{});
     }
 
     pub fn closeConn(self: *Mux) void {
-        self.mu.lockUncancelable();
+        self.mu.lockUncancelable(@src());
         self.mu.unlock();
 
         if (self.closed) return;
@@ -228,7 +231,7 @@ pub const Mux = struct {
                     // do nothing
                 };
             } else {
-                try self.mu.lock();
+                try self.mu.lock(@src());
                 stream = self.streams.get(header.stream_id);
                 self.mu.unlock();
 
@@ -255,7 +258,7 @@ pub const Mux = struct {
     }
 
     pub fn writeFrame(self: *Mux, header: FrameHeader, payload: []const u8) !void {
-        try self.writer_mu.lock();
+        try self.writer_mu.lock(@src());
         defer self.writer_mu.unlock();
 
         var hdr_buf: [FrameHeader.encoded_size]u8 = undefined;
@@ -279,14 +282,14 @@ pub const Mux = struct {
         stream.* = .{ .mux = self, .stream_id = stream_id, .syn_sent = syn_sent };
         stream.initChannel();
 
-        try self.mu.lock();
+        try self.mu.lock(@src());
         defer self.mu.unlock();
         try self.streams.put(stream_id, stream);
         return stream;
     }
 
     pub fn destroyStream(self: *Mux, stream_id: u32) void {
-        self.mu.lock() catch return;
+        self.mu.lock(@src()) catch return;
         defer self.mu.unlock();
         if (self.streams.fetchRemove(stream_id)) |kv| {
             self.allocator.destroy(kv.value);
@@ -294,7 +297,7 @@ pub const Mux = struct {
     }
 
     fn closeChannels(self: *Mux) void {
-        self.mu.lockUncancelable();
+        self.mu.lockUncancelable(@src());
         defer self.mu.unlock();
 
         var it = self.streams.valueIterator();
@@ -304,7 +307,7 @@ pub const Mux = struct {
     }
 
     fn destroyStreams(self: *Mux) void {
-        self.mu.lockUncancelable();
+        self.mu.lockUncancelable(@src());
         defer self.mu.unlock();
 
         var it = self.streams.valueIterator();

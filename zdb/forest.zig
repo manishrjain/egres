@@ -120,14 +120,14 @@ pub const RouteTable = struct {
 
 pub const Memtables = struct {
     allocator: std.mem.Allocator,
-    mu: std.Thread.RwLock,
+    mu: zio.RwLock,
     current: *SkipList,
     immutables: std.ArrayList(*SkipList), // oldest at index 0
 
     pub fn init(allocator: std.mem.Allocator, current: *SkipList) Memtables {
         return .{
             .allocator = allocator,
-            .mu = .{},
+            .mu = .init,
             .current = current,
             .immutables = .{},
         };
@@ -140,13 +140,13 @@ pub const Memtables = struct {
     }
 
     pub fn put(self: *Memtables, key: Key, value: []const u8) !void {
-        self.mu.lockShared();
+        self.mu.lockSharedUncancelable();
         defer self.mu.unlockShared();
         try self.current.put(key, value);
     }
 
     pub fn memoryUsage(self: *Memtables) usize {
-        self.mu.lockShared();
+        self.mu.lockSharedUncancelable();
         defer self.mu.unlockShared();
         return self.current.memoryUsage();
     }
@@ -160,7 +160,7 @@ pub const Memtables = struct {
     /// ref a moment later, the skiplist stays alive until the iterator
     /// drops its ref. Caller frees the slice itself.
     pub fn getIterators(self: *Memtables, allocator: std.mem.Allocator) ![]merge_iterator.Iterator {
-        self.mu.lockShared();
+        self.mu.lockSharedUncancelable();
         defer self.mu.unlockShared();
         const total = self.immutables.items.len + 1;
         const out = try allocator.alloc(merge_iterator.Iterator, total);
@@ -175,7 +175,7 @@ pub const Memtables = struct {
     /// in place — no `newMemtable` has been applied yet, and any writes that
     /// land in `current` will be discarded by the first `swapCurrentOut`.
     pub fn currentId(self: *Memtables) u64 {
-        self.mu.lockShared();
+        self.mu.lockSharedUncancelable();
         defer self.mu.unlockShared();
         return self.current.id;
     }
@@ -190,7 +190,7 @@ pub const Memtables = struct {
     };
 
     pub fn stats(self: *Memtables) Stats {
-        self.mu.lockShared();
+        self.mu.lockSharedUncancelable();
         defer self.mu.unlockShared();
         var imm_bytes: usize = 0;
         for (self.immutables.items) |imm| imm_bytes += imm.memoryUsage();
@@ -204,7 +204,7 @@ pub const Memtables = struct {
     /// Look up a key across current and immutable memtables.
     /// Returns a duped Item owned by the caller.
     pub fn get(self: *Memtables, allocator: std.mem.Allocator, search_key: Key) !?Item {
-        self.mu.lockShared();
+        self.mu.lockSharedUncancelable();
         defer self.mu.unlockShared();
 
         if (self.current.get(search_key)) |item| {
@@ -230,7 +230,7 @@ pub const Memtables = struct {
     /// would otherwise sit in immutables forever, since no flush ever targets
     /// id=0.
     pub fn swapCurrentOut(self: *Memtables, new_id: u64, log_index: u64) !void {
-        self.mu.lock();
+        self.mu.lockUncancelable();
         defer self.mu.unlock();
 
         if (self.current.id == 0) {
@@ -248,7 +248,7 @@ pub const Memtables = struct {
     /// thing around is the initial placeholder (no real `newMemtable` entry
     /// has been applied yet), which the caller treats as "no snapshot yet."
     pub fn oldestInMemoryLogIndex(self: *Memtables) u64 {
-        self.mu.lockShared();
+        self.mu.lockSharedUncancelable();
         defer self.mu.unlockShared();
         if (self.immutables.items.len > 0) return self.immutables.items[0].created_at_log_index;
         return self.current.created_at_log_index;
@@ -272,7 +272,7 @@ pub const Memtables = struct {
     ///     install above handles the data side.
     /// Steady-state: FIFO ordering means oldest always equals expected.
     pub fn popOldestIfMatches(self: *Memtables, expected_id: u64) void {
-        self.mu.lock();
+        self.mu.lockUncancelable();
         defer self.mu.unlock();
 
         while (self.immutables.items.len > 0 and self.immutables.items[0].id < expected_id) {
@@ -302,7 +302,7 @@ pub const Memtables = struct {
 
     /// Return the oldest immutable memtable without removing it.
     pub fn peekOldest(self: *Memtables) ?*SkipList {
-        self.mu.lockShared();
+        self.mu.lockSharedUncancelable();
         defer self.mu.unlockShared();
 
         if (self.immutables.items.len == 0) return null;
@@ -326,7 +326,7 @@ pub const Forest = struct {
     trees: std.AutoHashMap(u64, *Tree),
     ns_routes: std.AutoHashMap(u32, *RouteTable),
     table_cache: TableCache,
-    mu: std.Thread.RwLock,
+    mu: utils.TrackedRwLock,
     memtables: Memtables,
 
     /// Open a forest with empty in-memory state. Persistent state is restored
@@ -378,7 +378,9 @@ pub const Forest = struct {
         self.ns_routes.deinit();
 
         self.ms.deinit();
+        self.file_ids.mu.deinit();
         self.table_cache.deinit();
+        self.mu.deinit();
         self.allocator.destroy(self);
     }
 
@@ -445,7 +447,7 @@ pub const Forest = struct {
         // Route each key to a tree and add to the appropriate builder.
         while (iter.itemRef()) |item| {
             const tree_id = blk: {
-                self.mu.lockShared();
+                self.mu.lockSharedUncancelable(@src());
                 defer self.mu.unlockShared();
                 const rt = self.ns_routes.get(item.key.namespace) orelse {
                     try iter.next();
@@ -609,7 +611,7 @@ pub const Forest = struct {
             return item;
         }
 
-        self.mu.lockShared();
+        self.mu.lockSharedUncancelable(@src());
         defer self.mu.unlockShared();
 
         const rt = self.ns_routes.get(search_key.namespace) orelse return null;
@@ -662,7 +664,7 @@ pub const Forest = struct {
             var tree: *Tree = undefined;
             var tree_range = KeyRange{};
             {
-                self.mu.lockShared();
+                self.mu.lockSharedUncancelable(@src());
                 defer self.mu.unlockShared();
                 const rt = self.ns_routes.get(ns) orelse return emitted;
                 const tid = blk: {
@@ -759,7 +761,7 @@ pub const Forest = struct {
     /// which is independent of (and immune to) ids in other nodes'
     /// namespaces that show up in the manifest.
     pub fn openTablesFromManifest(self: *Forest) !void {
-        self.mu.lock();
+        self.mu.lockUncancelable(@src());
         defer self.mu.unlock();
 
         var max_tree_id: u64 = 0;
@@ -791,7 +793,7 @@ pub const Forest = struct {
     /// Create a new tree for the given namespace and key range.
     /// Single-node path (no Raft) — used by tests. Returns the new tree_id.
     pub fn createTree(self: *Forest, namespace_id: u32, range: KeyRange) !u64 {
-        self.mu.lock();
+        self.mu.lockUncancelable(@src());
         defer self.mu.unlock();
 
         const tree_id = self.next_tree_id.fetchAdd(1, .monotonic);
@@ -817,7 +819,7 @@ pub const Forest = struct {
     pub fn buildNamespaceCreate(self: *Forest, alloc: std.mem.Allocator, namespace_id: u32) !manifest.ManifestChange {
         std.debug.assert(namespace_id > 0);
         {
-            self.mu.lockShared();
+            self.mu.lockSharedUncancelable(@src());
             defer self.mu.unlockShared();
             if (self.ns_routes.contains(namespace_id)) return error.NamespaceAlreadyExists;
         }
@@ -840,7 +842,7 @@ pub const Forest = struct {
     ///
     /// Skips any TreeChange whose namespace already has a route table.
     pub fn applyNamespaceCreate(self: *Forest, mc: manifest.ManifestChange) !void {
-        self.mu.lock();
+        self.mu.lockUncancelable(@src());
         defer self.mu.unlock();
 
         for (mc.tree_changes) |tc| {
@@ -858,7 +860,7 @@ pub const Forest = struct {
 
     /// Get a tree by its id.
     pub fn getTree(self: *Forest, tree_id: u64) ?*Tree {
-        self.mu.lockShared();
+        self.mu.lockSharedUncancelable(@src());
         defer self.mu.unlockShared();
         return self.trees.get(tree_id);
     }
@@ -869,7 +871,7 @@ pub const Forest = struct {
     /// since `buildFlush` silently drops items whose namespace has no
     /// route.
     pub fn hasNamespace(self: *Forest, namespace_id: u32) bool {
-        self.mu.lockShared();
+        self.mu.lockSharedUncancelable(@src());
         defer self.mu.unlockShared();
         return self.ns_routes.contains(namespace_id);
     }
@@ -895,7 +897,7 @@ pub const Forest = struct {
         self: *Forest,
         skip: ?*const std.AutoHashMap(u64, void),
     ) ?CompactionTarget {
-        self.mu.lockShared();
+        self.mu.lockSharedUncancelable(@src());
         defer self.mu.unlockShared();
 
         var best: ?CompactionTarget = null;
@@ -922,7 +924,7 @@ pub const Forest = struct {
     /// TODO: We should ideally do this based on the tree the keys are going to
     /// hit, instead of any tree in the namespace.
     pub fn maxL0TableCountForNs(self: *Forest, ns: u32) u32 {
-        self.mu.lockShared();
+        self.mu.lockSharedUncancelable(@src());
         defer self.mu.unlockShared();
         const route = self.ns_routes.get(ns) orelse return 0;
         var max_count: u32 = 0;
@@ -1016,7 +1018,7 @@ pub const Forest = struct {
         // the numbers we need, release. Each level access takes its own
         // lock inside numTables/getTotalSize.
         {
-            self.mu.lockShared();
+            self.mu.lockSharedUncancelable(@src());
             defer self.mu.unlockShared();
             tree_count = self.trees.count();
             var it = self.trees.iterator();
@@ -1094,7 +1096,7 @@ pub const Forest = struct {
     }
 
     fn writeTreeStats(self: *Forest, w: *std.Io.Writer, tree_id: u64) !void {
-        self.mu.lockShared();
+        self.mu.lockSharedUncancelable(@src());
         defer self.mu.unlockShared();
 
         const tree = self.trees.get(tree_id) orelse {
@@ -1129,7 +1131,7 @@ pub const Forest = struct {
         var ids: std.ArrayList(u64) = .{};
         defer ids.deinit(self.allocator);
         {
-            self.mu.lockShared();
+            self.mu.lockSharedUncancelable(@src());
             defer self.mu.unlockShared();
             var it = self.ms.trees.iterator();
             while (it.next()) |kv| {
@@ -1270,7 +1272,7 @@ pub const Forest = struct {
         var table_changes: std.ArrayList(manifest.TableChange) = .{};
 
         for (left_tree.levels, 0..) |*llv, llv_idx| {
-            llv.mu.lockShared();
+            llv.mu.lockSharedUncancelable(@src());
             defer llv.mu.unlockShared();
 
             for (llv.tables.items) |tbe| {

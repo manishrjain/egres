@@ -99,8 +99,6 @@ fn makeModules(
     buffers_gen.addImport("zbuf", zbuf);
 
     // Infra
-    const flags = makeModule(b, target, optimize, "u/flags.zig");
-
     const utils = makeModule(b, target, optimize, "u/utils.zig");
     utils.addImport("zio", zio);
     // utils/compress.zig does @cImport for lz4/zstd. Bake the include paths
@@ -109,6 +107,9 @@ fn makeModules(
     utils.addIncludePath(b.path("."));
     utils.addIncludePath(b.path("third_party/lz4/lib"));
     utils.addIncludePath(b.path("third_party/zstd/lib"));
+
+    const flags = makeModule(b, target, optimize, "u/flags.zig");
+    flags.addImport("zio", zio);
 
     const vfs = makeModule(b, target, optimize, "vfs/vfs.zig");
     vfs.addImport("zio", zio);

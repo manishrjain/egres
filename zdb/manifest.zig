@@ -3,6 +3,7 @@ const zen = @import("buffers.gen.zig");
 const Key = @import("key.zig").Key;
 const vfs = @import("vfs");
 const zbuf = @import("zbuf").zbuf;
+const utils = @import("utils");
 
 // -------------------------------------------------------------------------
 // Error set
@@ -35,7 +36,7 @@ pub const TreeState = struct {
 pub const ForestState = struct {
     allocator: std.mem.Allocator,
     trees: std.AutoHashMap(u64, TreeState),
-    mu: std.Thread.Mutex,
+    mu: utils.TrackedMutex,
 
     pub fn init(allocator: std.mem.Allocator) ForestState {
         return .{
@@ -56,6 +57,7 @@ pub const ForestState = struct {
         var it = self.trees.iterator();
         while (it.next()) |kv| self.freeTree(kv.value_ptr);
         self.trees.deinit();
+        self.mu.deinit();
     }
 
     /// Applies a single table CREATE or DELETE to the tree's levels.
@@ -114,7 +116,7 @@ pub const ForestState = struct {
     ) !void {
         if (table_changes.len == 0 and tree_changes.len == 0) return;
 
-        self.mu.lock();
+        self.mu.lockUncancelable(@src());
         defer self.mu.unlock();
 
         for (tree_changes) |tc| try self.applyTreeChange(tc);

@@ -646,6 +646,15 @@ pub fn main() !void {
     const argv = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, argv);
 
+    // Bootstrap fiber: flag init and the rest of setup runs in fiber
+    // context so flag locks aren't blocking an executor thread.
+    const bootstrap_rt = try zio.Runtime.init(alloc, .{ .executors = .exact(1) });
+    defer bootstrap_rt.deinit();
+    var handle = try bootstrap_rt.spawn(bootstrap, .{ alloc, argv });
+    try handle.join();
+}
+
+fn bootstrap(alloc: std.mem.Allocator, argv: [][:0]u8) !void {
     // --- step 1: extract the positional subcommand (argv[1] if present and
     // doesn't start with `--`). Anything else goes to the flag parser. This
     // keeps the verb natural (`loadtest run`) without needing flag gymnastics
