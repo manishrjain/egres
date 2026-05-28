@@ -53,8 +53,8 @@ test "Channel: bounded blocking handoff with capacity 1" {
     var g: fiber.Group(void) = .init(std.testing.allocator);
     defer g.deinit();
     // Pin both to worker 0 — `total` is a plain u32, not atomic.
-    try g.spawn(.{ .worker_id = 0 }, Producer.run, .{&ch});
-    try g.spawn(.{ .worker_id = 0 }, Consumer.run, .{ &ch, &total });
+    try g.spawn(.{ .worker_id = 0, .locked = true }, Producer.run, .{&ch});
+    try g.spawn(.{ .worker_id = 0, .locked = true }, Consumer.run, .{ &ch, &total });
     g.wait();
 
     try std.testing.expectEqual(@as(u32, 100 * 101 / 2), total);
@@ -214,7 +214,7 @@ test "Channel: cross-worker MPMC stress (4 producers x 4 consumers x cap 8)" {
     for (0..N_PRODUCERS) |i| {
         const wid: u8 = @intCast(i % n_workers);
         try g.spawn(
-            .{ .worker_id = wid },
+            .{ .worker_id = wid, .locked = true },
             Producer.run,
             .{ &ch, &produced_total, &producers_done, N_PRODUCERS, ITEMS_PER_PRODUCER },
         );
@@ -222,7 +222,7 @@ test "Channel: cross-worker MPMC stress (4 producers x 4 consumers x cap 8)" {
     for (0..N_CONSUMERS) |i| {
         const wid: u8 = @intCast(i % n_workers);
         try g.spawn(
-            .{ .worker_id = wid },
+            .{ .worker_id = wid, .locked = true },
             Consumer.run,
             .{ &ch, &received_total },
         );

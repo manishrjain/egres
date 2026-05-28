@@ -50,11 +50,32 @@ pub const Deadlines = deadlines.Deadlines;
 pub const Timeout = deadlines.Timeout;
 pub const Spinlock = spinlock.Spinlock;
 
+/// FIFO ready queue, concurrent-safe via a per-queue spinlock.
+///
+/// `pushTail` is called only by the worker that owns the queue.
+/// `popHead` is called by both the owner (its own pop in
+/// `Worker.run`, mode = `.any`) and by thieves (`Worker.trySteal`,
+/// mode = `.unlocked`). The spinlock makes the queue safe under
+/// that concurrent use without committing to a full lock-free
+/// deque — the spin cost dominates only during stealing, which by
+/// definition only happens when peers are idle.
 const ReadyQueue = struct {
+    sl: Spinlock = .{},
     head: ?*Fiber = null,
     tail: ?*Fiber = null,
+    count: u32 = 0,
 
-    fn push(self: *ReadyQueue, f: *Fiber) void {
+    pub const PopMode = enum {
+        /// Pop any fiber at the head — owner mode.
+        any,
+        /// Pop the first unlocked (stealable) fiber, skipping
+        /// pinned ones in place — thief mode.
+        unlocked,
+    };
+
+    fn pushTail(self: *ReadyQueue, f: *Fiber) void {
+        self.sl.lock();
+        defer self.sl.unlock();
         f.ready_next = null;
         if (self.tail) |t| {
             t.ready_next = f;
@@ -62,14 +83,26 @@ const ReadyQueue = struct {
             self.head = f;
         }
         self.tail = f;
+        self.count += 1;
     }
 
-    fn popFront(self: *ReadyQueue) ?*Fiber {
-        const head = self.head orelse return null;
-        self.head = head.ready_next;
-        if (self.head == null) self.tail = null;
-        head.ready_next = null;
-        return head;
+    fn popHead(self: *ReadyQueue, mode: PopMode) ?*Fiber {
+        self.sl.lock();
+        defer self.sl.unlock();
+        var prev: ?*Fiber = null;
+        var cur = self.head;
+        while (cur) |f| {
+            if (mode == .any or !f.locked) {
+                if (prev) |p| p.ready_next = f.ready_next else self.head = f.ready_next;
+                if (self.tail == f) self.tail = prev;
+                f.ready_next = null;
+                self.count -= 1;
+                return f;
+            }
+            prev = f;
+            cur = f.ready_next;
+        }
+        return null;
     }
 };
 
@@ -121,11 +154,26 @@ pub const Worker = struct {
     /// the calling thread that invoked `Runtime.run`).
     thread: ?std.Thread = null,
 
-    /// Count of `.exclusive`-sharing fibers currently homed on this
-    /// worker. Used by `pickWorker` to spread exclusive fibers across
-    /// a lane's workers. Incremented at spawn, decremented when the
-    /// fiber finishes.
-    live_exclusive: std.atomic.Value(u32) = .init(0),
+    /// Round-robin cursor for picking steal victims within our
+    /// lane. Initialized to `id` so peers start at distinct offsets
+    /// and don't gang up on the same first victim.
+    steal_cursor: u8 = 0,
+
+    /// Index into `rt.lane_ranges` / `rt.idle_mask` — cached at init
+    /// so the hot idle path skips the linear `myLaneRange` scan.
+    lane_idx: u8 = 0,
+    /// Which u64 word inside `rt.idle_mask[lane_idx]` holds our bit.
+    /// `(id - lane_range.start) / 64`.
+    lane_word_idx: u8 = 0,
+    /// Our bit within that word: `1 << ((id - lane_range.start) % 64)`.
+    lane_bit_mask: u64 = 0,
+
+    /// TSC reading at the most recent `loop.run(.no_wait)` pump.
+    /// Under heavy local load we'd otherwise never reach the idle
+    /// path where libxev gets polled — timer ticks, async wakes,
+    /// and Deadlines completions would all stall. We pump every
+    /// ~1 ms of fiber work to keep those responsive.
+    last_pump_ticks: u64 = 0,
 
     pub fn init(w: *Worker, id: u8, rt: *Runtime) !void {
         w.id = id;
@@ -140,7 +188,24 @@ pub const Worker = struct {
         w.remote_queue = .{};
         w.wake_completion = undefined;
         w.thread = null;
-        w.live_exclusive = .init(0);
+        w.steal_cursor = id;
+
+        // Resolve our lane from `rt.lane_ranges`, populated by
+        // `Runtime.init` before this loop. The lane offset
+        // (id - lane_range.start) is split into a word index and a
+        // bit within that word so masks scale to 256 workers/lane.
+        var found: bool = false;
+        for (rt.lane_ranges, 0..) |r, lane_i| {
+            if (id >= r.start and id < r.end) {
+                const off: u8 = id - r.start;
+                w.lane_idx = @intCast(lane_i);
+                w.lane_word_idx = off / bits_per_word;
+                w.lane_bit_mask = @as(u64, 1) << @intCast(off % bits_per_word);
+                found = true;
+                break;
+            }
+        }
+        std.debug.assert(found);
     }
 
     pub fn deinit(self: *Worker, allocator: std.mem.Allocator) void {
@@ -150,14 +215,55 @@ pub const Worker = struct {
     }
 
     pub fn scheduleLocal(self: *Worker, f: *Fiber) void {
-        self.ready[@intFromEnum(f.priority)].push(f);
+        self.ready[@intFromEnum(f.priority)].pushTail(f);
     }
 
-    fn popNextReady(self: *Worker) ?*Fiber {
+    fn popNextReady(self: *Worker, mode: ReadyQueue.PopMode) ?*Fiber {
         var i: usize = Priority.count;
         while (i > 0) {
             i -= 1;
-            if (self.ready[i].popFront()) |f| return f;
+            if (self.ready[i].popHead(mode)) |f| return f;
+        }
+        return null;
+    }
+
+    /// Worker range of the lane this worker belongs to. Uses
+    /// `lane_idx` cached at init.
+    fn myLaneRange(self: *Worker) Range {
+        return self.rt.lane_ranges[self.lane_idx];
+    }
+
+    /// Try to steal one ready, unlocked fiber from a peer in our lane. Picks
+    /// victims via `steal_cursor` round-robin within the lane. On success,
+    /// updates the fiber's `worker_id` to us and returns it; caller is
+    /// responsible for pushing it onto our ready queue (or running it
+    /// directly).
+    fn trySteal(self: *Worker) ?*Fiber {
+        const range = self.myLaneRange();
+        const width: u8 = range.end - range.start;
+        if (width <= 1) return null; // alone in the lane — no peers
+
+        const K: u8 = width - 1;
+        var attempts: u8 = 0;
+        while (attempts < K) {
+            const peer_id: u8 = range.start + (self.steal_cursor % width);
+            if (peer_id == self.id) {
+                self.steal_cursor +%= 1;
+                continue; // don't waste an attempt on ourselves
+            }
+            attempts += 1;
+
+            const peer = &self.rt.workers[peer_id];
+            if (peer.popNextReady(.unlocked)) |f| {
+                // It's possible that there're more ready fibers available on
+                // this worker. So, don't advance steal_cursor until we've
+                // exhausted them.
+                f.worker_id = self.id;
+                f.times_stolen += 1;
+                return f;
+            } else {
+                self.steal_cursor +%= 1;
+            }
         }
         return null;
     }
@@ -187,6 +293,10 @@ pub const Worker = struct {
         // atomic load on every dispatch.
         tsc_factor_tls = tsc_ns_per_cycle_q32.load(.acquire);
 
+        // Seed the libxev-pump baseline so the first pump check has
+        // a meaningful delta. See `last_pump_ticks` doc.
+        self.last_pump_ticks = readTicks();
+
         fb.coro.setupStackGrowth() catch |err| {
             std.debug.panic("setupStackGrowth failed: {}", .{err});
         };
@@ -207,53 +317,134 @@ pub const Worker = struct {
             wakeAsyncCallback,
         );
 
+        // `published` tracks whether we've already announced ourselves
+        // as idle this round. If we have, the next "no work found"
+        // pass means we genuinely have nothing to do and should park.
+        // Cleared every time we find work (so the next dry spell can
+        // publish again) or after returning from `loop.run`.
+        var published: bool = false;
+
         while (self.rt.live_count.load(.acquire) > 0) {
+            // Keep libxev's `cached_now` fresh once per dispatch tick.
+            // Any `xev.Timer.run` / `TCP.read`/`write`/... a fiber issues
+            // computes its absolute kernel deadline as `cached_now +
+            // next_ms` (see `timer_next` + `IORING_TIMEOUT_ABS`). Stale
+            // cached_now → SQE armed in the past → kernel fires it
+            // synchronously, making `sleep(N)` return in ~0 ms. One
+            // CLOCK_MONOTONIC vDSO read per outer iteration is ~10 ns
+            // and amortizes across however many libxev ops the fibers
+            // we dispatch issue.
+            self.loop.update_now();
+
             self.drainRemote();
 
-            if (self.popNextReady()) |f| {
-                self.current_fiber = f;
-                const enter = readTicks();
-
-                f.coro.step();
-
-                const exit = readTicks();
-                self.current_fiber = null;
-                // Skip the reading if the counter went backwards
-                // (e.g., thread migrated mid-step to a CPU with a
-                // slightly behind TSC). Real-world frequency: rare.
-                // Metrics aggregators wanting tight invariants can
-                // do their own outlier filtering downstream.
-                if (exit >= enter) f.cpu_total_ns +%= cyclesToNs(exit - enter);
-
-                if (f.isFinished()) {
-                    // The fiber wrote its result into JoinState; let
-                    // the hook flip `finished=true` and hand back any
-                    // parked joiner. We do the actual wake here so
-                    // `fiber.zig` doesn't have to import the runtime.
-                    if (f.on_finished(f)) |waiter| wake(waiter);
-                    // Paired with the spawn-time fetchAdd. Always
-                    // home_worker_id == self.id at the point we see
-                    // `.finished` (the fiber's last step ran here).
-                    if (f.sharing == .exclusive) {
-                        _ = self.live_exclusive.fetchSub(1, .release);
-                    }
-                    const remaining = self.rt.live_count.fetchSub(1, .release) - 1;
-                    if (remaining == 0) self.rt.broadcastStop(self.id);
-                    continue;
+            if (self.popNextReady(.any)) |f| {
+                if (published) {
+                    self.clearIdle();
+                    published = false;
                 }
-                switch (f.intent) {
-                    .reschedule => self.scheduleLocal(f),
-                    .park => {},
-                }
+                self.runFiber(f);
                 continue;
             }
 
-            // Nothing local ready. Block until a libxev completion
-            // (timer / I/O / cross-thread async wake) fires.
+            // Nothing local ready. Try to steal from a peer in our
+            // lane before falling through to libxev — work stealing
+            // happens exactly when this worker would otherwise sit
+            // idle, so the contention cost is "free" from the
+            // owner's perspective.
+            if (self.trySteal()) |stolen| {
+                if (published) {
+                    self.clearIdle();
+                    published = false;
+                }
+                self.scheduleLocal(stolen);
+                continue;
+            }
+
+            // First dry pass: announce that we're idle so producers
+            // in `routeToWorker` can redirect new stealable fibers
+            // straight to us. Then `continue` back to the top — the
+            // next iteration's drainRemote/popNextReady/trySteal IS
+            // the post-publish recheck, catching anything that
+            // landed between our previous checks and the publish.
+            if (!published) {
+                self.publishIdle();
+                published = true;
+                continue;
+            }
+
+            // Second dry pass with `published == true`: nothing
+            // arrived during the recheck, so park until libxev wakes
+            // us (timer, I/O completion, or a producer notifying our
+            // wake_async after redirecting work to us).
             self.loop.run(.once) catch |err| {
                 std.debug.panic("xev.Loop.run failed: {}", .{err});
             };
+            self.clearIdle();
+            published = false;
         }
+    }
+
+    /// Run one ready fiber: bracket `coro.step()` with TSC samples
+    /// for CPU accounting, pump libxev periodically so timers stay
+    /// responsive under sustained local load, and rebucket the
+    /// fiber per its yield intent (or retire it if it finished).
+    fn runFiber(self: *Worker, f: *Fiber) void {
+        self.current_fiber = f;
+        const enter = readTicks();
+
+        f.coro.step();
+
+        const exit = readTicks();
+        self.current_fiber = null;
+        // Skip the reading if the counter went backwards (e.g.,
+        // thread migrated mid-step to a CPU with a slightly behind
+        // TSC). Real-world frequency: rare. Metrics aggregators
+        // wanting tight invariants can do their own outlier
+        // filtering downstream.
+        if (exit >= enter) f.cpu_total_ns +%= cyclesToNs(exit - enter);
+
+        // Pump libxev periodically so timers (coarse clock,
+        // Deadlines) and async wakes (cross-thread remote pushes)
+        // stay responsive even when this worker is continuously
+        // busy. `no_wait` returns immediately if no completions are
+        // ready — overhead is a single io_uring_enter syscall per
+        // ~1 ms of work.
+        if (cyclesToNs(exit -% self.last_pump_ticks) >= std.time.ns_per_ms) {
+            self.loop.run(.no_wait) catch {};
+            self.last_pump_ticks = exit;
+        }
+
+        if (f.isFinished()) {
+            // The fiber wrote its result into JoinState; let the
+            // hook flip `finished=true` and hand back any parked
+            // joiner. We do the actual wake here so `fiber.zig`
+            // doesn't have to import the runtime.
+            if (f.on_finished(f)) |waiter| wake(waiter);
+            const remaining = self.rt.live_count.fetchSub(1, .release) - 1;
+            if (remaining == 0) self.rt.broadcastStop(self.id);
+            return;
+        }
+        switch (f.intent) {
+            .reschedule => self.scheduleLocal(f),
+            .park => {},
+        }
+    }
+
+    /// Set our bit in `rt.idle_mask` so producers can find us and
+    /// redirect work directly. Release so a producer reading our
+    /// bit happens-after any of our prior queue inspections.
+    inline fn publishIdle(self: *Worker) void {
+        _ = self.rt.idle_mask[self.lane_idx][self.lane_word_idx]
+            .fetchOr(self.lane_bit_mask, .release);
+    }
+
+    /// Clear our bit. Acquire so subsequent reads of `remote_queue`
+    /// / `ready` observe a producer's pre-notify writes. Idempotent:
+    /// `popIdlePeer` may have already cleared the bit by picking us.
+    inline fn clearIdle(self: *Worker) void {
+        _ = self.rt.idle_mask[self.lane_idx][self.lane_word_idx]
+            .fetchAnd(~self.lane_bit_mask, .acquire);
     }
 };
 
@@ -311,6 +502,15 @@ pub const LaneConfig = struct {
 /// Inclusive-start, exclusive-end worker range owned by one lane.
 const Range = struct { start: u8, end: u8 };
 
+/// Bits per word in the per-lane idle mask. u64 is the largest
+/// integer with single-instruction atomics on every target we care
+/// about (x86_64, aarch64, RISC-V); going wider would force a libcall
+/// fallback on at least one of them.
+const bits_per_word: u8 = 64;
+/// Worker `id` is u8 (max 256 distinct ids); one full lane therefore
+/// fits in `256 / 64 = 4` u64 words. Asserted at `Runtime.init`.
+const max_idle_mask_words: u8 = 4;
+
 /// Process-wide singleton — egres expects exactly one fiber `Runtime`
 /// at a time. Set by `Runtime.init`, cleared by `Runtime.deinit`.
 /// Module-level helpers (`spawn`, `coarseMs`, `Group`) route through
@@ -337,6 +537,17 @@ pub const Runtime = struct {
     /// for tie-breaking in `.exclusive` placement.
     lane_rr: [fb.Lane.count]std.atomic.Value(u8) = @splat(.init(0)),
 
+    /// Per-lane idle worker bitmap. Bit `i` (across all words) set ⇒
+    /// worker `lane_range.start + i` is parked in `loop.run(.once)`
+    /// waiting for work. Producers in `routeToWorker` ctz this and
+    /// CAS-clear a bit to redirect a stealable fiber straight to an
+    /// idle peer, so work lands where it'll run instead of going to
+    /// the originally-targeted (possibly busy) worker and getting
+    /// stolen later. Four u64 words covers the full 256-worker
+    /// `u8 id` range. Cache-line aligned to avoid false sharing with
+    /// `lane_rr` and other Runtime hot fields.
+    idle_mask: [fb.Lane.count][max_idle_mask_words]std.atomic.Value(u64) align(std.atomic.cache_line) = @splat(@splat(.init(0))),
+
     pub fn init(self: *Runtime, allocator: std.mem.Allocator, opts: InitOptions) !void {
         const n = opts.num_workers orelse 1;
         std.debug.assert(n >= 1);
@@ -362,6 +573,17 @@ pub const Runtime = struct {
         self.lane_ranges[@intFromEnum(fb.Lane.raft)] = .{ .start = 0, .end = raft_w };
         self.lane_ranges[@intFromEnum(fb.Lane.default)] = .{ .start = default_start, .end = default_end };
         self.lane_rr = @splat(.init(0));
+        self.idle_mask = @splat(@splat(.init(0)));
+
+        // Each lane's bitmap is `max_idle_mask_words` u64s, so any
+        // lane width that fits in `u8 id` (== 256) fits in the mask.
+        // The asserts here are belt-and-suspenders: invalid configs
+        // could still be caught by the `n <= maxInt(u8)` bound above,
+        // but spelling it out here documents the invariant.
+        const lane_cap: usize = @as(usize, max_idle_mask_words) * bits_per_word;
+        for (self.lane_ranges) |r| {
+            std.debug.assert(@as(usize, r.end - r.start) <= lane_cap);
+        }
 
         self.workers = try allocator.alloc(Worker, n);
         errdefer allocator.free(self.workers);
@@ -472,18 +694,56 @@ fn workerEntry(w: *Worker) void {
     w.run();
 }
 
-/// Route a fiber to its home worker's ready queue. If we're on the
-/// home thread, push directly; otherwise push to the home's remote
-/// queue and notify its `wake_async` so the home's `loop.run(.once)`
-/// returns and the outer loop drains the remote queue.
-fn routeToHome(rt: *Runtime, f: *Fiber) void {
-    const home = &rt.workers[f.home_worker_id];
-    if (Worker.current == home) {
-        home.scheduleLocal(f);
-    } else {
-        home.remote_queue.push(f);
-        home.wake_async.notify() catch {};
+/// Route a fiber to a worker's ready queue.
+///
+/// `redirect` controls whether to consult the lane's idle mask. Set
+/// only by `spawn` — placing a fresh fiber benefits from picking an
+/// idle peer (work lands where it'll run, skipping a steal hop).
+/// `wake` passes `false`: resuming an existing fiber wants to stay
+/// on whatever worker it was on for cache locality, mirroring how
+/// Go's `goready` and Tokio's notify path both keep the wake local
+/// and let stealing handle imbalance over time.
+///
+/// If `redirect` is set AND the fiber is not locked, claim an idle
+/// peer in the target's lane via `popIdlePeer` (CAS-clear its bit)
+/// and retarget the fiber to it. Otherwise the fiber goes to its
+/// originally-assigned `f.worker_id`. Same-thread targets get a
+/// direct local push; cross-thread targets land on `remote_queue`
+/// + `wake_async.notify()`.
+fn routeToWorker(rt: *Runtime, f: *Fiber, redirect: bool) void {
+    if (redirect and !f.locked) {
+        const lane_idx = rt.workers[f.worker_id].lane_idx;
+        if (popIdlePeer(rt, lane_idx)) |idle_id| f.worker_id = idle_id;
     }
+    const target = &rt.workers[f.worker_id];
+    if (Worker.current == target) {
+        target.scheduleLocal(f);
+    } else {
+        target.remote_queue.push(f);
+        target.wake_async.notify() catch {};
+    }
+}
+
+/// Find one idle worker in the given lane and atomically claim it
+/// (CAS-clear its bit). Returns the worker's global id, or null if
+/// no peer is currently parked. CAS loop because multiple producers
+/// can be racing to redirect into the same lane.
+fn popIdlePeer(rt: *Runtime, lane_idx: u8) ?u8 {
+    const words = &rt.idle_mask[lane_idx];
+    for (words, 0..) |*word, word_i| {
+        var m = word.load(.acquire);
+        while (m != 0) {
+            const bit_i: u6 = @intCast(@ctz(m));
+            const bit: u64 = @as(u64, 1) << bit_i;
+            if (word.cmpxchgWeak(m, m & ~bit, .acq_rel, .acquire)) |actual| {
+                m = actual;
+                continue;
+            }
+            const off: u8 = @intCast(word_i * bits_per_word + bit_i);
+            return rt.lane_ranges[lane_idx].start + off;
+        }
+    }
+    return null;
 }
 
 /// Typed handle returned by `spawn`. Wraps the fiber pointer and a
@@ -526,38 +786,18 @@ pub fn JoinHandle(comptime T: type) type {
     };
 }
 
-/// Pick a home worker for a new fiber based on its lane + sharing.
-///   `.shared`     → round-robin within the lane's range.
-///   `.exclusive`  → worker in the lane with fewest live exclusive
-///                   fibers; tie-broken via the lane's RR counter.
-/// If the requested lane has no workers (e.g., tests with default
-/// `LaneConfig` don't configure raft), fall back to `.default`.
-fn pickWorker(rt: *Runtime, lane: fb.Lane, sharing: fb.Sharing) u8 {
+/// Pick a home worker for a new fiber: round-robin within the lane's
+/// range. If the requested lane has no workers (e.g., tests with the
+/// default `LaneConfig` don't configure raft), fall back to
+/// `.default`, which is always guaranteed to have >= 1 worker.
+fn pickWorker(rt: *Runtime, lane: fb.Lane) u8 {
     var range = rt.lane_ranges[@intFromEnum(lane)];
     if (range.start == range.end) {
         range = rt.lane_ranges[@intFromEnum(fb.Lane.default)];
     }
     const width: u8 = range.end - range.start;
     const rr_start = rt.lane_rr[@intFromEnum(lane)].fetchAdd(1, .monotonic);
-
-    if (sharing == .shared) {
-        return range.start + @as(u8, @intCast(rr_start % width));
-    }
-    // `.exclusive`: scan the range starting at the RR-rotated offset
-    // so initial ties get spread across the range over time. Pick
-    // the first worker with the minimum live_exclusive count.
-    var min_count: u32 = std.math.maxInt(u32);
-    var min_id: u8 = range.start;
-    var i: u8 = 0;
-    while (i < width) : (i += 1) {
-        const w: u8 = range.start + @as(u8, @intCast((rr_start +% i) % width));
-        const c = rt.workers[w].live_exclusive.load(.acquire);
-        if (c < min_count) {
-            min_count = c;
-            min_id = w;
-        }
-    }
-    return min_id;
+    return range.start + @as(u8, @intCast(rr_start % width));
 }
 
 /// Spawn `func(args...)` as a new fiber on the process-wide runtime.
@@ -574,27 +814,22 @@ pub fn spawn(
     const rt = g_rt orelse @panic("fiber.spawn: Runtime not initialized");
     // Pick home worker: explicit `worker_id` wins, else lane-aware
     // placement via `pickWorker`.
-    const home_id: u8 = opts.worker_id orelse pickWorker(rt, opts.lane, opts.sharing);
+    const home_id: u8 = opts.worker_id orelse pickWorker(rt, opts.lane);
     std.debug.assert(home_id < rt.workers.len);
 
     const f = try Fiber.init(rt.allocator, opts, func, args);
     errdefer f.deinit(rt.allocator);
 
-    f.home_worker_id = home_id;
+    f.worker_id = home_id;
+    f.locked = opts.locked;
 
     try rt.appendFiber(f);
-
-    // Bump the chosen worker's `.exclusive` count; paired decrement
-    // runs in the Worker.run finish path. Done after `appendFiber`
-    // succeeds so we don't have to roll it back on errors.
-    if (opts.sharing == .exclusive) {
-        _ = rt.workers[home_id].live_exclusive.fetchAdd(1, .release);
-    }
 
     f.state.store(@bitCast(State{ .tag = .ready, .awaken = false }), .release);
 
     _ = rt.live_count.fetchAdd(1, .release);
-    routeToHome(rt, f);
+    // Spawn — eligible to redirect to an idle peer in the lane.
+    routeToWorker(rt, f, true);
 
     // Same comptime-generated Ctx type Fiber.init used to allocate
     // `f.ctx`. Accessing `&ctx.state` by name lets Zig compute the
@@ -614,7 +849,7 @@ pub fn yield() void {
 /// set) the token is consumed and `park` returns without yielding.
 /// Otherwise the fiber transitions to `.waiting`, records park
 /// metadata, and yields. A later `wake` CAS'es it back to `.ready`
-/// and routes it through `routeToHome` — same-thread direct push
+/// and routes it through `routeToWorker` — same-thread direct push
 /// or cross-thread `remote_queue` + `wake_async.notify`.
 pub fn park() void {
     const w = currentWorker();
@@ -681,7 +916,9 @@ pub fn wake(f: *Fiber) void {
     }
 
     const w = currentWorker();
-    routeToHome(w.rt, f);
+    // Wake — keep the fiber on its current worker for cache locality;
+    // stealing will rebalance over time if needed.
+    routeToWorker(w.rt, f, false);
 }
 
 pub fn currentWorker() *Worker {
@@ -692,11 +929,22 @@ pub fn currentFiber() *Fiber {
     return currentWorker().current_fiber.?;
 }
 
-/// The `Runtime` the calling fiber is running on. Convenience over
-/// `currentWorker().rt` for code that just wants the runtime pointer
-/// (most spawn / Group construction sites).
+/// Null-safe variant for callers outside the fiber dispatch (signal
+/// handlers, test-runner logFn, watchdog) that need to ask "are we
+/// inside a fiber right now?" without panicking. Returns null when
+/// called from a non-worker thread, or from a worker thread that's
+/// between fibers (in `loop.run`, `drainRemote`, etc.).
+pub fn currentFiberOrNull() ?*Fiber {
+    const w = Worker.current orelse return null;
+    return w.current_fiber;
+}
+
+/// Process-wide active `Runtime`. Sources from the `g_rt` singleton
+/// rather than `Worker.current`, so any thread (not just one
+/// currently running a fiber) can call it after `Runtime.init`.
+/// Panics if no runtime is initialized.
 pub fn currentRuntime() *Runtime {
-    return currentWorker().rt;
+    return g_rt orelse @panic("fiber.currentRuntime: Runtime not initialized");
 }
 
 /// Coarse millisecond clock — same value the in-runtime fibers see.
@@ -712,6 +960,20 @@ pub fn dumpFibers(rt: *Runtime, writer: *std.Io.Writer) !void {
     rt.fibers_sl.lock();
     defer rt.fibers_sl.unlock();
     const now_ms = rt.clock.ms();
+
+    // Per-worker queue depths first — the cheap, summary view that
+    // shows imbalance at a glance before the per-fiber dump.
+    try writer.writeAll("workers:\n");
+    for (rt.workers, 0..) |*w, wid| {
+        var ready_total: u32 = 0;
+        for (w.ready) |q| ready_total += q.count;
+        try writer.print(
+            "  w{d:>2} ready={d} (normal={d} high={d})\n",
+            .{ wid, ready_total, w.ready[@intFromEnum(fb.Priority.normal)].count, w.ready[@intFromEnum(fb.Priority.high)].count },
+        );
+    }
+    try writer.writeAll("fibers:\n");
+
     for (rt.fibers.items, 0..) |f, i| {
         const s = f.loadState();
         const letter: u8 = switch (s.tag) {
@@ -724,7 +986,7 @@ pub fn dumpFibers(rt: *Runtime, writer: *std.Io.Writer) !void {
         if (s.tag == .waiting) {
             try writer.print(" parked_for={d}ms", .{now_ms - f.parked_since_ms});
         }
-        try writer.print(" cpu_total={d}ms\n", .{@divTrunc(f.cpu_total_ns, std.time.ns_per_ms)});
+        try writer.print(" cpu_total={d}ms times_stolen={d}\n", .{ @divTrunc(f.cpu_total_ns, std.time.ns_per_ms), f.times_stolen });
     }
 }
 
@@ -751,26 +1013,6 @@ inline fn readTicks() u64 {
             break :blk t;
         },
         else => 0,
-    };
-}
-
-/// Monotonic nanoseconds since some unspecified epoch. Uses
-/// `std.posix.system.clock_gettime` — Zig dispatches at comptime to
-/// the platform's native `clock_gettime` (Linux syscall on Linux,
-/// libc on macOS/BSD). Only called by `calibrateTsc`; the hot-path
-/// CPU accounting uses `rdtsc` instead.
-///
-/// Windows returns 0 — would need `QueryPerformanceCounter` via
-/// `std.os.windows`. Until then, TSC calibration short-circuits
-/// (`tsc_delta == 0` path) on Windows, leaving `cpu_total_ns` at 0.
-fn monoNsUseRarely() i64 {
-    return switch (comptime builtin.os.tag) {
-        .windows => 0,
-        else => blk: {
-            var tp: std.posix.timespec = undefined;
-            _ = std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &tp);
-            break :blk @as(i64, tp.sec) * std.time.ns_per_s + tp.nsec;
-        },
     };
 }
 
@@ -827,11 +1069,11 @@ fn calibrateTsc() void {
 
     var i: usize = 0;
     while (i < N) {
-        const ns_start = monoNsUseRarely();
+        const ns_start = coarse.clockNsUseRarely(.monotonic);
         const tsc_start = readTicks();
         _ = std.posix.system.nanosleep(&req, null);
         const tsc_end = readTicks();
-        const ns_end = monoNsUseRarely();
+        const ns_end = coarse.clockNsUseRarely(.monotonic);
 
         const ns_delta: u64 = @intCast(ns_end - ns_start);
         const tsc_delta = tsc_end - tsc_start;

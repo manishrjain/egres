@@ -136,7 +136,7 @@ test "Watermark: cross-worker — many waiters across multiple advances" {
     for (0..N_WAITERS) |i| {
         const wid: u8 = @intCast(i % num_workers);
         try g.spawn(
-            .{ .worker_id = wid },
+            .{ .worker_id = wid, .locked = true },
             Waiter.run,
             .{ &wm, @as(u64, @intCast(i + 1)), &completed },
         );

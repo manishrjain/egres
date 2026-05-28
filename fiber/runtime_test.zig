@@ -154,15 +154,21 @@ test "Runtime: high priority runs before normal in queue scan" {
         }
     };
 
-    // Pin both to the same worker so we exercise the per-queue
-    // priority scan rather than cross-worker scheduling.
+    // Pin both spawns to the worker our driver is on. Same-thread
+    // routeToWorker takes the scheduleLocal path and both fibers
+    // land directly in ready[priority] — no cross-thread
+    // remote_queue + wake_async.notify race that could let worker 0
+    // wake on the first notify, run the normal fiber, and only then
+    // see the high one. The per-worker priority scan is the property
+    // under test, and it only holds with both fibers visible together.
+    const wid = fiber.currentWorker().id;
     var n_ctx = Body{ .flag = &first, .letter = 'n' };
     var h_ctx = Body{ .flag = &first, .letter = 'h' };
 
     var g: fiber.Group(void) = .init(std.testing.allocator);
     defer g.deinit();
-    try g.spawn(.{ .worker_id = 0, .priority = .normal }, Body.run, .{&n_ctx});
-    try g.spawn(.{ .worker_id = 0, .priority = .high }, Body.run, .{&h_ctx});
+    try g.spawn(.{ .worker_id = wid, .priority = .normal, .locked = true }, Body.run, .{&n_ctx});
+    try g.spawn(.{ .worker_id = wid, .priority = .high, .locked = true }, Body.run, .{&h_ctx});
     g.wait();
 
     try std.testing.expectEqual(@as(?u8, 'h'), first);
@@ -192,7 +198,11 @@ test "Runtime: cross-worker spawn routes via remote queue" {
 
     for (0..N) |i| {
         const target: u8 = @intCast(i % n_workers);
-        try g.spawn(.{ .worker_id = target }, Body.run, .{&per_worker});
+        // Lock to the requested worker: the test asserts exactly
+        // `N_PER_WORKER` fibers landed on each of the first 4 workers,
+        // which only holds if wake-on-push isn't redirecting the
+        // unlocked default elsewhere.
+        try g.spawn(.{ .worker_id = target, .locked = true }, Body.run, .{&per_worker});
     }
     g.wait();
 
