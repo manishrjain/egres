@@ -1,6 +1,12 @@
 const std = @import("std");
 const fiber = @import("fiber");
 
+/// Fresh monotonic ms — same source `Deadlines.register` / `onTimer`
+/// use. Direct vDSO read; no cache lag under load.
+fn nowMs() i64 {
+    return @divTrunc(fiber.clockNsUseRarely(.monotonic), std.time.ns_per_ms);
+}
+
 test "Deadlines: timer fires after the registered duration" {
     const Ctx = struct {
         fired: bool = false,
@@ -13,7 +19,7 @@ test "Deadlines: timer fires after the registered duration" {
         fn onFire(opaque_ctx: *anyopaque) void {
             const c: *Ctx = @ptrCast(@alignCast(opaque_ctx));
             c.fired = true;
-            c.fire_at_ms = fiber.coarseMs();
+            c.fire_at_ms = nowMs();
             if (c.waiter) |f| fiber.wake(f);
         }
     };
@@ -22,7 +28,7 @@ test "Deadlines: timer fires after the registered duration" {
     ctx.waiter = me;
 
     const w = fiber.currentWorker();
-    const before = fiber.coarseMs();
+    const before = nowMs();
 
     // Timeout lives on this fiber's stack; valid until the test
     // returns. We park before that and only resume after the callback
@@ -33,10 +39,11 @@ test "Deadlines: timer fires after the registered duration" {
         .callback = &Cb.onFire,
         .callback_ctx = &ctx,
     };
-    try w.deadlines.register(w.rt.allocator,&t, before, 20);
+    try w.deadlines.register(w.rt.allocator, &t, 20);
     fiber.park();
 
     const elapsed = ctx.fire_at_ms - before;
+    std.log.debug("elapsed = {d} ms, fired = {} (registered for 20 ms)", .{ elapsed, ctx.fired });
     try std.testing.expect(ctx.fired);
     try std.testing.expect(elapsed >= 18);
     try std.testing.expect(elapsed < 200);
@@ -66,7 +73,6 @@ test "Deadlines: cancel(t) before fire prevents the callback" {
     ctx.waiter = me;
 
     const w = fiber.currentWorker();
-    const now = fiber.coarseMs();
 
     var t_canceled: fiber.Timeout = .{
         .deadline_ms = undefined,
@@ -84,9 +90,9 @@ test "Deadlines: cancel(t) before fire prevents the callback" {
     // Register the to-be-canceled one first (earlier — would be the
     // heap head + the in-flight timer's target if not removed). Cancel
     // it, then register a later deadline we actually want to wait on.
-    try w.deadlines.register(w.rt.allocator,&t_canceled, now, 5);
+    try w.deadlines.register(w.rt.allocator, &t_canceled, 5);
     w.deadlines.cancel(&t_canceled);
-    try w.deadlines.register(w.rt.allocator,&t_wake, now, 30);
+    try w.deadlines.register(w.rt.allocator, &t_wake, 30);
 
     fiber.park();
 
@@ -112,13 +118,13 @@ test "Deadlines: re-arm to earlier deadline registered after a later one" {
     const Cb = struct {
         fn onShort(opaque_ctx: *anyopaque) void {
             const c: *Ctx = @ptrCast(@alignCast(opaque_ctx));
-            c.short_fire_at = fiber.coarseMs();
+            c.short_fire_at = nowMs();
             c.fired_count += 1;
             if (c.fired_count == 2) if (c.waiter) |f| fiber.wake(f);
         }
         fn onLong(opaque_ctx: *anyopaque) void {
             const c: *Ctx = @ptrCast(@alignCast(opaque_ctx));
-            c.long_fire_at = fiber.coarseMs();
+            c.long_fire_at = nowMs();
             c.fired_count += 1;
             if (c.fired_count == 2) if (c.waiter) |f| fiber.wake(f);
         }
@@ -128,7 +134,7 @@ test "Deadlines: re-arm to earlier deadline registered after a later one" {
     ctx.waiter = me;
 
     const w = fiber.currentWorker();
-    const now = fiber.coarseMs();
+    const now = nowMs();
 
     var t_long: fiber.Timeout = .{
         .deadline_ms = undefined,
@@ -144,14 +150,17 @@ test "Deadlines: re-arm to earlier deadline registered after a later one" {
     };
 
     // 40 ms first — arms timer for 40 ms.
-    try w.deadlines.register(w.rt.allocator,&t_long, now, 40);
+    try w.deadlines.register(w.rt.allocator, &t_long, 40);
     // 10 ms second — must reset timer to 10 ms.
-    try w.deadlines.register(w.rt.allocator,&t_short, now, 10);
+    try w.deadlines.register(w.rt.allocator, &t_short, 10);
 
+    // Only the second callback (fired_count == 2) calls wake, so
+    // park resumes after both have run.
     fiber.park();
 
     const short_elapsed = ctx.short_fire_at - now;
     const long_elapsed = ctx.long_fire_at - now;
+    std.log.debug("short_elapsed = {d} ms (expected 8 <= ... < 25), long_elapsed = {d} ms (expected 35 <= ... < 250), fired_count = {d}", .{ short_elapsed, long_elapsed, ctx.fired_count });
     // Short fires near 10 ms — if the reset didn't happen, this would
     // be near 40 ms instead.  Tight gap (15 ms) is what catches the
     // "reset didn't happen" bug; loose ceiling tolerates scheduler

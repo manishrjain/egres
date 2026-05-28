@@ -2,12 +2,15 @@ const std = @import("std");
 const fiber = @import("fiber");
 
 test "io.sleep: 100 fibers sleeping 10ms in parallel finish under 50ms" {
-    var counter: u32 = 0;
+    // Atomic: the unlocked default + wake-on-push redirect spreads
+    // these fibers across many workers; 100 simultaneous wakes from
+    // the timer barrage race the counter increment otherwise.
+    var counter: std.atomic.Value(u32) = .init(0);
 
     const Body = struct {
-        fn run(c: *u32) void {
+        fn run(c: *std.atomic.Value(u32)) void {
             fiber.sleep(10);
-            c.* += 1;
+            _ = c.fetchAdd(1, .acq_rel);
         }
     };
 
@@ -20,12 +23,15 @@ test "io.sleep: 100 fibers sleeping 10ms in parallel finish under 50ms" {
     g.wait();
     const elapsed = fiber.coarseMs() - start;
 
-    try std.testing.expectEqual(@as(u32, 100), counter);
+    try std.testing.expectEqual(@as(u32, 100), counter.load(.acquire));
     // Concurrency check: 100 × sleep(10) serially would be ~1000 ms;
     // parallel should be one timer-tick.  Upper bound is loose since
     // Phase B runs ~50 fiber tests concurrently on the same workers,
     // so individual sleep+wake latency competes with the rest of the
     // suite.  The 200 ms ceiling still rules out serial execution.
+    if (elapsed < 9 or elapsed >= 200) {
+        std.log.err("elapsed = {d} ms (expected 9 <= elapsed < 200)", .{elapsed});
+    }
     try std.testing.expect(elapsed >= 9);
     try std.testing.expect(elapsed < 200);
 }
@@ -42,6 +48,9 @@ test "io.sleep: single fiber sleeps for the requested duration" {
     h.join();
     const elapsed = fiber.coarseMs() - start;
 
+    if (elapsed < 19 or elapsed >= 200) {
+        std.log.err("elapsed = {d} ms (expected 19 <= elapsed < 200)", .{elapsed});
+    }
     try std.testing.expect(elapsed >= 19);
     try std.testing.expect(elapsed < 200);
 }

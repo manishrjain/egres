@@ -1,13 +1,13 @@
-//! Process-wide coarse monotonic clock. One `xev.Timer` armed on the
+//! Process-wide coarse wall clock. One `xev.Timer` armed on the
 //! lead worker's loop; fires every 1 ms; the callback reads
-//! `loop.now()` and publishes the result through an atomic
-//! `cached_ms` that any fiber on any worker reads via `ms()`.
+//! `std.time.milliTimestamp()` and publishes the result through an
+//! atomic `cached_ms` that any fiber on any worker reads via `ms()`.
 //!
-//! libxev's `Loop.now()` and `cached_now` aren't thread-safe: the
-//! `cached_now = ts` assignment is two non-atomic 64-bit stores and
-//! `flags.now_outdated` is a plain bool. Single-thread is fine;
-//! cross-thread reads can witness torn values. The atomic side-steps
-//! that for the consumer-facing API.
+//! Source is wall-clock (CLOCK_REALTIME) so the cached value is a
+//! meaningful "ms since Unix epoch" for diagnostics + logs.  The
+//! `onTick` callback applies a `@max` floor against the previously
+//! cached value so the published clock can only ever move forward
+//! — NTP step-back corrections don't make the cache walk backwards.
 //!
 //! Per-worker deadline heaps for I/O timeouts live in `Deadlines`
 //! (`fiber/deadlines.zig`), not here — cancellation has to run on the
@@ -25,7 +25,41 @@
 //! read `ms()`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const xev = @import("xev");
+
+pub const ClockKind = enum {
+    /// CLOCK_MONOTONIC — never goes backwards; correct source for
+    /// measuring elapsed time (TSC calibration, deadlines).
+    monotonic,
+    /// CLOCK_REALTIME — wall clock; may step backwards on NTP
+    /// adjustments. The right source for "what time is it now?"
+    /// timestamps published to logs and metrics.
+    realtime,
+};
+
+/// Read the requested clock as nanoseconds. Returns 0 on Windows
+/// (would need `QueryPerformanceCounter` for monotonic and
+/// `GetSystemTimeAsFileTime` for realtime — not implemented).
+///
+/// "Use rarely" — the call is a syscall (vDSO-accelerated on Linux,
+/// ~10 ns), so it's fine in init/calibration paths or once-per-tick
+/// reads, but the hot-path CPU accounting in `Worker.run` should
+/// stick to `rdtsc` + `cyclesToNs` instead.
+pub fn clockNsUseRarely(comptime kind: ClockKind) i64 {
+    return switch (comptime builtin.os.tag) {
+        .windows => 0,
+        else => blk: {
+            const clk = switch (kind) {
+                .monotonic => std.posix.CLOCK.MONOTONIC,
+                .realtime => std.posix.CLOCK.REALTIME,
+            };
+            var tp: std.posix.timespec = undefined;
+            _ = std.posix.system.clock_gettime(clk, &tp);
+            break :blk @as(i64, tp.sec) * std.time.ns_per_s + tp.nsec;
+        },
+    };
+}
 
 pub const CoarseClock = struct {
     /// Loop that this clock arms its timer on. Set by `bind` before
@@ -58,15 +92,24 @@ pub const CoarseClock = struct {
     /// Must happen once during runtime init.
     pub fn bind(self: *CoarseClock, loop: *xev.Loop) void {
         self.loop = loop;
-        // Safe — bind runs on the same thread that owns the loop,
-        // before any cross-thread reads exist.
-        self.cached_ms.store(loop.now(), .release);
+        self.cached_ms.store(@divTrunc(clockNsUseRarely(.realtime), std.time.ns_per_ms), .release);
     }
 
     /// Arm the first tick. Caller must have called `bind` first.
     /// Idempotent.
+    ///
+    /// Re-seeds `cached_ms` from the wall clock here, not just at
+    /// `bind` time. The runtime can be `init`ed (which calls `bind`)
+    /// well before workers actually `run` — e.g., the test runner
+    /// initializes the fiber runtime up front for watchdog
+    /// visibility but only starts workers in Phase B. Without this
+    /// re-seed, the first reader after start sees a `cached_ms`
+    /// frozen at init time, and the first tick then jumps it forward
+    /// by however long Phase A took (seconds), producing absurd
+    /// elapsed deltas for the unlucky reader.
     pub fn start(self: *CoarseClock) void {
         if (self.running) return;
+        self.cached_ms.store(@divTrunc(clockNsUseRarely(.realtime), std.time.ns_per_ms), .release);
         self.running = true;
         self.arm();
     }
@@ -96,12 +139,17 @@ pub const CoarseClock = struct {
     }
 
     fn onTick(self: *CoarseClock) void {
-        // `loop.now()` runs on the lead worker's thread (same one
-        // driving the loop), so the un-synchronized libxev cache is
-        // fine *here*. We immediately publish through our atomic so
-        // cross-thread readers see a consistent value.
-        const now = self.loop.?.now();
-        self.cached_ms.store(now, .release);
+        // Wall-clock source (CLOCK_REALTIME) so the timestamp is
+        // meaningful as an absolute "ms since Unix epoch" value to
+        // diagnostics + logs. Single-writer (lead worker's tick),
+        // so the load+max+store sequence is race-free.
+        //
+        // The @max defense protects against backwards NTP jumps:
+        // if the wall clock steps back, the cache holds at the
+        // previous higher value until real time catches up.
+        const now = @divTrunc(clockNsUseRarely(.realtime), std.time.ns_per_ms);
+        const prev = self.cached_ms.load(.acquire);
+        self.cached_ms.store(@max(prev, now), .release);
     }
 };
 

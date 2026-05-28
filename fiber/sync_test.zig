@@ -105,7 +105,7 @@ test "Mutex: hand-off preserves FIFO order under contention" {
             .acquired_idx = &acquired_idx,
             .id = @intCast(i + 1),
         };
-        try g.spawn(.{ .worker_id = 0 }, Body.run, .{c});
+        try g.spawn(.{ .worker_id = 0, .locked = true }, Body.run, .{c});
     }
 
     // Releaser unblocks the pre-acquired lock once it gets a turn.
@@ -114,7 +114,7 @@ test "Mutex: hand-off preserves FIFO order under contention" {
             m.unlock();
         }
     };
-    try g.spawn(.{ .worker_id = 0 }, Releaser.run, .{&mu});
+    try g.spawn(.{ .worker_id = 0, .locked = true }, Releaser.run, .{&mu});
 
     g.wait();
 
@@ -148,7 +148,7 @@ test "Mutex: cross-worker contention preserves the increment count" {
     try g.ensureTotalCapacity(N_TOTAL);
     for (0..N_TOTAL) |i| {
         const wid: u8 = @intCast(i % n_workers);
-        try g.spawn(.{ .worker_id = wid }, Body.run, .{ &mu, &counter });
+        try g.spawn(.{ .worker_id = wid, .locked = true }, Body.run, .{ &mu, &counter });
     }
     g.wait();
 
@@ -182,7 +182,7 @@ test "RWMutex: multiple readers can hold simultaneously" {
     // worker could fully process reader N before reader N+1 even
     // arrives — `max_concurrent` would never get past 1.
     const wid = fiber.currentWorker().id;
-    for (0..5) |_| try g.spawn(.{ .worker_id = wid }, Reader.run, .{ &rw, &active, &max_concurrent });
+    for (0..5) |_| try g.spawn(.{ .worker_id = wid, .locked = true }, Reader.run, .{ &rw, &active, &max_concurrent });
     g.wait();
 
     try std.testing.expectEqual(@as(u32, 5), max_concurrent);
@@ -207,7 +207,7 @@ test "RWMutex: writer excludes other writers and readers" {
     var g: fiber.Group(void) = .init(std.testing.allocator);
     defer g.deinit();
     try g.ensureTotalCapacity(5);
-    for (0..5) |_| try g.spawn(.{ .worker_id = 0 }, Writer.run, .{ &rw, &observed_inside, &concurrent_in_writer });
+    for (0..5) |_| try g.spawn(.{ .worker_id = 0, .locked = true }, Writer.run, .{ &rw, &observed_inside, &concurrent_in_writer });
     g.wait();
 
     try std.testing.expectEqual(@as(u32, 1), concurrent_in_writer);
@@ -253,12 +253,12 @@ test "RWMutex: writer-preferred — pending writer blocks new readers" {
     // parked on `rw` when the readers attempt their lockShared. We
     // poll the spawned fibers' state.tag instead of trusting spawn
     // order to translate into run order.
-    const wh = try fiber.spawn(.{ .worker_id = 0 }, WriterRun.run, .{&w_ctx});
+    const wh = try fiber.spawn(.{ .worker_id = 0, .locked = true }, WriterRun.run, .{&w_ctx});
     while (wh.fiber.loadState().tag != .waiting) fiber.yield();
     // Writer is queued. Spawn the readers — writer-pref must make
     // them park instead of acquiring the shared lock.
-    const r1h = try fiber.spawn(.{ .worker_id = 0 }, ReaderRun.run, .{&r1_ctx});
-    const r2h = try fiber.spawn(.{ .worker_id = 0 }, ReaderRun.run, .{&r2_ctx});
+    const r1h = try fiber.spawn(.{ .worker_id = 0, .locked = true }, ReaderRun.run, .{&r1_ctx});
+    const r2h = try fiber.spawn(.{ .worker_id = 0, .locked = true }, ReaderRun.run, .{&r2_ctx});
     while (r1h.fiber.loadState().tag != .waiting) fiber.yield();
     while (r2h.fiber.loadState().tag != .waiting) fiber.yield();
     // All three parked. Release the pre-acquired shared lock —
@@ -318,11 +318,11 @@ test "RWMutex: cross-worker torture — reader observations are monotonic" {
 
     for (0..N_READERS) |i| {
         const wid: u8 = @intCast(i % n_workers);
-        try g.spawn(.{ .worker_id = wid }, Reader.run, .{ &rw, &counter, &violation });
+        try g.spawn(.{ .worker_id = wid, .locked = true }, Reader.run, .{ &rw, &counter, &violation });
     }
     for (0..N_WRITERS) |i| {
         const wid: u8 = @intCast(i % n_workers);
-        try g.spawn(.{ .worker_id = wid }, Writer.run, .{ &rw, &counter });
+        try g.spawn(.{ .worker_id = wid, .locked = true }, Writer.run, .{ &rw, &counter });
     }
     g.wait();
 

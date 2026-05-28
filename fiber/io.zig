@@ -31,6 +31,9 @@ pub fn sleep(ms: u64) void {
     const timer = xev.Timer.init() catch |err| {
         std.debug.panic("xev.Timer.init failed: {}", .{err});
     };
+    // `Worker.run` refreshes `loop.cached_now` once per outer-loop
+    // iteration so any libxev op a fiber issues (this `timer.run`,
+    // TCP read/write, …) sees a current monotonic baseline.
     timer.run(&w.loop, &completion, ms, TimerWaiter, &waiter, timerCallback);
 
     rt.park();

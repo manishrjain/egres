@@ -2,14 +2,22 @@ const std = @import("std");
 const fiber = @import("fiber");
 
 test "CoarseClock: ms() advances during a parked fiber's sleep" {
-    const before = fiber.coarseMs();
+    // Measure elapsed via direct vDSO CLOCK_MONOTONIC, not
+    // `fiber.coarseMs()`. The coarse clock cache is what we'd be
+    // observing in production code, but using it as the test's
+    // source of truth conflates two things: (1) whether `sleep`
+    // actually slept, and (2) whether worker 0's 1 ms tick stayed
+    // current. Under heavy parallel load the tick can lag, making
+    // `coarseMs` deltas under-report by 10+ ms even when the sleep
+    // ran fine. We sidestep that here by reading a fresh clock.
+    const before_ns = fiber.clockNsUseRarely(.monotonic);
     fiber.sleep(30);
-    const after = fiber.coarseMs();
-    const observed_delta = after - before;
+    const after_ns = fiber.clockNsUseRarely(.monotonic);
+    const observed_delta = @divTrunc(after_ns - before_ns, std.time.ns_per_ms);
 
-    // The ticker fires once a millisecond regardless of whether the
-    // fiber is running, so the coarse clock should reflect ~30 ms of
-    // wall passing during the sleep. Generous bounds for CI noise.
+    if (observed_delta < 25 or observed_delta >= 250) {
+        std.log.err("observed_delta = {d} ms (expected 25 <= delta < 250)", .{observed_delta});
+    }
     try std.testing.expect(observed_delta >= 25);
     try std.testing.expect(observed_delta < 250);
 }
