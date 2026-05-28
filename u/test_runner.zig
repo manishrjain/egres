@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zio = @import("zio");
 const rt = @import("runtime");
+const fiber = @import("fiber");
 const context = utils.context;
 
 // 0.16 helpers: std.Thread.Mutex / ResetEvent / time.nanoTimestamp are gone.
@@ -1108,6 +1109,9 @@ fn driver(
 
     for (builtin.test_functions) |t| {
         if (std.mem.startsWith(u8, t.name, ".test_root.")) continue;
+        // fiber.* tests belong to Phase B (fiberDriver on fiber.Runtime).
+        // Skip here so we don't run them under zio.
+        if (std.mem.startsWith(u8, t.name, "fiber.")) continue;
         const user_name = if (std.mem.indexOf(u8, t.name, ".test.")) |p|
             t.name[p + ".test.".len ..]
         else
@@ -1254,6 +1258,135 @@ fn driver(
     for (bench_handles.items) |*h| h.join();
 }
 
+// ── Phase B: fiber.* tests on a fiber.Runtime ────────────────────────
+//
+// `fiber.*` tests run as fibers on a dedicated fiber.Runtime — disjoint
+// from zio.  No cross-runtime sync: Phase B runs serially after Phase A
+// drains, so the output writer / counters have a single owner at a
+// time.  fiber tests use `fiber.currentRuntime()` to access the shared
+// runtime + `Group.wait()` / `JoinHandle.join()` for sub-fiber sync.
+
+const FiberCtx = struct {
+    // Counters target for the current round. Parallel round writes to
+    // `counters`; serial retry round swaps in `retry_counters`.
+    counters: *Counters,
+    retry_counters: *Counters,
+    // Filled by the parallel round. The serial round drains it.
+    failures: *std.ArrayList(std.builtin.TestFn),
+    failures_mu: fiber.Mutex = .{},
+    // true while the serial retry round is active.
+    is_retry: bool = false,
+    print_mu: fiber.Mutex = .{},
+    seq: std.atomic.Value(u32) = .{ .raw = 0 },
+    total: u32 = 0,
+    out: *std.Io.Writer,
+    tty: Tty,
+    args: Args,
+};
+
+fn fiberDriver(fctx: *FiberCtx) void {
+    var kept: std.ArrayList(std.builtin.TestFn) = .empty;
+    defer kept.deinit(std.heap.page_allocator);
+
+    for (builtin.test_functions) |t| {
+        if (!std.mem.startsWith(u8, t.name, "fiber.")) continue;
+        if (std.mem.startsWith(u8, t.name, ".test_root.")) continue;
+        const user_name = if (std.mem.indexOf(u8, t.name, ".test.")) |p|
+            t.name[p + ".test.".len ..]
+        else
+            t.name;
+        const is_big = std.mem.startsWith(u8, user_name, "BIG: ");
+        const is_bench = std.mem.startsWith(u8, user_name, "BENCH: ");
+        const is_hang = std.mem.startsWith(u8, user_name, "HANG: ");
+        if (fctx.args.filter) |f| if (std.mem.indexOf(u8, t.name, f) == null) continue;
+        if (fctx.args.exclude) |x| if (std.mem.indexOf(u8, t.name, x) != null) continue;
+        if (is_bench) continue; // No fiber benchmarks today; add when needed.
+        if (fctx.args.only_bench) continue;
+        if (is_big and !fctx.args.run_big) continue;
+        if (is_hang and !fctx.args.run_hang) continue;
+        kept.append(std.heap.page_allocator, t) catch unreachable;
+    }
+
+    fctx.total = @intCast(kept.items.len);
+    if (kept.items.len == 0) return;
+
+    // ── Parallel round ────────────────────────────────────────────
+    {
+        var g: fiber.Group(void) = .init(std.heap.page_allocator);
+        defer g.deinit();
+        g.ensureTotalCapacity(kept.items.len) catch unreachable;
+        for (kept.items) |t| g.spawn(.{}, runFiberOne, .{ t, fctx }) catch unreachable;
+        g.wait();
+    }
+
+    // ── Serial retry round ────────────────────────────────────────
+    // Mirrors zioDriver's retry path: re-run any parallel-round
+    // failures one at a time, writing into retry_counters so flaky
+    // tests (failed parallel, passed serial) don't count as failures
+    // in the final summary.
+    if (fctx.failures.items.len == 0) return;
+
+    fctx.print_mu.lock();
+    fctx.out.writeAll("\n") catch {};
+    writeColored(fctx.out, fctx.tty, .bright_yellow, "Retrying {d} failed fiber test(s) serially...\n", .{fctx.failures.items.len});
+    fctx.out.flush() catch {};
+    fctx.print_mu.unlock();
+
+    fctx.is_retry = true;
+    fctx.total = @intCast(fctx.failures.items.len);
+    fctx.seq.store(0, .seq_cst);
+
+    for (fctx.failures.items) |t| {
+        const h = fiber.spawn(.{}, runFiberOne, .{ t, fctx }) catch unreachable;
+        h.join();
+    }
+}
+
+fn runFiberOne(t: std.builtin.TestFn, fctx: *FiberCtx) void {
+    const t0 = nowNs();
+    const result: ?anyerror = if (t.func()) |_| null else |e| e;
+    const elapsed_ms = @divTrunc(nowNs() - t0, std.time.ns_per_ms);
+
+    const target_counters = if (fctx.is_retry) fctx.retry_counters else fctx.counters;
+    const seq = fctx.seq.fetchAdd(1, .seq_cst) + 1;
+
+    fctx.print_mu.lock();
+    defer fctx.print_mu.unlock();
+
+    var prefix_buf: [32]u8 = undefined;
+    const prefix_str = std.fmt.bufPrint(&prefix_buf, "[{d}/{d}]", .{ seq, fctx.total }) catch unreachable;
+    writeColored(fctx.out, fctx.tty, .dim, "{s}", .{prefix_str});
+    const prefix_pad = if (prefix_width > prefix_str.len) prefix_width - prefix_str.len else 1;
+    for (0..prefix_pad) |_| fctx.out.writeByte(' ') catch {};
+
+    writeDisplayName(fctx.out, fctx.tty, t.name);
+    fctx.out.print(" ... ", .{}) catch {};
+
+    if (result) |err| switch (err) {
+        error.SkipZigTest => {
+            _ = target_counters.skipped.fetchAdd(1, .seq_cst);
+            writeColored(fctx.out, fctx.tty, .bright_yellow, "SKIP\n", .{});
+        },
+        else => {
+            _ = target_counters.failed.fetchAdd(1, .seq_cst);
+            writeColored(fctx.out, fctx.tty, .bright_red, "FAIL: {s}", .{@errorName(err)});
+            writeColored(fctx.out, fctx.tty, .dim, " ({d}ms)\n", .{elapsed_ms});
+            // Parallel-round failures get queued for the serial
+            // retry; failures during retry are final.
+            if (!fctx.is_retry) {
+                fctx.failures_mu.lock();
+                defer fctx.failures_mu.unlock();
+                fctx.failures.append(std.heap.page_allocator, t) catch {};
+            }
+        },
+    } else {
+        _ = target_counters.passed.fetchAdd(1, .seq_cst);
+        writeColored(fctx.out, fctx.tty, .bright_green, "OK", .{});
+        writeColored(fctx.out, fctx.tty, .dim, " ({d}ms)\n", .{elapsed_ms});
+    }
+    fctx.out.flush() catch {};
+}
+
 pub fn main(init: std.process.Init) !void {
     context.initGlobal(init);
     var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
@@ -1314,6 +1447,31 @@ pub fn main(init: std.process.Init) !void {
     // Drain the coarse.Clock tick fiber, if any test started it.
     // Without this, `rt.deinit()` asserts task_count == 0 fails.
     utils.coarse.Clock.stop();
+
+    // ── Phase B ─────────────────────────────────────────────────────
+    // fiber.* tests run on a dedicated fiber.Runtime.  Disjoint from
+    // zio: the fiber phase runs after the zio phase has drained so the
+    // output writer / counters have a single owner.
+    {
+        var fiber_rt: fiber.Runtime = undefined;
+        try fiber_rt.init(std.heap.page_allocator, .{ .num_workers = args.parallel });
+        defer fiber_rt.deinit();
+
+        var fiber_failures: std.ArrayList(std.builtin.TestFn) = .empty;
+        defer fiber_failures.deinit(std.heap.page_allocator);
+
+        var fctx: FiberCtx = .{
+            .counters = &counters,
+            .retry_counters = &retry_counters,
+            .failures = &fiber_failures,
+            .out = out,
+            .tty = tty,
+            .args = args,
+        };
+
+        _ = try fiber.spawn(.{}, fiberDriver, .{&fctx});
+        fiber_rt.run();
+    }
 
     const total_ms = @divTrunc(nowNs() - t0_all, std.time.ns_per_ms);
     const main_passed = counters.passed.load(.seq_cst);

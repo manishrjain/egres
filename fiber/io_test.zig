@@ -2,10 +2,6 @@ const std = @import("std");
 const fiber = @import("fiber");
 
 test "io.sleep: 100 fibers sleeping 10ms in parallel finish under 50ms" {
-    var rt: fiber.Runtime = undefined;
-    try rt.init(std.testing.allocator, .{});
-    defer rt.deinit();
-
     var counter: u32 = 0;
 
     const Body = struct {
@@ -15,49 +11,43 @@ test "io.sleep: 100 fibers sleeping 10ms in parallel finish under 50ms" {
         }
     };
 
-    for (0..100) |_| {
-        _ = try fiber.spawn(&rt, .{}, Body.run, .{&counter});
-    }
+    var g: fiber.Group(void) = .init(std.testing.allocator);
+    defer g.deinit();
+    try g.ensureTotalCapacity(100);
 
-    const start = rt.ms();
-    rt.run();
-    const elapsed = rt.ms() - start;
+    const start = fiber.coarseMs();
+    for (0..100) |_| try g.spawn(.{}, Body.run, .{&counter});
+    g.wait();
+    const elapsed = fiber.coarseMs() - start;
 
     try std.testing.expectEqual(@as(u32, 100), counter);
     // Concurrency check: 100 × sleep(10) serially would be ~1000 ms;
-    // parallel should be one timer-tick. The upper bound is what we
-    // actually care about — proves the loop multiplexes the timers.
+    // parallel should be one timer-tick.  Upper bound is loose since
+    // Phase B runs ~50 fiber tests concurrently on the same workers,
+    // so individual sleep+wake latency competes with the rest of the
+    // suite.  The 200 ms ceiling still rules out serial execution.
     try std.testing.expect(elapsed >= 9);
-    try std.testing.expect(elapsed < 50);
+    try std.testing.expect(elapsed < 200);
 }
 
 test "io.sleep: single fiber sleeps for the requested duration" {
-    var rt: fiber.Runtime = undefined;
-    try rt.init(std.testing.allocator, .{});
-    defer rt.deinit();
-
     const Body = struct {
         fn run() void {
             fiber.sleep(20);
         }
     };
 
-    _ = try fiber.spawn(&rt, .{}, Body.run, .{});
-
-    const start = rt.ms();
-    rt.run();
-    const elapsed = rt.ms() - start;
+    const start = fiber.coarseMs();
+    const h = try fiber.spawn(.{}, Body.run, .{});
+    h.join();
+    const elapsed = fiber.coarseMs() - start;
 
     try std.testing.expect(elapsed >= 19);
-    try std.testing.expect(elapsed < 50);
+    try std.testing.expect(elapsed < 200);
 }
 
 test "io.tcp: echo server with multiple clients" {
     const N = 8;
-
-    var rt: fiber.Runtime = undefined;
-    try rt.init(std.testing.allocator, .{});
-    defer rt.deinit();
 
     const loopback: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(0) };
     var listener = try fiber.listen(loopback, 64);
@@ -70,34 +60,12 @@ test "io.tcp: echo server with multiple clients" {
     var oks: [N]u32 = .{0} ** N;
     var client_ctxs: [N]ClientCtx = undefined;
 
-    const AcceptorCtx = struct {
-        listener: *fiber.Listener,
-        rt: *fiber.Runtime,
-        target: usize,
-        echo_ctxs: []EchoCtx,
-    };
-    var acceptor_ctx: AcceptorCtx = .{
-        .listener = &listener,
-        .rt = &rt,
-        .target = N,
-        .echo_ctxs = &echo_ctxs,
-    };
-
     const Echo = struct {
         fn run(c: *EchoCtx) void {
             var buf: [16]u8 = undefined;
             const n = c.stream.read(&buf) catch return;
             c.stream.writeAll(buf[0..n]) catch return;
             c.stream.close();
-        }
-    };
-
-    const Acceptor = struct {
-        fn run(c: *AcceptorCtx) void {
-            for (0..c.target) |i| {
-                c.echo_ctxs[i].stream = c.listener.accept() catch unreachable;
-                _ = fiber.spawn(c.rt, .{}, Echo.run, .{&c.echo_ctxs[i]}) catch unreachable;
-            }
         }
     };
 
@@ -118,7 +86,38 @@ test "io.tcp: echo server with multiple clients" {
         }
     };
 
-    _ = try fiber.spawn(&rt, .{}, Acceptor.run, .{&acceptor_ctx});
+    // Acceptor runs as a sibling fiber. It owns the listener loop for
+    // exactly N accepts, then returns; we join it via the group.
+    const AcceptorCtx = struct {
+        listener: *fiber.Listener,
+        target: usize,
+        echo_ctxs: []EchoCtx,
+        echo_group: *fiber.Group(void),
+    };
+    var echo_group: fiber.Group(void) = .init(std.testing.allocator);
+    defer echo_group.deinit();
+    try echo_group.ensureTotalCapacity(N);
+
+    const Acceptor = struct {
+        fn run(c: *AcceptorCtx) void {
+            for (0..c.target) |i| {
+                c.echo_ctxs[i].stream = c.listener.accept() catch unreachable;
+                c.echo_group.spawn(.{}, Echo.run, .{&c.echo_ctxs[i]}) catch unreachable;
+            }
+        }
+    };
+    var acceptor_ctx: AcceptorCtx = .{
+        .listener = &listener,
+        .target = N,
+        .echo_ctxs = &echo_ctxs,
+        .echo_group = &echo_group,
+    };
+
+    var clients: fiber.Group(void) = .init(std.testing.allocator);
+    defer clients.deinit();
+    try clients.ensureTotalCapacity(N);
+
+    const acceptor_handle = try fiber.spawn(.{}, Acceptor.run, .{&acceptor_ctx});
 
     for (&client_ctxs, &oks, 0..) |*c, *ok, i| {
         c.* = .{
@@ -126,10 +125,12 @@ test "io.tcp: echo server with multiple clients" {
             .id = @intCast(i),
             .ok = ok,
         };
-        _ = try fiber.spawn(&rt, .{}, Client.run, .{c});
+        try clients.spawn(.{}, Client.run, .{c});
     }
 
-    rt.run();
+    clients.wait();
+    acceptor_handle.join();
+    echo_group.wait();
 
     for (oks) |ok| try std.testing.expectEqual(@as(u32, 1), ok);
 }

@@ -121,6 +121,12 @@ pub const Worker = struct {
     /// the calling thread that invoked `Runtime.run`).
     thread: ?std.Thread = null,
 
+    /// Count of `.exclusive`-sharing fibers currently homed on this
+    /// worker. Used by `pickWorker` to spread exclusive fibers across
+    /// a lane's workers. Incremented at spawn, decremented when the
+    /// fiber finishes.
+    live_exclusive: std.atomic.Value(u32) = .init(0),
+
     pub fn init(w: *Worker, id: u8, rt: *Runtime) !void {
         w.id = id;
         w.rt = rt;
@@ -134,6 +140,7 @@ pub const Worker = struct {
         w.remote_queue = .{};
         w.wake_completion = undefined;
         w.thread = null;
+        w.live_exclusive = .init(0);
     }
 
     pub fn deinit(self: *Worker, allocator: std.mem.Allocator) void {
@@ -224,6 +231,12 @@ pub const Worker = struct {
                     // parked joiner. We do the actual wake here so
                     // `fiber.zig` doesn't have to import the runtime.
                     if (f.on_finished(f)) |waiter| wake(waiter);
+                    // Paired with the spawn-time fetchAdd. Always
+                    // home_worker_id == self.id at the point we see
+                    // `.finished` (the fiber's last step ran here).
+                    if (f.sharing == .exclusive) {
+                        _ = self.live_exclusive.fetchSub(1, .release);
+                    }
                     const remaining = self.rt.live_count.fetchSub(1, .release) - 1;
                     if (remaining == 0) self.rt.broadcastStop(self.id);
                     continue;
@@ -282,7 +295,27 @@ pub const InitOptions = struct {
     /// existing single-thread call sites keep working unchanged).
     /// Callers wanting multi-thread set this explicitly.
     num_workers: ?usize = null,
+    /// Per-lane worker counts. `.default` lane gets whatever workers
+    /// are left after the named lanes are assigned (and must end up
+    /// with >= 1).
+    lanes: LaneConfig = .{},
 };
+
+/// Per-lane worker counts at init. `.default` is implicit — it gets
+/// `num_workers - raft`. Tests use `LaneConfig{}` (raft = 0), which
+/// puts every worker in the default lane.
+pub const LaneConfig = struct {
+    raft: u8 = 0,
+};
+
+/// Inclusive-start, exclusive-end worker range owned by one lane.
+const Range = struct { start: u8, end: u8 };
+
+/// Process-wide singleton — egres expects exactly one fiber `Runtime`
+/// at a time. Set by `Runtime.init`, cleared by `Runtime.deinit`.
+/// Module-level helpers (`spawn`, `coarseMs`, `Group`) route through
+/// it so callers don't have to thread the runtime pointer around.
+var g_rt: ?*Runtime = null;
 
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
@@ -296,10 +329,26 @@ pub const Runtime = struct {
     fibers_sl: Spinlock = .{},
     live_count: std.atomic.Value(usize) = .init(0),
 
+    /// Worker range per lane. Indexed by `@intFromEnum(Lane)`. Empty
+    /// ranges (start == end) trigger fallback to `.default` at
+    /// pickWorker time.
+    lane_ranges: [fb.Lane.count]Range = @splat(.{ .start = 0, .end = 0 }),
+    /// Per-lane round-robin counter. Used for `.shared` placement and
+    /// for tie-breaking in `.exclusive` placement.
+    lane_rr: [fb.Lane.count]std.atomic.Value(u8) = @splat(.init(0)),
+
     pub fn init(self: *Runtime, allocator: std.mem.Allocator, opts: InitOptions) !void {
         const n = opts.num_workers orelse 1;
         std.debug.assert(n >= 1);
         std.debug.assert(n <= std.math.maxInt(u8));
+
+        // Lane ranges: contiguous worker IDs by lane. raft takes the
+        // first `raft` slots; default takes the rest. Default must end
+        // up with >= 1 worker.
+        const raft_w: u8 = opts.lanes.raft;
+        std.debug.assert(@as(usize, raft_w) < n); // default lane needs >= 1
+        const default_start: u8 = raft_w;
+        const default_end: u8 = @intCast(n);
 
         // Pay the 1 ms calibration cost up front so the first fiber
         // dispatch doesn't get charged with it. Idempotent across
@@ -310,6 +359,9 @@ pub const Runtime = struct {
         self.fibers = .empty;
         self.fibers_sl = .{};
         self.live_count = .init(0);
+        self.lane_ranges[@intFromEnum(fb.Lane.raft)] = .{ .start = 0, .end = raft_w };
+        self.lane_ranges[@intFromEnum(fb.Lane.default)] = .{ .start = default_start, .end = default_end };
+        self.lane_rr = @splat(.init(0));
 
         self.workers = try allocator.alloc(Worker, n);
         errdefer allocator.free(self.workers);
@@ -325,9 +377,18 @@ pub const Runtime = struct {
 
         self.clock = try CoarseClock.init();
         self.clock.bind(&self.workers[0].loop);
+
+        // Register as the process-wide singleton. Two concurrent
+        // Runtimes would silently fight for `g_rt`; the assertion
+        // makes that a hard failure instead of a subtle bug.
+        std.debug.assert(g_rt == null);
+        g_rt = self;
     }
 
     pub fn deinit(self: *Runtime) void {
+        std.debug.assert(g_rt == self);
+        g_rt = null;
+
         for (self.fibers.items) |f| {
             f.deinit(self.allocator);
         }
@@ -465,23 +526,55 @@ pub fn JoinHandle(comptime T: type) type {
     };
 }
 
-/// Spawn `func(args...)` as a new fiber on `rt`. The args tuple is
-/// copied into a heap-allocated context owned by the Fiber (see
-/// `Fiber.init`); callers only need to keep alive what the args point
-/// to. Returns a `JoinHandle(T)` where `T` is `func`'s return type —
-/// `join()` retrieves the value once the body finishes.
+/// Pick a home worker for a new fiber based on its lane + sharing.
+///   `.shared`     → round-robin within the lane's range.
+///   `.exclusive`  → worker in the lane with fewest live exclusive
+///                   fibers; tie-broken via the lane's RR counter.
+/// If the requested lane has no workers (e.g., tests with default
+/// `LaneConfig` don't configure raft), fall back to `.default`.
+fn pickWorker(rt: *Runtime, lane: fb.Lane, sharing: fb.Sharing) u8 {
+    var range = rt.lane_ranges[@intFromEnum(lane)];
+    if (range.start == range.end) {
+        range = rt.lane_ranges[@intFromEnum(fb.Lane.default)];
+    }
+    const width: u8 = range.end - range.start;
+    const rr_start = rt.lane_rr[@intFromEnum(lane)].fetchAdd(1, .monotonic);
+
+    if (sharing == .shared) {
+        return range.start + @as(u8, @intCast(rr_start % width));
+    }
+    // `.exclusive`: scan the range starting at the RR-rotated offset
+    // so initial ties get spread across the range over time. Pick
+    // the first worker with the minimum live_exclusive count.
+    var min_count: u32 = std.math.maxInt(u32);
+    var min_id: u8 = range.start;
+    var i: u8 = 0;
+    while (i < width) : (i += 1) {
+        const w: u8 = range.start + @as(u8, @intCast((rr_start +% i) % width));
+        const c = rt.workers[w].live_exclusive.load(.acquire);
+        if (c < min_count) {
+            min_count = c;
+            min_id = w;
+        }
+    }
+    return min_id;
+}
+
+/// Spawn `func(args...)` as a new fiber on the process-wide runtime.
+/// The args tuple is copied into a heap-allocated context owned by
+/// the Fiber (see `Fiber.init`); callers only need to keep alive
+/// what the args point to. Returns a `JoinHandle(T)` where `T` is
+/// `func`'s return type — `join()` retrieves the value once the body
+/// finishes.
 pub fn spawn(
-    rt: *Runtime,
     opts: SpawnOptions,
     comptime func: anytype,
     args: std.meta.ArgsTuple(@TypeOf(func)),
 ) !JoinHandle(fb.ReturnOf(func)) {
-    // Pick home worker: explicit `worker_id`, else current worker,
-    // else default to worker 0 (caller is on a non-worker thread,
-    // e.g., the main thread before `rt.run` has been called).
-    const home_id: u8 = if (opts.worker_id) |id|
-        id
-    else if (Worker.current) |w| w.id else 0;
+    const rt = g_rt orelse @panic("fiber.spawn: Runtime not initialized");
+    // Pick home worker: explicit `worker_id` wins, else lane-aware
+    // placement via `pickWorker`.
+    const home_id: u8 = opts.worker_id orelse pickWorker(rt, opts.lane, opts.sharing);
     std.debug.assert(home_id < rt.workers.len);
 
     const f = try Fiber.init(rt.allocator, opts, func, args);
@@ -490,6 +583,13 @@ pub fn spawn(
     f.home_worker_id = home_id;
 
     try rt.appendFiber(f);
+
+    // Bump the chosen worker's `.exclusive` count; paired decrement
+    // runs in the Worker.run finish path. Done after `appendFiber`
+    // succeeds so we don't have to roll it back on errors.
+    if (opts.sharing == .exclusive) {
+        _ = rt.workers[home_id].live_exclusive.fetchAdd(1, .release);
+    }
 
     f.state.store(@bitCast(State{ .tag = .ready, .awaken = false }), .release);
 
@@ -590,6 +690,22 @@ pub fn currentWorker() *Worker {
 
 pub fn currentFiber() *Fiber {
     return currentWorker().current_fiber.?;
+}
+
+/// The `Runtime` the calling fiber is running on. Convenience over
+/// `currentWorker().rt` for code that just wants the runtime pointer
+/// (most spawn / Group construction sites).
+pub fn currentRuntime() *Runtime {
+    return currentWorker().rt;
+}
+
+/// Coarse millisecond clock — same value the in-runtime fibers see.
+/// One atomic load, callable from any thread (fiber-context or not)
+/// as long as the runtime has been initialized. Panics if called
+/// before `Runtime.init` or after `Runtime.deinit`.
+pub inline fn coarseMs() i64 {
+    const r = g_rt orelse @panic("fiber.coarseMs: Runtime not initialized");
+    return r.ms();
 }
 
 pub fn dumpFibers(rt: *Runtime, writer: *std.Io.Writer) !void {

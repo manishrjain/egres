@@ -81,6 +81,33 @@ pub const Priority = enum(u1) {
     pub const count = 2;
 };
 
+/// Worker-placement lane. Set at spawn; routes the fiber to a worker
+/// in the lane's range. `.default` is the catch-all; `.raft` is
+/// opt-in for code that wants mainLoop/applyLoop on workers reserved
+/// for them.
+///
+/// If the requested lane has zero workers configured (e.g., tests
+/// don't set `.raft`), placement falls back to `.default`.
+pub const Lane = enum(u8) {
+    default = 0,
+    raft = 1,
+
+    pub const count = 2;
+};
+
+/// Worker-sharing intent.
+///   `.shared`     — co-schedule freely with any other fiber.
+///   `.exclusive`  — prefer a worker without another exclusive fiber;
+///                   double up only when the lane is saturated.
+///
+/// Placement-only; orthogonal to `Priority` (which controls which
+/// queue the fiber sits in once placed). raft mainLoop / applyLoop
+/// are the canonical `.exclusive` callers.
+pub const Sharing = enum(u8) {
+    shared = 0,
+    exclusive = 1,
+};
+
 pub const Tag = enum(u2) { new, ready, waiting, finished };
 
 /// Atomic lifecycle state. The `awaken` pre-wake token closes the race
@@ -103,8 +130,13 @@ pub const YieldIntent = enum(u8) {
 };
 
 pub const SpawnOptions = struct {
+    /// Explicit worker pin. When set, the lane / sharing fields are
+    /// ignored — used for tests + diagnostics that want a specific
+    /// worker regardless of placement policy.
     worker_id: ?u8 = null,
+    lane: Lane = .default,
     priority: Priority = .normal,
+    sharing: Sharing = .shared,
     stack_max: usize = default_stack_max,
     stack_commit: usize = default_stack_commit,
 };
@@ -145,6 +177,7 @@ pub const Fiber = struct {
     intent: YieldIntent,
 
     priority: Priority,
+    sharing: Sharing,
     home_worker_id: u8,
 
     cpu_total_ns: u64,
@@ -232,6 +265,7 @@ pub const Fiber = struct {
             .state = std.atomic.Value(u8).init(@bitCast(init_state)),
             .intent = .reschedule,
             .priority = opts.priority,
+            .sharing = opts.sharing,
             .home_worker_id = opts.worker_id orelse 0,
             .cpu_total_ns = 0,
             .parked_since_ms = 0,

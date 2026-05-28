@@ -9,6 +9,8 @@ pub const coro = fb.coro;
 pub const default_stack_max = fb.default_stack_max;
 pub const default_stack_commit = fb.default_stack_commit;
 pub const Priority = fb.Priority;
+pub const Lane = fb.Lane;
+pub const Sharing = fb.Sharing;
 pub const Tag = fb.Tag;
 pub const State = fb.State;
 pub const YieldIntent = fb.YieldIntent;
@@ -23,6 +25,7 @@ const rt = @import("runtime.zig");
 
 pub const Worker = rt.Worker;
 pub const Runtime = rt.Runtime;
+pub const LaneConfig = rt.LaneConfig;
 pub const CoarseClock = rt.CoarseClock;
 pub const Deadlines = rt.Deadlines;
 pub const Timeout = rt.Timeout;
@@ -34,6 +37,8 @@ pub const park = rt.park;
 pub const wake = rt.wake;
 pub const currentWorker = rt.currentWorker;
 pub const currentFiber = rt.currentFiber;
+pub const currentRuntime = rt.currentRuntime;
+pub const coarseMs = rt.coarseMs;
 pub const dumpFibers = rt.dumpFibers;
 pub const tscNsPerCycleQ32 = rt.tscNsPerCycleQ32;
 
@@ -54,6 +59,9 @@ pub const CloseMode = channel_mod.CloseMode;
 
 const watermark_mod = @import("watermark.zig");
 pub const Watermark = watermark_mod.Watermark;
+
+const group_mod = @import("group.zig");
+pub const Group = group_mod.Group;
 
 // From io.zig — I/O operations that cooperatively park.
 const io = @import("io.zig");
