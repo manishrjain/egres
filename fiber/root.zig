@@ -47,6 +47,8 @@ pub const tscNsPerCycleQ32 = rt.tscNsPerCycleQ32;
 // Lower-level data structure used by `Deadlines`.
 pub const heap = @import("heap.zig");
 
+pub const LocalQueue = @import("local_queue.zig").LocalQueue;
+
 // Sync primitives built on `park` / `wake`.
 const sync = @import("sync.zig");
 pub const WaitQueue = sync.WaitQueue;
