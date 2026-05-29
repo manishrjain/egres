@@ -40,6 +40,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Fiber = @import("fiber.zig").Fiber;
+const Spinlock = @import("spinlock.zig").Spinlock;
 
 pub const LocalQueue = struct {
     const Self = @This();
@@ -221,5 +222,133 @@ pub const LocalQueue = struct {
         const t = self.tail.load(.monotonic);
         const h = self.head.load(.monotonic);
         return if (t > h) @intCast(t - h) else 0;
+    }
+};
+
+/// Runtime-wide overflow / admission queue. Spinlock-protected
+/// ring buffer of `*Fiber`. Capacity starts at `initial_capacity`
+/// and doubles on push when full. Used for:
+///
+///   - Bootstrap spawns from a non-worker thread (the host thread
+///     calling `fiber.spawn` before `Runtime.run` has been entered).
+///   - Spillover from a worker whose `LocalQueue` is full.
+///
+/// Multi-producer, multi-consumer; producers (`push`) and consumers
+/// (`popBatchTo`) all serialize on the same spinlock. Bulk dequeue
+/// writes fibers DIRECTLY into the destination `LocalQueue`'s slot
+/// array, then advances `dest.tail` with a single release-store —
+/// the same pattern `LocalQueue.stealBatchTo` uses, so peers
+/// stealing from `dest` observe the batch atomically rather than
+/// piecemeal.
+///
+/// Not a hot path. Workers prefer their own local queue first,
+/// peers via stealing second, and consult the global queue when
+/// both are empty.
+pub const GlobalQueue = struct {
+    allocator: Allocator,
+    sl: Spinlock = .{},
+
+    // Ring buffer for *Fiber. Capacity is a power of two so the
+    // slot index is `(head + i) & mask`. All access under `sl`, so
+    // none of these need atomic ops. `tail` is derivable as
+    // `(head + size) & mask` and isn't stored.
+    fibers: []*Fiber,
+    mask: usize,
+    head: usize = 0,
+    size: usize = 0,
+
+    pub fn init(allocator: Allocator, initial_capacity: usize) !GlobalQueue {
+        std.debug.assert(std.math.isPowerOfTwo(initial_capacity));
+        std.debug.assert(initial_capacity >= 2);
+        const fibers = try allocator.alloc(*Fiber, initial_capacity);
+        return .{
+            .allocator = allocator,
+            .fibers = fibers,
+            .mask = initial_capacity - 1,
+        };
+    }
+
+    pub fn deinit(self: *GlobalQueue) void {
+        self.allocator.free(self.fibers);
+    }
+
+    pub fn capacity(self: *const GlobalQueue) usize {
+        return self.mask + 1;
+    }
+
+    /// Append `f` to the back. Grows the ring (doubling) when full.
+    /// Safe from any thread.
+    pub fn push(self: *GlobalQueue, f: *Fiber) Allocator.Error!void {
+        self.sl.lock();
+        defer self.sl.unlock();
+
+        if (self.size == self.capacity()) try self.grow();
+        self.fibers[(self.head + self.size) & self.mask] = f;
+        self.size += 1;
+    }
+
+    fn grow(self: *GlobalQueue) Allocator.Error!void {
+        const new_cap = self.capacity() * 2;
+        const new_fibers = try self.allocator.alloc(*Fiber, new_cap);
+
+        // Compact live range into new buffer starting at index 0.
+        // The old range may wrap, so check head + size vs capacity.
+        const head_to_end = self.capacity() - self.head;
+        if (self.size <= head_to_end) {
+            // Contiguous in old buffer: one memcpy.
+            @memcpy(new_fibers[0..self.size], self.fibers[self.head..][0..self.size]);
+        } else {
+            // Wraps. Copy [head..capacity) then [0..size - head_to_end).
+            @memcpy(new_fibers[0..head_to_end], self.fibers[self.head..]);
+            @memcpy(new_fibers[head_to_end..self.size], self.fibers[0 .. self.size - head_to_end]);
+        }
+        self.allocator.free(self.fibers);
+        self.fibers = new_fibers;
+        self.mask = new_cap - 1;
+        self.head = 0;
+    }
+
+    /// Take up to `min(max_take, size, dest_room)` fibers from the
+    /// front of the queue and write them directly into `dest`'s
+    /// slot array, then advance `dest.tail` with a single
+    /// release-store. Caller must own `dest`. Returns the count
+    /// transferred.
+    pub fn popBatchTo(
+        self: *GlobalQueue,
+        dest: *LocalQueue,
+        max_take: usize,
+    ) usize {
+        self.sl.lock();
+        defer self.sl.unlock();
+
+        if (self.size == 0) return 0;
+        const dest_room = dest.capacity() - dest.len();
+        const take = @min(@min(max_take, self.size), dest_room);
+        if (take == 0) return 0;
+
+        const dest_t = dest.tail.load(.monotonic);
+        for (0..take) |i| {
+            const src_idx = (self.head + i) & self.mask;
+            const dest_idx: usize = @intCast(
+                @as(u64, @bitCast(dest_t + @as(i64, @intCast(i)))) & dest.mask,
+            );
+            dest.slots[dest_idx].store(self.fibers[src_idx], .monotonic);
+        }
+        // Single release-store publishes every slot write above to
+        // any thief that later acquire-loads dest.tail.
+        dest.tail.store(dest_t + @as(i64, @intCast(take)), .release);
+
+        self.head = (self.head + take) & self.mask;
+        self.size -= take;
+        return take;
+    }
+
+    /// Snapshot length. Takes the spinlock; intended for tests /
+    /// stats, not for control flow on the hot path (`popBatchTo`'s
+    /// return value already tells you if work was available).
+    pub fn len(self: *GlobalQueue) usize {
+        self.sl.lock();
+        defer self.sl.unlock();
+        return self.size;
     }
 };

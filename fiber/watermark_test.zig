@@ -130,13 +130,11 @@ test "Watermark: cross-worker — many waiters across multiple advances" {
     defer g.deinit();
     try g.ensureTotalCapacity(N_WAITERS);
 
-    // Targets spread 1..N_WAITERS, distributed across all available
-    // workers via worker_id pinning.
-    const num_workers = fiber.currentRuntime().workers.len;
+    // Targets spread 1..N_WAITERS. All land on the current worker's
+    // local queue; stealing distributes them across peers.
     for (0..N_WAITERS) |i| {
-        const wid: u8 = @intCast(i % num_workers);
         try g.spawn(
-            .{ .worker_id = wid, .locked = true },
+            .{},
             Waiter.run,
             .{ &wm, @as(u64, @intCast(i + 1)), &completed },
         );

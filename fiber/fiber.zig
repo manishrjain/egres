@@ -118,17 +118,6 @@ pub const YieldIntent = enum(u8) {
 };
 
 pub const SpawnOptions = struct {
-    /// Explicit worker pin. When set, the `lane` field is ignored.
-    /// By default also locks the fiber to the chosen worker (no
-    /// migration); pass `unlocked = true` to override and allow
-    /// stealing despite the explicit start worker.
-    worker_id: ?u8 = null,
-    /// Whether the fiber is pinned to its initial worker. Defaults
-    /// to false (migratable) so `routeToWorker`'s wake-on-push and
-    /// `trySteal` can rebalance load freely. Set `true` for fibers
-    /// that must stay on a specific worker — typically combined
-    /// with an explicit `worker_id` to pin to that worker.
-    locked: bool = false,
     lane: Lane = .default,
     priority: Priority = .normal,
     stack_max: usize = default_stack_max,
@@ -171,17 +160,6 @@ pub const Fiber = struct {
     intent: YieldIntent,
 
     priority: Priority,
-    /// Worker the fiber lives on right now. Set at spawn from
-    /// either `opts.worker_id` or `pickWorker`'s result, and updated
-    /// in place by `Worker.trySteal` when a thief migrates the fiber.
-    /// Wakes route here; the local-vs-remote check in `Worker.run`
-    /// compares against it.
-    worker_id: u8,
-    /// True iff the fiber is pinned to its current worker. Mirrors
-    /// `SpawnOptions.locked` at spawn time; the stealing path and
-    /// the wake-on-push redirect both check this to know whether
-    /// they can migrate the fiber.
-    locked: bool,
     /// Cumulative count of times this fiber has been stolen onto a
     /// new worker. Diagnostic + makes steal tests deterministic
     /// (assert `> 0` instead of timing-based "did it migrate?").
@@ -274,10 +252,6 @@ pub const Fiber = struct {
             .state = std.atomic.Value(u8).init(@bitCast(init_state)),
             .intent = .reschedule,
             .priority = opts.priority,
-            // Placeholder — `spawn` overwrites with the picked
-            // worker and sets `locked` after `pickWorker`.
-            .worker_id = 0,
-            .locked = false,
             .times_stolen = 0,
             .cpu_total_ns = 0,
             .parked_since_ms = 0,

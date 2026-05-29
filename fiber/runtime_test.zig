@@ -154,67 +154,60 @@ test "Runtime: high priority runs before normal in queue scan" {
         }
     };
 
-    // Pin both spawns to the worker our driver is on. Same-thread
-    // routeToWorker takes the scheduleLocal path and both fibers
-    // land directly in ready[priority] — no cross-thread
-    // remote_queue + wake_async.notify race that could let worker 0
-    // wake on the first notify, run the normal fiber, and only then
-    // see the high one. The per-worker priority scan is the property
-    // under test, and it only holds with both fibers visible together.
-    const wid = fiber.currentWorker().id;
+    // Both spawns land on the current worker's local queue (spawn
+    // always pushes to current worker now). The per-worker
+    // priority scan picks high before normal — that's the
+    // invariant under test.
     var n_ctx = Body{ .flag = &first, .letter = 'n' };
     var h_ctx = Body{ .flag = &first, .letter = 'h' };
 
     var g: fiber.Group(void) = .init(std.testing.allocator);
     defer g.deinit();
-    try g.spawn(.{ .worker_id = wid, .priority = .normal, .locked = true }, Body.run, .{&n_ctx});
-    try g.spawn(.{ .worker_id = wid, .priority = .high, .locked = true }, Body.run, .{&h_ctx});
+    try g.spawn(.{ .priority = .normal }, Body.run, .{&n_ctx});
+    try g.spawn(.{ .priority = .high }, Body.run, .{&h_ctx});
     g.wait();
 
     try std.testing.expectEqual(@as(?u8, 'h'), first);
 }
 
-test "Runtime: cross-worker spawn routes via remote queue" {
-    // Cap at 4 to keep the test's structure (one worker per slot)
-    // independent of the runner's `--parallel` choice.
-    const n_workers: usize = @min(4, fiber.currentRuntime().workers.len);
-    const N_PER_WORKER = 25;
-    const N = n_workers * N_PER_WORKER;
+test "Runtime: bursty spawns distribute across workers via stealing" {
+    // Spawn N short-lived fibers from a single fiber (which sits on
+    // some worker). All land on the spawner's local queue; idle
+    // peers steal half-batches from it. The test verifies that
+    // (a) every fiber ran and (b) at least 2 workers participated
+    // when more than one is available.
+    const rt = fiber.currentRuntime();
+    const n_workers: usize = rt.workers.len;
+    if (n_workers < 2) return error.SkipZigTest;
 
-    var per_worker: [4]std.atomic.Value(u32) = .{
-        .init(0), .init(0), .init(0), .init(0),
-    };
+    const N = 64;
+
+    var ran: std.atomic.Value(u32) = .init(0);
+    var per_worker: [256]std.atomic.Value(u32) = @splat(.init(0));
 
     const Body = struct {
-        fn run(pw: *[4]std.atomic.Value(u32)) void {
+        fn run(ran_ptr: *std.atomic.Value(u32), pw: *[256]std.atomic.Value(u32)) void {
             const wid = fiber.currentWorker().id;
             _ = pw[wid].fetchAdd(1, .release);
+            _ = ran_ptr.fetchAdd(1, .release);
         }
     };
 
     var g: fiber.Group(void) = .init(std.testing.allocator);
     defer g.deinit();
     try g.ensureTotalCapacity(N);
-
-    for (0..N) |i| {
-        const target: u8 = @intCast(i % n_workers);
-        // Lock to the requested worker: the test asserts exactly
-        // `N_PER_WORKER` fibers landed on each of the first 4 workers,
-        // which only holds if wake-on-push isn't redirecting the
-        // unlocked default elsewhere.
-        try g.spawn(.{ .worker_id = target, .locked = true }, Body.run, .{&per_worker});
+    for (0..N) |_| {
+        try g.spawn(.{}, Body.run, .{ &ran, &per_worker });
     }
     g.wait();
 
-    // Every spawned fiber ran. Each pinned worker ran exactly its
-    // share — proves the remote_queue + wake_async routing works.
-    for (per_worker[0..n_workers], 0..) |*counter, i| {
-        const got = counter.load(.acquire);
-        std.testing.expectEqual(@as(u32, N_PER_WORKER), got) catch |err| {
-            std.log.err("worker {d} ran {d} fibers, expected {d}", .{ i, got, N_PER_WORKER });
-            return err;
-        };
+    try std.testing.expectEqual(@as(u32, N), ran.load(.acquire));
+
+    var distinct: u32 = 0;
+    for (per_worker[0..n_workers]) |*c| {
+        if (c.load(.acquire) > 0) distinct += 1;
     }
+    try std.testing.expect(distinct >= 2);
 }
 
 test "Runtime: JoinHandle returns the spawned fiber's value" {
