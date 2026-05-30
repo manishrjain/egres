@@ -158,11 +158,42 @@ const bench = utils.bench;
 //   --only-bench        Run only `BENCH: ...` tests (used by `zig build bench`).
 //   --parallel <N>      Concurrent test fibers. 0 (default) = max(2, cpu_count/2).
 
+/// Override the Io instance that `std.debug` (including `defaultPanic`)
+/// uses. The default — `Io.Threaded.global_single_threaded` — is
+/// explicitly documented as "does not support concurrency". When
+/// multiple fiber-worker threads panic concurrently, they all hit
+/// that single-threaded Io and race on its internal state, ending
+/// up with corrupted writer pointers (page-aligned `0x...0000`
+/// junk) and SEGV inside `Io.Writer.write` deep in the panic-print
+/// path. We point it at `std.testing.io_instance` (a real multi-
+/// threaded `Io.Threaded.init`) so concurrent panics print safely.
+pub const std_options_debug_threaded_io: ?*std.Io.Threaded = &std.testing.io_instance;
+
 pub const std_options: std.Options = .{
     .log_scope_levels = &.{
         .{ .scope = .zio, .level = .info },
     },
     .logFn = capturingLogFn,
+
+    // TODO: escalate upstream in Zig forum / issue tracker.
+    // Zig 0.16's `std.debug.Dwarf.SelfUnwinder` is not thread-safe:
+    //   - Lazy init of `SelfInfo` races on first concurrent call.
+    //   - Even after init, `nextInner` mutates per-walk FDE/CIE
+    //     caches that get clobbered by concurrent walks.
+    // Symptoms under our multi-worker fiber runtime: SEGV inside
+    // `Dwarf.SelfUnwinder.nextInner(unwinder=0x0, cache_entry=0x0)`,
+    // followed by recursive-panic in the panic handler's own
+    // stack-walk. Triggered by `std.testing.allocator`'s leak-
+    // source recording (one captureCurrentStackTrace per alloc),
+    // by our own `captureTrace(&f.park_trace)` in `park()`, and
+    // by the panic handler itself.
+    //
+    // Disabling stack tracing globally for this test binary
+    // sidesteps all of the above. `std.testing.allocator` still
+    // detects leaks (alloc/free balance) — we just lose the
+    // "allocated at:" source pointers in leak reports. Acceptable
+    // until the stdlib unwinder gets a mutex (or per-thread state).
+    .allow_stack_tracing = false,
 };
 
 const default_parallel: u6 = 0;

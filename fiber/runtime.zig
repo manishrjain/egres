@@ -203,18 +203,13 @@ pub const Worker = struct {
                     "fiber: GlobalQueue push failed: {}",
                     .{gerr},
                 );
-                // Spilled to global — peers will discover it on
-                // their next searching pass. Still worth notifying
-                // a parked peer since we have spillover-ready work.
-                if (self.rt.num_searching.load(.acquire) == 0) {
-                    notifyIdlePeer(self.rt, self.lane_idx);
-                }
+                // BISECT: notifyIdlePeer disabled. Workers discover
+                // global-queue work via their own searching-pass
+                // global pull instead of being explicitly notified.
                 return;
             },
         };
-        if (self.ready[prio_idx].len() < 2) return;
-        if (self.rt.num_searching.load(.acquire) != 0) return;
-        notifyIdlePeer(self.rt, self.lane_idx);
+        // BISECT: notifyIdlePeer disabled.
     }
 
     fn popNextReady(self: *Worker) ?*Fiber {
@@ -317,21 +312,11 @@ pub const Worker = struct {
             wakeAsyncCallback,
         );
 
-        // Worker state machine:
-        //   running → searching → parked → searching → running
-        //
-        // `searching` is true between "no local work found" and
-        // either "found work via steal" or "about to park". A
-        // producer pushing onto its own local consults `num_searching`
-        // and skips notifying anyone if some peer is already in the
-        // searching state — they'll discover the new work themselves.
-        //
-        // `published` tracks whether we've also set our bit in
-        // `idle_mask`. We set the bit just before parking so
-        // producers can find us; we clear it on wake.
-        var searching: bool = false;
-        var published: bool = false;
-
+        // BISECT mode: workers busy-poll. No park, no publishIdle,
+        // no num_searching bookkeeping, no notifyIdlePeer. This
+        // isolates the chunk-1 corruption to either the steal path,
+        // the queue ops, or normal scheduleLocal — by eliminating
+        // every park/wake/notify code path.
         while (self.rt.live_count.load(.acquire) > 0) {
             // Keep libxev's `cached_now` fresh once per dispatch tick.
             // Any `xev.Timer.run` / `TCP.read`/`write`/... a fiber issues
@@ -347,84 +332,33 @@ pub const Worker = struct {
             self.drainRemote();
 
             if (self.popNextReady()) |f| {
-                if (searching) {
-                    const prev_search = self.rt.num_searching.fetchSub(1, .seq_cst);
-                    std.debug.assert(prev_search > 0);
-                    searching = false;
-                }
-                if (published) {
-                    self.clearIdle();
-                    published = false;
-                }
                 self.runFiber(f);
                 continue;
             }
 
-            // No local work. Enter searching state (if not already).
-            // The fetchAdd is seq_cst because producer's notify check
-            // reads `num_searching` and we need our increment to be
-            // globally visible before we start probing peers.
-            if (!searching) {
-                const prev_search = self.rt.num_searching.fetchAdd(1, .seq_cst);
-                // Tripwire: never let num_searching exceed worker
-                // count. An imbalanced fetchAdd / fetchSub on any
-                // exit path would leak the counter and silently
-                // disable producer-side notifies.
-                std.debug.assert(prev_search < self.rt.workers.len);
-                searching = true;
+            // Pull from the global queues first.
+            var pulled: bool = false;
+            for (0..Priority.count) |prio| {
+                if (self.rt.global[prio].popBatchTo(
+                    &self.ready[prio],
+                    global_pull_batch,
+                ) > 0) pulled = true;
             }
-
-            // TODO: pull from rt.global[prio] here — current
-            // implementation deadlocks/crashes under concurrent
-            // peer activity. Disabled until I isolate the race.
-            // For now, bootstrap pushes to worker 0's local, and
-            // spillover to global gets consumed lazily (panics if
-            // global accumulates — fine for current test load).
+            if (pulled) continue;
 
             // Try to steal a batch from a peer in our lane.
-            // stealBatchTo lands stolen fibers in our own queues, so
-            // the next outer-loop iteration's popNextReady picks them
-            // up.
             if (self.trySteal()) continue;
 
-            // No peer had work either. Publish ourselves as idle (set
-            // our bit in idle_mask) so producers can find us, then
-            // continue back to the top — the next iteration's
-            // drainRemote / popNextReady / trySteal IS the
-            // post-publish recheck, closing the race window with a
-            // producer that landed work between our steal attempt and
-            // our publishIdle.
-            if (!published) {
-                self.publishIdle();
-                published = true;
-                continue;
-            }
-
-            // Already published and still nothing. Drop the
-            // searching state (we're about to park, not search) and
-            // block in libxev until a wake_async notify, I/O
-            // completion, or timer fires.
-            if (searching) {
-                const prev_search = self.rt.num_searching.fetchSub(1, .seq_cst);
-                // Tripwire: never let num_searching wrap negative
-                // (the atomic is u32 so an underflow → giant value).
-                std.debug.assert(prev_search > 0);
-                searching = false;
-            }
-            self.loop.run(.once) catch |err| {
+            // BISECT: no parking. Just busy-poll libxev (non-blocking)
+            // and loop back to the top. Workers burn CPU while idle
+            // but never sleep, so the park/wake/notify race surface
+            // is eliminated. publishIdle/clearIdle removed too —
+            // nobody parks, nobody publishes idle bits.
+            self.loop.run(.no_wait) catch |err| {
                 std.debug.panic("xev.Loop.run failed: {}", .{err});
             };
-            self.clearIdle();
-            published = false;
+            std.atomic.spinLoopHint();
         }
-        // Loop exit: live_count went to 0. If we were still in the
-        // searching state when we read it, balance the counter so
-        // shutdown leaves num_searching at 0.
-        if (searching) {
-            const prev_search = self.rt.num_searching.fetchSub(1, .seq_cst);
-            std.debug.assert(prev_search > 0);
-        }
-        if (published) self.clearIdle();
     }
 
     /// Run one ready fiber: bracket `coro.step()` with TSC samples
@@ -933,6 +867,14 @@ pub fn park() void {
 
     f.parked_since_ms = currentWorker().rt.clock.ms();
     // TODO: Re-enable later
+    // TODO: re-enable when Zig stdlib's Dwarf unwinder is
+    // thread-safe (or when we replace this with our own fp-walker).
+    // Even with `std.options.allow_stack_tracing = false`, calls
+    // into stdlib code paths that themselves walk the stack
+    // (panic handler, allocator leak reports) get short-circuited
+    // — but enabling this here would still risk hitting the
+    // unwinder's per-walk cache-mutation race. See
+    // `project_captureTrace_unwinder_race.md` in memory.
     // captureTrace(&f.park_trace);
 
     f.intent = .park;
