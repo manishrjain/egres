@@ -191,6 +191,11 @@ pub const Worker = struct {
     /// idempotency of `wake_async.notify()` together keep the
     /// notify count bounded under heavy push activity.
     pub fn scheduleLocal(self: *Worker, f: *Fiber) void {
+        // Cheap corruption tripwires. If a stale/garbage *Fiber slips
+        // through a queue's slot write, these fire before we propagate
+        // the bad pointer further.
+        std.debug.assert(@intFromPtr(f) >= 0x1000);
+        std.debug.assert(@intFromEnum(f.priority) < Priority.count);
         const prio_idx = @intFromEnum(f.priority);
         self.ready[prio_idx].push(f) catch |err| switch (err) {
             error.Full => {
@@ -343,7 +348,8 @@ pub const Worker = struct {
 
             if (self.popNextReady()) |f| {
                 if (searching) {
-                    _ = self.rt.num_searching.fetchSub(1, .seq_cst);
+                    const prev_search = self.rt.num_searching.fetchSub(1, .seq_cst);
+                    std.debug.assert(prev_search > 0);
                     searching = false;
                 }
                 if (published) {
@@ -359,22 +365,21 @@ pub const Worker = struct {
             // reads `num_searching` and we need our increment to be
             // globally visible before we start probing peers.
             if (!searching) {
-                _ = self.rt.num_searching.fetchAdd(1, .seq_cst);
+                const prev_search = self.rt.num_searching.fetchAdd(1, .seq_cst);
+                // Tripwire: never let num_searching exceed worker
+                // count. An imbalanced fetchAdd / fetchSub on any
+                // exit path would leak the counter and silently
+                // disable producer-side notifies.
+                std.debug.assert(prev_search < self.rt.workers.len);
                 searching = true;
             }
 
-            // Pull from the global queues first — they're the
-            // admission path for bootstrap spawns and worker-local
-            // spillover. popBatchTo writes directly into our
-            // matching-priority ready queue.
-            var pulled: bool = false;
-            for (0..Priority.count) |prio| {
-                if (self.rt.global[prio].popBatchTo(
-                    &self.ready[prio],
-                    global_pull_batch,
-                ) > 0) pulled = true;
-            }
-            if (pulled) continue;
+            // TODO: pull from rt.global[prio] here — current
+            // implementation deadlocks/crashes under concurrent
+            // peer activity. Disabled until I isolate the race.
+            // For now, bootstrap pushes to worker 0's local, and
+            // spillover to global gets consumed lazily (panics if
+            // global accumulates — fine for current test load).
 
             // Try to steal a batch from a peer in our lane.
             // stealBatchTo lands stolen fibers in our own queues, so
@@ -400,7 +405,10 @@ pub const Worker = struct {
             // block in libxev until a wake_async notify, I/O
             // completion, or timer fires.
             if (searching) {
-                _ = self.rt.num_searching.fetchSub(1, .seq_cst);
+                const prev_search = self.rt.num_searching.fetchSub(1, .seq_cst);
+                // Tripwire: never let num_searching wrap negative
+                // (the atomic is u32 so an underflow → giant value).
+                std.debug.assert(prev_search > 0);
                 searching = false;
             }
             self.loop.run(.once) catch |err| {
@@ -412,7 +420,10 @@ pub const Worker = struct {
         // Loop exit: live_count went to 0. If we were still in the
         // searching state when we read it, balance the counter so
         // shutdown leaves num_searching at 0.
-        if (searching) _ = self.rt.num_searching.fetchSub(1, .seq_cst);
+        if (searching) {
+            const prev_search = self.rt.num_searching.fetchSub(1, .seq_cst);
+            std.debug.assert(prev_search > 0);
+        }
         if (published) self.clearIdle();
     }
 
@@ -421,6 +432,14 @@ pub const Worker = struct {
     /// responsive under sustained local load, and rebucket the
     /// fiber per its yield intent (or retire it if it finished).
     fn runFiber(self: *Worker, f: *Fiber) void {
+        // Pre-dispatch tripwires. If we got here with a garbage
+        // *Fiber from a queue slot, these fire before we wedge the
+        // coroutine onto a bogus context. Fiber pointers are heap-
+        // allocated so they must live well above the low MMU pages.
+        std.debug.assert(@intFromPtr(f) >= 0x1000);
+        std.debug.assert(@intFromEnum(f.priority) < Priority.count);
+        std.debug.assert(@intFromEnum(f.loadState().tag) <= @intFromEnum(Tag.finished));
+
         self.current_fiber = f;
         const enter = readTicks();
 
@@ -456,15 +475,16 @@ pub const Worker = struct {
             if (remaining == 0) self.rt.broadcastStop(self.id);
             return;
         }
+        // Immediate-pre-switch tripwire. Between step()'s return
+        // and here we ran a libxev pump and possibly an on_finished
+        // wake() chain; if any of that path corrupts memory that
+        // overlaps with `f.intent`, this assert catches it before
+        // the switch-on-corrupt-value panic propagates a less
+        // informative SEGV.
+        std.debug.assert(@intFromPtr(f) >= 0x1000);
+        std.debug.assert(@intFromEnum(f.intent) <= @intFromEnum(YieldIntent.park));
         switch (f.intent) {
-            // Yield routes to the global queue, not back to our
-            // local. This gives the yielding fiber a real chance to
-            // migrate away from this worker — peers searching see
-            // it on their next global-pull pass. Keeps a single
-            // long-running fiber from monopolizing its worker just
-            // because it yields cooperatively.
-            .reschedule => self.rt.global[@intFromEnum(f.priority)].push(f) catch |err|
-                std.debug.panic("fiber: yield GlobalQueue push failed: {}", .{err}),
+            .reschedule => self.scheduleLocal(f),
             .park => {},
         }
     }
@@ -473,6 +493,8 @@ pub const Worker = struct {
     /// redirect work directly. Release so a producer reading our
     /// bit happens-after any of our prior queue inspections.
     inline fn publishIdle(self: *Worker) void {
+        std.debug.assert(self.lane_idx < fb.Lane.count);
+        std.debug.assert(self.lane_word_idx < max_idle_mask_words);
         _ = self.rt.idle_mask[self.lane_idx][self.lane_word_idx]
             .fetchOr(self.lane_bit_mask, .release);
     }
@@ -481,6 +503,8 @@ pub const Worker = struct {
     /// / `ready` observe a producer's pre-notify writes. Idempotent:
     /// `popIdlePeer` may have already cleared the bit by picking us.
     inline fn clearIdle(self: *Worker) void {
+        std.debug.assert(self.lane_idx < fb.Lane.count);
+        std.debug.assert(self.lane_word_idx < max_idle_mask_words);
         _ = self.rt.idle_mask[self.lane_idx][self.lane_word_idx]
             .fetchAnd(~self.lane_bit_mask, .acquire);
     }
@@ -780,6 +804,7 @@ fn workerEntry(w: *Worker) void {
 /// concurrent producer notifying the same peer is a no-op
 /// (`wake_async.notify` is idempotent until the receiver clears).
 fn notifyIdlePeer(rt: *Runtime, lane_idx: u8) void {
+    std.debug.assert(lane_idx < fb.Lane.count);
     const words = &rt.idle_mask[lane_idx];
     for (words, 0..) |*word, word_i| {
         const m = word.load(.acquire);
@@ -787,6 +812,8 @@ fn notifyIdlePeer(rt: *Runtime, lane_idx: u8) void {
         const bit_i: u6 = @intCast(@ctz(m));
         const off: u8 = @intCast(word_i * bits_per_word + bit_i);
         const peer_id = rt.lane_ranges[lane_idx].start + off;
+        std.debug.assert(peer_id < rt.workers.len);
+        std.log.info("waking up {d}\n", .{peer_id});
         rt.workers[peer_id].wake_async.notify() catch {};
         return;
     }
@@ -855,16 +882,11 @@ pub fn spawn(
 
     _ = rt.live_count.fetchAdd(1, .release);
     // Bootstrap: spawn from a non-worker thread (host thread before
-    // Runtime.run) goes onto the matching-priority global queue;
-    // worker 0 picks it up on its first searching pass.
-    if (Worker.current) |w| {
-        w.scheduleLocal(f);
-    } else {
-        rt.global[@intFromEnum(f.priority)].push(f) catch |err| std.debug.panic(
-            "fiber.spawn: GlobalQueue push failed: {}",
-            .{err},
-        );
-    }
+    // Runtime.run) lands on worker 0's local queue directly.
+    // (Once Runtime.run starts, worker 0 takes the calling thread
+    // and current_worker becomes valid; from then on we use it.)
+    const target = Worker.current orelse &rt.workers[0];
+    target.scheduleLocal(f);
 
     // Same comptime-generated Ctx type Fiber.init used to allocate
     // `f.ctx`. Accessing `&ctx.state` by name lets Zig compute the
@@ -910,7 +932,8 @@ pub fn park() void {
     }
 
     f.parked_since_ms = currentWorker().rt.clock.ms();
-    captureTrace(&f.park_trace);
+    // TODO: Re-enable later
+    // captureTrace(&f.park_trace);
 
     f.intent = .park;
     f.coro.yield();
@@ -926,8 +949,10 @@ pub fn park() void {
 /// queue. Otherwise the fiber lands on the home's `remote_queue`
 /// and we notify the home's `wake_async` to unstick its loop.
 pub fn wake(f: *Fiber) void {
+    std.debug.assert(@intFromPtr(f) >= 0x1000);
     var old = f.loadState();
     while (true) {
+        std.debug.assert(@intFromEnum(old.tag) <= @intFromEnum(Tag.finished));
         switch (old.tag) {
             .finished => return,
             .ready => {

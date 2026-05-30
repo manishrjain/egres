@@ -105,6 +105,7 @@ pub const LocalQueue = struct {
     /// Owner-only. Append `f` at the tail. Returns `error.Full` if
     /// the queue is at capacity.
     pub fn push(self: *Self, f: *Fiber) Error!void {
+        std.debug.assert(@intFromPtr(f) >= 0x1000);
         const t = self.tail.load(.monotonic);
         const h = self.head.load(.acquire);
         if (t - h >= @as(i64, @intCast(self.capacity()))) {
@@ -133,6 +134,11 @@ pub const LocalQueue = struct {
             return null;
         }
         const f = self.slotGet(t);
+        // Tripwire: any *Fiber pointer we return from a queue slot
+        // must be a real heap address. A stale-undef-fill value
+        // (0xAAAA…) or a stack address here means the slot write
+        // raced with something else.
+        std.debug.assert(@intFromPtr(f) >= 0x1000);
         if (h != t) return f; // > 1 element left — no race
 
         // Slow Path: Exactly one element: race with a concurrent steal CAS.
@@ -187,6 +193,11 @@ pub const LocalQueue = struct {
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const f = victim.slotGet(h + @as(i64, @intCast(i)));
+            // Tripwire: every stolen pointer must be a real heap
+            // address. Catches a victim slot that was written
+            // out-of-order with respect to victim.tail, or a slot
+            // that's still undef-filled (push hasn't run yet).
+            std.debug.assert(@intFromPtr(f) >= 0x1000);
             dest.slotPut(dest_t + @as(i64, @intCast(i)), f);
         }
 
@@ -279,6 +290,7 @@ pub const GlobalQueue = struct {
     /// Append `f` to the back. Grows the ring (doubling) when full.
     /// Safe from any thread.
     pub fn push(self: *GlobalQueue, f: *Fiber) Allocator.Error!void {
+        std.debug.assert(@intFromPtr(f) >= 0x1000);
         self.sl.lock();
         defer self.sl.unlock();
 
@@ -329,10 +341,15 @@ pub const GlobalQueue = struct {
         const dest_t = dest.tail.load(.monotonic);
         for (0..take) |i| {
             const src_idx = (self.head + i) & self.mask;
+            const f = self.fibers[src_idx];
+            // Tripwire: every transferred fiber must be a real
+            // pointer. Catches a slot the producer never actually
+            // wrote (size bookkeeping out of sync with the buffer).
+            std.debug.assert(@intFromPtr(f) >= 0x1000);
             const dest_idx: usize = @intCast(
                 @as(u64, @bitCast(dest_t + @as(i64, @intCast(i)))) & dest.mask,
             );
-            dest.slots[dest_idx].store(self.fibers[src_idx], .monotonic);
+            dest.slots[dest_idx].store(f, .monotonic);
         }
         // Single release-store publishes every slot write above to
         // any thief that later acquire-loads dest.tail.

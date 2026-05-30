@@ -228,12 +228,16 @@ test "Runtime: JoinHandle fast-path after producer already finished" {
         }
     };
 
+    std.log.debug("starting spawn\n", .{});
     const ph = try fiber.spawn(.{}, Producer.run, .{});
+    std.log.debug("fiber spawn done\n", .{});
     // Yield enough times that the no-op producer finishes first.
     // join() should then take the fast path (sees .finished, returns
     // the cached result without parking).
     fiber.yield();
+    std.log.debug("yield 1 done\n", .{});
     fiber.yield();
+    std.log.debug("yield 2 done\n", .{});
     try std.testing.expectEqual(@as(u32, 7), ph.join());
 }
 
