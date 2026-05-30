@@ -112,10 +112,9 @@ pub const Mutex = struct {
         if (waiter == null) self.state.store(0, .release);
         self.sl.unlock();
 
-        // Wake outside the spinlock: cross-thread wake may push to
-        // the home worker's remote_queue and issue an eventfd
-        // notify (kernel syscall). Holding sl during that would
-        // pin a peer thread to a cache line for an entire syscall.
+        // Wake outside the spinlock: scheduleLocal acquires either a
+        // Chase-Lev local queue (lock-free push) or the global queue
+        // spinlock; either way it shouldn't be nested under sl.
         if (waiter) |w| rt.wake(w);
     }
 };
@@ -167,9 +166,9 @@ pub const Condition = struct {
     /// Wake every fiber currently in the wait queue. We collect the
     /// fibers under `sl` (using their now-free `waker_next` field
     /// as a transient local-list link) then wake them outside the
-    /// spinlock — wake may push to a peer worker's remote_queue +
-    /// `wake_async.notify()`, and we don't want a syscall under
-    /// `sl`.
+    /// spinlock — wake calls scheduleLocal which may itself acquire
+    /// the global queue spinlock; nesting under `sl` would serialize
+    /// every waker through one critical section.
     pub fn broadcast(self: *Condition) void {
         self.sl.lock();
         var head: ?*Fiber = null;

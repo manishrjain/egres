@@ -137,16 +137,19 @@ test "LocalQueue: stealBatchTo claims half the victim's items" {
     }
 }
 
-test "LocalQueue: stealBatchTo of size=1 claims 1 (no truncation to 0)" {
+test "LocalQueue: stealBatchTo on size=1 victim returns .empty (don't steal the last fiber)" {
+    // Stealing the only available fiber races with the owner's
+    // single-element pop slow path — the two can both believe they
+    // hold it. Refusing to steal at size=1 closes that race window.
     var victim: LocalQueue = try .init(std.testing.allocator, 4);
     defer victim.deinit(std.testing.allocator);
     var thief: LocalQueue = try .init(std.testing.allocator, 4);
     defer thief.deinit(std.testing.allocator);
 
     try victim.push(fakeFiber(42));
-    const r = victim.stealBatchTo(&thief);
-    try std.testing.expectEqual(@as(usize, 1), r.count);
-    try expectPop(&thief, 42);
+    try std.testing.expectEqual(LocalQueue.Steal.empty, victim.stealBatchTo(&thief));
+    try std.testing.expectEqual(@as(usize, 1), victim.len());
+    try std.testing.expectEqual(@as(usize, 0), thief.len());
 }
 
 test "LocalQueue: stealBatchTo on empty victim returns .empty" {

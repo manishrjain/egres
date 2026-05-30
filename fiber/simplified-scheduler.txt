@@ -1,0 +1,113 @@
+SIMPLIFIED FIBER SCHEDULER — SKETCH
+======================================
+
+Core idea: no work-stealing. Producer-initiated balance via idle bits.
+One queue per worker (FIFO, spinlock), one queue per priority in global.
+
+DATA
+----
+Worker:
+    id            : u8
+    ready         : [Priority.count]LocalQueue   // spinlock FIFO ring
+    idle_bit      : in Runtime.idle_mask (one bit per worker)
+    wake_async    : xev.Async                    // unstick parked loop
+    loop          : xev.Loop
+
+Runtime:
+    workers       : []Worker
+    global        : [Priority.count]GlobalQueue  // spinlock ring, growable
+    idle_mask     : atomic bitmap, 1 bit per worker
+    live_count    : atomic usize
+
+Fiber: unchanged (state, intent, running_on_worker, ...).
+
+SCHEDULE (producer-initiated balance)
+-------------------------------------
+fn scheduleLocal(f):
+    self = Worker.current
+    if self == null:                  // bootstrap / non-worker thread
+        global[f.prio].push(f); notify_one_idle(); return
+
+    // donate when we already have work AND a peer can use it
+    if self.ready[f.prio].len() >= 1 and idle_mask != 0:
+        global[f.prio].push(f)
+        notify_one_idle()             // 2-line eventfd notify; no CAS-claim
+        return
+
+    // otherwise keep it hot on us
+    self.ready[f.prio].push(f) catch error.Full:
+        global[f.prio].push(f); notify_one_idle()
+
+WORKER LOOP
+-----------
+fn Worker.run():
+    Worker.current = self
+    while live_count > 0:
+        loop.update_now()
+
+        // (1) hottest work first: our own local
+        if f = popHighestPrio(self.ready):
+            runFiber(f); continue
+
+        // (2) take a fair share from global
+        take = max(1, total_global_size / num_workers)
+        if pulled := global.popBatchTo(self.ready, take) > 0:
+            continue
+
+        // (3) genuinely idle: publish, park on libxev, then unpublish
+        publishIdle(self)               // set our bit in idle_mask
+        loop.run(.once)                 // sleeps until eventfd / IO / timer
+        clearIdle(self)
+
+RUNFIBER  (unchanged from current fix)
+--------------------------------------
+fn runFiber(f):
+    CAS-claim f.running_on_worker: no_owner -> my_id, else panic
+
+    f.coro.step()
+
+    captured_intent   = f.intent       // CAPTURE BEFORE RELEASE
+    captured_finished = f.isFinished() // CAPTURE BEFORE RELEASE
+    f.current = null
+    CAS-release f.running_on_worker
+
+    if captured_finished:               // finish path, decrement live_count
+        ...; return
+
+    switch captured_intent:
+        .reschedule -> scheduleLocal(f)
+        .park       -> {}
+
+NOTIFY (drastically simpler — eventfd coalesces, no CAS-claim needed)
+---------------------------------------------------------------------
+fn notify_one_idle():
+    if mask = idle_mask.load() != 0:
+        peer_id = ctz(mask)
+        workers[peer_id].wake_async.notify()   // safe to overfire; xev coalesces
+
+DELETIONS (~400 LOC dropped)
+----------------------------
+- LocalQueue Chase-Lev deque  -> replace with spinlock FIFO ring
+- stealBatchTo / stealOne     -> gone
+- trySteal / steal_cursor     -> gone
+- num_thieves bookkeeping     -> gone
+- lane_ranges / lane_idx /    -> optional: keep only if lane affinity wanted
+  lane_word_idx / lane_bit_mask
+- CAS-claim in notifyIdlePeer -> 2-line notify
+- size<=1 size-2 race guards  -> not needed in spinlock FIFO
+
+PROPERTIES
+----------
+- Hot fiber stays on its worker (cache locality)
+- Surplus auto-flows to global when peers are idle
+- Idle workers always see fresh work via global
+- Producer-side balance only — no consumer ever reads peer state
+- One bit per push to decide local vs global (~5 ns)
+- Adaptive global batch leaves headroom for late-arriving idle peers
+
+OPEN CHOICE
+-----------
+Keep lanes (raft vs default) or drop:
+- Keep: gives Raft fibers their own worker pool, avoids interference.
+- Drop: simpler; rely on priority + global pool.
+Probably keep lanes; the routing change is independent.

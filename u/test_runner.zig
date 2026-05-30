@@ -169,6 +169,27 @@ const bench = utils.bench;
 /// threaded `Io.Threaded.init`) so concurrent panics print safely.
 pub const std_options_debug_threaded_io: ?*std.Io.Threaded = &std.testing.io_instance;
 
+/// Custom panic handler. Default `defaultPanic` walks the stack via
+/// `Dwarf.SelfUnwinder`, which has thread-safety bugs we hit under
+/// heavy parallel test load. This minimal hook writes msg +
+/// first_trace_addr (the panic call-site) directly to stderr via
+/// raw `write` syscall, then aborts. Resolve the address with:
+///   addr2line -fipCe <binary> <addr>
+fn minimalPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    const marker = "[MINIMAL_PANIC_FIRED]\n";
+    _ = std.os.linux.write(2, marker.ptr, marker.len);
+    // 4 KiB so a long DOUBLE_PUSH ring dump (~800-1200 bytes) fits.
+    // Without this, `rawStderrPrint`'s `bufPrint` returns an empty
+    // slice on overflow and we see only "[MINIMAL_PANIC_FIRED]" with
+    // no body.
+    var buf: [4096]u8 = undefined;
+    const tid = std.Thread.getCurrentId();
+    const trace_addr = first_trace_addr orelse 0;
+    rawStderrPrint(&buf, "\nthread {d} panic: {s}\n  first_trace_addr: 0x{x}\n", .{ tid, msg, trace_addr });
+    std.process.abort();
+}
+pub const panic = std.debug.FullPanic(minimalPanic);
+
 pub const std_options: std.Options = .{
     .log_scope_levels = &.{
         .{ .scope = .zio, .level = .info },
@@ -193,6 +214,9 @@ pub const std_options: std.Options = .{
     // detects leaks (alloc/free balance) — we just lose the
     // "allocated at:" source pointers in leak reports. Acceptable
     // until the stdlib unwinder gets a mutex (or per-thread state).
+    // Our `minimalPanic` doesn't call `captureCurrentStackTrace`,
+    // and `std.testing.allocator`'s leak-trace path benefits from
+    // being disabled (concurrent Dwarf walks race). Keep off.
     .allow_stack_tracing = false,
 };
 

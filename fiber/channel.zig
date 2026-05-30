@@ -15,8 +15,8 @@
 //! `{len, head, tail, closed, queue}` update; the fiber's
 //! awaken-bit handles the "wake fires while we're between
 //! sl.unlock and park" race; wake is always called outside the
-//! spinlock so cross-thread routing (remote_queue + eventfd
-//! notify) doesn't pin a peer thread waiting for our sl.
+//! spinlock so `scheduleLocal`'s global-queue spinlock isn't
+//! nested under ours.
 
 const std = @import("std");
 const fb = @import("fiber.zig");

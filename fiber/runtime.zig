@@ -64,28 +64,83 @@ const local_queue_capacity: usize = 256;
 /// 8 is roughly where that lands for our typical scale.
 const global_pull_batch: usize = 8;
 
-/// Lock-free Treiber stack for cross-thread fiber injection. Push is
-/// one CAS; drain is one atomic swap. The drained chain is LIFO —
-/// `lifoToFifo` flips it before scheduling.
-const RemoteQueue = struct {
-    head: std.atomic.Value(?*Fiber) align(std.atomic.cache_line) = .init(null),
+/// Path that produced a `scheduleLocal` call. Threaded explicitly
+/// through `scheduleLocal` so the DOUBLE_PUSH diagnostic can
+/// identify WHICH callsite produced the offending push — narrowing
+/// down which state path is racing without a stack trace.
+pub const ScheduleCaller = enum { spawn, wake, reschedule };
 
-    fn push(self: *RemoteQueue, f: *Fiber) void {
-        var current = self.head.load(.monotonic);
-        while (true) {
-            f.remote_next = current;
-            if (self.head.cmpxchgWeak(current, f, .release, .monotonic)) |actual| {
-                current = actual;
-                continue;
-            }
-            return;
+/// Atomically bump `f.push_count` and assert the queue-residency
+/// invariant: at most one pending push at a time
+/// (`push_count - pop_count <= 1`). A violation means the fiber
+/// got pushed into a queue while already in another queue —
+/// downstream this lets two workers both pop it and step it
+/// concurrently. Called by `scheduleLocal` after a successful
+/// push (local or global fallback). The diagnostic identifies
+/// the pushing worker, queue tier, and ScheduleCaller path.
+/// Append a single event to the fiber's 16-slot ring buffer.
+/// `kind` is 0=spawn, 1=wake, 2=reschedule (matching ScheduleCaller's
+/// enum order), or 3=pop. `count` is push_count for pushes and
+/// pop_count for pops. Caller has already updated last_push/last_pop.
+fn logEvent(f: *Fiber, worker_id: u8, kind: u8, count: u32) void {
+    const event: u32 = (@as(u32, worker_id) << 24) |
+        (@as(u32, kind) << 16) |
+        (count & 0xFFFF);
+    const slot = f.event_ring_idx.fetchAdd(1, .acq_rel) & 31;
+    f.event_ring[slot].store(event, .release);
+}
+
+fn checkPushInvariant(f: *Fiber, worker_id: u8, tier: []const u8, via: ScheduleCaller) void {
+    const prev_push = f.push_count.fetchAdd(1, .acq_rel);
+    const pop = f.pop_count.load(.acquire);
+    const new_push = prev_push + 1;
+    const packed_push: u32 = (@as(u32, worker_id) << 16) | (new_push & 0xFFFF);
+    f.last_push.store(packed_push, .release);
+    logEvent(f, worker_id, @intFromEnum(via), new_push);
+    if (new_push -% pop > 1) {
+        const last_push_raw = f.last_push.load(.acquire);
+        const last_pop_raw = f.last_pop.load(.acquire);
+        // Dump the ring: 32 events in chronological order (oldest
+        // first). Highest event_ring_idx points one past the most
+        // recent slot, so we start at that index and walk forward.
+        const idx_now = f.event_ring_idx.load(.acquire);
+        var buf: [2048]u8 = undefined;
+        var written: usize = 0;
+        for (0..32) |i| {
+            const s = (idx_now +% @as(u32, @intCast(i))) & 31;
+            const e = f.event_ring[s].load(.acquire);
+            if (e == 0) continue;
+            const wkr = (e >> 24) & 0xFF;
+            const kind_i = (e >> 16) & 0xFF;
+            const num = e & 0xFFFF;
+            const kind_name: []const u8 = switch (kind_i) {
+                0 => "spawn",
+                1 => "wake",
+                2 => "reschedule",
+                3 => "POP",
+                4 => "ENTER",
+                5 => "EXIT",
+                else => "?",
+            };
+            const slice = std.fmt.bufPrint(
+                buf[written..],
+                "[w{d}/{s}/#{d}]",
+                .{ wkr, kind_name, num },
+            ) catch break;
+            written += slice.len;
         }
+        std.debug.panic(
+            "DOUBLE_PUSH fiber=0x{x} worker={d} tier={s} via={s} push={d} pop={d} " ++
+                "last_push=(w{d}, push#{d}) last_pop=(w{d}, pop#{d}) ring={s}",
+            .{
+                @intFromPtr(f),        worker_id,              tier,
+                @tagName(via),         new_push,               pop,
+                last_push_raw >> 16,   last_push_raw & 0xFFFF, last_pop_raw >> 16,
+                last_pop_raw & 0xFFFF, buf[0..written],
+            },
+        );
     }
-
-    fn drain(self: *RemoteQueue) ?*Fiber {
-        return self.head.swap(null, .acquire);
-    }
-};
+}
 
 pub const Worker = struct {
     pub threadlocal var current: ?*Worker = null;
@@ -100,14 +155,9 @@ pub const Worker = struct {
     /// from the head (FIFO from owner's view) via stealBatchTo.
     ready: [Priority.count]LocalQueue = undefined,
 
-    /// Cross-thread fiber injection. Pushed to by peer workers /
-    /// external threads via `RemoteQueue.push`; drained by this
-    /// worker at the top of every outer-loop iteration.
-    remote_queue: RemoteQueue = .{},
-
-    /// Cross-thread wake mechanism. Peer workers that pushed onto
-    /// `remote_queue` call `wake_async.notify()` to unstick our
-    /// `loop.run(.once)`.
+    /// Cross-thread wake mechanism. Peer workers notify this
+    /// `wake_async` to unstick our `loop.run(.once)` so a parked
+    /// worker observes new work pushed to the global queue.
     wake_async: xev.Async,
     wake_completion: xev.Completion = undefined,
 
@@ -152,7 +202,6 @@ pub const Worker = struct {
         while (inited < Priority.count) : (inited += 1) {
             w.ready[inited] = try .init(rt.allocator, local_queue_capacity);
         }
-        w.remote_queue = .{};
         w.wake_completion = undefined;
         w.thread = null;
         w.steal_cursor = id;
@@ -182,41 +231,18 @@ pub const Worker = struct {
         self.loop.deinit();
     }
 
-    /// The single ready-queue enqueue primitive. Used by spawn,
-    /// wake, and yield-reschedule alike — all "fiber became ready"
-    /// events land here. On LocalQueue.Full, spill to the runtime's
-    /// `global` queue. After pushing, if our local now holds at
-    /// least 2 fibers AND no peer is already searching, notify one
-    /// parked peer to wake up and steal. `num_searching` and the
-    /// idempotency of `wake_async.notify()` together keep the
-    /// notify count bounded under heavy push activity.
-    pub fn scheduleLocal(self: *Worker, f: *Fiber) void {
-        // Cheap corruption tripwires. If a stale/garbage *Fiber slips
-        // through a queue's slot write, these fire before we propagate
-        // the bad pointer further.
-        std.debug.assert(@intFromPtr(f) >= 0x1000);
-        std.debug.assert(@intFromEnum(f.priority) < Priority.count);
-        const prio_idx = @intFromEnum(f.priority);
-        self.ready[prio_idx].push(f) catch |err| switch (err) {
-            error.Full => {
-                self.rt.global[prio_idx].push(f) catch |gerr| std.debug.panic(
-                    "fiber: GlobalQueue push failed: {}",
-                    .{gerr},
-                );
-                // BISECT: notifyIdlePeer disabled. Workers discover
-                // global-queue work via their own searching-pass
-                // global pull instead of being explicitly notified.
-                return;
-            },
-        };
-        // BISECT: notifyIdlePeer disabled.
-    }
-
     fn popNextReady(self: *Worker) ?*Fiber {
         var i: usize = Priority.count;
         while (i > 0) {
             i -= 1;
-            if (self.ready[i].pop()) |f| return f;
+            if (self.ready[i].pop()) |f| {
+                const prev_pop = f.pop_count.fetchAdd(1, .acq_rel);
+                const new_pop = prev_pop + 1;
+                const packed_pop: u32 = (@as(u32, self.id) << 16) | (new_pop & 0xFFFF);
+                f.last_pop.store(packed_pop, .release);
+                logEvent(f, self.id, 3, new_pop);
+                return f;
+            }
         }
         return null;
     }
@@ -234,7 +260,18 @@ pub const Worker = struct {
     /// other was empty. Returns true if any fiber was transferred;
     /// the caller's run-loop then pops from local on the next
     /// iteration.
+    ///
+    /// `rt.num_thieves` is incremented for the lifetime of this
+    /// call (via `defer` for the decrement). The producer's notify-
+    /// on-spillover check in `scheduleLocal` reads this counter:
+    /// when it's > 0, somebody is already probing peers for work,
+    /// and the producer skips waking a parked peer. That keeps the
+    /// "wake an idle worker" path one-at-a-time instead of a
+    /// thundering herd.
     fn trySteal(self: *Worker) bool {
+        _ = self.rt.num_thieves.fetchAdd(1, .seq_cst);
+        defer _ = self.rt.num_thieves.fetchSub(1, .seq_cst);
+
         const range = self.myLaneRange();
         const width: u8 = range.end - range.start;
         if (width <= 1) return false; // alone in the lane — no peers
@@ -263,20 +300,6 @@ pub const Worker = struct {
         return false;
     }
 
-    /// Move every fiber on our remote queue to our local ready queue.
-    /// Called at the top of every outer-loop iteration so cross-thread
-    /// arrivals get picked up promptly. The Treiber-stack drain is
-    /// newest-first; `lifoToFifo` flips it so spawn order is preserved
-    /// when peer threads push a burst of fibers to this worker.
-    fn drainRemote(self: *Worker) void {
-        var f: ?*Fiber = lifoToFifo(self.remote_queue.drain());
-        while (f) |entry| {
-            f = entry.remote_next;
-            entry.remote_next = null;
-            self.scheduleLocal(entry);
-        }
-    }
-
     pub fn run(self: *Worker) void {
         const prev = current;
         current = self;
@@ -303,7 +326,8 @@ pub const Worker = struct {
 
         // Arm the cross-thread wake handle. The callback re-arms
         // automatically; its only job is to unstick `loop.run(.once)`
-        // so the outer loop re-drains `remote_queue`.
+        // so the outer loop observes new work pushed to the global
+        // queue.
         self.wake_async.wait(
             &self.loop,
             &self.wake_completion,
@@ -313,7 +337,7 @@ pub const Worker = struct {
         );
 
         // BISECT mode: workers busy-poll. No park, no publishIdle,
-        // no num_searching bookkeeping, no notifyIdlePeer. This
+        // no num_thieves bookkeeping, no notifyIdlePeer. This
         // isolates the chunk-1 corruption to either the steal path,
         // the queue ops, or normal scheduleLocal — by eliminating
         // every park/wake/notify code path.
@@ -328,8 +352,6 @@ pub const Worker = struct {
             // and amortizes across however many libxev ops the fibers
             // we dispatch issue.
             self.loop.update_now();
-
-            self.drainRemote();
 
             if (self.popNextReady()) |f| {
                 self.runFiber(f);
@@ -347,7 +369,7 @@ pub const Worker = struct {
             if (pulled) continue;
 
             // Try to steal a batch from a peer in our lane.
-            if (self.trySteal()) continue;
+            // if (self.trySteal()) continue;
 
             // BISECT: no parking. Just busy-poll libxev (non-blocking)
             // and loop back to the top. Workers burn CPU while idle
@@ -372,7 +394,42 @@ pub const Worker = struct {
         // allocated so they must live well above the low MMU pages.
         std.debug.assert(@intFromPtr(f) >= 0x1000);
         std.debug.assert(@intFromEnum(f.priority) < Priority.count);
-        std.debug.assert(@intFromEnum(f.loadState().tag) <= @intFromEnum(Tag.finished));
+        // CRITICAL: if we popped a fiber whose state is already
+        // .finished, the queue handed us a fiber that already
+        // completed elsewhere. That's the path to the live_count
+        // underflow — we'd decrement, but the original finish-path
+        // run already did so.
+        const entry_state = f.loadState();
+        if (entry_state.tag == .finished) std.debug.panic(
+            "DOUBLE_POP_FINISHED worker={d} fiber=0x{x} live={d}",
+            .{
+                self.id,
+                @intFromPtr(f),
+                self.rt.live_count.load(.acquire),
+            },
+        );
+        std.debug.assert(@intFromEnum(entry_state.tag) <= @intFromEnum(Tag.finished));
+
+        // Concurrent-step tripwire. CAS-claim ownership: a successful
+        // CAS means we're the only worker between `step()` and the
+        // matching release below. A losing CAS means another worker
+        // is right now executing the same fiber's stack — exactly
+        // the corruption mode (overlapping `parent_context` writes,
+        // shared coro stack) we suspect drives the live_count and
+        // Worker-state crashes at high worker counts.
+        const my_id: u16 = self.id;
+        if (f.running_on_worker.cmpxchgStrong(
+            fb.Fiber.no_owner,
+            my_id,
+            .acq_rel,
+            .acquire,
+        )) |other| {
+            std.debug.panic(
+                "CONCURRENT_STEP fiber=0x{x} self_worker={d} other_worker={d}",
+                .{ @intFromPtr(f), my_id, other },
+            );
+        }
+        logEvent(f, self.id, 4, f.pop_count.load(.acquire)); // ENTER
 
         self.current_fiber = f;
         const enter = readTicks();
@@ -380,7 +437,41 @@ pub const Worker = struct {
         f.coro.step();
 
         const exit = readTicks();
+        // Capture `f.intent` BEFORE releasing the CAS-claim. After
+        // release, a peer worker may legitimately CAS-claim F (via a
+        // wake-induced push followed by a pop), run F's body for a
+        // new cycle, and overwrite `f.intent` with the new cycle's
+        // outcome. Without capture, our later `switch (f.intent)`
+        // would read the PEER's value and push F via the wrong
+        // intent — duplicating F into two queues. The fix is to act
+        // on this step's body's intent, captured here while it's
+        // still ours.
+        const captured_intent = f.intent;
+        // Same reason as captured_intent: read `.finished` here, not
+        // after release, so a peer that runs F to completion in a
+        // new cycle doesn't trick us into firing the finish path
+        // twice (which would double-decrement `live_count`).
+        const captured_finished = f.isFinished();
         self.current_fiber = null;
+        // Release ownership now that step() has fully returned. Use
+        // a CAS (not a blind store): we *should* be the current
+        // owner (since we CAS-claimed at entry and no one else can
+        // legally write `running_on_worker` between then and now).
+        // If the CAS fails, someone else wrote `running_on_worker`
+        // while we were stepping — a smoking-gun for an undetected
+        // concurrent runFiber on F.
+        if (f.running_on_worker.cmpxchgStrong(
+            my_id,
+            fb.Fiber.no_owner,
+            .acq_rel,
+            .acquire,
+        )) |actual| {
+            std.debug.panic(
+                "RELEASE_LOST fiber=0x{x} self={d} actual_owner={d}",
+                .{ @intFromPtr(f), my_id, actual },
+            );
+        }
+        logEvent(f, self.id, 5, f.push_count.load(.acquire)); // EXIT
         // Skip the reading if the counter went backwards (e.g.,
         // thread migrated mid-step to a CPU with a slightly behind
         // TSC). Real-world frequency: rare. Metrics aggregators
@@ -399,13 +490,18 @@ pub const Worker = struct {
             self.last_pump_ticks = exit;
         }
 
-        if (f.isFinished()) {
+        if (captured_finished) {
             // The fiber wrote its result into JoinState; let the
             // hook flip `finished=true` and hand back any parked
             // joiner. We do the actual wake here so `fiber.zig`
             // doesn't have to import the runtime.
             if (f.on_finished(f)) |waiter| wake(waiter);
-            const remaining = self.rt.live_count.fetchSub(1, .release) - 1;
+            const prev = self.rt.live_count.fetchSub(1, .release);
+            if (prev == 0) std.debug.panic(
+                "LIVE_COUNT_UNDERFLOW worker={d} fiber=0x{x}",
+                .{ self.id, @intFromPtr(f) },
+            );
+            const remaining = prev - 1;
             if (remaining == 0) self.rt.broadcastStop(self.id);
             return;
         }
@@ -416,9 +512,9 @@ pub const Worker = struct {
         // the switch-on-corrupt-value panic propagates a less
         // informative SEGV.
         std.debug.assert(@intFromPtr(f) >= 0x1000);
-        std.debug.assert(@intFromEnum(f.intent) <= @intFromEnum(YieldIntent.park));
-        switch (f.intent) {
-            .reschedule => self.scheduleLocal(f),
+        std.debug.assert(@intFromEnum(captured_intent) <= @intFromEnum(YieldIntent.park));
+        switch (captured_intent) {
+            .reschedule => scheduleLocal(f, .reschedule),
             .park => {},
         }
     }
@@ -433,9 +529,9 @@ pub const Worker = struct {
             .fetchOr(self.lane_bit_mask, .release);
     }
 
-    /// Clear our bit. Acquire so subsequent reads of `remote_queue`
-    /// / `ready` observe a producer's pre-notify writes. Idempotent:
-    /// `popIdlePeer` may have already cleared the bit by picking us.
+    /// Clear our bit. Acquire so subsequent reads of `ready` observe
+    /// a producer's pre-notify writes. Idempotent: `popIdlePeer` may
+    /// have already cleared the bit by picking us.
     inline fn clearIdle(self: *Worker) void {
         std.debug.assert(self.lane_idx < fb.Lane.count);
         std.debug.assert(self.lane_word_idx < max_idle_mask_words);
@@ -444,19 +540,6 @@ pub const Worker = struct {
     }
 };
 
-/// In-place reverse a `remote_next`-linked list. The Treiber-stack
-/// drain produces newest-first; the caller wants oldest-first.
-fn lifoToFifo(head: ?*Fiber) ?*Fiber {
-    var fifo: ?*Fiber = null;
-    var lifo = head;
-    while (lifo) |f| {
-        lifo = f.remote_next;
-        f.remote_next = fifo;
-        fifo = f;
-    }
-    return fifo;
-}
-
 fn wakeAsyncCallback(
     _: ?*Worker,
     _: *xev.Loop,
@@ -464,7 +547,7 @@ fn wakeAsyncCallback(
     _: xev.Async.WaitError!void,
 ) xev.CallbackAction {
     // The notify's job is just to unstick `loop.run(.once)`. The
-    // worker's outer loop will drain `remote_queue` and check
+    // worker's outer loop will re-check the global queue and
     // `live_count` on its next iteration.
     return .rearm;
 }
@@ -542,13 +625,15 @@ pub const Runtime = struct {
     /// `lane_rr` and other Runtime hot fields.
     idle_mask: [fb.Lane.count][max_idle_mask_words]std.atomic.Value(u64) align(std.atomic.cache_line) = @splat(@splat(.init(0))),
 
-    /// Workers currently in the "searching" state — i.e., between
-    /// running a fiber and parking, actively trying to steal. A
-    /// producer that lands work on its own local consults this
-    /// counter: if > 0, somebody is already going to discover the
-    /// new work via stealing and no notify is needed. Saves the
-    /// thundering-herd of wake_async.notify() syscalls on every push.
-    num_searching: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
+    /// Workers currently inside `Worker.trySteal` — i.e., actively
+    /// probing peers for stealable work. Incremented on trySteal
+    /// entry, decremented on return (via `defer`). A producer that
+    /// lands new work on its own local consults this counter in
+    /// `scheduleLocal`: if > 0, some peer is already searching and
+    /// will discover the new work, so we skip notifying a parked
+    /// peer. Keeps wake_async.notify() one-at-a-time instead of a
+    /// thundering herd on every push.
+    num_thieves: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
 
     /// Process-wide admission / overflow queues, one per priority.
     /// Receives:
@@ -586,7 +671,7 @@ pub const Runtime = struct {
         self.lane_ranges[@intFromEnum(fb.Lane.default)] = .{ .start = default_start, .end = default_end };
         self.lane_rr = @splat(.init(0));
         self.idle_mask = @splat(@splat(.init(0)));
-        self.num_searching = .init(0);
+        self.num_thieves = .init(0);
         // Init one global queue per priority. Track how many
         // succeeded so errdefer rolls back partial init.
         var gq_inited: usize = 0;
@@ -715,41 +800,49 @@ fn workerEntry(w: *Worker) void {
     w.run();
 }
 
-/// Route a fiber to a worker's ready queue.
-///
-/// `redirect` controls whether to consult the lane's idle mask. Set
-/// only by `spawn` — placing a fresh fiber benefits from picking an
-/// idle peer (work lands where it'll run, skipping a steal hop).
-/// `wake` passes `false`: resuming an existing fiber wants to stay
-/// on whatever worker it was on for cache locality, mirroring how
-/// Go's `goready` and Tokio's notify path both keep the wake local
-/// and let stealing handle imbalance over time.
-///
-/// If `redirect` is set AND the fiber is not locked, claim an idle
-/// peer in the target's lane via `popIdlePeer` (CAS-clear its bit)
-/// and retarget the fiber to it. Otherwise the fiber goes to its
-/// originally-assigned `f.worker_id`. Same-thread targets get a
-/// direct local push; cross-thread targets land on `remote_queue`
-/// + `wake_async.notify()`.
 /// Find one parked peer in `lane_idx` and notify its `wake_async`.
 /// Called from `scheduleLocal` when a push creates spillover and
-/// no peer is already searching. We don't clear the bit — the
-/// notified worker clears its own bit as it wakes from park. A
-/// concurrent producer notifying the same peer is a no-op
-/// (`wake_async.notify` is idempotent until the receiver clears).
+/// no peer is currently inside `trySteal`. Finds one parked peer
+/// via `idle_mask`, atomically claims its bit (CAS-clears) so only
+/// one producer notifies it, then notifies the peer's `wake_async`.
+///
+/// **Why CAS-claim?** Without it, two producers seeing the same set
+/// bit would both call `peer.wake_async.notify()`. That is *safe at
+/// the libxev level* — xev.Async is eventfd-backed on Linux and the
+/// eventfd counter coalesces multiple writes — but each redundant
+/// notify is a wasted syscall AND, more importantly, would re-fire
+/// the wake_async callback after the peer has already cleared its
+/// bit, woken, and started running. The CAS-claim ensures
+/// "one producer notifies, one peer wakes, exactly once per park
+/// cycle." The losing producer either finds another set bit further
+/// on or returns having done nothing — equally safe.
 fn notifyIdlePeer(rt: *Runtime, lane_idx: u8) void {
     std.debug.assert(lane_idx < fb.Lane.count);
     const words = &rt.idle_mask[lane_idx];
     for (words, 0..) |*word, word_i| {
-        const m = word.load(.acquire);
-        if (m == 0) continue;
-        const bit_i: u6 = @intCast(@ctz(m));
-        const off: u8 = @intCast(word_i * bits_per_word + bit_i);
-        const peer_id = rt.lane_ranges[lane_idx].start + off;
-        std.debug.assert(peer_id < rt.workers.len);
-        std.log.info("waking up {d}\n", .{peer_id});
-        rt.workers[peer_id].wake_async.notify() catch {};
-        return;
+        var m = word.load(.acquire);
+        while (m != 0) {
+            const bit_i: u6 = @intCast(@ctz(m));
+            const bit: u64 = @as(u64, 1) << bit_i;
+            // CAS-claim: clear our chosen bit. If another producer
+            // (or the peer itself, waking up) already cleared it,
+            // `actual` reflects the new state — retry with what we
+            // saw, in case a *different* bit in the same word is
+            // still set.
+            if (word.cmpxchgWeak(m, m & ~bit, .acq_rel, .acquire)) |actual| {
+                m = actual;
+                continue;
+            }
+            // We claimed it. Notify the peer.
+            const off: u8 = @intCast(word_i * bits_per_word + bit_i);
+            const peer_id = rt.lane_ranges[lane_idx].start + off;
+            std.debug.assert(peer_id < rt.workers.len);
+            std.log.debug("notifyIdlePeer: {d}", .{peer_id});
+
+            // TODO: re-enable this.
+            // rt.workers[peer_id].wake_async.notify() catch {};
+            return;
+        }
     }
 }
 
@@ -793,6 +886,90 @@ pub fn JoinHandle(comptime T: type) type {
     };
 }
 
+/// The single ready-queue enqueue primitive. Used by spawn, wake,
+/// and yield-reschedule alike — all "fiber became ready" events
+/// land here. Derives the target worker from the threadlocal
+/// `Worker.current`:
+///
+///   - Inside a worker thread → push into that worker's local
+///     queue (single-owner Chase-Lev). On `error.Full`, spill to
+///     the runtime's global queue.
+///   - On a non-worker thread (host bootstrap, foreign callbacks)
+///     → push directly to global. Chase-Lev push assumes a single
+///     owner-pusher; pushing into worker[0]'s local from outside
+///     would race on the tail/slot stores. The spinlock-protected
+///     global queue is the only multi-producer-safe target.
+///
+/// Three callers reach this:
+///   - `spawn` (running_on_worker == no_owner): no spin.
+///   - `runFiber` reschedule (running_on_worker == self.id): we
+///     hold the claim ourselves, spinning would deadlock.
+///   - `wake` (running_on_worker == some peer): spin until they
+///     release. The window is the few instructions between park's
+///     state CAS and runFiber's release — microseconds at worst.
+///
+/// The spin is the park/wake interlock: `park()` flips `state` to
+/// `.waiting` BEFORE calling `coro.yield()`; the worker running the
+/// parking fiber doesn't release `running_on_worker` until step()
+/// has fully returned. A wake that observes `.waiting` between
+/// those two points would otherwise queue the fiber while the
+/// previous owner is still mid-yield — letting a third worker pop
+/// it and step() concurrently, corrupting `f.parent_context` and
+/// running the fiber's stack on two threads.
+pub fn scheduleLocal(f: *Fiber, via: ScheduleCaller) void {
+    std.debug.assert(@intFromPtr(f) >= 0x1000);
+    std.debug.assert(@intFromEnum(f.priority) < Priority.count);
+
+    const self = Worker.current orelse {
+        const rt = g_rt orelse @panic(
+            "fiber.scheduleLocal: Runtime not initialized",
+        );
+        const prio_idx = @intFromEnum(f.priority);
+        rt.global[prio_idx].push(f) catch |err| std.debug.panic(
+            "fiber: global-bootstrap push failed: {}",
+            .{err},
+        );
+        checkPushInvariant(f, 0xFF, "global-bootstrap", via);
+        return;
+    };
+
+    // Spin until F's previous runner has released its CAS-claim.
+    // With release happening BEFORE the reschedule push, the only
+    // owner we should ever see here is some peer worker that has
+    // just finished `step()` and is in the few-instruction tail
+    // after step-return but before `running_on_worker.store(no_owner)`.
+    // (The `owner == self.id` short-circuit was removed: in the
+    // current design release always precedes the reschedule push,
+    // so owner is no_owner when reschedule's scheduleLocal runs.
+    // Allowing the shortcut might have masked the bug we're hunting
+    // by letting a push proceed while a stale-self-claim is still
+    // in place.)
+    while (true) {
+        const owner = f.running_on_worker.load(.acquire);
+        if (owner == fb.Fiber.no_owner) break;
+        std.atomic.spinLoopHint();
+    }
+
+    const prio_idx = @intFromEnum(f.priority);
+    self.ready[prio_idx].push(f) catch |err| switch (err) {
+        error.Full => {
+            self.rt.global[prio_idx].push(f) catch |gerr| std.debug.panic(
+                "fiber: GlobalQueue push failed: {}",
+                .{gerr},
+            );
+            checkPushInvariant(f, self.id, "global", via);
+            if (self.rt.num_thieves.load(.acquire) == 0) {
+                notifyIdlePeer(self.rt, self.lane_idx);
+            }
+            return;
+        },
+    };
+    checkPushInvariant(f, self.id, "local", via);
+    if (self.ready[prio_idx].len() < 2) return;
+    if (self.rt.num_thieves.load(.acquire) != 0) return;
+    notifyIdlePeer(self.rt, self.lane_idx);
+}
+
 /// Spawn `func(args...)` as a new fiber on the process-wide runtime.
 /// The args tuple is copied into a heap-allocated context owned by
 /// the Fiber (see `Fiber.init`); callers only need to keep alive
@@ -815,12 +992,7 @@ pub fn spawn(
     f.state.store(@bitCast(State{ .tag = .ready, .awaken = false }), .release);
 
     _ = rt.live_count.fetchAdd(1, .release);
-    // Bootstrap: spawn from a non-worker thread (host thread before
-    // Runtime.run) lands on worker 0's local queue directly.
-    // (Once Runtime.run starts, worker 0 takes the calling thread
-    // and current_worker becomes valid; from then on we use it.)
-    const target = Worker.current orelse &rt.workers[0];
-    target.scheduleLocal(f);
+    scheduleLocal(f, .spawn);
 
     // Same comptime-generated Ctx type Fiber.init used to allocate
     // `f.ctx`. Accessing `&ctx.state` by name lets Zig compute the
@@ -840,8 +1012,8 @@ pub fn yield() void {
 /// set) the token is consumed and `park` returns without yielding.
 /// Otherwise the fiber transitions to `.waiting`, records park
 /// metadata, and yields. A later `wake` CAS'es it back to `.ready`
-/// and routes it through `routeToWorker` — same-thread direct push
-/// or cross-thread `remote_queue` + `wake_async.notify`.
+/// and routes it through `scheduleLocal` — the wake-caller's local
+/// queue if they're on a worker, otherwise the global queue.
 pub fn park() void {
     const w = currentWorker();
     const f = w.current_fiber.?;
@@ -884,12 +1056,9 @@ pub fn park() void {
 /// Wake a fiber. Safe to call on a fiber in any state: `.finished`
 /// is a no-op; `.ready` deposits an awaken token for a concurrent
 /// `park` to consume; `.new` / `.waiting` transitions to `.ready`
-/// and routes the fiber to its home worker's queue.
-///
-/// Routing is home-worker-pinned: if the caller is on the fiber's
-/// home thread, the push goes directly to the home's local ready
-/// queue. Otherwise the fiber lands on the home's `remote_queue`
-/// and we notify the home's `wake_async` to unstick its loop.
+/// and queues the fiber via `scheduleLocal` — onto the wake-caller's
+/// local queue (if they're on a worker) or onto the global queue.
+/// Idle peers pick up the work via stealing or via the global pull.
 pub fn wake(f: *Fiber) void {
     std.debug.assert(@intFromPtr(f) >= 0x1000);
     var old = f.loadState();
@@ -918,8 +1087,11 @@ pub fn wake(f: *Fiber) void {
     }
 
     // Wake lands the fiber on whichever worker is making the wake
-    // call. Stealing rebalances over time if peers are idle.
-    currentWorker().scheduleLocal(f);
+    // call. Stealing rebalances over time if peers are idle. If
+    // wake fires from a non-worker thread (libxev callback before
+    // its handle is bound to a fiber, etc.) `scheduleLocal` routes
+    // to global.
+    scheduleLocal(f, .wake);
 }
 
 pub fn currentWorker() *Worker {
@@ -934,7 +1106,7 @@ pub fn currentFiber() *Fiber {
 /// handlers, test-runner logFn, watchdog) that need to ask "are we
 /// inside a fiber right now?" without panicking. Returns null when
 /// called from a non-worker thread, or from a worker thread that's
-/// between fibers (in `loop.run`, `drainRemote`, etc.).
+/// between fibers (in `loop.run`, `trySteal`, etc.).
 pub fn currentFiberOrNull() ?*Fiber {
     const w = Worker.current orelse return null;
     return w.current_fiber;

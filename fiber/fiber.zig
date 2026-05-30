@@ -159,6 +159,47 @@ pub const Fiber = struct {
     state: std.atomic.Value(u8),
     intent: YieldIntent,
 
+    /// Tripwire for concurrent `coro.step()` on the same Fiber.
+    /// `runFiber` CASes this from `no_owner` to its worker id on
+    /// entry; on exit it stores `no_owner`. Two workers calling
+    /// step() concurrently would each overwrite `parent_context` and
+    /// scribble on the same fiber stack — the CAS catches the
+    /// offender before that corruption happens. `u16` (not u8) so
+    /// `no_owner = 0xFFFF` doesn't alias a valid worker id.
+    running_on_worker: std.atomic.Value(u16),
+
+    /// Diagnostic counters for the duplication-in-queue hypothesis.
+    /// Every `scheduleLocal` push increments `push_count`; every
+    /// successful pop in `popNextReady` increments `pop_count`. The
+    /// invariant is `0 <= push_count - pop_count <= 1` (at most one
+    /// queue entry). A push that bumps `push_count - pop_count` past 1
+    /// proves the same fiber was queued twice without an intervening
+    /// pop — i.e. it's in two queues at once.
+    push_count: std.atomic.Value(u32),
+    pop_count: std.atomic.Value(u32),
+
+    /// Packed `(worker_id : u16, push_count_value : u16)` of the most
+    /// recent push, and same shape for the most recent pop. Written
+    /// atomically (single u32 store) so a panicking thread can dump
+    /// both sides without tearing. Diagnostic only.
+    last_push: std.atomic.Value(u32),
+    last_pop: std.atomic.Value(u32),
+
+    /// Ring buffer of the last 32 events. Each slot is
+    /// `(worker_id << 24) | (kind << 16) | (count & 0xFFFF)` where
+    /// `kind` is:
+    ///   0=spawn, 1=wake, 2=reschedule  (push events; count = push#)
+    ///   3=pop                          (pop_count; count = pop#)
+    ///   4=runFiber_entry               (CAS-claim succeeded; count = pop#)
+    ///   5=runFiber_exit                (CAS released; count = push# OR 0)
+    ///
+    /// `event_ring_idx` is the atomic write counter — slot = `idx & 31`.
+    /// On a DOUBLE_PUSH panic we dump the whole ring so we can trace
+    /// the exact sequence of pop, runFiber_entry, runFiber_exit, and
+    /// push events leading up to the violation.
+    event_ring: [32]std.atomic.Value(u32),
+    event_ring_idx: std.atomic.Value(u32),
+
     priority: Priority,
     /// Cumulative count of times this fiber has been stolen onto a
     /// new worker. Diagnostic + makes steal tests deterministic
@@ -178,11 +219,6 @@ pub const Fiber = struct {
     // Intrusive ready-queue link. Owned by whichever priority FIFO
     // the fiber is on; null when not enqueued.
     ready_next: ?*Fiber,
-    // Intrusive remote-queue link. Used when a peer worker pushes
-    // this fiber onto its home worker's cross-thread injection
-    // stack. Disjoint from ready_next — a fiber is either in the
-    // remote queue or the local ready queue, never both.
-    remote_next: ?*Fiber,
     // Intrusive wait-queue links. A fiber is in at most one wait
     // queue at a time (parked on a Mutex, Condition, Channel, etc.),
     // so a single pair of pointers suffices. Both null when not in
@@ -193,6 +229,11 @@ pub const Fiber = struct {
     /// runtime's `appendFiber` / `removeFiber` so swap-remove can find
     /// the fiber in O(1). `maxInt` while not registered.
     registry_index: usize,
+
+    /// Sentinel for `running_on_worker` meaning "no worker currently
+    /// executing this fiber's coro." Picked > 0xFF so it can't alias
+    /// any valid worker id.
+    pub const no_owner: u16 = 0xFFFF;
 
     /// Create a fiber that will run `func(args...)`. The args tuple is
     /// copied into a heap-allocated context owned by the Fiber; callers
@@ -251,13 +292,23 @@ pub const Fiber = struct {
             .on_finished = &helpers.onFinished,
             .state = std.atomic.Value(u8).init(@bitCast(init_state)),
             .intent = .reschedule,
+            .running_on_worker = std.atomic.Value(u16).init(no_owner),
+            .push_count = std.atomic.Value(u32).init(0),
+            .pop_count = std.atomic.Value(u32).init(0),
+            .last_push = std.atomic.Value(u32).init(0),
+            .last_pop = std.atomic.Value(u32).init(0),
+            .event_ring = blk: {
+                var r: [32]std.atomic.Value(u32) = undefined;
+                for (&r) |*slot| slot.* = std.atomic.Value(u32).init(0);
+                break :blk r;
+            },
+            .event_ring_idx = std.atomic.Value(u32).init(0),
             .priority = opts.priority,
             .times_stolen = 0,
             .cpu_total_ns = 0,
             .parked_since_ms = 0,
             .park_trace = @splat(0),
             .ready_next = null,
-            .remote_next = null,
             .waker_prev = null,
             .waker_next = null,
             .registry_index = std.math.maxInt(usize),

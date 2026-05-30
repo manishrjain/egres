@@ -178,10 +178,22 @@ pub const LocalQueue = struct {
         // total order with victim's pop tail-store.
         const h = victim.head.load(.seq_cst);
         const t = victim.tail.load(.seq_cst);
-        if (h >= t) return .empty;
+        // Signed diff first, then bound check, THEN cast. If we cast
+        // first, a victim caught mid-pop-slow-path can briefly show
+        // `head > tail` (owner decremented tail; head not yet
+        // restored), and the unsigned cast panics. The single
+        // `diff <= 1` check covers all three skip cases:
+        //   diff < 0  → race, victim not stable; bail
+        //   diff == 0 → empty
+        //   diff == 1 → only the owner's last fiber; don't steal it,
+        //               that's the size=1 pop/steal race window the
+        //               caller is trying to avoid.
+        const diff = t - h;
+        if (diff <= 1) return .empty;
+        const size: usize = @intCast(diff);
 
-        const size: usize = @intCast(t - h);
-        // ceil(size / 2): for size=1 we still claim 1.
+        // ceil(size / 2). size is guaranteed >= 2 by the diff check
+        // above, so n is always >= 1.
         var n = (size + 1) / 2;
         if (n > dest_room) n = dest_room;
 
@@ -233,6 +245,135 @@ pub const LocalQueue = struct {
         const t = self.tail.load(.monotonic);
         const h = self.head.load(.monotonic);
         return if (t > h) @intCast(t - h) else 0;
+    }
+};
+
+/// Drop-in replacement for `LocalQueue` with the same public API,
+/// but every operation runs under a single per-queue spinlock and
+/// the bookkeeping fields are plain (non-atomic) `usize`s. The
+/// logic is intentionally trivial: each method does its work in
+/// one critical section, with no cross-thread atomics or memory-
+/// model subtleties. Used to A/B against `LocalQueue` when the
+/// Chase-Lev variant's pop/steal race is suspected — if a bug
+/// reproduces under `LocalQueue` but disappears under
+/// `LocalQueue2`, the issue is in the lock-free queue logic.
+///
+/// Same layout idea as `LocalQueue`: a power-of-two ring buffer
+/// where `head` is the next pop-by-thief index and `head + size`
+/// is the owner's push/pop slot. Owner ops are LIFO (push/pop at
+/// the tail); thief ops are FIFO (steal from the head).
+pub const LocalQueue2 = struct {
+    const Self = @This();
+
+    pub const Error = error{Full};
+    pub const Steal = LocalQueue.Steal;
+
+    sl: Spinlock = .{},
+    fibers: []*Fiber,
+    head: usize = 0,
+    size: usize = 0,
+    mask: usize,
+
+    pub fn init(allocator: Allocator, cap: usize) !Self {
+        std.debug.assert(std.math.isPowerOfTwo(cap));
+        std.debug.assert(cap >= 2);
+        const fibers = try allocator.alloc(*Fiber, cap);
+        return .{ .fibers = fibers, .mask = cap - 1 };
+    }
+
+    pub fn deinit(self: *Self, allocator: Allocator) void {
+        allocator.free(self.fibers);
+    }
+
+    pub fn capacity(self: *const Self) usize {
+        return self.mask + 1;
+    }
+
+    /// Owner-only by convention, but the lock makes it safe from
+    /// anywhere. Returns `error.Full` at capacity.
+    pub fn push(self: *Self, f: *Fiber) Error!void {
+        std.debug.assert(@intFromPtr(f) >= 0x1000);
+        self.sl.lock();
+        defer self.sl.unlock();
+        if (self.size == self.capacity()) return error.Full;
+        self.fibers[(self.head + self.size) & self.mask] = f;
+        self.size += 1;
+    }
+
+    /// Owner-only by convention. Pops from the tail (LIFO).
+    pub fn pop(self: *Self) ?*Fiber {
+        self.sl.lock();
+        defer self.sl.unlock();
+        if (self.size == 0) return null;
+        self.size -= 1;
+        const f = self.fibers[(self.head + self.size) & self.mask];
+        std.debug.assert(@intFromPtr(f) >= 0x1000);
+        return f;
+    }
+
+    /// Thief-only. Pops from the head (FIFO).
+    pub fn stealOne(self: *Self) ?*Fiber {
+        self.sl.lock();
+        defer self.sl.unlock();
+        if (self.size == 0) return null;
+        const f = self.fibers[self.head & self.mask];
+        std.debug.assert(@intFromPtr(f) >= 0x1000);
+        self.head = (self.head + 1) & self.mask;
+        self.size -= 1;
+        return f;
+    }
+
+    /// Thief-only. Steal up to `ceil(victim.size / 2)` fibers from
+    /// `victim`'s head, append to `dest`'s tail. To avoid deadlock
+    /// between symmetric (A steals from B while B steals from A)
+    /// callers, we lock `victim` first and `tryLock` `dest`. On
+    /// `tryLock` failure we report `.contended` rather than
+    /// risk a circular wait.
+    pub fn stealBatchTo(victim: *Self, dest: *Self) Steal {
+        victim.sl.lock();
+        // Skip stealing the last fiber — same boundary case the
+        // Chase-Lev variant respects to avoid the size=1 owner/
+        // thief race window.
+        if (victim.size <= 1) {
+            victim.sl.unlock();
+            return .empty;
+        }
+
+        if (!dest.sl.tryLock()) {
+            victim.sl.unlock();
+            return .contended;
+        }
+
+        const dest_room = dest.capacity() - dest.size;
+        if (dest_room == 0) {
+            dest.sl.unlock();
+            victim.sl.unlock();
+            return .dest_full;
+        }
+
+        var n = (victim.size + 1) / 2;
+        if (n > dest_room) n = dest_room;
+
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const f = victim.fibers[(victim.head + i) & victim.mask];
+            std.debug.assert(@intFromPtr(f) >= 0x1000);
+            dest.fibers[(dest.head + dest.size + i) & dest.mask] = f;
+        }
+        victim.head = (victim.head + n) & victim.mask;
+        victim.size -= n;
+        dest.size += n;
+
+        dest.sl.unlock();
+        victim.sl.unlock();
+        return .{ .count = n };
+    }
+
+    /// Snapshot length. Brief critical section.
+    pub fn len(self: *Self) usize {
+        self.sl.lock();
+        defer self.sl.unlock();
+        return self.size;
     }
 };
 
@@ -325,39 +466,32 @@ pub const GlobalQueue = struct {
     /// slot array, then advance `dest.tail` with a single
     /// release-store. Caller must own `dest`. Returns the count
     /// transferred.
+    /// Pull up to `max_take` fibers from the front of the global
+    /// queue into `dest`'s tail. `dest` can be either `LocalQueue`
+    /// (lock-free Chase-Lev) or `LocalQueue2` (spinlock-protected)
+    /// — both expose `push`/`capacity` so we just call `push` per
+    /// fiber. Returns the count transferred (may be less than
+    /// `max_take` if dest hits capacity mid-transfer).
     pub fn popBatchTo(
         self: *GlobalQueue,
-        dest: *LocalQueue,
+        dest: anytype,
         max_take: usize,
     ) usize {
         self.sl.lock();
         defer self.sl.unlock();
 
         if (self.size == 0) return 0;
-        const dest_room = dest.capacity() - dest.len();
-        const take = @min(@min(max_take, self.size), dest_room);
-        if (take == 0) return 0;
-
-        const dest_t = dest.tail.load(.monotonic);
-        for (0..take) |i| {
-            const src_idx = (self.head + i) & self.mask;
+        const take = @min(max_take, self.size);
+        var transferred: usize = 0;
+        while (transferred < take) : (transferred += 1) {
+            const src_idx = (self.head + transferred) & self.mask;
             const f = self.fibers[src_idx];
-            // Tripwire: every transferred fiber must be a real
-            // pointer. Catches a slot the producer never actually
-            // wrote (size bookkeeping out of sync with the buffer).
             std.debug.assert(@intFromPtr(f) >= 0x1000);
-            const dest_idx: usize = @intCast(
-                @as(u64, @bitCast(dest_t + @as(i64, @intCast(i)))) & dest.mask,
-            );
-            dest.slots[dest_idx].store(f, .monotonic);
+            dest.push(f) catch break; // dest hit capacity
         }
-        // Single release-store publishes every slot write above to
-        // any thief that later acquire-loads dest.tail.
-        dest.tail.store(dest_t + @as(i64, @intCast(take)), .release);
-
-        self.head = (self.head + take) & self.mask;
-        self.size -= take;
-        return take;
+        self.head = (self.head + transferred) & self.mask;
+        self.size -= transferred;
+        return transferred;
     }
 
     /// Snapshot length. Takes the spinlock; intended for tests /
