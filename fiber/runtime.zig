@@ -11,8 +11,9 @@
 //! queue at the top of every outer-loop iteration.
 //!
 //! `yield()` / `park()` / `wake()` are namespace-level free functions
-//! that operate on the currently-running fiber, looked up via the
-//! `Worker.current` thread-local.
+//! that operate on the currently-running fiber, looked up via
+//! `currentWorkerOrNull()` (the migration-safe accessor for the
+//! `current_do_not_use_directly` thread-local).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -21,6 +22,7 @@ const fb = @import("fiber.zig");
 const coarse = @import("coarse_clock.zig");
 const deadlines = @import("deadlines.zig");
 const spinlock = @import("spinlock.zig");
+const queue = @import("queue.zig");
 
 /// Q32.32 fixed point: `ns_per_cycle * 2^32`. Set exactly once by
 /// `calibrateTsc` via CAS; zero means "not yet calibrated." This is
@@ -41,70 +43,86 @@ const Fiber = fb.Fiber;
 const State = fb.State;
 const Tag = fb.Tag;
 const Priority = fb.Priority;
+const Lane = fb.Lane;
 const SpawnOptions = fb.SpawnOptions;
 const FiberFn = fb.FiberFn;
 const YieldIntent = fb.YieldIntent;
+
+const LocalQueue = queue.LocalQueue;
+const GlobalQueue = queue.GlobalQueue;
+const RemoteQueue = queue.RemoteQueue;
+const IdleWorkers = queue.IdleWorkers;
 
 pub const CoarseClock = coarse.CoarseClock;
 pub const Deadlines = deadlines.Deadlines;
 pub const Timeout = deadlines.Timeout;
 pub const Spinlock = spinlock.Spinlock;
 
-const ReadyQueue = struct {
-    head: ?*Fiber = null,
-    tail: ?*Fiber = null,
+/// Batch size for pulling normal-priority work out of a lane's
+/// GlobalQueue into a worker's local ring on each loop pass. Half the
+/// local ring so an idle peer can still grab a share; tunable.
+const refill_batch: usize = 8;
 
-    fn push(self: *ReadyQueue, f: *Fiber) void {
-        f.ready_next = null;
-        if (self.tail) |t| {
-            t.ready_next = f;
-        } else {
-            self.head = f;
-        }
-        self.tail = f;
-    }
+/// Initial slot count for each lane's GlobalQueue (grows by doubling).
+const global_queue_initial_capacity: usize = 256;
 
-    fn popFront(self: *ReadyQueue) ?*Fiber {
-        const head = self.head orelse return null;
-        self.head = head.ready_next;
-        if (self.head == null) self.tail = null;
-        head.ready_next = null;
-        return head;
-    }
+/// Whether the `runFiber` concurrency guard is compiled in. It's a pure
+/// debug assertion (an atomic RMW per dispatch); gated to safety builds
+/// so the locked increment is fully eliminated from unsafe release builds
+/// — used with `if (comptime runfiber_guard)` so no runtime branch remains.
+const runfiber_guard = switch (builtin.mode) {
+    .Debug, .ReleaseSafe => true,
+    .ReleaseFast, .ReleaseSmall => false,
 };
 
-/// Lock-free Treiber stack for cross-thread fiber injection. Push is
-/// one CAS; drain is one atomic swap. The drained chain is LIFO —
-/// `lifoToFifo` flips it before scheduling.
-const RemoteQueue = struct {
-    head: std.atomic.Value(?*Fiber) align(std.atomic.cache_line) = .init(null),
+/// Process-wide singleton runtime. There is exactly one runtime, so
+/// workers carry no backpointer — they and `spawn` resolve it through
+/// `runtime()`. Set at the end of `Runtime.init`, cleared by `deinit`.
+var g_rt: ?*Runtime = null;
 
-    fn push(self: *RemoteQueue, f: *Fiber) void {
-        var current = self.head.load(.monotonic);
-        while (true) {
-            f.remote_next = current;
-            if (self.head.cmpxchgWeak(current, f, .release, .monotonic)) |actual| {
-                current = actual;
-                continue;
-            }
-            return;
-        }
-    }
+/// The process-singleton runtime. Panics if no runtime has been
+/// initialized. Safe from any thread (the singleton is set at the end of
+/// `Runtime.init`). `spawn` / `wake` and the workers resolve the runtime
+/// through this.
+pub fn runtime() *Runtime {
+    return g_rt orelse @panic("fiber runtime not initialized");
+}
 
-    fn drain(self: *RemoteQueue) ?*Fiber {
-        return self.head.swap(null, .acquire);
-    }
-};
+/// Coarse monotonic milliseconds from the singleton runtime's clock.
+/// Convenience for code that isn't holding a `*Runtime`. Panics if no
+/// runtime is initialized.
+pub inline fn coarseMs() i64 {
+    return runtime().ms();
+}
+
+/// Contiguous worker-id range owned by a lane. `len == 0` means the
+/// lane has no workers configured; routing falls back to `.default`.
+const LaneRange = struct { start: u8, len: u8 };
 
 pub const Worker = struct {
-    pub threadlocal var current: ?*Worker = null;
+    /// The worker running on this OS thread. Do NOT read directly — use
+    /// `currentWorkerOrNull()` / `currentWorker()`, which are `noinline` +
+    /// barriered so the read isn't hoisted across a coro `yield()` (fibers
+    /// migrate between worker threads, so a cached value goes stale). Only
+    /// `Worker.run` writes it.
+    pub threadlocal var current_do_not_use_directly: ?*Worker = null;
 
     id: u8,
-    rt: *Runtime,
+    /// Index into `Runtime.lane_ranges` / `.global` / `.idle` for the
+    /// lane this worker belongs to. Set in `Runtime.init`.
+    lane_idx: u8 = 0,
     loop: xev.Loop,
     deadlines: Deadlines,
     current_fiber: ?*Fiber = null,
-    ready: [Priority.count]ReadyQueue = @splat(.{}),
+    /// TSC reading at the last libxev pump (see `dispatch`). Lets a
+    /// continuously-busy worker still service timers / async wakes about
+    /// once per millisecond without blocking.
+    last_pump_ticks: u64 = 0,
+    /// Two ready rings, one per `Priority`. Owner-thread only — no work
+    /// stealing, so no locking. `ready[normal]` spills to / refills from
+    /// this lane's GlobalQueue; `ready[high]` is pinned and must not
+    /// overflow (see `scheduleLocal`).
+    ready: [Priority.count]LocalQueue = @splat(.{}),
 
     /// Cross-thread fiber injection. Pushed to by peer workers /
     /// external threads via `RemoteQueue.push`; drained by this
@@ -121,15 +139,16 @@ pub const Worker = struct {
     /// the calling thread that invoked `Runtime.run`).
     thread: ?std.Thread = null,
 
-    pub fn init(w: *Worker, id: u8, rt: *Runtime) !void {
+    pub fn init(w: *Worker, id: u8) !void {
         w.id = id;
-        w.rt = rt;
+        w.lane_idx = 0; // real value assigned in Runtime.init
         w.loop = try xev.Loop.init(.{});
         errdefer w.loop.deinit();
         w.wake_async = try xev.Async.init();
         errdefer w.wake_async.deinit();
         w.deadlines = try Deadlines.init(&w.loop);
         w.current_fiber = null;
+        w.last_pump_ticks = 0;
         w.ready = @splat(.{});
         w.remote_queue = .{};
         w.wake_completion = undefined;
@@ -142,26 +161,77 @@ pub const Worker = struct {
         self.loop.deinit();
     }
 
+    /// Enqueue `f` on this worker's matching priority ring. On overflow:
+    /// high priority panics (it's pinned and expected to fit); normal
+    /// priority spills to this lane's GlobalQueue and pokes an idle peer.
     pub fn scheduleLocal(self: *Worker, f: *Fiber) void {
-        self.ready[@intFromEnum(f.priority)].push(f);
+        self.ready[@intFromEnum(f.priority)].push(f) catch {
+            if (f.priority == .high) {
+                @panic("high-priority local queue overflow");
+            }
+            const rt = runtime();
+            rt.global[self.lane_idx].push(f) catch {
+                @panic("out of memory spilling fiber to global queue");
+            };
+            rt.notifyIdlePeer(self.lane_idx);
+        };
+    }
+
+    /// Commit a park that `park()` deferred. Runs on the worker AFTER the
+    /// fiber's `coro.yield()` has fully suspended it (and after the
+    /// `runFiber` concurrency guard is released), so the `.ready ->
+    /// .waiting` transition — which makes the fiber wakeable, hence
+    /// runnable on any worker — can't expose a not-yet-suspended coro. If
+    /// a `wake` deposited an awaken token while we were switching away,
+    /// reschedule instead of parking. Same CAS dance `park` used to do
+    /// inline, relocated to close the handoff race.
+    fn commitPark(self: *Worker, f: *Fiber) void {
+        var old = f.loadState();
+        while (true) {
+            std.debug.assert(old.tag == .ready);
+            if (old.awaken) {
+                const new = State{ .tag = .ready, .awaken = false };
+                if (f.casState(old, new)) |actual| {
+                    old = actual;
+                    continue;
+                }
+                self.scheduleLocal(f); // token consumed -> stay runnable
+                return;
+            }
+            const new = State{ .tag = .waiting, .awaken = false };
+            if (f.casState(old, new)) |actual| {
+                old = actual;
+                continue;
+            }
+            return; // parked; a later wake will enqueue us
+        }
     }
 
     fn popNextReady(self: *Worker) ?*Fiber {
         var i: usize = Priority.count;
         while (i > 0) {
             i -= 1;
-            if (self.ready[i].popFront()) |f| return f;
+            if (self.ready[i].pop()) |f| return f;
         }
         return null;
     }
 
+    /// Whether any priority's local ready ring holds work. Lets the run
+    /// loop test for work after a find step without popping a fiber it
+    /// would then have to dispatch inline.
+    fn hasReady(self: *const Worker) bool {
+        for (&self.ready) |*q| {
+            if (!q.isEmpty()) return true;
+        }
+        return false;
+    }
+
     /// Move every fiber on our remote queue to our local ready queue.
     /// Called at the top of every outer-loop iteration so cross-thread
-    /// arrivals get picked up promptly. The Treiber-stack drain is
-    /// newest-first; `lifoToFifo` flips it so spawn order is preserved
-    /// when peer threads push a burst of fibers to this worker.
+    /// (high-priority) arrivals get picked up promptly. `drainFifo`
+    /// returns them oldest-first so a burst keeps its spawn order.
     fn drainRemote(self: *Worker) void {
-        var f: ?*Fiber = lifoToFifo(self.remote_queue.drain());
+        var f: ?*Fiber = self.remote_queue.drainFifo();
         while (f) |entry| {
             f = entry.remote_next;
             entry.remote_next = null;
@@ -169,10 +239,87 @@ pub const Worker = struct {
         }
     }
 
+    /// Pull a batch of normal-priority work from this lane's GlobalQueue
+    /// into the local normal ring, when there's room. Cheap no-op when
+    /// the ring is full (skips taking the global spinlock).
+    fn refillFromGlobal(self: *Worker) void {
+        const dest = &self.ready[@intFromEnum(Priority.normal)];
+        const room = dest.capacity() - dest.len();
+        if (room == 0) return;
+        _ = runtime().global[self.lane_idx].popBatchTo(dest, @min(room, refill_batch));
+    }
+
+    /// This worker's bit offset within its lane's idle bitmap.
+    fn laneOffset(self: *const Worker) u8 {
+        return self.id - runtime().lane_ranges[self.lane_idx].start;
+    }
+
+    fn markIdle(self: *Worker) void {
+        runtime().idle[self.lane_idx].markIdle(self.laneOffset());
+    }
+
+    fn clearIdle(self: *Worker) void {
+        runtime().idle[self.lane_idx].clearIdle(self.laneOffset());
+    }
+
+    /// Step one fiber, then handle completion (wake any parked joiner)
+    /// or its yield intent. CPU-time accounting and the periodic libxev
+    /// pump live in the run loop, which brackets this call with
+    /// `readTicks`. No live counting — the runtime keeps running until
+    /// `stop()`; a finished fiber simply leaves the scheduler.
+    fn runFiber(self: *Worker, f: *Fiber) void {
+        self.current_fiber = f;
+
+        // Concurrency guard, held across the step AND the finish check:
+        // a fiber is single-owner, so only one worker may run it at a
+        // time. If `running` reaches 2, the fiber was double-scheduled
+        // onto two queues (a scheduler bug) — panic with a stack trace
+        // before the two threads corrupt its shared coro stack. The
+        // fiber is not in any queue during this window (we popped it), so
+        // no peer can legally touch it. We must release the guard BEFORE
+        // re-scheduling a `.reschedule` fiber, though: that push can
+        // spill to the global queue, where a peer may legitimately pick
+        // the fiber up the instant we let go.
+        const finished = blk: {
+            if (comptime runfiber_guard) {
+                const concurrent = f.running.fetchAdd(1, .acq_rel) + 1;
+                if (concurrent >= 2) std.debug.panic(
+                    "fiber 0x{x} stepped concurrently by {d} workers (this worker = {d})",
+                    .{ @intFromPtr(f), concurrent, self.id },
+                );
+            }
+            defer if (comptime runfiber_guard) {
+                _ = f.running.fetchSub(1, .release);
+            };
+
+            f.coro.step();
+            self.current_fiber = null;
+
+            if (f.isFinished()) {
+                // The fiber wrote its result into JoinState; the hook
+                // flips `finished=true` and returns any parked joiner.
+                // We wake it here so `fiber.zig` needn't import the runtime.
+                if (f.on_finished(f)) |waiter| wake(waiter);
+                break :blk true;
+            }
+            break :blk false;
+        };
+        if (finished) return;
+
+        // Guard released and the fiber is now genuinely suspended, so it
+        // is safe to make it re-runnable on any worker.
+        switch (f.intent) {
+            .reschedule => self.scheduleLocal(f),
+            .park => self.commitPark(f),
+        }
+    }
+
     pub fn run(self: *Worker) void {
-        const prev = current;
-        current = self;
-        defer current = prev;
+        // The one legitimate site that writes the thread-local. Reads go
+        // through `currentWorkerOrNull()`; here we own it directly.
+        const prev = current_do_not_use_directly;
+        current_do_not_use_directly = self;
+        defer current_do_not_use_directly = prev;
 
         // Seed this worker thread's TSC conversion factor from the
         // global once (set during Runtime.init by calibrateTsc).
@@ -186,12 +333,12 @@ pub const Worker = struct {
         defer fb.coro.cleanupStackGrowth();
 
         // Lead worker drives the process-wide coarse clock.
-        if (self.id == 0) self.rt.clock.start();
-        defer if (self.id == 0) self.rt.clock.stop();
+        if (self.id == 0) runtime().clock.start();
+        defer if (self.id == 0) runtime().clock.stop();
 
         // Arm the cross-thread wake handle. The callback re-arms
         // automatically; its only job is to unstick `loop.run(.once)`
-        // so the outer loop re-drains `remote_queue`.
+        // so the outer loop re-checks `stopping` / re-finds work.
         self.wake_async.wait(
             &self.loop,
             &self.wake_completion,
@@ -200,62 +347,62 @@ pub const Worker = struct {
             wakeAsyncCallback,
         );
 
-        while (self.rt.live_count.load(.acquire) > 0) {
-            self.drainRemote();
+        // Seed the pump clock so the first periodic pump lands ~1 ms in.
+        self.last_pump_ticks = readTicks();
+        self.loop.update_now();
 
+        const rt = runtime();
+        while (!rt.stopping.load(.acquire)) {
+            // 1. Run the local ready queues to exhaustion first (high
+            //    before normal). Only when they're empty do we reach for
+            //    more work — drainRemote / refillFromGlobal are
+            //    work-*finding* steps, not per-iteration overhead.
             if (self.popNextReady()) |f| {
-                self.current_fiber = f;
                 const enter = readTicks();
-
-                f.coro.step();
-
+                self.runFiber(f);
                 const exit = readTicks();
-                self.current_fiber = null;
-                // Skip the reading if the counter went backwards
-                // (e.g., thread migrated mid-step to a CPU with a
-                // slightly behind TSC). Real-world frequency: rare.
-                // Metrics aggregators wanting tight invariants can
-                // do their own outlier filtering downstream.
+                // Skip the reading if the counter went backwards (thread
+                // migrated mid-step to a CPU with a slightly behind TSC).
                 if (exit >= enter) f.cpu_total_ns +%= cyclesToNs(exit - enter);
 
-                if (f.isFinished()) {
-                    // The fiber wrote its result into JoinState; let
-                    // the hook flip `finished=true` and hand back any
-                    // parked joiner. We do the actual wake here so
-                    // `fiber.zig` doesn't have to import the runtime.
-                    if (f.on_finished(f)) |waiter| wake(waiter);
-                    const remaining = self.rt.live_count.fetchSub(1, .release) - 1;
-                    if (remaining == 0) self.rt.broadcastStop(self.id);
-                    continue;
-                }
-                switch (f.intent) {
-                    .reschedule => self.scheduleLocal(f),
-                    .park => {},
+                // Pump libxev periodically so timers (coarse clock,
+                // Deadlines) and async wakes (cross-thread remote pushes)
+                // stay responsive even when this worker is continuously
+                // busy. `no_wait` returns immediately if no completions
+                // are ready — one io_uring_enter syscall per ~1 ms of work.
+                if (cyclesToNs(exit -% self.last_pump_ticks) >= std.time.ns_per_ms) {
+                    self.loop.run(.no_wait) catch {};
+                    self.last_pump_ticks = exit;
                 }
                 continue;
             }
 
-            // Nothing local ready. Block until a libxev completion
-            // (timer / I/O / cross-thread async wake) fires.
+            // 2. Local empty: find work, then loop back to run it.
+            self.drainRemote();
+            self.refillFromGlobal();
+            if (self.hasReady()) continue;
+
+            // 3. Still nothing. Mark idle BEFORE a final work-find so a
+            //    producer that pushes work and then consults the idle
+            //    bitmap can't slip into the gap (lost wakeup).
+            self.markIdle();
+            self.drainRemote();
+            self.refillFromGlobal();
+            if (self.hasReady()) {
+                self.clearIdle();
+                continue;
+            }
+
+            // 4. Block until a libxev completion (timer / I/O / cross-
+            //    thread async wake, including stop's) fires, then clear
+            //    our idle bit and re-find work on the next pass.
             self.loop.run(.once) catch |err| {
                 std.debug.panic("xev.Loop.run failed: {}", .{err});
             };
+            self.clearIdle();
         }
     }
 };
-
-/// In-place reverse a `remote_next`-linked list. The Treiber-stack
-/// drain produces newest-first; the caller wants oldest-first.
-fn lifoToFifo(head: ?*Fiber) ?*Fiber {
-    var fifo: ?*Fiber = null;
-    var lifo = head;
-    while (lifo) |f| {
-        lifo = f.remote_next;
-        f.remote_next = fifo;
-        fifo = f;
-    }
-    return fifo;
-}
 
 fn wakeAsyncCallback(
     _: ?*Worker,
@@ -264,8 +411,8 @@ fn wakeAsyncCallback(
     _: xev.Async.WaitError!void,
 ) xev.CallbackAction {
     // The notify's job is just to unstick `loop.run(.once)`. The
-    // worker's outer loop will drain `remote_queue` and check
-    // `live_count` on its next iteration.
+    // worker's outer loop will re-find work (remote / global) and
+    // re-check `stopping` on its next iteration.
     return .rearm;
 }
 
@@ -282,6 +429,13 @@ pub const InitOptions = struct {
     /// existing single-thread call sites keep working unchanged).
     /// Callers wanting multi-thread set this explicitly.
     num_workers: ?usize = null,
+
+    /// Workers reserved for the `.raft` lane. These are the LAST
+    /// `raft_workers` worker ids; the remaining (lower) ids form the
+    /// `.default` lane. Must be `< num_workers` so the default lane
+    /// (which owns lead worker 0) is never empty. 0 (default) leaves the
+    /// raft lane empty — `.raft` spawns then fall back to `.default`.
+    raft_workers: usize = 0,
 };
 
 pub const Runtime = struct {
@@ -294,12 +448,27 @@ pub const Runtime = struct {
     /// the spinlock too.
     fibers: std.ArrayList(*Fiber) = .empty,
     fibers_sl: Spinlock = .{},
-    live_count: std.atomic.Value(usize) = .init(0),
+
+    /// Set by `stop()`; once true every worker's run loop exits after
+    /// its current pass. The runtime otherwise runs forever (workers
+    /// park when idle) — there is no live-fiber counting.
+    stopping: std.atomic.Value(bool) = .init(false),
+
+    /// Per-lane admission / overflow queues for normal-priority work.
+    /// Indexed by `@intFromEnum(Lane)`.
+    global: [Lane.count]GlobalQueue = undefined,
+    /// Contiguous worker-id range each lane owns. A `len == 0` lane
+    /// falls back to `.default` (see `effectiveLaneIdx`).
+    lane_ranges: [Lane.count]LaneRange = undefined,
+    /// Per-lane idle-worker bitmaps; producers `claim` one to wake a
+    /// single parked peer in that lane.
+    idle: [Lane.count]IdleWorkers = .{ .{}, .{} },
 
     pub fn init(self: *Runtime, allocator: std.mem.Allocator, opts: InitOptions) !void {
         const n = opts.num_workers orelse 1;
         std.debug.assert(n >= 1);
         std.debug.assert(n <= std.math.maxInt(u8));
+        std.debug.assert(opts.raft_workers < n); // default lane (the fallback) is never empty
 
         // Pay the 1 ms calibration cost up front so the first fiber
         // dispatch doesn't get charged with it. Idempotent across
@@ -309,7 +478,25 @@ pub const Runtime = struct {
         self.allocator = allocator;
         self.fibers = .empty;
         self.fibers_sl = .{};
-        self.live_count = .init(0);
+        self.stopping = .init(false);
+        self.idle = .{ .{}, .{} };
+
+        // Lane layout: raft takes the first worker ids, default the rest —
+        //   raft    = [0, raft_workers)
+        //   default = [raft_workers, n)
+        const raft_count: u8 = @intCast(opts.raft_workers);
+        self.lane_ranges = .{
+            .{ .start = raft_count, .len = @intCast(n - opts.raft_workers) }, // .default
+            .{ .start = 0, .len = raft_count }, // .raft
+        };
+
+        // Per-lane global queues for normal-priority work.
+        var g_inited: usize = 0;
+        errdefer for (self.global[0..g_inited]) |*gq| gq.deinit();
+        for (&self.global) |*gq| {
+            gq.* = try GlobalQueue.init(allocator, global_queue_initial_capacity);
+            g_inited += 1;
+        }
 
         self.workers = try allocator.alloc(Worker, n);
         errdefer allocator.free(self.workers);
@@ -319,12 +506,20 @@ pub const Runtime = struct {
             for (self.workers[0..initialized]) |*w| w.deinit(allocator);
         }
         for (self.workers, 0..) |*w, i| {
-            try Worker.init(w, @intCast(i), self);
+            try Worker.init(w, @intCast(i));
+            w.lane_idx = if (i < raft_count)
+                @intFromEnum(Lane.raft)
+            else
+                @intFromEnum(Lane.default);
             initialized += 1;
         }
 
         self.clock = try CoarseClock.init();
         self.clock.bind(&self.workers[0].loop);
+
+        // Publish as the process singleton. There is exactly one runtime
+        // alive at a time; `spawn` resolves it through `runtime()`.
+        g_rt = self;
     }
 
     pub fn deinit(self: *Runtime) void {
@@ -335,6 +530,8 @@ pub const Runtime = struct {
         self.clock.deinit();
         for (self.workers) |*w| w.deinit(self.allocator);
         self.allocator.free(self.workers);
+        for (&self.global) |*gq| gq.deinit();
+        g_rt = null;
     }
 
     fn appendFiber(self: *Runtime, f: *Fiber) !void {
@@ -358,13 +555,31 @@ pub const Runtime = struct {
         f.registry_index = std.math.maxInt(usize);
     }
 
-    /// Called from a worker that just decremented `live_count` to 0.
-    /// Notifies every peer worker's `wake_async` so they unstick
-    /// their `loop.run(.once)` and observe the zero count.
-    fn broadcastStop(self: *Runtime, except_id: u8) void {
-        for (self.workers) |*w| {
-            if (w.id == except_id) continue;
-            w.wake_async.notify() catch {};
+    /// Request shutdown: every worker's run loop exits after its current
+    /// pass. Notifies all workers' `wake_async` so parked workers unstick
+    /// their `loop.run(.once)` and observe `stopping`. Safe from any
+    /// thread — a fiber via `fiber.stop()`, or an external thread.
+    pub fn stop(self: *Runtime) void {
+        self.stopping.store(true, .release);
+        for (self.workers) |*w| w.wake_async.notify() catch {};
+    }
+
+    /// Effective lane index for `lane`: itself when it owns workers, else
+    /// `.default` (the never-empty fallback lane).
+    fn effectiveLaneIdx(self: *Runtime, lane: Lane) u8 {
+        const idx: u8 = @intFromEnum(lane);
+        if (self.lane_ranges[idx].len == 0) return @intFromEnum(Lane.default);
+        return idx;
+    }
+
+    /// Wake one parked worker in `lane_idx` to come pull from the global
+    /// queue. `claim` atomically takes a single idle bit, so exactly one
+    /// producer wakes exactly one peer; no-op when none are idle.
+    fn notifyIdlePeer(self: *Runtime, lane_idx: u8) void {
+        if (self.idle[lane_idx].claim()) |off| {
+            const peer_id: usize = @as(usize, self.lane_ranges[lane_idx].start) + off;
+            std.debug.assert(peer_id < self.workers.len);
+            self.workers[peer_id].wake_async.notify() catch {};
         }
     }
 
@@ -411,17 +626,39 @@ fn workerEntry(w: *Worker) void {
     w.run();
 }
 
-/// Route a fiber to its home worker's ready queue. If we're on the
-/// home thread, push directly; otherwise push to the home's remote
-/// queue and notify its `wake_async` so the home's `loop.run(.once)`
-/// returns and the outer loop drains the remote queue.
-fn routeToHome(rt: *Runtime, f: *Fiber) void {
-    const home = &rt.workers[f.home_worker_id];
-    if (Worker.current == home) {
-        home.scheduleLocal(f);
-    } else {
-        home.remote_queue.push(f);
-        home.wake_async.notify() catch {};
+/// Route a ready fiber to a queue. Shared by `spawn` and `wake`.
+///
+///   - High priority is pinned: it goes to its home worker — directly to
+///     the home's local ring when we're already on the home thread, else
+///     onto the home's remote queue with an async notify.
+///   - Normal priority is lane-bound but worker-free: when we're running
+///     on a worker in the fiber's lane, push to that local ring (spilling
+///     to the lane's global queue on overflow via `scheduleLocal`);
+///     otherwise admit to the lane's global queue and wake an idle peer.
+fn routeReady(rt: *Runtime, f: *Fiber) void {
+    switch (f.priority) {
+        .high => {
+            const home = &rt.workers[f.home_worker_id];
+            if (currentWorkerOrNull() == home) {
+                home.scheduleLocal(f);
+            } else {
+                home.remote_queue.push(f);
+                home.wake_async.notify() catch {};
+            }
+        },
+        .normal => {
+            const lane_idx = rt.effectiveLaneIdx(f.lane);
+            if (currentWorkerOrNull()) |w| {
+                if (w.lane_idx == lane_idx) {
+                    w.scheduleLocal(f);
+                    return;
+                }
+            }
+            rt.global[lane_idx].push(f) catch {
+                @panic("out of memory admitting fiber to global queue");
+            };
+            rt.notifyIdlePeer(lane_idx);
+        },
     }
 }
 
@@ -465,36 +702,47 @@ pub fn JoinHandle(comptime T: type) type {
     };
 }
 
-/// Spawn `func(args...)` as a new fiber on `rt`. The args tuple is
-/// copied into a heap-allocated context owned by the Fiber (see
-/// `Fiber.init`); callers only need to keep alive what the args point
-/// to. Returns a `JoinHandle(T)` where `T` is `func`'s return type —
-/// `join()` retrieves the value once the body finishes.
+/// Spawn `func(args...)` as a new fiber on the singleton runtime. The
+/// args tuple is copied into a heap-allocated context owned by the Fiber
+/// (see `Fiber.init`); callers only need to keep alive what the args
+/// point to. Returns a `JoinHandle(T)` where `T` is `func`'s return type
+/// — `join()` retrieves the value once the body finishes.
+///
+/// Priority / addressing contract:
+///   - High priority is pinned and MUST name a `worker_id`. The id is
+///     *lane-relative*: the absolute home worker is
+///     `lane.start + worker_id % lane.len` — e.g. worker_id 3 in a
+///     2-worker raft lane resolves to lane offset 1.
+///   - Normal priority migrates freely within its lane and must NOT name
+///     a `worker_id`.
+/// `lane` selects the worker range (default `.default`, the fallback when
+/// the requested lane has no workers).
 pub fn spawn(
-    rt: *Runtime,
     opts: SpawnOptions,
     comptime func: anytype,
     args: std.meta.ArgsTuple(@TypeOf(func)),
 ) !JoinHandle(fb.ReturnOf(func)) {
-    // Pick home worker: explicit `worker_id`, else current worker,
-    // else default to worker 0 (caller is on a non-worker thread,
-    // e.g., the main thread before `rt.run` has been called).
-    const home_id: u8 = if (opts.worker_id) |id|
-        id
-    else if (Worker.current) |w| w.id else 0;
-    std.debug.assert(home_id < rt.workers.len);
+    const rt = runtime();
+    switch (opts.priority) {
+        .high => std.debug.assert(opts.worker_id != null),
+        .normal => std.debug.assert(opts.worker_id == null),
+    }
 
     const f = try Fiber.init(rt.allocator, opts, func, args);
     errdefer f.deinit(rt.allocator);
 
-    f.home_worker_id = home_id;
+    // `f.lane` is set from `opts` in `Fiber.init`. For high priority,
+    // resolve the lane-relative `worker_id` to an absolute home worker.
+    if (opts.priority == .high) {
+        const range = rt.lane_ranges[rt.effectiveLaneIdx(f.lane)];
+        f.home_worker_id = range.start + (opts.worker_id.? % range.len);
+    }
 
     try rt.appendFiber(f);
 
     f.state.store(@bitCast(State{ .tag = .ready, .awaken = false }), .release);
 
-    _ = rt.live_count.fetchAdd(1, .release);
-    routeToHome(rt, f);
+    routeReady(rt, f);
 
     // Same comptime-generated Ctx type Fiber.init used to allocate
     // `f.ctx`. Accessing `&ctx.state` by name lets Zig compute the
@@ -514,32 +762,31 @@ pub fn yield() void {
 /// set) the token is consumed and `park` returns without yielding.
 /// Otherwise the fiber transitions to `.waiting`, records park
 /// metadata, and yields. A later `wake` CAS'es it back to `.ready`
-/// and routes it through `routeToHome` — same-thread direct push
-/// or cross-thread `remote_queue` + `wake_async.notify`.
+/// and routes it through `routeReady`.
 pub fn park() void {
     const w = currentWorker();
     const f = w.current_fiber.?;
 
+    // Fast path: a `wake` that already deposited an awaken token means we
+    // shouldn't park at all — consume it and keep running.
     var old = f.loadState();
-    while (true) {
+    while (old.awaken) {
         std.debug.assert(old.tag == .ready);
-        if (old.awaken) {
-            const new = State{ .tag = .ready, .awaken = false };
-            if (f.casState(old, new)) |actual| {
-                old = actual;
-                continue;
-            }
-            return; // token consumed; don't yield
-        }
-        const new = State{ .tag = .waiting, .awaken = false };
+        const new = State{ .tag = .ready, .awaken = false };
         if (f.casState(old, new)) |actual| {
             old = actual;
             continue;
         }
-        break;
+        return; // token consumed; don't yield
     }
 
-    f.parked_since_ms = currentWorker().rt.clock.ms();
+    // No token: record park metadata and yield. We deliberately do NOT
+    // transition to `.waiting` here. That commit runs in
+    // `Worker.commitPark` AFTER `coro.yield()` has fully suspended us, so
+    // a concurrent `wake` can't make us runnable on another worker before
+    // our context is saved (which would let two workers step one coro).
+    std.debug.assert(old.tag == .ready);
+    f.parked_since_ms = runtime().clock.ms();
     captureTrace(&f.park_trace);
 
     f.intent = .park;
@@ -549,12 +796,9 @@ pub fn park() void {
 /// Wake a fiber. Safe to call on a fiber in any state: `.finished`
 /// is a no-op; `.ready` deposits an awaken token for a concurrent
 /// `park` to consume; `.new` / `.waiting` transitions to `.ready`
-/// and routes the fiber to its home worker's queue.
-///
-/// Routing is home-worker-pinned: if the caller is on the fiber's
-/// home thread, the push goes directly to the home's local ready
-/// queue. Otherwise the fiber lands on the home's `remote_queue`
-/// and we notify the home's `wake_async` to unstick its loop.
+/// and re-routes the fiber via `routeReady` (high priority → its pinned
+/// home worker; normal priority → a local ring in its lane or that
+/// lane's global queue).
 pub fn wake(f: *Fiber) void {
     var old = f.loadState();
     while (true) {
@@ -580,16 +824,46 @@ pub fn wake(f: *Fiber) void {
         }
     }
 
-    const w = currentWorker();
-    routeToHome(w.rt, f);
+    routeReady(runtime(), f);
+}
+
+/// Request runtime shutdown from anywhere — typically a fiber that has
+/// finished the program's work. Every worker's run loop returns after
+/// its current pass, and `Runtime.run` returns on the calling thread.
+pub fn stop() void {
+    runtime().stop();
+}
+
+/// The worker running on the calling OS thread, or null off a worker
+/// thread (e.g. a bootstrap `spawn` from `main`). This is the ONLY place
+/// the `current_do_not_use_directly` thread-local is read.
+///
+/// `noinline` keeps this an opaque call LICM won't hoist out of a loop
+/// that yields; the empty `volatile` asm with a `memory` clobber also
+/// marks it non-readonly, so the guarantee doesn't rest on optimizer
+/// heuristics. Both matter because a parked fiber can resume on a
+/// DIFFERENT OS thread, so a cached worker pointer would be stale — its
+/// `current_fiber` null — after migration (a crash seen only in optimized
+/// builds). At the instant it runs the value is always correct.
+pub noinline fn currentWorkerOrNull() ?*Worker {
+    asm volatile ("" : : : .{ .memory = true });
+    return Worker.current_do_not_use_directly;
 }
 
 pub fn currentWorker() *Worker {
-    return Worker.current.?;
+    return currentWorkerOrNull().?;
 }
 
 pub fn currentFiber() *Fiber {
     return currentWorker().current_fiber.?;
+}
+
+/// Like `currentFiber` but returns null off a worker thread (or on a
+/// worker between fibers) instead of asserting. Used by the test runner
+/// to key per-fiber log buffers without knowing if we're on a fiber.
+pub fn currentFiberOrNull() ?*Fiber {
+    const w = currentWorkerOrNull() orelse return null;
+    return w.current_fiber;
 }
 
 pub fn dumpFibers(rt: *Runtime, writer: *std.Io.Writer) !void {

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zio = @import("zio");
 const rt = @import("runtime");
+const fiber = @import("fiber");
 const context = utils.context;
 
 // 0.16 helpers: std.Thread.Mutex / ResetEvent / time.nanoTimestamp are gone.
@@ -157,11 +158,66 @@ const bench = utils.bench;
 //   --only-bench        Run only `BENCH: ...` tests (used by `zig build bench`).
 //   --parallel <N>      Concurrent test fibers. 0 (default) = max(2, cpu_count/2).
 
+/// Override the Io instance that `std.debug` (including `defaultPanic`)
+/// uses. The default — `Io.Threaded.global_single_threaded` — is
+/// explicitly documented as "does not support concurrency". When
+/// multiple fiber-worker threads panic concurrently, they all hit
+/// that single-threaded Io and race on its internal state, ending
+/// up with corrupted writer pointers (page-aligned `0x...0000`
+/// junk) and SEGV inside `Io.Writer.write` deep in the panic-print
+/// path. We point it at `std.testing.io_instance` (a real multi-
+/// threaded `Io.Threaded.init`) so concurrent panics print safely.
+pub const std_options_debug_threaded_io: ?*std.Io.Threaded = &std.testing.io_instance;
+
+/// Custom panic handler. Default `defaultPanic` walks the stack via
+/// `Dwarf.SelfUnwinder`, which has thread-safety bugs we hit under
+/// heavy parallel test load. This minimal hook writes msg +
+/// first_trace_addr (the panic call-site) directly to stderr via
+/// raw `write` syscall, then aborts. Resolve the address with:
+///   addr2line -fipCe <binary> <addr>
+fn minimalPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    const marker = "[MINIMAL_PANIC_FIRED]\n";
+    _ = std.os.linux.write(2, marker.ptr, marker.len);
+    // 4 KiB so a long DOUBLE_PUSH ring dump (~800-1200 bytes) fits.
+    // Without this, `rawStderrPrint`'s `bufPrint` returns an empty
+    // slice on overflow and we see only "[MINIMAL_PANIC_FIRED]" with
+    // no body.
+    var buf: [4096]u8 = undefined;
+    const tid = std.Thread.getCurrentId();
+    const trace_addr = first_trace_addr orelse 0;
+    rawStderrPrint(&buf, "\nthread {d} panic: {s}\n  first_trace_addr: 0x{x}\n", .{ tid, msg, trace_addr });
+    std.process.abort();
+}
+pub const panic = std.debug.FullPanic(minimalPanic);
+
 pub const std_options: std.Options = .{
     .log_scope_levels = &.{
         .{ .scope = .zio, .level = .info },
     },
     .logFn = capturingLogFn,
+
+    // TODO: escalate upstream in Zig forum / issue tracker.
+    // Zig 0.16's `std.debug.Dwarf.SelfUnwinder` is not thread-safe:
+    //   - Lazy init of `SelfInfo` races on first concurrent call.
+    //   - Even after init, `nextInner` mutates per-walk FDE/CIE
+    //     caches that get clobbered by concurrent walks.
+    // Symptoms under our multi-worker fiber runtime: SEGV inside
+    // `Dwarf.SelfUnwinder.nextInner(unwinder=0x0, cache_entry=0x0)`,
+    // followed by recursive-panic in the panic handler's own
+    // stack-walk. Triggered by `std.testing.allocator`'s leak-
+    // source recording (one captureCurrentStackTrace per alloc),
+    // by our own `captureTrace(&f.park_trace)` in `park()`, and
+    // by the panic handler itself.
+    //
+    // Disabling stack tracing globally for this test binary
+    // sidesteps all of the above. `std.testing.allocator` still
+    // detects leaks (alloc/free balance) — we just lose the
+    // "allocated at:" source pointers in leak reports. Acceptable
+    // until the stdlib unwinder gets a mutex (or per-thread state).
+    // Our `minimalPanic` doesn't call `captureCurrentStackTrace`,
+    // and `std.testing.allocator`'s leak-trace path benefits from
+    // being disabled (concurrent Dwarf walks race). Keep off.
+    .allow_stack_tracing = false,
 };
 
 const default_parallel: u6 = 0;
@@ -235,25 +291,35 @@ var thread_watchdog: ?*ThreadWatchdog = null;
 /// fiber entered the test body but never finished.
 var verbose_start: bool = false;
 
+/// Identity used to key per-fiber log buffers. Phase A tests run as
+/// zio tasks; Phase B tests run as fiber.Fibers. Both are pointer
+/// types living in disjoint address spaces (different runtimes), so
+/// the raw pointer doubles as a unique key once cast to usize.
+fn currentLogKey() ?usize {
+    if (zio.getCurrentTaskOrNull()) |task| return @intFromPtr(task);
+    if (fiber.currentFiberOrNull()) |f| return @intFromPtr(f);
+    return null;
+}
+
 fn registerFiberLog(log: *FiberLog) void {
-    const task = zio.getCurrentTaskOrNull() orelse return;
+    const key = currentLogKey() orelse return;
     mlock(&log_map_mu);
     defer munlock(&log_map_mu);
-    if (log_map) |*m| m.put(@intFromPtr(task), log) catch {};
+    if (log_map) |*m| m.put(key, log) catch {};
 }
 
 fn unregisterFiberLog() void {
-    const task = zio.getCurrentTaskOrNull() orelse return;
+    const key = currentLogKey() orelse return;
     mlock(&log_map_mu);
     defer munlock(&log_map_mu);
-    if (log_map) |*m| _ = m.remove(@intFromPtr(task));
+    if (log_map) |*m| _ = m.remove(key);
 }
 
 fn lookupFiberLog() ?*FiberLog {
-    const task = zio.getCurrentTaskOrNull() orelse return null;
+    const key = currentLogKey() orelse return null;
     mlock(&log_map_mu);
     defer munlock(&log_map_mu);
-    if (log_map) |*m| return m.get(@intFromPtr(task));
+    if (log_map) |*m| return m.get(key);
     return null;
 }
 
@@ -638,6 +704,17 @@ fn threadWatchdogLoop(self: *ThreadWatchdog) void {
         var dump_writer: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
         defer dump_writer.deinit();
         zrt.dumpFibers(&dump_writer.writer) catch {};
+        rawStderrWriteAll(dump_writer.written());
+
+        // Phase B uses a dedicated fiber.Runtime; dump its state too.
+        // Safe to call from the watchdog thread — `fiber.Runtime` is
+        // initialized at main() entry, so the singleton is always
+        // live by the time the watchdog could fire.
+        const frt = fiber.runtime();
+        const fs = frt.stats();
+        rawStderrPrint(&line_buf, "fiber.Runtime: total={d} new={d} ready={d} waiting={d} finished={d}\n", .{ fs.total, fs.new, fs.ready, fs.waiting, fs.finished });
+        dump_writer.clearRetainingCapacity();
+        fiber.dumpFibers(frt, &dump_writer.writer) catch {};
         rawStderrWriteAll(dump_writer.written());
 
         // TrackedMutex dump (same buffered-then-raw-write pattern).
@@ -1108,6 +1185,9 @@ fn driver(
 
     for (builtin.test_functions) |t| {
         if (std.mem.startsWith(u8, t.name, ".test_root.")) continue;
+        // fiber.* tests belong to Phase B (fiberDriver on fiber.Runtime).
+        // Skip here so we don't run them under zio.
+        if (std.mem.startsWith(u8, t.name, "fiber.")) continue;
         const user_name = if (std.mem.indexOf(u8, t.name, ".test.")) |p|
             t.name[p + ".test.".len ..]
         else
@@ -1254,6 +1334,204 @@ fn driver(
     for (bench_handles.items) |*h| h.join();
 }
 
+// ── Phase B: fiber.* tests on a fiber.Runtime ────────────────────────
+//
+// `fiber.*` tests run as fibers on a dedicated fiber.Runtime — disjoint
+// from zio.  No cross-runtime sync: Phase B runs serially after Phase A
+// drains, so the output writer / counters have a single owner at a
+// time.  fiber tests use `fiber.runtime()` to access the shared
+// runtime + `Group.wait()` / `JoinHandle.join()` for sub-fiber sync.
+
+const FiberCtx = struct {
+    // Counters target for the current round. Parallel round writes to
+    // `counters`; serial retry round swaps in `retry_counters`.
+    counters: *Counters,
+    retry_counters: *Counters,
+    // Filled by the parallel round. The serial round drains it.
+    failures: *std.ArrayList(std.builtin.TestFn),
+    failures_mu: fiber.Mutex = .{},
+    // true while the serial retry round is active.
+    is_retry: bool = false,
+    print_mu: fiber.Mutex = .{},
+    seq: std.atomic.Value(u32) = .{ .raw = 0 },
+    total: u32 = 0,
+    out: *std.Io.Writer,
+    tty: Tty,
+    args: Args,
+    /// Watchdog's shared running-set so Phase B fiber tests show up
+    /// in the `RUNNING ...s: <name>` lines of stuck-state dumps. Same
+    /// pointer as Phase A's `SharedCtx.running`.
+    running: *RunningSet,
+};
+
+fn fiberDriver(fctx: *FiberCtx) void {
+    // This runs as the bootstrap fiber. egres2's runtime has no live-fiber
+    // counting — it runs until `stop()` — so stop it once the driver has
+    // run every fiber test (any return path), which lets `fiber_rt.run()`
+    // return on the main thread.
+    defer fiber.stop();
+
+    var kept: std.ArrayList(std.builtin.TestFn) = .empty;
+    defer kept.deinit(std.heap.page_allocator);
+
+    for (builtin.test_functions) |t| {
+        if (!std.mem.startsWith(u8, t.name, "fiber.")) continue;
+        if (std.mem.startsWith(u8, t.name, ".test_root.")) continue;
+        const user_name = if (std.mem.indexOf(u8, t.name, ".test.")) |p|
+            t.name[p + ".test.".len ..]
+        else
+            t.name;
+        const is_big = std.mem.startsWith(u8, user_name, "BIG: ");
+        const is_bench = std.mem.startsWith(u8, user_name, "BENCH: ");
+        const is_hang = std.mem.startsWith(u8, user_name, "HANG: ");
+        if (fctx.args.filter) |f| if (std.mem.indexOf(u8, t.name, f) == null) continue;
+        if (fctx.args.exclude) |x| if (std.mem.indexOf(u8, t.name, x) != null) continue;
+        if (is_bench) continue; // No fiber benchmarks today; add when needed.
+        if (fctx.args.only_bench) continue;
+        if (is_big and !fctx.args.run_big) continue;
+        if (is_hang and !fctx.args.run_hang) continue;
+        kept.append(std.heap.page_allocator, t) catch unreachable;
+    }
+
+    fctx.total = @intCast(kept.items.len);
+    if (kept.items.len == 0) return;
+
+    // ── Parallel round ────────────────────────────────────────────
+    // Worker-pool over a channel: spawn `parallel` worker fibers,
+    // each loops `ch.receive()` → run → repeat until the channel
+    // closes. Avoids the old "spawn N concurrent fibers" pattern
+    // where every test's body races simultaneously — that pegged
+    // timer + dispatch latency past tight test budgets (Deadlines,
+    // io.sleep, coarse_clock all started flaking under it).
+    // Bounded concurrency means at most `parallel` tests are mid-
+    // execution at any moment, matching how the user-facing
+    // `--parallel` knob is meant to behave.
+    {
+        const num_workers: usize = @max(1, fctx.args.parallel);
+        var ch: fiber.Channel(std.builtin.TestFn) = fiber.Channel(std.builtin.TestFn).initAlloc(std.heap.page_allocator, num_workers) catch unreachable;
+        defer ch.deinit();
+
+        var g: fiber.Group(void) = .init(std.heap.page_allocator);
+        defer g.deinit();
+        g.ensureTotalCapacity(num_workers) catch unreachable;
+        for (0..num_workers) |_| g.spawn(.{}, fiberTestWorker, .{ &ch, fctx }) catch unreachable;
+
+        // Producer side: feed every test in. `send` blocks when the
+        // channel buffer fills (capacity == num_workers), giving us
+        // natural backpressure — no point queueing more than the
+        // workers can grab.
+        for (kept.items) |t| ch.send(t) catch break;
+        ch.close(.graceful);
+
+        g.wait();
+    }
+
+    // ── Serial retry round ────────────────────────────────────────
+    // Mirrors zioDriver's retry path: re-run any parallel-round
+    // failures one at a time, writing into retry_counters so flaky
+    // tests (failed parallel, passed serial) don't count as failures
+    // in the final summary.
+    if (fctx.failures.items.len == 0) return;
+
+    fctx.print_mu.lock();
+    fctx.out.writeAll("\n") catch {};
+    writeColored(fctx.out, fctx.tty, .bright_yellow, "Retrying {d} failed fiber test(s) serially...\n", .{fctx.failures.items.len});
+    fctx.out.flush() catch {};
+    fctx.print_mu.unlock();
+
+    fctx.is_retry = true;
+    fctx.total = @intCast(fctx.failures.items.len);
+    fctx.seq.store(0, .seq_cst);
+
+    for (fctx.failures.items) |t| {
+        const h = fiber.spawn(.{}, runFiberOne, .{ t, fctx }) catch unreachable;
+        h.join();
+    }
+}
+
+fn fiberTestWorker(ch: *fiber.Channel(std.builtin.TestFn), fctx: *FiberCtx) void {
+    while (true) {
+        const t = ch.receive() catch |err| switch (err) {
+            error.ChannelClosed => return,
+        };
+        runFiberOne(t, fctx);
+    }
+}
+
+fn runFiberOne(t: std.builtin.TestFn, fctx: *FiberCtx) void {
+    fctx.running.add(t.name);
+    defer {
+        fctx.running.remove(t.name);
+        if (thread_watchdog) |w| w.touch();
+    }
+
+    // Per-test log capture: any `std.log.*` emitted by this test
+    // body goes into `fiber_log.bytes` via `capturingLogFn`. We
+    // print captured lines indented under the status line below so
+    // the test's status appears first, then its logs — instead of
+    // logs racing out before the status line.
+    var fiber_log: FiberLog = .{};
+    defer fiber_log.bytes.deinit(std.heap.page_allocator);
+    registerFiberLog(&fiber_log);
+    defer unregisterFiberLog();
+
+    const t0 = nowNs();
+    const result: ?anyerror = if (t.func()) |_| null else |e| e;
+    const elapsed_ms = @divTrunc(nowNs() - t0, std.time.ns_per_ms);
+
+    const target_counters = if (fctx.is_retry) fctx.retry_counters else fctx.counters;
+    const seq = fctx.seq.fetchAdd(1, .seq_cst) + 1;
+
+    fctx.print_mu.lock();
+    defer fctx.print_mu.unlock();
+
+    var prefix_buf: [32]u8 = undefined;
+    const prefix_str = std.fmt.bufPrint(&prefix_buf, "[{d}/{d}]", .{ seq, fctx.total }) catch unreachable;
+    writeColored(fctx.out, fctx.tty, .dim, "{s}", .{prefix_str});
+    const prefix_pad = if (prefix_width > prefix_str.len) prefix_width - prefix_str.len else 1;
+    for (0..prefix_pad) |_| fctx.out.writeByte(' ') catch {};
+
+    writeDisplayName(fctx.out, fctx.tty, t.name);
+    fctx.out.print(" ... ", .{}) catch {};
+
+    if (result) |err| switch (err) {
+        error.SkipZigTest => {
+            _ = target_counters.skipped.fetchAdd(1, .seq_cst);
+            writeColored(fctx.out, fctx.tty, .bright_yellow, "SKIP\n", .{});
+        },
+        else => {
+            _ = target_counters.failed.fetchAdd(1, .seq_cst);
+            writeColored(fctx.out, fctx.tty, .bright_red, "FAIL: {s}", .{@errorName(err)});
+            writeColored(fctx.out, fctx.tty, .dim, " ({d}ms)\n", .{elapsed_ms});
+            // Parallel-round failures get queued for the serial
+            // retry; failures during retry are final.
+            if (!fctx.is_retry) {
+                fctx.failures_mu.lock();
+                defer fctx.failures_mu.unlock();
+                fctx.failures.append(std.heap.page_allocator, t) catch {};
+            }
+        },
+    } else {
+        _ = target_counters.passed.fetchAdd(1, .seq_cst);
+        writeColored(fctx.out, fctx.tty, .bright_green, "OK", .{});
+        writeColored(fctx.out, fctx.tty, .dim, " ({d}ms)\n", .{elapsed_ms});
+    }
+
+    // Captured log lines indented under the status line, matching
+    // the Phase A `runOne` formatting.
+    if (fiber_log.bytes.items.len > 0) {
+        var lines = std.mem.splitScalar(u8, fiber_log.bytes.items, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            writeColored(fctx.out, fctx.tty, .dim, "  | {s}\n", .{line});
+        }
+    }
+    if (fiber_log.overflowed) {
+        writeColored(fctx.out, fctx.tty, .dim, "  | (output truncated at {d} bytes)\n", .{FiberLog.max_size});
+    }
+    fctx.out.flush() catch {};
+}
+
 pub fn main(init: std.process.Init) !void {
     context.initGlobal(init);
     var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
@@ -1304,6 +1582,24 @@ pub fn main(init: std.process.Init) !void {
     try rt.init(std.heap.page_allocator, .{ .total_threads = args.parallel });
     defer rt.deinit();
 
+    // Bring up the Phase B fiber runtime now so `fiber.runtime()`
+    // works throughout — including from the watchdog thread during a
+    // Phase A wedge. `init` only allocates state and installs the
+    // process-wide singleton; worker threads aren't spawned until
+    // `fiber_rt.run()` is called in Phase B.
+    //
+    // Runtime worker count == all available cores. The `--parallel`
+    // knob bounds *test dispatch* concurrency (see fiberDriver), not
+    // the worker pool. Giving the runtime full hardware concurrency
+    // lets a single test's spawned child fibers (e.g. the io.sleep
+    // test's 100 sleepers) actually spread across cores, while
+    // bounding how many test bodies are mid-execution keeps timer +
+    // wake latency from getting squeezed.
+    const fiber_workers: usize = std.Thread.getCpuCount() catch @as(usize, args.parallel);
+    var fiber_rt: fiber.Runtime = undefined;
+    try fiber_rt.init(std.heap.page_allocator, .{ .num_workers = fiber_workers });
+    defer fiber_rt.deinit();
+
     var counters: Counters = .{};
     var retry_counters: Counters = .{};
     var bench_counters: Counters = .{};
@@ -1314,6 +1610,29 @@ pub fn main(init: std.process.Init) !void {
     // Drain the coarse.Clock tick fiber, if any test started it.
     // Without this, `rt.deinit()` asserts task_count == 0 fails.
     utils.coarse.Clock.stop();
+
+    // ── Phase B ─────────────────────────────────────────────────────
+    // fiber.* tests run on the dedicated `fiber.Runtime` initialized
+    // up at main() entry. Disjoint from zio: the fiber phase runs
+    // after the zio phase has drained so the output writer / counters
+    // have a single owner.
+    {
+        var fiber_failures: std.ArrayList(std.builtin.TestFn) = .empty;
+        defer fiber_failures.deinit(std.heap.page_allocator);
+
+        var fctx: FiberCtx = .{
+            .counters = &counters,
+            .retry_counters = &retry_counters,
+            .failures = &fiber_failures,
+            .out = out,
+            .tty = tty,
+            .args = args,
+            .running = &twatch.running,
+        };
+
+        _ = try fiber.spawn(.{}, fiberDriver, .{&fctx});
+        fiber_rt.run();
+    }
 
     const total_ms = @divTrunc(nowNs() - t0_all, std.time.ns_per_ms);
     const main_passed = counters.passed.load(.seq_cst);

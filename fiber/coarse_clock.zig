@@ -25,7 +25,34 @@
 //! read `ms()`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const xev = @import("xev");
+
+pub const ClockKind = enum { monotonic, realtime };
+
+/// Read the requested clock as milliseconds. Returns 0 on Windows
+/// (would need `QueryPerformanceCounter` / `GetSystemTimeAsFileTime`).
+///
+/// "Use rarely" — the call is a syscall (vDSO-accelerated on Linux,
+/// ~10 ns), fine in init/calibration paths or once-per-tick reads, but
+/// the hot-path CPU accounting in `Worker.run` should stick to `rdtsc`.
+/// Direct CLOCK_MONOTONIC, no caching — unlike `loop.now()`, which can
+/// be arbitrarily stale between `loop.run` iterations under load.
+pub fn clockMsUseRarely(comptime kind: ClockKind) i64 {
+    const ns: i64 = switch (comptime builtin.os.tag) {
+        .windows => 0,
+        else => blk: {
+            const clk = switch (kind) {
+                .monotonic => std.posix.CLOCK.MONOTONIC,
+                .realtime => std.posix.CLOCK.REALTIME,
+            };
+            var tp: std.posix.timespec = undefined;
+            _ = std.posix.system.clock_gettime(clk, &tp);
+            break :blk @as(i64, tp.sec) * std.time.ns_per_s + tp.nsec;
+        },
+    };
+    return @divTrunc(ns, std.time.ns_per_ms);
+}
 
 pub const CoarseClock = struct {
     /// Loop that this clock arms its timer on. Set by `bind` before

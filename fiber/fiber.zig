@@ -81,6 +81,20 @@ pub const Priority = enum(u1) {
     pub const count = 2;
 };
 
+/// Worker-placement lane. Set at spawn; routes the fiber to a worker
+/// in the lane's range. `.default` is the catch-all; `.raft` is
+/// opt-in for code that wants mainLoop/applyLoop on workers reserved
+/// for them.
+///
+/// If the requested lane has zero workers configured (e.g., tests
+/// don't set `.raft`), placement falls back to `.default`.
+pub const Lane = enum(u8) {
+    default = 0,
+    raft = 1,
+
+    pub const count = 2;
+};
+
 pub const Tag = enum(u2) { new, ready, waiting, finished };
 
 /// Atomic lifecycle state. The `awaken` pre-wake token closes the race
@@ -104,6 +118,7 @@ pub const YieldIntent = enum(u8) {
 
 pub const SpawnOptions = struct {
     worker_id: ?u8 = null,
+    lane: Lane = .default,
     priority: Priority = .normal,
     stack_max: usize = default_stack_max,
     stack_commit: usize = default_stack_commit,
@@ -144,7 +159,18 @@ pub const Fiber = struct {
     state: std.atomic.Value(u8),
     intent: YieldIntent,
 
+    /// Concurrency guard: count of workers currently stepping this
+    /// fiber. Must never exceed 1 — a fiber is single-owner and only
+    /// one worker may run it at a time. `runFiber` increments on entry
+    /// and decrements on exit; a value of 2 means the fiber was
+    /// double-scheduled onto two queues (a scheduler bug) and we panic
+    /// before the shared coro stack corrupts.
+    running: std.atomic.Value(u32),
+
     priority: Priority,
+    /// Placement lane (`.default` / `.raft`). Set at spawn; used by
+    /// normal-priority routing to pick the right per-lane GlobalQueue.
+    lane: Lane,
     home_worker_id: u8,
 
     cpu_total_ns: u64,
@@ -155,9 +181,6 @@ pub const Fiber = struct {
     parked_since_ms: i64,
     park_trace: [8]usize,
 
-    // Intrusive ready-queue link. Owned by whichever priority FIFO
-    // the fiber is on; null when not enqueued.
-    ready_next: ?*Fiber,
     // Intrusive remote-queue link. Used when a peer worker pushes
     // this fiber onto its home worker's cross-thread injection
     // stack. Disjoint from ready_next — a fiber is either in the
@@ -231,12 +254,13 @@ pub const Fiber = struct {
             .on_finished = &helpers.onFinished,
             .state = std.atomic.Value(u8).init(@bitCast(init_state)),
             .intent = .reschedule,
+            .running = std.atomic.Value(u32).init(0),
             .priority = opts.priority,
+            .lane = opts.lane,
             .home_worker_id = opts.worker_id orelse 0,
             .cpu_total_ns = 0,
             .parked_since_ms = 0,
             .park_trace = @splat(0),
-            .ready_next = null,
             .remote_next = null,
             .waker_prev = null,
             .waker_next = null,

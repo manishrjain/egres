@@ -21,6 +21,7 @@ const std = @import("std");
 const xev = @import("xev");
 const fb = @import("fiber.zig");
 const heap = @import("heap.zig");
+const coarse = @import("coarse_clock.zig");
 
 const Fiber = fb.Fiber;
 const Allocator = std.mem.Allocator;
@@ -87,9 +88,15 @@ pub const Deadlines = struct {
     }
 
     /// Register a deadline. `ms_from_now` is clamped up to
-    /// `min_timeout_ms`. `current_ms` should be the caller's view of
-    /// "now" — typically `runtime.ms()`. The `Timeout` lives on the
-    /// caller's stack; this call only links it into the heap.
+    /// `min_timeout_ms`. The `Timeout` lives on the caller's stack;
+    /// this call only links it into the heap.
+    ///
+    /// "Now" is read via `clockMsUseRarely(.monotonic)` — direct vDSO
+    /// CLOCK_MONOTONIC, no caching. Using `loop.now()` would hand us
+    /// libxev's cached value, which can be arbitrarily stale between
+    /// `loop.run` iterations under heavy worker load; that stale
+    /// baseline could let `onTimer`'s drainExpired see both a short and
+    /// a long deadline "expired" in one sweep when only the short fired.
     ///
     /// Re-arms the xev timer iff this entry becomes the new earliest
     /// deadline. If the heap was non-empty and the existing head
@@ -99,9 +106,9 @@ pub const Deadlines = struct {
         self: *Deadlines,
         allocator: Allocator,
         t: *Timeout,
-        current_ms: i64,
         ms_from_now: u64,
     ) !void {
+        const current_ms = coarse.clockMsUseRarely(.monotonic);
         const ms = @max(ms_from_now, min_timeout_ms);
         t.deadline_ms = current_ms + @as(i64, @intCast(ms));
 
@@ -181,7 +188,7 @@ pub const Deadlines = struct {
 
 fn onTimer(
     ud: ?*Deadlines,
-    loop: *xev.Loop,
+    _: *xev.Loop,
     _: *xev.Completion,
     result: xev.Timer.RunError!void,
 ) xev.CallbackAction {
@@ -200,8 +207,9 @@ fn onTimer(
     };
 
     // Normal expiration: drain everything whose deadline has passed,
-    // then re-arm for the next entry if any remain.
-    const now = loop.now();
+    // then re-arm for the next entry if any remain. Same monotonic
+    // source as `register` — see its comment.
+    const now = coarse.clockMsUseRarely(.monotonic);
     self.drainExpired(now);
     self.armed = false;
     if (self.heap.peekMin() != null) self.armForHead(now);

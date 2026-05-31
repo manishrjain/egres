@@ -24,6 +24,9 @@ const rt = @import("runtime.zig");
 pub const Worker = rt.Worker;
 pub const Runtime = rt.Runtime;
 pub const CoarseClock = rt.CoarseClock;
+pub const coarseMs = rt.coarseMs;
+pub const clockMsUseRarely = @import("coarse_clock.zig").clockMsUseRarely;
+pub const ClockKind = @import("coarse_clock.zig").ClockKind;
 pub const Deadlines = rt.Deadlines;
 pub const Timeout = rt.Timeout;
 pub const Stats = rt.Stats;
@@ -32,8 +35,12 @@ pub const spawn = rt.spawn;
 pub const yield = rt.yield;
 pub const park = rt.park;
 pub const wake = rt.wake;
+pub const stop = rt.stop;
+pub const runtime = rt.runtime;
 pub const currentWorker = rt.currentWorker;
+pub const currentWorkerOrNull = rt.currentWorkerOrNull;
 pub const currentFiber = rt.currentFiber;
+pub const currentFiberOrNull = rt.currentFiberOrNull;
 pub const dumpFibers = rt.dumpFibers;
 pub const tscNsPerCycleQ32 = rt.tscNsPerCycleQ32;
 
@@ -51,6 +58,9 @@ pub const Notify = sync.Notify;
 const channel_mod = @import("channel.zig");
 pub const Channel = channel_mod.Channel;
 pub const CloseMode = channel_mod.CloseMode;
+
+const group_mod = @import("group.zig");
+pub const Group = group_mod.Group;
 
 const watermark_mod = @import("watermark.zig");
 pub const Watermark = watermark_mod.Watermark;

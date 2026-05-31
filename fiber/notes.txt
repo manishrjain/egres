@@ -1,0 +1,75 @@
+    /// Per-lane parked-worker bitmap. Bit `i` (across all words) set
+    /// ⇒ worker `lane_range.start + i` is parked in `loop.run(.once)`
+    /// waiting for work. `routeToWorker` reads this (ctz the first
+    /// nonzero word) to find a parked peer to notify when our local
+    /// just spilled. Four u64 words covers the full 256-worker
+    /// `u8 id` range. Cache-line aligned to avoid false sharing with
+    /// `lane_rr` and other Runtime hot fields.
+    idle_mask: [fb.Lane.count][max_idle_mask_words]std.atomic.Value(u64) align(std.atomic.cache_line) = @splat(@splat(.init(0))),
+
+/// Find one parked peer in `lane_idx` and notify its `wake_async`.
+/// Called from `scheduleLocal` when a push creates spillover and
+/// no peer is currently inside `trySteal`. Finds one parked peer
+/// via `idle_mask`, atomically claims its bit (CAS-clears) so only
+/// one producer notifies it, then notifies the peer's `wake_async`.
+///
+/// **Why CAS-claim?** Without it, two producers seeing the same set
+/// bit would both call `peer.wake_async.notify()`. That is *safe at
+/// the libxev level* — xev.Async is eventfd-backed on Linux and the
+/// eventfd counter coalesces multiple writes — but each redundant
+/// notify is a wasted syscall AND, more importantly, would re-fire
+/// the wake_async callback after the peer has already cleared its
+/// bit, woken, and started running. The CAS-claim ensures
+/// "one producer notifies, one peer wakes, exactly once per park
+/// cycle." The losing producer either finds another set bit further
+/// on or returns having done nothing — equally safe.
+fn notifyIdlePeer(rt: *Runtime, lane_idx: u8) void {
+    std.debug.assert(lane_idx < fb.Lane.count);
+    const words = &rt.idle_mask[lane_idx];
+    for (words, 0..) |*word, word_i| {
+        var m = word.load(.acquire);
+        while (m != 0) {
+            const bit_i: u6 = @intCast(@ctz(m));
+            const bit: u64 = @as(u64, 1) << bit_i;
+            // CAS-claim: clear our chosen bit. If another producer
+            // (or the peer itself, waking up) already cleared it,
+            // `actual` reflects the new state — retry with what we
+            // saw, in case a *different* bit in the same word is
+            // still set.
+            if (word.cmpxchgWeak(m, m & ~bit, .acq_rel, .acquire)) |actual| {
+                m = actual;
+                continue;
+            }
+            // We claimed it. Notify the peer.
+            const off: u8 = @intCast(word_i * bits_per_word + bit_i);
+            const peer_id = rt.lane_ranges[lane_idx].start + off;
+            std.debug.assert(peer_id < rt.workers.len);
+            std.log.debug("notifyIdlePeer: {d}", .{peer_id});
+
+            rt.workers[peer_id].wake_async.notify() catch {};
+            return;
+        }
+    }
+}
+
+For Runtime:
+
+    pub fn init(self: *Runtime, allocator: std.mem.Allocator, opts: InitOptions) !void {
+
+pub const InitOptions = struct {
+    /// Number of worker threads. `null` defaults to 1 today (so
+    /// existing single-thread call sites keep working unchanged).
+    /// Callers wanting multi-thread set this explicitly.
+    num_workers: ?usize = null,
+    /// Per-lane worker counts. `.default` lane gets whatever workers
+    /// are left after the named lanes are assigned (and must end up
+    /// with >= 1).
+    lanes: LaneConfig = .{},
+};
+
+/// Per-lane worker counts at init. `.default` is implicit — it gets
+/// `num_workers - raft`. Tests use `LaneConfig{}` (raft = 0), which
+/// puts every worker in the default lane.
+pub const LaneConfig = struct {
+    raft: u8 = 0,
+};
