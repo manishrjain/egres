@@ -1,5 +1,5 @@
 const std = @import("std");
-const zio = @import("zio");
+const fiber = @import("fiber");
 const zdb = @import("zdb");
 const Cache = zdb.cache.Cache;
 const ShardedCache = zdb.cache.ShardedCache;
@@ -283,9 +283,9 @@ test "ShardedCache concurrent puts and gets" {
         }
     };
 
-    var handles: [4]zio.JoinHandle(void) = undefined;
+    var handles: [4]fiber.JoinHandle(void) = undefined;
     const ctx = Ctx{ .sc = &sc, .alloc = alloc };
-    for (&handles) |*h| h.* = try zio.spawn(work.run, .{ctx});
+    for (&handles) |*h| h.* = try fiber.spawn(.{}, work.run, .{ctx});
     for (&handles) |*h| h.join();
 }
 

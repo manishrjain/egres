@@ -9,13 +9,12 @@
 
 const std = @import("std");
 const testing = std.testing;
-const zio = @import("zio");
-const rt = @import("runtime");
+const fiber = @import("fiber");
 const pgwire = @import("pgwire");
 
-const Channel = zio.Channel;
-const IpAddress = zio.net.IpAddress;
-const Stream = zio.net.Stream;
+const Channel = fiber.Channel;
+const IpAddress = fiber.net.IpAddress;
+const Stream = fiber.net.Stream;
 
 /// Stub handler. Records the SQL it sees and emits a single hardcoded
 /// row each time. Used by the driver test below.
@@ -99,11 +98,11 @@ const TestCtx = struct {
 };
 
 fn serverFn(ctx: *TestCtx) anyerror!void {
-    const addr = try IpAddress.parseIp4("127.0.0.1", 0);
+    const addr = try IpAddress.parseIpAndPort("127.0.0.1:0");
     const server = try addr.listen(.{});
     defer server.close();
 
-    try ctx.port_ch.send(server.socket.address.ip.getPort());
+    try ctx.port_ch.send(server.port());
 
     var stream = try server.accept(.{});
     defer stream.close();
@@ -113,9 +112,11 @@ fn serverFn(ctx: *TestCtx) anyerror!void {
 
 fn clientFn(ctx: *TestCtx) anyerror!void {
     const port = try ctx.port_ch.receive();
-    const addr = try IpAddress.parseIp4("127.0.0.1", port);
+    var addr_buf: [32]u8 = undefined;
+    const addr_str = try std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{port});
+    const addr = try IpAddress.parseIpAndPort(addr_str);
 
-    var stream = try zio.net.tcpConnectToAddress(addr, .{});
+    var stream = try addr.connect(.{});
     defer stream.close();
 
     // Send Startup3 + Query("SELECT 'hello'") + Terminate.
@@ -124,7 +125,7 @@ fn clientFn(ctx: *TestCtx) anyerror!void {
     try buildStartup(&to_send, ctx.a);
     try buildQuery(&to_send, ctx.a, "SELECT 'hello'");
     try buildTerminate(&to_send, ctx.a);
-    try stream.writeAll(to_send.items, .none);
+    try stream.writeAll(to_send.items);
 
     // Drain the server's response. The driver loop terminates when
     // the peer sends 'X', then the server closes the stream — so
@@ -133,7 +134,7 @@ fn clientFn(ctx: *TestCtx) anyerror!void {
     defer inbox.deinit(ctx.a);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = try stream.read(&buf, .none);
+        const n = try stream.read(&buf);
         if (n == 0) break;
         try inbox.appendSlice(ctx.a, buf[0..n]);
     }
@@ -213,11 +214,11 @@ test "driver: full startup + Query + Terminate round-trip" {
         .handler = &handler,
     };
 
-    var group = rt.Group(anyerror!void).init(a, .background);
+    var group = fiber.Group(anyerror!void).init(a);
     defer group.deinit();
 
-    try group.spawn(.shared, serverFn, .{&ctx});
-    try group.spawn(.shared, clientFn, .{&ctx});
+    try group.spawn(.{}, serverFn, .{&ctx});
+    try group.spawn(.{}, clientFn, .{&ctx});
 
     for (group.wait()) |r| try r;
 }

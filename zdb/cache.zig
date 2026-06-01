@@ -20,7 +20,7 @@
 //! For []const u8 keys, the cache takes ownership of the key on put.
 
 const std = @import("std");
-const zio = @import("zio");
+const fiber = @import("fiber");
 const utils = @import("utils");
 const Allocator = std.mem.Allocator;
 
@@ -417,7 +417,7 @@ pub fn ShardedCache(comptime K: type) type {
 
         const Shard = struct {
             cache: Cache(K),
-            lock: zio.RwLock,
+            lock: fiber.RWMutex,
         };
 
         allocator: Allocator,
@@ -432,7 +432,7 @@ pub fn ShardedCache(comptime K: type) type {
             errdefer for (shards[0..n]) |*s| s.cache.deinit();
             for (shards) |*s| {
                 s.cache = try Cache(K).init(alloc, per);
-                s.lock = .init;
+                s.lock = .{};
                 n += 1;
             }
             return Self{ .allocator = alloc, .shards = shards };
@@ -449,7 +449,7 @@ pub fn ShardedCache(comptime K: type) type {
 
         pub fn get(self: *Self, key: K) ?*Value {
             const s = self.pickShard(key);
-            s.lock.lockSharedUncancelable();
+            s.lock.lockShared();
             defer s.lock.unlockShared();
             return s.cache.get(key);
         }
@@ -457,7 +457,7 @@ pub fn ShardedCache(comptime K: type) type {
         /// See `Cache.put` for ownership semantics.
         pub fn put(self: *Self, key: K, val: *Value) !void {
             const s = self.pickShard(key);
-            s.lock.lockUncancelable();
+            s.lock.lock();
             defer s.lock.unlock();
             return s.cache.put(key, val);
         }
@@ -466,7 +466,7 @@ pub fn ShardedCache(comptime K: type) type {
         pub fn count(self: *Self) usize {
             var total: usize = 0;
             for (self.shards) |*s| {
-                s.lock.lockSharedUncancelable();
+                s.lock.lockShared();
                 defer s.lock.unlockShared();
                 total += s.cache.count();
             }
@@ -477,7 +477,7 @@ pub fn ShardedCache(comptime K: type) type {
         pub fn byteSize(self: *Self) usize {
             var total: usize = 0;
             for (self.shards) |*s| {
-                s.lock.lockSharedUncancelable();
+                s.lock.lockShared();
                 defer s.lock.unlockShared();
                 total += s.cache.byteSize();
             }

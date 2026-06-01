@@ -1,6 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
-const zio = @import("zio");
+const fiber = @import("fiber");
 const vfs = @import("vfs");
 const utils = @import("utils");
 const bandwidth = vfs.bandwidth;
@@ -400,7 +400,7 @@ test "write bandwidth enforcement" {
     defer (std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } }).close(ioOf());
 
     var v = VFS.new(&limiter);
-    const fh = vfs.FileHandle{ .file = zio.File.fromFd(fd), .file_size = file_size, .vfs = &v };
+    const fh = vfs.FileHandle{ .file = fiber.File.fromFd(fd), .file_size = file_size, .vfs = &v };
 
     // Drain the bucket.
     _ = blk: {
@@ -474,10 +474,10 @@ test "P1 prioritized over P2" {
     var p2_ctx = PriorityTestCtx{ .handle = handle, .bytes_read = std.atomic.Value(u64).init(0), .finish_order = &finish_order, .my_order = std.atomic.Value(u32).init(99) };
 
     // Launch P2 first, then P1 — P1 should still finish first.
-    var p2_handle = try zio.spawn(PriorityTestCtx.readerFn, .{ &p2_ctx, .p2 });
+    var p2_handle = try fiber.spawn(.{}, PriorityTestCtx.readerFn, .{ &p2_ctx, .p2 });
     // Small delay so P2 enters the wait loop first.
-    try zio.sleep(zio.Duration.fromMilliseconds(5));
-    var p1_handle = try zio.spawn(PriorityTestCtx.readerFn, .{ &p1_ctx, .p1 });
+    fiber.sleep(5);
+    var p1_handle = try fiber.spawn(.{}, PriorityTestCtx.readerFn, .{ &p1_ctx, .p1 });
 
     p1_handle.join();
     p2_handle.join();

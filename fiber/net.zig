@@ -118,7 +118,11 @@ pub const IpAddress = struct {
         tcp.connect(&w.loop, &c, self.inner, ConnectWaiter, &waiter, connectCallback);
         rt.park();
         try waiter.result;
-        return .{ .tcp = tcp };
+        const stream: Stream = .{ .tcp = tcp };
+        // NODELAY is a universal low-latency default — apply it to every
+        // connected stream at creation so callers don't have to.
+        stream.setNoDelay(true) catch {};
+        return stream;
     }
 };
 
@@ -137,7 +141,9 @@ pub const Server = struct {
         self.tcp.accept(&w.loop, &c, AcceptWaiter, &waiter, acceptCallback);
         rt.park();
         const tcp = try waiter.result;
-        return .{ .tcp = tcp };
+        const stream: Stream = .{ .tcp = tcp };
+        stream.setNoDelay(true) catch {}; // low-latency default (see connect)
+        return stream;
     }
 
     pub fn shutdown(self: Server, how: ShutdownHow) !void {
@@ -146,6 +152,11 @@ pub const Server = struct {
 
     pub fn close(self: Server) void {
         socketClose(self.tcp.fd);
+    }
+
+    /// The actual bound port — useful after listening on port 0.
+    pub fn port(self: Server) u16 {
+        return self.bound_addr.getPort();
     }
 };
 
@@ -190,6 +201,22 @@ pub const Stream = struct {
 
     pub fn close(self: Stream) void {
         socketClose(self.tcp.fd);
+    }
+
+    /// Raw socket fd — for `setsockopt` and friends.
+    pub fn handle(self: Stream) Sionet.Socket.Handle {
+        return self.tcp.fd;
+    }
+
+    /// Disable Nagle's algorithm (TCP_NODELAY).
+    pub fn setNoDelay(self: Stream, on: bool) !void {
+        const TCP = if (builtin.os.tag == .macos) std.c.TCP else std.os.linux.TCP;
+        try posix.setsockopt(self.tcp.fd, posix.IPPROTO.TCP, TCP.NODELAY, &std.mem.toBytes(@as(c_int, if (on) 1 else 0)));
+    }
+
+    /// Enable / disable SO_KEEPALIVE.
+    pub fn setKeepAlive(self: Stream, on: bool) !void {
+        try posix.setsockopt(self.tcp.fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(@as(c_int, if (on) 1 else 0)));
     }
 
     /// Buffered reader exposing a `std.Io.Reader` via `.interface`.

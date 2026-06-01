@@ -19,8 +19,7 @@
 //!   - If the pool is exhausted, further locks silently degrade to
 //!     untracked. lock/unlock still work; they just don't appear in dumps.
 const std = @import("std");
-const zio = @import("zio");
-const coarse = @import("coarse.zig");
+const fiber = @import("fiber");
 const context = @import("context.zig");
 
 /// Cap on simultaneously-tracked locks. Sized to a ~512 KiB static
@@ -58,7 +57,7 @@ pub const RegEntry = struct {
 };
 
 pub const TrackedMutex = struct {
-    inner: zio.Mutex = .init,
+    inner: fiber.Mutex = .{},
     entry: std.atomic.Value(?*RegEntry) = .init(null),
 
     pub fn tryLock(self: *TrackedMutex, comptime src: std.builtin.SourceLocation) bool {
@@ -68,19 +67,7 @@ pub const TrackedMutex = struct {
         return true;
     }
 
-    pub fn lock(self: *TrackedMutex, comptime src: std.builtin.SourceLocation) zio.Cancelable!void {
-        return self.lockImpl(src, true);
-    }
-
-    pub fn lockUncancelable(self: *TrackedMutex, comptime src: std.builtin.SourceLocation) void {
-        self.lockImpl(src, false);
-    }
-
-    fn lockImpl(
-        self: *TrackedMutex,
-        comptime src: std.builtin.SourceLocation,
-        comptime cancelable: bool,
-    ) (if (cancelable) zio.Cancelable!void else void) {
+    pub fn lock(self: *TrackedMutex, comptime src: std.builtin.SourceLocation) void {
         const e = ensureEntry(&self.entry);
         if (self.inner.tryLock()) {
             recordAcquire(e, src);
@@ -90,16 +77,15 @@ pub const TrackedMutex = struct {
             _ = ee.waiter_count.fetchAdd(1, .monotonic);
             ee.last_waiter_src = staticSrc(src);
         }
-        if (cancelable) {
-            self.inner.lock() catch |err| {
-                if (e) |ee| _ = ee.waiter_count.fetchSub(1, .monotonic);
-                return err;
-            };
-        } else {
-            self.inner.lockUncancelable();
-        }
+        self.inner.lock();
         if (e) |ee| _ = ee.waiter_count.fetchSub(1, .monotonic);
         recordAcquire(e, src);
+    }
+
+    /// Retained for source compatibility — fiber locks never cancel, so
+    /// this is identical to `lock`.
+    pub fn lockUncancelable(self: *TrackedMutex, comptime src: std.builtin.SourceLocation) void {
+        self.lock(src);
     }
 
     pub fn unlock(self: *TrackedMutex) void {
@@ -114,7 +100,7 @@ pub const TrackedMutex = struct {
 };
 
 pub const TrackedRwLock = struct {
-    inner: zio.RwLock = .init,
+    inner: fiber.RWMutex = .{},
     entry: std.atomic.Value(?*RegEntry) = .init(null),
 
     pub fn tryLock(self: *TrackedRwLock, comptime src: std.builtin.SourceLocation) bool {
@@ -131,30 +117,30 @@ pub const TrackedRwLock = struct {
         return true;
     }
 
-    pub fn lock(self: *TrackedRwLock, comptime src: std.builtin.SourceLocation) zio.Cancelable!void {
-        return self.acquire(src, false, true);
+    pub fn lock(self: *TrackedRwLock, comptime src: std.builtin.SourceLocation) void {
+        self.acquire(src, false);
     }
 
+    pub fn lockShared(self: *TrackedRwLock, comptime src: std.builtin.SourceLocation) void {
+        self.acquire(src, true);
+    }
+
+    /// Retained for source compatibility — fiber locks never cancel.
     pub fn lockUncancelable(self: *TrackedRwLock, comptime src: std.builtin.SourceLocation) void {
-        self.acquire(src, false, false);
-    }
-
-    pub fn lockShared(self: *TrackedRwLock, comptime src: std.builtin.SourceLocation) zio.Cancelable!void {
-        return self.acquire(src, true, true);
+        self.acquire(src, false);
     }
 
     pub fn lockSharedUncancelable(self: *TrackedRwLock, comptime src: std.builtin.SourceLocation) void {
-        self.acquire(src, true, false);
+        self.acquire(src, true);
     }
 
-    /// Shared body. `shared` and `cancelable` are both comptime so each
-    /// of the four public entrypoints collapses to a single fast path.
+    /// Shared body. `shared` is comptime so each public entrypoint
+    /// collapses to a single fast path.
     fn acquire(
         self: *TrackedRwLock,
         comptime src: std.builtin.SourceLocation,
         comptime shared: bool,
-        comptime cancelable: bool,
-    ) (if (cancelable) zio.Cancelable!void else void) {
+    ) void {
         const e = ensureEntry(&self.entry);
         // Fast path: uncontended → skip waiter accounting.
         const got = if (shared) self.inner.tryLockShared() else self.inner.tryLock();
@@ -167,15 +153,7 @@ pub const TrackedRwLock = struct {
             _ = ee.waiter_count.fetchAdd(1, .monotonic);
             ee.last_waiter_src = staticSrc(src);
         }
-        if (cancelable) {
-            const r = if (shared) self.inner.lockShared() else self.inner.lock();
-            r catch |err| {
-                if (e) |ee| _ = ee.waiter_count.fetchSub(1, .monotonic);
-                return err;
-            };
-        } else {
-            if (shared) self.inner.lockSharedUncancelable() else self.inner.lockUncancelable();
-        }
+        if (shared) self.inner.lockShared() else self.inner.lock();
         if (e) |ee| _ = ee.waiter_count.fetchSub(1, .monotonic);
         recordAcquire(e, src);
     }
@@ -207,7 +185,7 @@ fn recordAcquire(e: ?*RegEntry, comptime src: std.builtin.SourceLocation) void {
     // Per the file header, the entry fields are racy by design, so the
     // ordering is best-effort, not a hard invariant.
     ee.holder_src = staticSrc(src);
-    ee.last_held_since_ms = coarse.Clock.ms();
+    ee.last_held_since_ms = fiber.coarseMs();
     _ = ee.holder_count.fetchAdd(1, .monotonic);
 }
 
@@ -358,7 +336,7 @@ pub fn dump(w: *std.Io.Writer) !void {
         if (count == 0) continue;
         held += 1;
         const since = n.last_held_since_ms;
-        const held_for: i64 = if (since == 0) 0 else coarse.Clock.ms() - since;
+        const held_for: i64 = if (since == 0) 0 else fiber.coarseMs() - since;
         if (n.holder_src) |sl| {
             try w.print("held_by={s}:{d} held_for_ms={d}", .{ sl.file, sl.line, held_for });
         } else {

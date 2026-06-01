@@ -1,5 +1,5 @@
 const std = @import("std");
-const zio = @import("zio");
+const fiber = @import("fiber");
 
 /// Monotonically-advancing u64 with wait/signal. Many tasks block until
 /// the value crosses a target.
@@ -17,8 +17,8 @@ const zio = @import("zio");
 /// controls the wait paths.
 pub const Watermark = struct {
     value: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    mu: zio.Mutex = .init,
-    cv: zio.Condition = .init,
+    mu: fiber.Mutex = .{},
+    cv: fiber.Condition = .{},
     closed: bool = false, // protected by mu
 
     /// Lockless load. Cheap — safe to call on hot paths.
@@ -59,7 +59,7 @@ pub const Watermark = struct {
     /// Mark the watermark closed and wake every current/future waiter
     /// with `error.Closed`. Idempotent.
     pub fn close(self: *Watermark) void {
-        self.mu.lockUncancelable();
+        self.mu.lock();
         defer self.mu.unlock();
         if (!self.closed) {
             self.closed = true;
@@ -70,24 +70,27 @@ pub const Watermark = struct {
     /// Block until `value >= target` or `timeout` elapses. Returns
     /// `error.Closed` if `close()` is called, `error.Timeout` on expiry,
     /// `error.Canceled` if the task is canceled.
-    pub fn waitFor(self: *Watermark, target: u64, timeout: zio.Duration) !void {
-        const deadline: zio.Timeout = (zio.Timeout{ .duration = timeout }).toDeadline();
-        try self.mu.lock();
+    pub fn waitFor(self: *Watermark, target: u64, timeout_ms: u64) error{ Closed, Timeout }!void {
+        // TODO(fiber): enforce the timeout. fiber.Condition has no timed
+        // wait yet; until it lands this blocks like waitForUntimed and
+        // error.Timeout is never returned (kept in the set for callers).
+        _ = timeout_ms;
+        self.mu.lock();
         defer self.mu.unlock();
         while (self.value.load(.acquire) < target) {
             if (self.closed) return error.Closed;
-            try self.cv.timedWait(&self.mu, deadline);
+            self.cv.wait(&self.mu);
         }
     }
 
     /// Block until `value >= target`. Returns `error.Closed` on close,
     /// `error.Canceled` on cancel.
-    pub fn waitForUntimed(self: *Watermark, target: u64) !void {
-        try self.mu.lock();
+    pub fn waitForUntimed(self: *Watermark, target: u64) error{Closed}!void {
+        self.mu.lock();
         defer self.mu.unlock();
         while (self.value.load(.acquire) < target) {
             if (self.closed) return error.Closed;
-            try self.cv.wait(&self.mu);
+            self.cv.wait(&self.mu);
         }
     }
 };

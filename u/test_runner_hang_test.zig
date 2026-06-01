@@ -15,8 +15,8 @@
 //! verify the dump cadence on its own.
 
 const std = @import("std");
-const zio = @import("zio");
+const fiber = @import("fiber");
 
 test "HANG: hangs for 6 minutes (watchdog smoke test)" {
-    try zio.sleep(zio.Duration.fromMinutes(6));
+    fiber.sleep(6 * 60 * 1000);
 }

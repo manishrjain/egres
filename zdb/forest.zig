@@ -1,7 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.forest);
-const zio = @import("zio");
-const runtime = @import("runtime");
+const fiber = @import("fiber");
 const utils = @import("utils");
 const config = @import("config.zig");
 const manifest = @import("manifest.zig");
@@ -121,14 +120,14 @@ pub const RouteTable = struct {
 
 pub const Memtables = struct {
     allocator: std.mem.Allocator,
-    mu: zio.RwLock,
+    mu: fiber.RWMutex,
     current: *SkipList,
     immutables: std.ArrayList(*SkipList), // oldest at index 0
 
     pub fn init(allocator: std.mem.Allocator, current: *SkipList) Memtables {
         return .{
             .allocator = allocator,
-            .mu = .init,
+            .mu = .{},
             .current = current,
             .immutables = .empty,
         };
@@ -141,13 +140,13 @@ pub const Memtables = struct {
     }
 
     pub fn put(self: *Memtables, key: Key, value: []const u8) !void {
-        self.mu.lockSharedUncancelable();
+        self.mu.lockShared();
         defer self.mu.unlockShared();
         try self.current.put(key, value);
     }
 
     pub fn memoryUsage(self: *Memtables) usize {
-        self.mu.lockSharedUncancelable();
+        self.mu.lockShared();
         defer self.mu.unlockShared();
         return self.current.memoryUsage();
     }
@@ -161,7 +160,7 @@ pub const Memtables = struct {
     /// ref a moment later, the skiplist stays alive until the iterator
     /// drops its ref. Caller frees the slice itself.
     pub fn getIterators(self: *Memtables, allocator: std.mem.Allocator) ![]merge_iterator.Iterator {
-        self.mu.lockSharedUncancelable();
+        self.mu.lockShared();
         defer self.mu.unlockShared();
         const total = self.immutables.items.len + 1;
         const out = try allocator.alloc(merge_iterator.Iterator, total);
@@ -176,7 +175,7 @@ pub const Memtables = struct {
     /// in place — no `newMemtable` has been applied yet, and any writes that
     /// land in `current` will be discarded by the first `swapCurrentOut`.
     pub fn currentId(self: *Memtables) u64 {
-        self.mu.lockSharedUncancelable();
+        self.mu.lockShared();
         defer self.mu.unlockShared();
         return self.current.id;
     }
@@ -191,7 +190,7 @@ pub const Memtables = struct {
     };
 
     pub fn stats(self: *Memtables) Stats {
-        self.mu.lockSharedUncancelable();
+        self.mu.lockShared();
         defer self.mu.unlockShared();
         var imm_bytes: usize = 0;
         for (self.immutables.items) |imm| imm_bytes += imm.memoryUsage();
@@ -205,7 +204,7 @@ pub const Memtables = struct {
     /// Look up a key across current and immutable memtables.
     /// Returns a duped Item owned by the caller.
     pub fn get(self: *Memtables, allocator: std.mem.Allocator, search_key: Key) !?Item {
-        self.mu.lockSharedUncancelable();
+        self.mu.lockShared();
         defer self.mu.unlockShared();
 
         if (self.current.get(search_key)) |item| {
@@ -231,7 +230,7 @@ pub const Memtables = struct {
     /// would otherwise sit in immutables forever, since no flush ever targets
     /// id=0.
     pub fn swapCurrentOut(self: *Memtables, new_id: u64, log_index: u64) !void {
-        self.mu.lockUncancelable();
+        self.mu.lock();
         defer self.mu.unlock();
 
         if (self.current.id == 0) {
@@ -249,7 +248,7 @@ pub const Memtables = struct {
     /// thing around is the initial placeholder (no real `newMemtable` entry
     /// has been applied yet), which the caller treats as "no snapshot yet."
     pub fn oldestInMemoryLogIndex(self: *Memtables) u64 {
-        self.mu.lockSharedUncancelable();
+        self.mu.lockShared();
         defer self.mu.unlockShared();
         if (self.immutables.items.len > 0) return self.immutables.items[0].created_at_log_index;
         return self.current.created_at_log_index;
@@ -273,7 +272,7 @@ pub const Memtables = struct {
     ///     install above handles the data side.
     /// Steady-state: FIFO ordering means oldest always equals expected.
     pub fn popOldestIfMatches(self: *Memtables, expected_id: u64) void {
-        self.mu.lockUncancelable();
+        self.mu.lock();
         defer self.mu.unlock();
 
         while (self.immutables.items.len > 0 and self.immutables.items[0].id < expected_id) {
@@ -303,7 +302,7 @@ pub const Memtables = struct {
 
     /// Return the oldest immutable memtable without removing it.
     pub fn peekOldest(self: *Memtables) ?*SkipList {
-        self.mu.lockSharedUncancelable();
+        self.mu.lockShared();
         defer self.mu.unlockShared();
 
         if (self.immutables.items.len == 0) return null;
@@ -474,7 +473,7 @@ pub const Forest = struct {
         // write path (finish → create file → write → sync → close) and returns
         // the manifest TableChange directly.
         var flush_err: utils.ThreadSafeError = .{};
-        var g = runtime.Group(?manifest.TableChange).init(self.allocator, .background);
+        var g = fiber.Group(?manifest.TableChange).init(self.allocator);
         defer {
             _ = g.wait();
             g.deinit();
@@ -494,7 +493,7 @@ pub const Forest = struct {
             const file_id = try self.file_ids.allocate();
             const path = try fi.sstPath(self.allocator, self.opts.dir, file_id);
 
-            try g.spawn(.shared, writeAndSyncTable, .{
+            try g.spawn(.{}, writeAndSyncTable, .{
                 self.allocator, tb, path, file_id, tree_id, &flush_err,
             });
         }
@@ -510,7 +509,7 @@ pub const Forest = struct {
 
         // Best-effort directory sync.
         if (self.opts.dir.len > 0) {
-            var dir_sync = try runtime.spawnOn(.background, .shared, vfs.syncDir, .{self.opts.dir});
+            var dir_sync = try fiber.spawn(.{}, vfs.syncDir, .{self.opts.dir});
             defer dir_sync.join();
         }
 

@@ -1,7 +1,6 @@
 const std = @import("std");
 const utils = @import("utils");
 const raft = @import("raft");
-const zio = @import("zio");
 const vfs = @import("vfs");
 const zbuf = @import("zbuf").zbuf;
 const zen = raft.buffers;

@@ -1,7 +1,6 @@
 const std = @import("std");
 const raft = @import("raft");
-const zio = @import("zio");
-const runtime = @import("runtime");
+const fiber = @import("fiber");
 const cluster_mod = @import("cluster.zig");
 const zen = raft.buffers;
 
@@ -10,13 +9,16 @@ const TestLog = cluster_mod.TestLog;
 const Config = raft.Config;
 const NodeId = raft.NodeId;
 
-// TODO: re-enable. The integration tests below were silently skipped for
-// some time because `runTestsInZioRuntime` had a type-check bug that
-// rejected helpers with inferred error sets. Once the dispatcher was fixed,
-// `testLeaderElection` (the first cluster-based test) hangs in
-// `cluster.waitForTicks` — a real regression in the test harness or in
-// the raft tick/transport flow that needs a focused debugging session.
-// Diskwal tests run via a separate test target and are unaffected.
+// TODO: re-enable once the post-election stall is fixed. On the fiber stack
+// (2026-06) `testLeaderElection` now gets MUCH further than before — the
+// 3-node cluster fully elects a leader, applies the bootstrap conf-change,
+// and replicates+commits it to all nodes (verified via debug logs). But it
+// then deadlocks in `cluster.waitForTicks(50)`: the fiber dump shows
+// ready=0, ~8 long-lived fibers parked ~20s (the tickLoop→event_ch→mainLoop
+// chain appears to wedge) while transport connection churn continues
+// (finished≈276). Needs a focused debugging session (per-fiber stacks /
+// instrumentation). `cluster.zig` itself is now fixed for Zig 0.16
+// (nanoTimestamp→fiber.coarseMs, std.fs→vfs). Diskwal tests run separately.
 test "all" {
     return error.SkipZigTest;
 }
@@ -297,14 +299,14 @@ pub fn testTransportStartsAndStopsCleanly() !void {
     var rt = raft.RaftRuntime.init(std.testing.allocator, node);
     defer rt.deinit();
 
-    var group = runtime.Group(void).init(std.testing.allocator, .background);
+    var group = fiber.Group(void).init(std.testing.allocator);
     defer {
         group.wait();
         group.deinit();
     }
-    try group.spawn(.shared, runRaftRuntime, .{&rt});
+    try group.spawn(.{}, runRaftRuntime, .{&rt});
 
-    zio.sleep(zio.Duration.fromMilliseconds(50)) catch return;
+    fiber.sleep(50);
     node.startShutdown();
 }
 
@@ -330,12 +332,12 @@ pub fn testTransportProcessesProposal() !void {
     var rt = raft.RaftRuntime.init(std.testing.allocator, node);
     defer rt.deinit();
 
-    var group = runtime.Group(void).init(std.testing.allocator, .background);
+    var group = fiber.Group(void).init(std.testing.allocator);
     defer {
         group.wait();
         group.deinit();
     }
-    try group.spawn(.shared, runRaftRuntime, .{&rt});
+    try group.spawn(.{}, runRaftRuntime, .{&rt});
 
     const Ctx = struct {
         done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -356,7 +358,7 @@ pub fn testTransportProcessesProposal() !void {
             observed = true;
             break;
         }
-        zio.sleep(zio.Duration.fromMilliseconds(10)) catch break;
+        fiber.sleep(10);
     }
 
     try std.testing.expect(observed);
@@ -383,14 +385,14 @@ pub fn testTransportStopIsClean() !void {
     var rt = raft.RaftRuntime.init(std.testing.allocator, node);
     defer rt.deinit();
 
-    var group = runtime.Group(void).init(std.testing.allocator, .background);
+    var group = fiber.Group(void).init(std.testing.allocator);
     defer {
         group.wait();
         group.deinit();
     }
-    try group.spawn(.shared, runRaftRuntime, .{&rt});
+    try group.spawn(.{}, runRaftRuntime, .{&rt});
 
-    zio.sleep(zio.Duration.fromMilliseconds(50)) catch return;
+    fiber.sleep(50);
     node.startShutdown();
 }
 

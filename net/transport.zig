@@ -1,6 +1,5 @@
 const std = @import("std");
-const zio = @import("zio");
-const runtime = @import("runtime");
+const fiber = @import("fiber");
 const serial_mod = @import("serial");
 const utils = @import("utils");
 const Serial = serial_mod.Serial;
@@ -11,9 +10,10 @@ const builtin = @import("builtin");
 
 const handshake_size: usize = 18;
 
-fn configureSocket(conn: zio.net.Stream) void {
-    conn.socket.setNoDelay(true) catch {};
-    conn.socket.setKeepAlive(true) catch {};
+fn configureSocket(conn: fiber.net.Stream) void {
+    // NODELAY is applied at socket creation by fiber.net. Here we add raft's
+    // aggressive keepalive policy (peer-death detection) on top.
+    conn.setKeepAlive(true) catch {};
 
     // Set keepalive parameters: 5s idle, 1s interval, 3 probes → ~8s detection.
     const os_tag = comptime builtin.os.tag;
@@ -23,7 +23,7 @@ fn configureSocket(conn: zio.net.Stream) void {
     const TCP = if (is_macos) std.c.TCP else std.os.linux.TCP;
     const IDLE = if (is_macos) TCP.KEEPALIVE else TCP.KEEPIDLE;
 
-    const fd = conn.socket.handle;
+    const fd = conn.handle();
     const tcp_proto = std.posix.IPPROTO.TCP;
     std.posix.setsockopt(fd, tcp_proto, IDLE, &std.mem.toBytes(@as(c_int, 5))) catch {};
     std.posix.setsockopt(fd, tcp_proto, TCP.KEEPINTVL, &std.mem.toBytes(@as(c_int, 1))) catch {};
@@ -62,15 +62,15 @@ pub const Transport = struct {
 
     allocator: Allocator,
     cfg: Config,
-    listen_addr: zio.net.IpAddress,
+    listen_addr: fiber.net.IpAddress,
     mu: utils.TrackedMutex,
     peers: std.AutoHashMap(u64, *PeerSlot),
-    group: runtime.Group(void),
-    listener: ?zio.net.Server,
+    group: fiber.Group(void),
+    listener: ?fiber.net.Server,
     shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(allocator: Allocator, cfg: Config) !Transport {
-        const listen_addr = try zio.net.IpAddress.parseIpAndPort(cfg.listen_addr);
+        const listen_addr = try fiber.net.IpAddress.parseIpAndPort(cfg.listen_addr);
         const peers = std.AutoHashMap(u64, *PeerSlot).init(allocator);
         log.info("node {d}: initialized, cluster={d}", .{ cfg.self_id, cfg.cluster_id });
         return .{
@@ -79,7 +79,7 @@ pub const Transport = struct {
             .listen_addr = listen_addr,
             .mu = .{},
             .peers = peers,
-            .group = runtime.Group(void).init(allocator, .raft),
+            .group = fiber.Group(void).init(allocator),
             .listener = null,
         };
     }
@@ -91,7 +91,7 @@ pub const Transport = struct {
         // Close all connections so reader/writer loops exit.
         var num_closed: u32 = 0;
         {
-            self.mu.lock(@src()) catch {};
+            self.mu.lock(@src());
             defer self.mu.unlock();
             var it = self.peers.valueIterator();
             while (it.next()) |slot_ptr| {
@@ -122,7 +122,7 @@ pub const Transport = struct {
     /// Add a peer dynamically and start dialing it.
     /// Safe to call while the server is running.
     pub fn addPeer(self: *Transport, id: u64, addr: []const u8) !void {
-        self.mu.lock(@src()) catch return error.Cancelled;
+        self.mu.lock(@src());
         defer self.mu.unlock();
         log.debug("addPeer for {d} {s}\n", .{ id, addr });
 
@@ -148,7 +148,7 @@ pub const Transport = struct {
             log.debug("addPeer got address {s} for peer {d}\n", .{ addr, id });
             slot.addr = try self.allocator.dupe(u8, addr);
             for ([_]Priority{ .p0, .p1 }) |pri| {
-                self.group.spawn(.shared, dialLoop, .{ self, id, pri }) catch |err| {
+                self.group.spawn(.{ .lane = .raft }, dialLoop, .{ self, id, pri }) catch |err| {
                     log.err("failed to spawn dial loop for peer {d}: {s}", .{ id, @errorName(err) });
                 };
             }
@@ -163,12 +163,12 @@ pub const Transport = struct {
 
         // Start dial loops for this peer.
         for ([_]Priority{ .p0, .p1 }) |pri| {
-            self.group.spawn(.shared, dialLoop, .{ self, id, pri }) catch {};
+            self.group.spawn(.{ .lane = .raft }, dialLoop, .{ self, id, pri }) catch {};
         }
     }
 
     pub fn removePeer(self: *Transport, id: u64) void {
-        self.mu.lock(@src()) catch return;
+        self.mu.lock(@src());
         defer self.mu.unlock();
 
         const slot = self.peers.get(id) orelse return;
@@ -188,22 +188,22 @@ pub const Transport = struct {
         }
         log.info("node {d}: listening on {s}", .{ self.cfg.self_id, self.cfg.listen_addr });
 
-        try self.group.spawn(.shared, acceptLoop, .{self});
-        try self.group.spawn(.shared, livenessLoop, .{self});
+        try self.group.spawn(.{ .lane = .raft }, acceptLoop, .{self});
+        try self.group.spawn(.{ .lane = .raft }, livenessLoop, .{self});
 
         // Spawn one dial coroutine per (peer, priority) pair.
         var it = self.peers.iterator();
         while (it.next()) |kv| {
             const peer_id = kv.key_ptr.*;
             for ([_]Priority{ .p0, .p1 }) |pri| {
-                self.group.spawn(.shared, dialLoop, .{ self, peer_id, pri }) catch {};
+                self.group.spawn(.{ .lane = .raft }, dialLoop, .{ self, peer_id, pri }) catch {};
             }
         }
     }
 
     /// Get Serial connection for a peer at given priority. Returns null if not connected.
     pub fn getPeerConn(self: *Transport, peer_id: u64, priority: Priority) ?*Serial {
-        self.mu.lock(@src()) catch return null;
+        self.mu.lock(@src());
         defer self.mu.unlock();
         const slot = self.peers.get(peer_id) orelse return null;
         return slot.conn[@intFromEnum(priority)];
@@ -211,7 +211,7 @@ pub const Transport = struct {
 
     /// Set drop_messages on all connections for a specific peer.
     pub fn setDropForPeer(self: *Transport, peer_id: u64, drop: bool) void {
-        self.mu.lock(@src()) catch return;
+        self.mu.lock(@src());
         defer self.mu.unlock();
         const slot = self.peers.get(peer_id) orelse return;
         for (&slot.conn) |c| {
@@ -221,7 +221,7 @@ pub const Transport = struct {
 
     /// Set drop_messages on all connections for all peers.
     pub fn setDropAll(self: *Transport, drop: bool) void {
-        self.mu.lock(@src()) catch return;
+        self.mu.lock(@src());
         defer self.mu.unlock();
         var it = self.peers.valueIterator();
         while (it.next()) |slot_ptr| {
@@ -234,7 +234,7 @@ pub const Transport = struct {
     /// Return the actual bound port (useful when listening on port 0).
     pub fn getListenPort(self: *Transport) u16 {
         const listener = self.listener orelse return 0;
-        return listener.socket.address.ip.getPort();
+        return listener.port();
     }
 
     /// Queue a refcounted payload for sending to a peer. Non-blocking.
@@ -252,13 +252,13 @@ pub const Transport = struct {
         while (true) {
             const conn = self.listener.?.accept(.{}) catch return;
             configureSocket(conn);
-            self.group.spawn(.shared, handleInbound, .{ self, conn }) catch {
+            self.group.spawn(.{ .lane = .raft }, handleInbound, .{ self, conn }) catch {
                 conn.close();
             };
         }
     }
 
-    fn handleInbound(self: *Transport, conn: zio.net.Stream) void {
+    fn handleInbound(self: *Transport, conn: fiber.net.Stream) void {
         log.debug("handleInbound for Transport", .{});
         defer log.debug("handleInbound DONE", .{});
 
@@ -337,14 +337,14 @@ pub const Transport = struct {
         const pri_idx = @intFromEnum(priority);
 
         {
-            self.mu.lock(@src()) catch return;
+            self.mu.lock(@src());
             defer self.mu.unlock();
             if (self.peers.get(peer_id)) |slot| {
                 _ = slot.dial_loops.fetchAdd(1, .acq_rel);
             }
         }
         defer {
-            self.mu.lock(@src()) catch {};
+            self.mu.lock(@src());
             defer self.mu.unlock();
             if (self.peers.get(peer_id)) |slot| {
                 _ = slot.dial_loops.fetchSub(1, .acq_rel);
@@ -358,7 +358,7 @@ pub const Transport = struct {
         var backoff_ms: u64 = 250;
         while (!self.shutting_down.load(.acquire)) {
             const state = blk: {
-                self.mu.lock(@src()) catch return;
+                self.mu.lock(@src());
                 defer self.mu.unlock();
                 const slot = self.peers.get(peer_id) orelse return;
                 break :blk .{
@@ -367,18 +367,18 @@ pub const Transport = struct {
                 };
             };
             if (state.connected) {
-                zio.sleep(zio.Duration.fromMilliseconds(backoff_ms)) catch return;
+                fiber.sleep(backoff_ms);
                 continue;
             }
 
-            const addr = zio.net.IpAddress.parseIpAndPort(state.addr) catch |err| {
+            const addr = fiber.net.IpAddress.parseIpAndPort(state.addr) catch |err| {
                 log.err("node {d}: failed to parse addr for peer {d}: {s}", .{ self.cfg.self_id, peer_id, @errorName(err) });
-                zio.sleep(zio.Duration.fromMilliseconds(backoff_ms)) catch return;
+                fiber.sleep(backoff_ms);
                 backoff_ms = @min(backoff_ms * 2, 5000);
                 continue;
             };
-            const conn = addr.connect(.{ .timeout = .fromSeconds(2) }) catch {
-                zio.sleep(zio.Duration.fromMilliseconds(backoff_ms)) catch return;
+            const conn = addr.connect(.{}) catch {
+                fiber.sleep(backoff_ms);
                 backoff_ms = @min(backoff_ms * 2, 5000);
                 continue;
             };
@@ -386,14 +386,14 @@ pub const Transport = struct {
 
             sendHandshake(conn, self.cfg.cluster_id, self.cfg.self_id, priority, .permanent) catch {
                 conn.close();
-                zio.sleep(zio.Duration.fromMilliseconds(backoff_ms)) catch return;
+                fiber.sleep(backoff_ms);
                 backoff_ms = @min(backoff_ms * 2, 5000);
                 continue;
             };
 
             const hs = recvHandshake(conn) catch {
                 conn.close();
-                zio.sleep(zio.Duration.fromMilliseconds(backoff_ms)) catch return;
+                fiber.sleep(backoff_ms);
                 backoff_ms = @min(backoff_ms * 2, 5000);
                 continue;
             };
@@ -403,21 +403,21 @@ pub const Transport = struct {
                     self.cfg.self_id, peer_id, hs.cluster_id,
                 });
                 conn.close();
-                zio.sleep(zio.Duration.fromMilliseconds(backoff_ms)) catch return;
+                fiber.sleep(backoff_ms);
                 backoff_ms = @min(backoff_ms * 2, 5000);
                 continue;
             }
 
             const s = Serial.init(self.allocator, conn) catch {
                 conn.close();
-                zio.sleep(zio.Duration.fromMilliseconds(backoff_ms)) catch return;
+                fiber.sleep(backoff_ms);
                 continue;
             };
 
             const installed = self.installConn(peer_id, priority, s);
             if (installed != s) {
                 s.deinit();
-                zio.sleep(zio.Duration.fromMilliseconds(backoff_ms)) catch return;
+                fiber.sleep(backoff_ms);
                 continue;
             }
 
@@ -446,16 +446,16 @@ pub const Transport = struct {
 
         while (!self.shutting_down.load(.acquire)) {
             to_probe.clearRetainingCapacity();
-            zio.sleep(zio.Duration.fromSeconds(1)) catch return;
+            fiber.sleep(1000);
             if (self.shutting_down.load(.acquire)) {
                 return;
             }
 
             {
-                self.mu.lock(@src()) catch return;
+                self.mu.lock(@src());
                 defer self.mu.unlock();
 
-                const now = utils.coarse.Clock.ms();
+                const now = fiber.coarseMs();
                 var peer_it = self.peers.iterator();
                 while (peer_it.next()) |kv| {
                     const slot = kv.value_ptr.*;
@@ -488,7 +488,7 @@ pub const Transport = struct {
 
     /// Get or create a PeerSlot for a peer (no address, inbound-only).
     fn getOrCreateSlot(self: *Transport, peer_id: u64) !void {
-        self.mu.lock(@src()) catch return error.Cancelled;
+        self.mu.lock(@src());
         defer self.mu.unlock();
 
         if (self.peers.contains(peer_id)) return;
@@ -501,7 +501,7 @@ pub const Transport = struct {
     fn installConn(self: *Transport, peer_id: u64, priority: Priority, s: *Serial) *Serial {
         const pri_idx = @intFromEnum(priority);
 
-        self.mu.lock(@src()) catch return s;
+        self.mu.lock(@src());
         defer self.mu.unlock();
 
         const slot = self.peers.get(peer_id) orelse return s;
@@ -524,10 +524,7 @@ pub const Transport = struct {
     fn removeConn(self: *Transport, peer_id: u64, priority: Priority, s: *Serial) void {
         const pri_idx = @intFromEnum(priority);
 
-        self.mu.lock(@src()) catch {
-            s.deinit();
-            return;
-        };
+        self.mu.lock(@src());
         defer self.mu.unlock();
 
         const slot = self.peers.get(peer_id) orelse {
@@ -550,20 +547,20 @@ pub const Transport = struct {
         purpose: Purpose,
     };
 
-    pub fn sendHandshake(conn: zio.net.Stream, cluster_id: u64, node_id: u64, priority: Priority, purpose: Purpose) !void {
+    pub fn sendHandshake(conn: fiber.net.Stream, cluster_id: u64, node_id: u64, priority: Priority, purpose: Purpose) !void {
         var buf: [handshake_size]u8 = undefined;
         std.mem.writeInt(u64, buf[0..8], cluster_id, .little);
         std.mem.writeInt(u64, buf[8..16], node_id, .little);
         buf[16] = @intFromEnum(priority);
         buf[17] = @intFromEnum(purpose);
-        conn.writeAll(&buf, .none) catch return error.HandshakeFailed;
+        conn.writeAll(&buf) catch return error.HandshakeFailed;
     }
 
-    pub fn recvHandshake(conn: zio.net.Stream) !Handshake {
+    pub fn recvHandshake(conn: fiber.net.Stream) !Handshake {
         var buf: [handshake_size]u8 = undefined;
         var off: usize = 0;
         while (off < buf.len) {
-            const n = conn.read(buf[off..], .none) catch return error.HandshakeFailed;
+            const n = conn.read(buf[off..]) catch return error.HandshakeFailed;
             if (n == 0) return error.HandshakeFailed;
             off += n;
         }

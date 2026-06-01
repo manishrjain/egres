@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const testing = std.testing;
-const rt = @import("runtime");
+const fiber = @import("fiber");
 const pgwire = @import("pgwire");
 
 const parser = pgwire.parser_mod;
@@ -164,12 +164,12 @@ test "parse: 1000 concurrent fibers parse distinct queries (no leaks, no races)"
         }
     };
 
-    var group = rt.Group(void).init(a, .background);
+    var group = fiber.Group(void).init(a);
     defer group.deinit();
     try group.ensureTotalCapacity(1000);
     var i: u32 = 0;
     while (i < 1000) : (i += 1) {
-        try group.spawn(.shared, Worker.run, .{ a, i, &failures });
+        try group.spawn(.{}, Worker.run, .{ a, i, &failures });
     }
     group.wait();
     try testing.expectEqual(@as(u32, 0), failures.load(.seq_cst));

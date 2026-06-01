@@ -1,8 +1,7 @@
 const std = @import("std");
-const zio = @import("zio");
 const raft = @import("raft");
 const zdb = @import("zdb");
-const runtime = @import("runtime");
+const fiber = @import("fiber");
 const zdb_server = @import("zdb_server");
 const flags = @import("flags");
 const utils = @import("utils");
@@ -106,32 +105,61 @@ const Args = struct {
     wal_dir: []const u8,
 };
 
+/// Set by the SIGINT/SIGTERM handler; appMain polls it to begin shutdown.
+/// A signal handler must be async-signal-safe, so it does nothing but store
+/// this flag — it never touches the fiber runtime.
+var g_shutdown_requested: std.atomic.Value(bool) = .init(false);
+
+fn shutdownSignalHandler(_: std.posix.SIG) callconv(.c) void {
+    g_shutdown_requested.store(true, .release);
+}
+
+/// Install SIGINT/SIGTERM handlers that flag shutdown. POSIX-only for now;
+/// Windows console-ctrl handling is a TODO.
+fn installShutdownSignals() void {
+    if (@import("builtin").os.tag == .windows) return;
+    const posix = std.posix;
+    var sa = posix.Sigaction{
+        .handler = .{ .handler = shutdownSignalHandler },
+        .mask = posix.sigemptyset(),
+        .flags = posix.SA.RESTART,
+    };
+    posix.sigaction(posix.SIG.INT, &sa, null);
+    posix.sigaction(posix.SIG.TERM, &sa, null);
+}
+
 pub fn main(init: std.process.Init) !void {
     defer log.info("shutdown complete", .{});
     utils.context.initGlobal(init);
     const allocator = utils.context.g().gpa;
     const argv = try utils.context.g().argv();
 
-    // Single shared zio.Runtime. `total_threads = 0` → auto-detect from
-    // CPU count. Every fiber spawn for the rest of the process goes
-    // through `runtime.spawnOn` and lands on a thread here; thread-group
-    // routing (.raft / .query / .background) is recorded intent today,
-    // enforceable once zio gains `spawnOn(thread_idx, ...)`.
-    try runtime.init(allocator, .{});
-    defer runtime.deinit();
-    log.info("runtime initialized", .{});
+    // The in-tree fiber runtime. One worker per core; worker id 0 is the
+    // dedicated `.raft` lane so raft loops get priority isolation, the rest
+    // form the `.default` lane (client / compaction / snapshot work).
+    // `run()` blocks this thread (worker 0) until `fiber.stop()`, which
+    // `bootstrapAndStop` calls when bootstrap returns (i.e. on shutdown).
+    const cpus = std.Thread.getCpuCount() catch 4;
+    var fiber_rt: fiber.Runtime = undefined;
+    try fiber_rt.init(allocator, .{ .num_workers = cpus, .raft_workers = 1 });
+    defer fiber_rt.deinit();
+    log.info("runtime initialized: {d} workers", .{cpus});
 
-    var handle = try runtime.spawnOn(.background, .shared, bootstrap, .{ allocator, argv });
-    try handle.join();
+    _ = try fiber.spawn(.{}, bootstrapAndStop, .{ allocator, argv });
+    fiber_rt.run();
+}
+
+/// Spawned on the default lane to drive process bootstrap. Stops the
+/// runtime (unblocks `fiber_rt.run()` in `main`) whenever bootstrap
+/// returns — normal shutdown or an early error.
+fn bootstrapAndStop(allocator: std.mem.Allocator, argv: []const []const u8) void {
+    defer fiber.stop();
+    bootstrap(allocator, argv) catch |err| {
+        log.err("bootstrap failed: {s}", .{@errorName(err)});
+    };
 }
 
 fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
-    // Spawn the cached-time ticker. Lives for the rest of the process.
-    utils.coarse.Clock.start() catch |err| {
-        log.err("coarse.Clock.start failed: {s}", .{@errorName(err)});
-        return err;
-    };
-
     flags.initGlobal(allocator);
     defer flags.deinitGlobal();
     const live_listen = try flags.g().register("listen", ListenCfg);
@@ -259,14 +287,6 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     var sm = storage_impl.asStateMachine();
     node.state_machine = &sm;
 
-    // zio runtime must be created before raft_rt so its defer (deinit) runs last,
-    // after all coroutines are cleaned up.
-    const rt = try zio.Runtime.init(
-        allocator,
-        .{ .executors = .exact(1) },
-    );
-    defer deinitWithLog("zio_rt", rt);
-
     var raft_rt = raft.RaftRuntime.init(allocator, node);
     defer deinitWithLog("raft_rt", &raft_rt);
 
@@ -285,7 +305,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
 
     // appMain(&raft_rt, &zdb_srv, node, &args);
     // // Entry point: spawn appMain on the raft pool. It orchestrates everything.
-    var handle = try runtime.spawnOn(.raft, .shared, appMain, .{ &raft_rt, &zdb_srv, node, &args });
+    var handle = try fiber.spawn(.{ .lane = .raft }, appMain, .{ &raft_rt, &zdb_srv, node, &args });
     handle.join();
 
     log.info("shutting down...", .{});
@@ -301,9 +321,8 @@ fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, node: *ra
     // fires below, `defer g.cancel()` propagates cancellation into each
     // shim's `handle.join()`, which in turn cancels the inner loop running
     // on its actual target runtime (.query / .background).
-    var g = runtime.Group(void).init(node.allocator, .background);
+    var g = fiber.Group(void).init(node.allocator);
     defer g.deinit();
-    defer g.cancel();
 
     // Initialize transport (needed for both join and raft loops).
     node.initTransport() catch |err| {
@@ -340,45 +359,40 @@ fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, node: *ra
     node.applyCommits();
 
     log.info("appMain: spawning raft runtime on raft pool", .{});
-    g.spawn(.shared, runRaft, .{raft_rt}) catch |err| {
+    g.spawn(.{}, runRaft, .{raft_rt}) catch |err| {
         log.err("appMain: spawn runRaft failed: {s}", .{@errorName(err)});
         return;
     };
 
     log.info("appMain: spawning client server on query pool", .{});
-    g.spawn(.shared, runServer, .{zdb_srv}) catch |err| {
+    g.spawn(.{}, runServer, .{zdb_srv}) catch |err| {
         log.err("appMain: spawn runServer failed: {s}", .{@errorName(err)});
         return;
     };
 
     log.info("appMain: spawning compaction loop on background pool", .{});
-    g.spawn(.shared, runCompaction, .{zdb_srv}) catch |err| {
+    g.spawn(.{}, runCompaction, .{zdb_srv}) catch |err| {
         log.err("appMain: spawn runCompaction failed: {s}", .{@errorName(err)});
         return;
     };
 
     log.info("appMain: spawning snapshot loop on background pool", .{});
-    g.spawn(.shared, runSnapshot, .{zdb_srv}) catch |err| {
+    g.spawn(.{}, runSnapshot, .{zdb_srv}) catch |err| {
         log.err("appMain: spawn runSnapshot failed: {s}", .{@errorName(err)});
         return;
     };
 
+    installShutdownSignals();
     log.info("appMain: waiting for SIGINT/SIGTERM to shutdown", .{});
-    var sigint = zio.Signal.init(.interrupt) catch return;
-    defer sigint.deinit();
-    var sigterm = zio.Signal.init(.terminate) catch return;
-    defer sigterm.deinit();
-
-    const result = zio.select(.{
-        .sigint = &sigint,
-        .sigterm = &sigterm,
-    }) catch return;
-
-    switch (result) {
-        .sigint => log.info("received SIGINT, shutting down...", .{}),
-        .sigterm => log.info("received SIGTERM, shutting down...", .{}),
+    // Poll the async-signal-safe flag (the handler can't touch the runtime).
+    // 100 ms is plenty responsive for Ctrl-C; `isShuttingDown()` also covers
+    // shutdown requested from elsewhere (e.g. a fatal loop error).
+    while (!g_shutdown_requested.load(.acquire) and !node.isShuttingDown()) {
+        fiber.sleep(100);
     }
+    log.info("received shutdown signal, shutting down...", .{});
     node.startShutdown();
+    g.wait();
 }
 
 fn runRaft(r: *raft.RaftRuntime) void {
@@ -401,7 +415,7 @@ fn runRaft(r: *raft.RaftRuntime) void {
 /// Spawn the client TCP accept loop on the query runtime pool.
 /// Must be called from a zio coroutine. Blocks until cancelled.
 fn runServer(s: *zdb_server.ZdbServer) void {
-    var handle = runtime.spawnOn(.query, .shared, zdb_server.ZdbServer.runClientLoop, .{s}) catch |err| {
+    var handle = fiber.spawn(.{}, zdb_server.ZdbServer.runClientLoop, .{s}) catch |err| {
         log.err("runServer err: {}", .{err});
         return;
     };
@@ -412,7 +426,7 @@ fn runServer(s: *zdb_server.ZdbServer) void {
 /// that polls WAL size/age and proposes snapshots through Raft.
 /// Must be called from a zio coroutine. Blocks until cancelled.
 fn runSnapshot(s: *zdb_server.ZdbServer) void {
-    var handle = runtime.spawnOn(.background, .shared, zdb_server.ZdbServer.runSnapshotLoop, .{s}) catch |err| {
+    var handle = fiber.spawn(.{}, zdb_server.ZdbServer.runSnapshotLoop, .{s}) catch |err| {
         log.err("runSnapshot err: {}", .{err});
         return;
     };
@@ -422,7 +436,7 @@ fn runSnapshot(s: *zdb_server.ZdbServer) void {
 /// Spawn the compaction loop on the background runtime pool.
 /// Must be called from a zio coroutine. Blocks until cancelled.
 fn runCompaction(s: *zdb_server.ZdbServer) void {
-    var handle = runtime.spawnOn(.background, .shared, zdb_server.ZdbServer.runCompactionLoop, .{s}) catch |err| {
+    var handle = fiber.spawn(.{}, zdb_server.ZdbServer.runCompactionLoop, .{s}) catch |err| {
         log.err("runCompaction err: {}", .{err});
         return;
     };

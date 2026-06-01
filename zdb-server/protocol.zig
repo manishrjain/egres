@@ -1,5 +1,5 @@
 const std = @import("std");
-const zio = @import("zio");
+const fiber = @import("fiber");
 
 pub const Command = union(enum) {
     set: SetCmd,
@@ -441,52 +441,52 @@ pub fn parseLine(line: []const u8) !Command {
 
 /// Write a successful response: "OK\n". Used for conf/ns_create where there's
 /// no committed timestamp to surface.
-pub fn writeOk(stream: zio.net.Stream) !void {
-    try stream.writeAll("OK\n", .none);
+pub fn writeOk(stream: fiber.net.Stream) !void {
+    try stream.writeAll("OK\n");
 }
 
 /// Write a successful set response carrying the committed HLC timestamp:
 /// "OK <ts>\n". Clients track the max observed commit ts for read-your-writes.
-pub fn writeSetOk(stream: zio.net.Stream, commit_ts: u64) !void {
+pub fn writeSetOk(stream: fiber.net.Stream, commit_ts: u64) !void {
     var buf: [32]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "OK {d}\n", .{commit_ts}) catch unreachable;
-    try stream.writeAll(s, .none);
+    try stream.writeAll(s);
 }
 
 /// Write the static help text followed by a blank line. Same termination
 /// shape as `zdb` / `raft` so simple line-buffered clients can read until
 /// `\n\n`.
-pub fn writeHelp(stream: zio.net.Stream) !void {
-    try stream.writeAll(help_text, .none);
-    try stream.writeAll("\n", .none);
+pub fn writeHelp(stream: fiber.net.Stream) !void {
+    try stream.writeAll(help_text);
+    try stream.writeAll("\n");
 }
 
 /// Write an error response: "ERR <msg>\n"
-pub fn writeErr(stream: zio.net.Stream, msg: []const u8) !void {
-    try stream.writeAll("ERR ", .none);
-    try stream.writeAll(msg, .none);
-    try stream.writeAll("\n", .none);
+pub fn writeErr(stream: fiber.net.Stream, msg: []const u8) !void {
+    try stream.writeAll("ERR ");
+    try stream.writeAll(msg);
+    try stream.writeAll("\n");
 }
 
 /// Write a not-leader response: "NOT_LEADER <leader_id>\n"
-pub fn writeNotLeader(stream: zio.net.Stream, leader_id: u64) !void {
+pub fn writeNotLeader(stream: fiber.net.Stream, leader_id: u64) !void {
     var buf: [32]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "NOT_LEADER {d}\n", .{leader_id}) catch unreachable;
-    try stream.writeAll(s, .none);
+    try stream.writeAll(s);
 }
 
 /// Write a get-found response: "FOUND <ts> <value>\n"
-pub fn writeFound(stream: zio.net.Stream, ts: u64, value: []const u8) !void {
+pub fn writeFound(stream: fiber.net.Stream, ts: u64, value: []const u8) !void {
     var buf: [64]u8 = undefined;
     const hdr = std.fmt.bufPrint(&buf, "FOUND {d} ", .{ts}) catch unreachable;
-    try stream.writeAll(hdr, .none);
-    try stream.writeAll(value, .none);
-    try stream.writeAll("\n", .none);
+    try stream.writeAll(hdr);
+    try stream.writeAll(value);
+    try stream.writeAll("\n");
 }
 
 /// Write a get-not-found response: "NOT_FOUND\n"
-pub fn writeNotFound(stream: zio.net.Stream) !void {
-    try stream.writeAll("NOT_FOUND\n", .none);
+pub fn writeNotFound(stream: fiber.net.Stream) !void {
+    try stream.writeAll("NOT_FOUND\n");
 }
 
 /// Write a single scan ITEM line through a buffered `std.Io.Writer`.

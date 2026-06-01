@@ -1,6 +1,5 @@
 const std = @import("std");
-const zio = @import("zio");
-const runtime = @import("runtime");
+const fiber = @import("fiber");
 const utils = @import("utils");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.serial);
@@ -28,17 +27,17 @@ pub const Serial = struct {
     const buf_size: usize = 4096;
 
     allocator: Allocator,
-    tcp_stream: zio.net.Stream,
+    tcp_stream: fiber.net.Stream,
     writer_mu: utils.TrackedMutex,
     write_buf: []u8,
     read_buf: []u8,
-    buf_reader: zio.net.Stream.Reader,
-    outbound: zio.Channel(OutboundMsg),
+    buf_reader: fiber.net.Stream.Reader,
+    outbound: fiber.Channel(OutboundMsg),
     last_recv_ms: std.atomic.Value(i64),
     closed: bool,
     drop_messages: std.atomic.Value(bool),
 
-    pub fn init(allocator: Allocator, tcp_stream: zio.net.Stream) !*Serial {
+    pub fn init(allocator: Allocator, tcp_stream: fiber.net.Stream) !*Serial {
         const write_buf = try allocator.alloc(u8, buf_size);
         errdefer allocator.free(write_buf);
         const read_buf = try allocator.alloc(u8, buf_size);
@@ -51,8 +50,8 @@ pub const Serial = struct {
             .write_buf = write_buf,
             .read_buf = read_buf,
             .buf_reader = tcp_stream.reader(read_buf),
-            .outbound = try zio.Channel(OutboundMsg).initAlloc(allocator, 256),
-            .last_recv_ms = std.atomic.Value(i64).init(utils.coarse.Clock.ms()),
+            .outbound = try fiber.Channel(OutboundMsg).initAlloc(allocator, 256),
+            .last_recv_ms = std.atomic.Value(i64).init(fiber.coarseMs()),
             .closed = false,
             .drop_messages = std.atomic.Value(bool).init(false),
         };
@@ -95,7 +94,7 @@ pub const Serial = struct {
 
     /// Send a framed message. Thread-safe via writer_mu.
     pub fn send(self: *Serial, message_type: u16, payload: []const u8) !void {
-        try self.writer_mu.lock(@src());
+        self.writer_mu.lock(@src());
         defer self.writer_mu.unlock();
 
         var buf_writer = self.tcp_stream.writer(self.write_buf);
@@ -144,9 +143,9 @@ pub const Serial = struct {
     /// Reader calls on_message for each inbound frame.
     /// Writer drains the outbound channel and sends frames.
     pub fn run(self: *Serial, ctx: *anyopaque, on_message: OnMessageFn) void {
-        var g = runtime.Group(void).init(self.allocator, .raft);
+        var g = fiber.Group(void).init(self.allocator);
         defer g.deinit();
-        g.spawn(.shared, writerLoop, .{self}) catch |err| {
+        g.spawn(.{ .lane = .raft }, writerLoop, .{self}) catch |err| {
             log.err("failed to spawn writer loop: {s}", .{@errorName(err)});
             return;
         };
@@ -168,7 +167,7 @@ pub const Serial = struct {
             defer if (msg.payload.len > 0) self.allocator.free(msg.payload);
 
             // Update the liveness of this connection.
-            self.last_recv_ms.store(utils.coarse.Clock.ms(), .release);
+            self.last_recv_ms.store(fiber.coarseMs(), .release);
             if (msg.message_type == msg_type_pong) continue; // liveness ack, nothing to do
             if (msg.message_type == msg_type_ping) {
                 self.send(msg_type_pong, &.{}) catch |err| {

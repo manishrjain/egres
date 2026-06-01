@@ -1,6 +1,6 @@
 const std = @import("std");
-const zio = @import("zio");
-const rt = @import("runtime");
+const fiber = @import("fiber");
+const vfs = @import("vfs");
 const raft = @import("raft");
 pub const Node = raft.Node;
 pub const NodeId = raft.NodeId;
@@ -13,7 +13,7 @@ pub const TestLog = struct {
     pub fn init(allocator: std.mem.Allocator, id: NodeId) !TestLog {
         const wal_dir = try makeWalDir(allocator, id);
         errdefer {
-            std.fs.cwd().deleteTree(wal_dir) catch {};
+            vfs.deleteTree(wal_dir) catch {};
             allocator.free(wal_dir);
         }
         const disk = try raft.DiskWAL.openPath(wal_dir, allocator, 1024);
@@ -22,15 +22,15 @@ pub const TestLog = struct {
 
     pub fn deinit(self: *TestLog, allocator: std.mem.Allocator) void {
         self.disk.deinit();
-        std.fs.cwd().deleteTree(self.wal_dir) catch {};
+        vfs.deleteTree(self.wal_dir) catch {};
         allocator.free(self.wal_dir);
     }
 
     fn makeWalDir(allocator: std.mem.Allocator, id: NodeId) ![]u8 {
         var buf: [192]u8 = undefined;
-        const ts = std.time.nanoTimestamp();
+        const ts = fiber.coarseMs();
         const path = try std.fmt.bufPrint(&buf, "/tmp/egres-test-cluster-{d}-{d}", .{ ts, id });
-        try std.fs.cwd().makePath(path);
+        try vfs.createDirPath(path);
         return allocator.dupe(u8, path);
     }
 };
@@ -45,7 +45,7 @@ pub const TestCluster = struct {
         node: *Node,
         wal: TestLog,
         peers: []const raft.Peer,
-        group: rt.Group(void),
+        group: fiber.Group(void),
     };
 
     pub fn init(
@@ -67,7 +67,7 @@ pub const TestCluster = struct {
                 .node = undefined,
                 .wal = try TestLog.init(allocator, id),
                 .peers = peers,
-                .group = rt.Group(void).init(allocator, .raft),
+                .group = fiber.Group(void).init(allocator),
             };
             var ncfg = config;
             ncfg.id = id;
@@ -113,10 +113,10 @@ pub const TestCluster = struct {
         var node_it = cluster.nodes.valueIterator();
         while (node_it.next()) |entry_ptr| {
             const entry = entry_ptr.*;
-            entry.group.spawn(.exclusive, Node.tickLoop, .{ entry.node, entry.node.config.tick_interval_ms }) catch {};
-            entry.group.spawn(.exclusive, Node.mainLoop, .{ entry.node, entry.node.config.tick_interval_ms }) catch {};
-            entry.group.spawn(.exclusive, Node.applyLoop, .{entry.node}) catch {};
-            entry.group.spawn(.shared, Node.callbackLoop, .{entry.node}) catch {};
+            entry.group.spawn(.{ .lane = .raft }, Node.tickLoop, .{ entry.node, entry.node.config.tick_interval_ms }) catch {};
+            entry.group.spawn(.{ .lane = .raft }, Node.mainLoop, .{ entry.node, entry.node.config.tick_interval_ms }) catch {};
+            entry.group.spawn(.{ .lane = .raft }, Node.applyLoop, .{entry.node}) catch {};
+            entry.group.spawn(.{ .lane = .raft }, Node.callbackLoop, .{entry.node}) catch {};
         }
         std.debug.print("TestCluster.init: done\n", .{});
         return cluster;
@@ -175,7 +175,7 @@ pub const TestCluster = struct {
                 i += 1;
             }
             if (all_done) return;
-            zio.sleep(zio.Duration.fromMilliseconds(1)) catch return;
+            fiber.sleep(1);
         }
     }
 

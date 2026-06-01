@@ -1,6 +1,5 @@
 const std = @import("std");
-const zio = @import("zio");
-const runtime = @import("runtime");
+const fiber = @import("fiber");
 const utils = @import("utils");
 const config = @import("config.zig");
 const manifest = @import("manifest.zig");
@@ -161,13 +160,12 @@ pub const TableCache = struct {
         var tse: utils.ThreadSafeError = .{};
         var completed = std.atomic.Value(usize).init(0);
         const total = misses.items.len;
-        var g = runtime.Group(void).init(self.allocator, .query);
+        var g = fiber.Group(void).init(self.allocator);
         defer g.deinit();
-        defer g.cancel();
         try g.ensureTotalCapacity(1 + misses.items.len);
-        g.spawn(.shared, loadTablesWatchdog, .{ total, &completed }) catch {};
+        g.spawn(.{}, loadTablesWatchdog, .{ total, &completed }) catch {};
         for (misses.items) |n| {
-            try g.spawn(.shared, openFiber, .{ self, n, &tse, &completed });
+            try g.spawn(.{}, openFiber, .{ self, n, &tse, &completed });
         }
         g.wait();
         if (tse.get()) |err| return err;
@@ -178,11 +176,11 @@ pub const TableCache = struct {
     /// as soon as all opens are accounted for, so it doesn't hold the
     /// group's `wait()` open.
     fn loadTablesWatchdog(total: usize, completed: *std.atomic.Value(usize)) void {
-        const start = utils.coarse.Clock.ms();
+        const start = fiber.coarseMs();
         var last_warn = start;
         while (completed.load(.acquire) < total) {
-            zio.sleep(zio.Duration.fromMilliseconds(500)) catch return;
-            const now = utils.coarse.Clock.ms();
+            fiber.sleep(500);
+            const now = fiber.coarseMs();
             if (now - last_warn >= 15_000) {
                 log.warn("loadTables watchdog: {d}/{d} opens completed after {d}ms", .{
                     completed.load(.acquire), total, now - start,
@@ -851,7 +849,7 @@ pub const Tree = struct {
         var bld = Builder.init(self.allocator, cfg);
         defer bld.deinit();
 
-        var flush_group = runtime.Group(?FlushResult).init(self.allocator, .background);
+        var flush_group = fiber.Group(?FlushResult).init(self.allocator);
         defer {
             _ = flush_group.wait();
             flush_group.deinit();
@@ -931,7 +929,7 @@ pub const Tree = struct {
         // Start dir sync while we're waiting for file syncs to be done. We can do dir sync here
         // because files have already been created and written. So, dir should have everything it
         // needs.
-        var dir_sync = try runtime.spawnOn(.background, .shared, vfs.syncDir, .{self.opts.dir});
+        var dir_sync = try fiber.spawn(.{}, vfs.syncDir, .{self.opts.dir});
         defer dir_sync.join();
 
         // Join all sync fibers and collect output file IDs.
@@ -1027,7 +1025,7 @@ pub const Tree = struct {
     fn flushBuilderOutput(
         self: *Tree,
         bld: *Builder,
-        group: *runtime.Group(?FlushResult),
+        group: *fiber.Group(?FlushResult),
         file_ids: *fi.FileIds,
     ) !void {
         var tb = try bld.finish();
@@ -1042,7 +1040,7 @@ pub const Tree = struct {
         try wh.write(tb.bytes, 0, bld.cfg.priority);
 
         // Sync in a fiber; data is in page cache after write.
-        try group.spawn(.shared, syncFile, .{ self.allocator, wh, path, id });
+        try group.spawn(.{}, syncFile, .{ self.allocator, wh, path, id });
     }
 
     fn syncFile(

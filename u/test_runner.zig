@@ -1,7 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const zio = @import("zio");
-const rt = @import("runtime");
 const fiber = @import("fiber");
 const context = utils.context;
 
@@ -693,23 +692,12 @@ fn threadWatchdogLoop(self: *ThreadWatchdog) void {
             const secs = @as(f64, @floatFromInt(ms)) / 1000.0;
             rawStderrPrint(&line_buf, "  RUNNING {d:.1}s: {s}\n", .{ secs, t.name });
         }
-        // Zio fiber state: same memory-buffer-then-raw-write trick so
-        // the dump bypasses any zio-backed I/O even when the runtime is
-        // wedged. `rt.stats()` and `rt.dumpFibers()` both lock
-        // `fibers_mutex` (an `os.Mutex` = std.Thread-safe), so calling
-        // them from the watchdog thread is fine.
-        const zrt = rt.underlying();
-        const zs = zrt.stats();
-        rawStderrPrint(&line_buf, "zio fibers: total={d} ready={d} blocked={d}\n", .{ zs.total, zs.ready, zs.blocked });
+        // Fiber runtime state: memory-buffer-then-raw-write so the dump
+        // bypasses runtime-backed I/O even when wedged. Safe from the
+        // watchdog thread — `fiber.Runtime` is the process singleton (live
+        // from main() entry) and stats()/dumpFibers() lock internally.
         var dump_writer: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
         defer dump_writer.deinit();
-        zrt.dumpFibers(&dump_writer.writer) catch {};
-        rawStderrWriteAll(dump_writer.written());
-
-        // Phase B uses a dedicated fiber.Runtime; dump its state too.
-        // Safe to call from the watchdog thread — `fiber.Runtime` is
-        // initialized at main() entry, so the singleton is always
-        // live by the time the watchdog could fire.
         const frt = fiber.runtime();
         const fs = frt.stats();
         rawStderrPrint(&line_buf, "fiber.Runtime: total={d} new={d} ready={d} waiting={d} finished={d}\n", .{ fs.total, fs.new, fs.ready, fs.waiting, fs.finished });
@@ -1139,201 +1127,6 @@ fn runBench(t: std.builtin.TestFn, ctx: *SharedCtx, my_index: u64) void {
     ctx.out.flush() catch {};
 }
 
-fn driver(
-    args: Args,
-    counters: *Counters,
-    retry_counters: *Counters,
-    bench_counters: *Counters,
-    alloc: std.mem.Allocator,
-    out: *std.Io.Writer,
-    tty: Tty,
-) !void {
-    // Spawn the coarse.Clock tick fiber on the runner's long-lived runtime
-    // so it survives across every test fiber. `Clock.start()` is idempotent
-    // and uses a process-global `started` flag — re-spawning it inside an
-    // individual test would attach the tick fiber to that test's runtime
-    // (or be a no-op if any earlier test had already set the flag), and
-    // when that runtime is deinit'd the fiber dies. Result: subsequent
-    // tests calling `Clock.ms()` would read a frozen cache. `Clock.stop()`
-    // in `main()` runs after all tests finish, draining this fiber.
-    try utils.coarse.Clock.start();
-
-    // Currently-running tests, owned by the std.Thread ThreadWatchdog so
-    // its diagnostics can name which tests are stuck. The watchdog itself
-    // is set up in main() before the zio runtime starts; here we just
-    // grab a pointer to its RunningSet for the test ctx.
-    const running: *RunningSet = if (thread_watchdog) |w| &w.running else unreachable;
-
-    var watermark: utils.Watermark = .{};
-    // Pre-credit `permits` slots so the first `permits` fibers
-    // satisfy their `value >= my_index + 1` check immediately
-    // without entering cv.wait.
-    watermark.advance(args.parallel);
-    var completed_count: std.atomic.Value(u64) = .{ .raw = 0 };
-    var print_mu: zio.Mutex = .init;
-    var seq: std.atomic.Value(u32) = .{ .raw = 0 };
-    var failures: std.ArrayList(std.builtin.TestFn) = .empty;
-    defer failures.deinit(std.heap.page_allocator);
-
-    // Partition into regular tests and BENCH:-prefixed benchmarks. Regular
-    // tests run in parallel (with retry); benchmarks run serially with
-    // auto-tuned iteration counts.
-    var kept: std.ArrayList(std.builtin.TestFn) = .empty;
-    defer kept.deinit(alloc);
-    var bench_tests: std.ArrayList(std.builtin.TestFn) = .empty;
-    defer bench_tests.deinit(alloc);
-
-    for (builtin.test_functions) |t| {
-        if (std.mem.startsWith(u8, t.name, ".test_root.")) continue;
-        // fiber.* tests belong to Phase B (fiberDriver on fiber.Runtime).
-        // Skip here so we don't run them under zio.
-        if (std.mem.startsWith(u8, t.name, "fiber.")) continue;
-        const user_name = if (std.mem.indexOf(u8, t.name, ".test.")) |p|
-            t.name[p + ".test.".len ..]
-        else
-            t.name;
-        const is_big = std.mem.startsWith(u8, user_name, "BIG: ");
-        const is_bench = std.mem.startsWith(u8, user_name, "BENCH: ");
-        const is_hang = std.mem.startsWith(u8, user_name, "HANG: ");
-        if (args.filter) |f| if (std.mem.indexOf(u8, t.name, f) == null) continue;
-        if (args.exclude) |x| if (std.mem.indexOf(u8, t.name, x) != null) continue;
-        if (is_bench) {
-            if (!args.only_bench) continue;
-            try bench_tests.append(alloc, t);
-            continue;
-        }
-        if (args.only_bench) continue;
-        if (is_big and !args.run_big) continue;
-        if (is_hang and !args.run_hang) continue;
-        try kept.append(alloc, t);
-    }
-
-    var ctx = SharedCtx{
-        .watermark = &watermark,
-        .completed_count = &completed_count,
-        .permits = args.parallel,
-        .print_mu = &print_mu,
-        .counters = counters,
-        .seq = &seq,
-        .total = @intCast(kept.items.len),
-        .out = out,
-        .tty = tty,
-        .failures = &failures,
-        .running = running,
-    };
-
-    // Parallel round: run all tests, collecting failures. Use
-    // `spawnWith` instead of `Group.spawn` so each test fiber carries a
-    // spawn-site `@src()` that `rt.dumpFibers()` can print in the
-    // watchdog dump.
-    {
-        running.completed = &seq;
-        running.total = @intCast(kept.items.len);
-        defer {
-            running.completed = null;
-            running.total = 0;
-        }
-        const zrt = rt.underlying();
-        var handles: std.ArrayList(zio.JoinHandle(void)) = .empty;
-        defer handles.deinit(alloc);
-        for (kept.items, 0..) |t, i| {
-            const h = try zrt.spawnWith(.{ .spawn_loc = @src() }, runOne, .{ t, &ctx, @as(u64, i) });
-            try handles.append(alloc, h);
-        }
-        for (handles.items) |*h| h.join();
-    }
-
-    // Serial retry round: re-run any failures one at a time. Skips when
-    // parallel was already 1 (retry would be the same execution mode) or
-    // there's nothing to retry.
-    if (failures.items.len > 0 and args.parallel > 1) {
-        print_mu.lockUncancelable();
-        out.writeAll("\n") catch {};
-        writeColored(out, tty, .bright_yellow, "Retrying {d} failed test(s) serially...\n", .{failures.items.len});
-        out.flush() catch {};
-        print_mu.unlock();
-
-        var retry_watermark: utils.Watermark = .{};
-        retry_watermark.advance(1); // permits=1 for retry round
-        var retry_completed_count: std.atomic.Value(u64) = .{ .raw = 0 };
-        var retry_seq: std.atomic.Value(u32) = .{ .raw = 0 };
-        var retry_ctx = SharedCtx{
-            .watermark = &retry_watermark,
-            .completed_count = &retry_completed_count,
-            .permits = 1,
-            .print_mu = &print_mu,
-            .counters = retry_counters,
-            .seq = &retry_seq,
-            .total = @intCast(failures.items.len),
-            .out = out,
-            .tty = tty,
-            .failures = null, // one round of retry only
-            .running = running,
-        };
-
-        running.completed = &retry_seq;
-        running.total = @intCast(failures.items.len);
-        defer {
-            running.completed = null;
-            running.total = 0;
-        }
-        const zrt = rt.underlying();
-        var retry_handles: std.ArrayList(zio.JoinHandle(void)) = .empty;
-        defer retry_handles.deinit(alloc);
-        for (failures.items, 0..) |t, i| {
-            const h = try zrt.spawnWith(.{ .spawn_loc = @src() }, runOne, .{ t, &retry_ctx, @as(u64, i) });
-            try retry_handles.append(alloc, h);
-        }
-        for (retry_handles.items) |*h| h.join();
-    }
-
-    // Bench round: serial, auto-tuned iteration count. Only runs when
-    // there are BENCH:-prefixed tests in the kept set.
-    if (bench_tests.items.len == 0) return;
-
-    print_mu.lockUncancelable();
-    out.writeAll("\n") catch {};
-    writeColored(out, tty, .bright_yellow, "Running {d} benchmark(s)...\n", .{bench_tests.items.len});
-    out.flush() catch {};
-    print_mu.unlock();
-
-    // Sort benchmarks alphabetically by full name. Sequential dispatch
-    // means execution order = sort order, so output groups related
-    // variants together rather than declaration order.
-    std.mem.sort(std.builtin.TestFn, bench_tests.items, {}, struct {
-        fn lt(_: void, a: std.builtin.TestFn, b_: std.builtin.TestFn) bool {
-            return std.mem.lessThan(u8, a.name, b_.name);
-        }
-    }.lt);
-
-    var bench_watermark: utils.Watermark = .{};
-    bench_watermark.advance(1); // permits=1 for bench round
-    var bench_completed_count: std.atomic.Value(u64) = .{ .raw = 0 };
-    var bench_seq: std.atomic.Value(u32) = .{ .raw = 0 };
-    var bench_ctx = SharedCtx{
-        .watermark = &bench_watermark,
-        .completed_count = &bench_completed_count,
-        .permits = 1,
-        .print_mu = &print_mu,
-        .counters = bench_counters,
-        .seq = &bench_seq,
-        .total = @intCast(bench_tests.items.len),
-        .out = out,
-        .tty = tty,
-        .failures = null,
-        .running = running,
-    };
-
-    const zrt = rt.underlying();
-    var bench_handles: std.ArrayList(zio.JoinHandle(void)) = .empty;
-    defer bench_handles.deinit(alloc);
-    for (bench_tests.items, 0..) |t, i| {
-        const h = try zrt.spawnWith(.{ .spawn_loc = @src() }, runBench, .{ t, &bench_ctx, @as(u64, i) });
-        try bench_handles.append(alloc, h);
-    }
-    for (bench_handles.items) |*h| h.join();
-}
-
 // ── Phase B: fiber.* tests on a fiber.Runtime ────────────────────────
 //
 // `fiber.*` tests run as fibers on a dedicated fiber.Runtime — disjoint
@@ -1375,7 +1168,6 @@ fn fiberDriver(fctx: *FiberCtx) void {
     defer kept.deinit(std.heap.page_allocator);
 
     for (builtin.test_functions) |t| {
-        if (!std.mem.startsWith(u8, t.name, "fiber.")) continue;
         if (std.mem.startsWith(u8, t.name, ".test_root.")) continue;
         const user_name = if (std.mem.indexOf(u8, t.name, ".test.")) |p|
             t.name[p + ".test.".len ..]
@@ -1576,25 +1368,11 @@ pub fn main(init: std.process.Init) !void {
         thread_watchdog = null;
     }
 
-    // Use the egres single-runtime seam so deeper code paths
-    // (coarse.Clock, raft loops, etc.) that call `runtime.spawnOn`
-    // share the same runtime as the test runner.
-    try rt.init(std.heap.page_allocator, .{ .total_threads = args.parallel });
-    defer rt.deinit();
-
-    // Bring up the Phase B fiber runtime now so `fiber.runtime()`
-    // works throughout — including from the watchdog thread during a
-    // Phase A wedge. `init` only allocates state and installs the
-    // process-wide singleton; worker threads aren't spawned until
-    // `fiber_rt.run()` is called in Phase B.
-    //
-    // Runtime worker count == all available cores. The `--parallel`
-    // knob bounds *test dispatch* concurrency (see fiberDriver), not
-    // the worker pool. Giving the runtime full hardware concurrency
-    // lets a single test's spawned child fibers (e.g. the io.sleep
-    // test's 100 sleepers) actually spread across cores, while
-    // bounding how many test bodies are mid-execution keeps timer +
-    // wake latency from getting squeezed.
+    // One in-tree fiber runtime; every test runs as a fiber on it.
+    // Worker count == all cores so a single test's child fibers (e.g.
+    // the io.sleep test's 100 sleepers) spread out; the `--parallel`
+    // knob bounds how many test *bodies* dispatch at once (see
+    // fiberDriver), not the worker pool.
     const fiber_workers: usize = std.Thread.getCpuCount() catch @as(usize, args.parallel);
     var fiber_rt: fiber.Runtime = undefined;
     try fiber_rt.init(std.heap.page_allocator, .{ .num_workers = fiber_workers });
@@ -1602,20 +1380,9 @@ pub fn main(init: std.process.Init) !void {
 
     var counters: Counters = .{};
     var retry_counters: Counters = .{};
-    var bench_counters: Counters = .{};
+    var bench_counters: Counters = .{}; // BENCH: tests not yet ported to fiber
     const t0_all = nowNs();
 
-    var handle = try rt.spawnOn(.background, .shared, driver, .{ args, &counters, &retry_counters, &bench_counters, alloc, out, tty });
-    try handle.join();
-    // Drain the coarse.Clock tick fiber, if any test started it.
-    // Without this, `rt.deinit()` asserts task_count == 0 fails.
-    utils.coarse.Clock.stop();
-
-    // ── Phase B ─────────────────────────────────────────────────────
-    // fiber.* tests run on the dedicated `fiber.Runtime` initialized
-    // up at main() entry. Disjoint from zio: the fiber phase runs
-    // after the zio phase has drained so the output writer / counters
-    // have a single owner.
     {
         var fiber_failures: std.ArrayList(std.builtin.TestFn) = .empty;
         defer fiber_failures.deinit(std.heap.page_allocator);

@@ -15,6 +15,7 @@
 const std = @import("std");
 const zio = @import("zio");
 const utils = @import("utils");
+const fiber = @import("fiber");
 const bench = utils.bench;
 
 fn benchTrackedMutex(b: *bench.Bench) !void {
@@ -22,7 +23,6 @@ fn benchTrackedMutex(b: *bench.Bench) !void {
     // rather than falling back to std.time.milliTimestamp. Without
     // this, the benchmark would measure the fallback path and falsely
     // suggest tracking is more expensive than it really is in prod.
-    try utils.coarse.Clock.start();
     var mu: utils.TrackedMutex = .{};
     defer mu.deinit();
     b.resetTimer();
@@ -44,7 +44,6 @@ fn benchZioMutex(b: *bench.Bench) !void {
 }
 
 fn benchTrackedRwLockShared(b: *bench.Bench) !void {
-    try utils.coarse.Clock.start();
     var rw: utils.TrackedRwLock = .{};
     defer rw.deinit();
     b.resetTimer();
@@ -75,11 +74,10 @@ fn benchMilliTimestamp(b: *bench.Bench) !void {
 }
 
 fn benchCoarseClock(b: *bench.Bench) !void {
-    try utils.coarse.Clock.start();
     b.resetTimer();
     var sink: i64 = 0;
     var i: u64 = 0;
-    while (i < b.n) : (i += 1) sink +%= utils.coarse.Clock.ms();
+    while (i < b.n) : (i += 1) sink +%= fiber.coarseMs();
     std.mem.doNotOptimizeAway(sink);
 }
 
@@ -88,4 +86,4 @@ test "BENCH: zio-mutex lock-unlock" { try benchZioMutex(bench.current()); }
 test "BENCH: tracked-rwlock shared-lock-unlock" { try benchTrackedRwLockShared(bench.current()); }
 test "BENCH: zio-rwlock shared-lock-unlock" { try benchZioRwLockShared(bench.current()); }
 test "BENCH: clock std.time.milliTimestamp" { try benchMilliTimestamp(bench.current()); }
-test "BENCH: clock coarse.Clock.ms" { try benchCoarseClock(bench.current()); }
+test "BENCH: clock fiber.coarseMs" { try benchCoarseClock(bench.current()); }

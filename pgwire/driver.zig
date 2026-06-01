@@ -39,12 +39,12 @@
 //!    and breaks others.
 
 const std = @import("std");
-const zio = @import("zio");
+const fiber = @import("fiber");
 
 const conn_state = @import("conn_state.zig");
 const proto = @import("proto.zig");
 
-pub const Stream = zio.net.Stream;
+pub const Stream = fiber.net.Stream;
 
 pub const Options = struct {
     /// Per-read scratch buffer size. Chosen large enough that Startup
@@ -57,10 +57,6 @@ pub const Options = struct {
     /// large result sets without ever holding the whole result in
     /// memory.
     write_chunk: usize = 16 * 1024,
-    /// Per-read / per-write timeout. .none = block indefinitely. The
-    /// caller is expected to enforce idle timeouts at the listener
-    /// level if it wants stricter behavior.
-    timeout: zio.Timeout = .none,
     /// Configuration handed to ConnState.
     conn: conn_state.Config = .{},
 };
@@ -83,9 +79,7 @@ pub fn serve(
     defer alloc.free(write_buf);
 
     var r = stream.reader(read_buf);
-    r.setTimeout(opts.timeout);
     var w = stream.writer(write_buf);
-    w.setTimeout(opts.timeout);
 
     var state = conn_state.ConnState.init(alloc, &r.interface, &w.interface, opts.conn);
     defer state.deinit();

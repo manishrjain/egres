@@ -1,6 +1,6 @@
 const std = @import("std");
 const zio = @import("zio");
-const runtime = @import("runtime");
+const fiber = @import("fiber");
 const utils = @import("utils");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.mux);
@@ -116,7 +116,7 @@ pub const Mux = struct {
     streams: std.AutoHashMap(u32, *Stream),
     next_stream_id: std.atomic.Value(u32),
     on_stream: *const fn (*Stream) void,
-    group: runtime.Group(void),
+    group: fiber.Group(void),
     closed: bool,
     mu: utils.TrackedMutex,
 
@@ -134,7 +134,7 @@ pub const Mux = struct {
             .streams = std.AutoHashMap(u32, *Stream).init(allocator),
             .next_stream_id = std.atomic.Value(u32).init(initial_stream_id),
             .on_stream = on_stream,
-            .group = runtime.Group(void).init(allocator, .raft),
+            .group = fiber.Group(void).init(allocator),
             .closed = false,
             .mu = .{},
         };
@@ -227,11 +227,11 @@ pub const Mux = struct {
                     continue;
                 };
 
-                self.group.spawn(.shared, handleInbound, .{ self, stream.? }) catch {
+                self.group.spawn(.{ .lane = .raft }, handleInbound, .{ self, stream.? }) catch {
                     // do nothing
                 };
             } else {
-                try self.mu.lock(@src());
+                self.mu.lock(@src());
                 stream = self.streams.get(header.stream_id);
                 self.mu.unlock();
 
@@ -258,7 +258,7 @@ pub const Mux = struct {
     }
 
     pub fn writeFrame(self: *Mux, header: FrameHeader, payload: []const u8) !void {
-        try self.writer_mu.lock(@src());
+        self.writer_mu.lock(@src());
         defer self.writer_mu.unlock();
 
         var hdr_buf: [FrameHeader.encoded_size]u8 = undefined;
@@ -282,14 +282,14 @@ pub const Mux = struct {
         stream.* = .{ .mux = self, .stream_id = stream_id, .syn_sent = syn_sent };
         stream.initChannel();
 
-        try self.mu.lock(@src());
+        self.mu.lock(@src());
         defer self.mu.unlock();
         try self.streams.put(stream_id, stream);
         return stream;
     }
 
     pub fn destroyStream(self: *Mux, stream_id: u32) void {
-        self.mu.lock(@src()) catch return;
+        self.mu.lock(@src());
         defer self.mu.unlock();
         if (self.streams.fetchRemove(stream_id)) |kv| {
             self.allocator.destroy(kv.value);

@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
-const zio = @import("zio");
+const fiber = @import("fiber");
 const utils = @import("utils");
 pub const bandwidth = @import("bandwidth.zig");
 
@@ -69,7 +69,7 @@ pub const ReadResult = struct {
 
 
 pub const FileHandle = struct {
-    file: ?zio.File = null,
+    file: ?fiber.File = null,
     file_size: u64,
     mapped: ?[]align(page_size) const u8 = null,
     owned_buf: ?[]u8 = null, // memory mode: entire file read into this buffer
@@ -197,15 +197,15 @@ pub const FileHandle = struct {
             }
         }
 
-        const ev = zio.ev;
-        const fd = self.file.?.fd;
+        const f = self.file.?;
 
-        // Heap-allocate from the arena (zio fiber stacks are small).
-        const reads = try alloc.alloc(ev.FileRead, requests.len);
-        const iovs = try alloc.alloc([1]zio.os.iovec, requests.len);
+        // One BatchOp + page-aligned buffer per request, heap-allocated from
+        // the arena (fiber stacks are small). `preadBatch` submits them all
+        // in a single libxev submission and parks once until every read
+        // completes.
+        const ops = try alloc.alloc(fiber.File.BatchOp, requests.len);
         const bufs = try alloc.alloc([]u8, requests.len);
 
-        var group: ev.Group = .init(.gather);
         for (requests, 0..) |*req, i| {
             // Page-aligned offset and size for O_DIRECT compatibility.
             const aligned_offset = req.offset & ~@as(u64, page_size - 1);
@@ -213,17 +213,14 @@ pub const FileHandle = struct {
             const aligned_size = std.mem.alignForward(usize, prefix + req.len, page_size);
 
             bufs[i] = try alloc.alignedAlloc(u8, page_alignment, aligned_size);
-            reads[i] = ev.FileRead.init(fd, .fromSlice(bufs[i], &iovs[i]), aligned_offset);
-            group.add(&reads[i].c);
+            ops[i] = .{ .buf = bufs[i], .offset = aligned_offset };
         }
 
-        // Single io_uring submission for this chunk.
-        try zio.waitForIo(&group.c);
-        try group.c.getResult(.group);
+        try f.preadBatch(alloc, ops);
 
         // Fill request .data fields from the aligned read buffers.
         for (requests, 0..) |*req, i| {
-            _ = try reads[i].getResult();
+            _ = try ops[i].result;
             const prefix: usize = @intCast(req.offset & (page_size - 1));
             req.data = bufs[i][prefix .. prefix + req.len];
         }
@@ -321,14 +318,14 @@ pub const VFS = struct {
 
                 const file_size = try fdSize(fd);
                 const mapped = try posix.mmap(null, file_size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
-                return .{ .file = zio.File.fromFd(fd), .file_size = file_size, .mapped = mapped, .vfs = self };
+                return .{ .file = fiber.File.fromFd(fd), .file_size = file_size, .mapped = mapped, .vfs = self };
             },
             .default, .direct => {
                 const fd = try openDirect(path, opts);
                 errdefer closeFd(fd);
 
                 const file_size = try fdSize(fd);
-                return .{ .file = zio.File.fromFd(fd), .file_size = file_size, .vfs = self };
+                return .{ .file = fiber.File.fromFd(fd), .file_size = file_size, .vfs = self };
             },
             .memory => {
                 // memory mode reads the file once into a buffer; underlying fd is RO+default.
@@ -374,7 +371,7 @@ pub const VFS = struct {
             _ = posix.fcntl(fd, 48, 1) catch {};
         }
 
-        return .{ .file = zio.File.fromFd(fd), .file_size = 0, .vfs = self };
+        return .{ .file = fiber.File.fromFd(fd), .file_size = 0, .vfs = self };
     }
 
 };
@@ -388,39 +385,39 @@ pub const VFS = struct {
 // route through these so the project's "always use vfs" rule applies to
 // the whole filesystem surface, not just data-plane I/O.
 //
-// Where zio.fs has the op (`zio.deleteFile`, `zio.rename`, `zio.access`,
-// `zio.openDir`, …), we wrap it for naming consistency.
-// Where zio.fs is missing higher-level conveniences (`createDirPath`,
+// Where fiber.fs has the op (`fiber.Dir.cwd().deleteFile/rename/access`,
+// …), we wrap it for naming consistency.
+// Where fiber.fs is missing higher-level conveniences (`createDirPath`,
 // `deleteTree`, file iteration), we wrap `std.Io.Dir` with the global
 // `io` from `utils.context`.
 
 pub fn access(path: []const u8) !void {
-    try zio.Dir.cwd().access(path, .{});
+    try fiber.Dir.cwd().access(path, .{});
 }
 
-/// Recursive mkdir-p. Wraps std.Io.Dir.createDirPath (zio.fs doesn't have it).
+/// Recursive mkdir-p. Wraps std.Io.Dir.createDirPath (fiber.fs doesn't have it).
 pub fn createDirPath(path: []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(utils.context.g().io, path);
 }
 
-/// Recursive delete. Wraps std.Io.Dir.deleteTree (zio.fs doesn't have it).
+/// Recursive delete. Wraps std.Io.Dir.deleteTree (fiber.fs doesn't have it).
 pub fn deleteTree(path: []const u8) !void {
     try std.Io.Dir.cwd().deleteTree(utils.context.g().io, path);
 }
 
 pub fn renameFile(old_path: []const u8, new_path: []const u8) !void {
-    try zio.Dir.cwd().rename(old_path, zio.Dir.cwd(), new_path);
+    try fiber.Dir.cwd().rename(old_path, fiber.Dir.cwd(), new_path);
 }
 
 pub fn deleteFile(path: []const u8) !void {
-    try zio.Dir.cwd().deleteFile(path);
+    try fiber.Dir.cwd().deleteFile(path);
 }
 
 /// Best-effort directory fsync so newly created filenames are durable.
 /// Silently ignores errors (tmpfs, some network mounts don't support dir fsync).
 pub fn syncDir(path: []const u8) void {
     const fd = posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0) catch return;
-    const f = zio.File.fromFd(fd);
+    const f = fiber.File.fromFd(fd);
     defer f.close();
     f.sync(.{}) catch {};
 }
@@ -434,7 +431,7 @@ pub fn syncDir(path: []const u8) void {
 
 /// Create (truncating if it exists) and write `data` in one shot.
 pub fn writeFile(path: []const u8, data: []const u8) !void {
-    const f = try zio.Dir.cwd().createFile(path, .{});
+    const f = try fiber.Dir.cwd().createFile(path, .{});
     defer f.close();
     var off: u64 = 0;
     while (off < data.len) {
@@ -444,7 +441,7 @@ pub fn writeFile(path: []const u8, data: []const u8) !void {
 
 /// Open and read the whole file. Caller owns the returned buffer.
 pub fn readFile(path: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    const f = try zio.Dir.cwd().openFile(path, .{});
+    const f = try fiber.Dir.cwd().openFile(path, .{});
     defer f.close();
     const info = try f.stat();
     const buf = try allocator.alloc(u8, @intCast(info.size));
@@ -460,7 +457,7 @@ pub fn readFile(path: []const u8, allocator: std.mem.Allocator) ![]u8 {
 
 /// Stat a path for its size in bytes.
 pub fn fileSize(path: []const u8) !u64 {
-    const f = try zio.Dir.cwd().openFile(path, .{});
+    const f = try fiber.Dir.cwd().openFile(path, .{});
     defer f.close();
     return (try f.stat()).size;
 }
@@ -469,7 +466,7 @@ pub fn fileSize(path: []const u8) !u64 {
 // Directory iteration
 // ═══════════════════════════════════════════════════════════════════════
 //
-// zio.fs doesn't expose iteration today. We wrap std.Io.Dir's iterator
+// fiber.fs doesn't expose iteration today. We wrap std.Io.Dir's iterator
 // so callers don't have to thread `io` into every `next()` call.
 
 pub const DirIter = struct {

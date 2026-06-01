@@ -1,5 +1,5 @@
 const std = @import("std");
-const zio = @import("zio");
+const fiber = @import("fiber");
 const utils = @import("utils");
 
 const Mutex = utils.TrackedMutex;
@@ -9,7 +9,7 @@ const Mutex = utils.TrackedMutex;
 // which is what makes the waiter-source-attribution test meaningful.
 const Child = struct {
     fn run(mu: *Mutex) void {
-        mu.lock(@src()) catch return;
+        mu.lock(@src());
         defer mu.unlock();
     }
 };
@@ -22,16 +22,16 @@ test "TrackedMutex captures holder src and waiter count under contention" {
 
     // Parent fiber takes the lock first. After this, the entry has a
     // non-null `holder_src` pointing at the line below.
-    try mu.lock(@src());
+    mu.lock(@src());
 
-    var child = try zio.spawn(Child.run, .{&mu});
+    var child = try fiber.spawn(.{}, Child.run, .{&mu});
 
     // Spin-yield until the child has entered the slow path. The slow
     // path increments the entry's waiter_count BEFORE suspending, so
     // observing 1 here is a guarantee that the child has already set
     // last_waiter_src.
     const e = mu.entry.load(.acquire) orelse unreachable;
-    while (e.waiter_count.load(.monotonic) < 1) try zio.yield();
+    while (e.waiter_count.load(.monotonic) < 1) fiber.yield();
 
     try std.testing.expectEqual(@as(u32, 1), e.waiter_count.load(.monotonic));
     try std.testing.expect(e.holder_src != null);
@@ -55,7 +55,7 @@ test "TrackedMutex captures holder src and waiter count under contention" {
 test "TrackedMutex.dump emits a line for a registered mutex" {
     var mu: Mutex = .{};
     defer mu.deinit();
-    try mu.lock(@src());
+    mu.lock(@src());
     defer mu.unlock();
 
     var body: std.Io.Writer.Allocating = .init(std.testing.allocator);

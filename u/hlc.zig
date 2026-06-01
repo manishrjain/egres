@@ -1,5 +1,5 @@
 const std = @import("std");
-const zio = @import("zio");
+const fiber = @import("fiber");
 const context = @import("context.zig");
 
 // Hybrid Logical Clock.
@@ -184,8 +184,8 @@ test "concurrent next yields distinct monotonic HLCs" {
     };
     var a = Ctx{ .clock = &clock };
     var b = Ctx{ .clock = &clock };
-    var ta = try zio.spawn(Ctx.run, .{&a});
-    var tb = try zio.spawn(Ctx.run, .{&b});
+    var ta = try fiber.spawn(.{}, Ctx.run, .{&a});
+    var tb = try fiber.spawn(.{}, Ctx.run, .{&b});
     ta.join();
     tb.join();
 

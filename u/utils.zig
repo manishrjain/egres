@@ -1,5 +1,5 @@
 const std = @import("std");
-const zio = @import("zio");
+const fiber = @import("fiber");
 const builtin = @import("builtin");
 pub const compression = @import("compress.zig");
 pub const hlc = @import("hlc.zig");
@@ -7,7 +7,6 @@ pub const bench = @import("bench.zig");
 pub const tracked_mutex = @import("tracked_mutex.zig");
 pub const TrackedMutex = tracked_mutex.TrackedMutex;
 pub const TrackedRwLock = tracked_mutex.TrackedRwLock;
-pub const coarse = @import("coarse.zig");
 pub const context = @import("context.zig");
 pub const Watermark = @import("watermark.zig").Watermark;
 
@@ -28,10 +27,10 @@ pub const Watermark = @import("watermark.zig").Watermark;
 pub const WaitGroup = struct {
     counter: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
     ch_buf: [1]u8 = undefined,
-    ch: zio.Channel(u8) = undefined,
+    ch: fiber.Channel(u8) = undefined,
 
     pub fn init(self: *WaitGroup) void {
-        self.ch = zio.Channel(u8).init(&self.ch_buf);
+        self.ch = fiber.Channel(u8).init(&self.ch_buf);
     }
 
     pub fn add(self: *WaitGroup, delta: i32) void {
@@ -68,7 +67,7 @@ pub fn logEvery(comptime interval_secs: i64, comptime fmt: []const u8, args: any
     const S = struct {
         var last: i64 = 0;
     };
-    const now = coarse.Clock.ms();
+    const now = fiber.coarseMs();
     if (now - S.last > interval_secs * 1_000) {
         std.log.debug(fmt, args);
         S.last = now;
@@ -175,7 +174,7 @@ pub fn Queue(comptime T: type) type {
         head: usize = 0,
         closed: bool = false,
         max: usize,
-        mutex: zio.Mutex = .init,
+        mutex: fiber.Mutex = .{},
 
         pub fn init(allocator: std.mem.Allocator, max: usize) Self {
             return .{ .allocator = allocator, .max = max };
@@ -187,7 +186,7 @@ pub fn Queue(comptime T: type) type {
         }
 
         pub fn push(q: *Self, item: T) Error!void {
-            q.mutex.lockUncancelable();
+            q.mutex.lock();
             defer q.mutex.unlock();
             if (q.closed) return error.QueueClosed;
             const live = q.items.items.len - q.head;
@@ -196,7 +195,7 @@ pub fn Queue(comptime T: type) type {
         }
 
         pub fn pop(q: *Self) ?T {
-            q.mutex.lockUncancelable();
+            q.mutex.lock();
             defer q.mutex.unlock();
             if (q.head >= q.items.items.len) return null;
             const item = q.items.items[q.head];
@@ -216,26 +215,26 @@ pub fn Queue(comptime T: type) type {
         }
 
         pub fn peek(q: *Self) ?T {
-            q.mutex.lockUncancelable();
+            q.mutex.lock();
             defer q.mutex.unlock();
             if (q.head >= q.items.items.len) return null;
             return q.items.items[q.head];
         }
 
         pub fn count(q: *Self) usize {
-            q.mutex.lockUncancelable();
+            q.mutex.lock();
             defer q.mutex.unlock();
             return q.items.items.len - q.head;
         }
 
         pub fn isClosed(q: *Self) bool {
-            q.mutex.lockUncancelable();
+            q.mutex.lock();
             defer q.mutex.unlock();
             return q.closed;
         }
 
         pub fn close(q: *Self) void {
-            q.mutex.lockUncancelable();
+            q.mutex.lock();
             defer q.mutex.unlock();
             q.closed = true;
         }
@@ -250,44 +249,44 @@ pub fn SafeHashMap(comptime K: type, comptime V: type) type {
         const HashMap = std.AutoHashMap(K, V);
 
         map: HashMap,
-        mu: zio.Mutex = .init,
+        mu: fiber.Mutex = .{},
 
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{ .map = HashMap.init(allocator) };
         }
 
         pub fn get(self: *Self, key: K) ?V {
-            self.mu.lockUncancelable();
+            self.mu.lock();
             defer self.mu.unlock();
             return self.map.get(key);
         }
 
         pub fn put(self: *Self, key: K, value: V) !void {
-            self.mu.lockUncancelable();
+            self.mu.lock();
             defer self.mu.unlock();
             try self.map.put(key, value);
         }
 
         pub fn remove(self: *Self, key: K) bool {
-            self.mu.lockUncancelable();
+            self.mu.lock();
             defer self.mu.unlock();
             return self.map.remove(key);
         }
 
         pub fn fetchRemove(self: *Self, key: K) ?HashMap.KV {
-            self.mu.lockUncancelable();
+            self.mu.lock();
             defer self.mu.unlock();
             return self.map.fetchRemove(key);
         }
 
         pub fn contains(self: *Self, key: K) bool {
-            self.mu.lockUncancelable();
+            self.mu.lock();
             defer self.mu.unlock();
             return self.map.contains(key);
         }
 
         pub fn count(self: *Self) u32 {
-            self.mu.lockUncancelable();
+            self.mu.lock();
             defer self.mu.unlock();
             return self.map.count();
         }

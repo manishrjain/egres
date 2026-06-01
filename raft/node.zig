@@ -1,6 +1,5 @@
 const std = @import("std");
-const zio = @import("zio");
-const runtime = @import("runtime");
+const fiber = @import("fiber");
 const raftwal_mod = @import("raftwal.zig");
 const zen = @import("buffers_gen");
 const zbuf = @import("zbuf").zbuf;
@@ -207,10 +206,10 @@ pub const Node = struct {
     allocator: std.mem.Allocator,
 
     prng: std.Random.DefaultPrng,
-    proposal_ch: zio.Channel(ProposalRequest) = undefined,
-    apply_callbacks: zio.Channel(PendingApply) = undefined,
-    event_ch: zio.Channel(u8) = undefined,
-    inbound_ch: zio.Channel(InboundMsg) = undefined,
+    proposal_ch: fiber.Channel(ProposalRequest) = undefined,
+    apply_callbacks: fiber.Channel(PendingApply) = undefined,
+    event_ch: fiber.Channel(u8) = undefined,
+    inbound_ch: fiber.Channel(InboundMsg) = undefined,
     shutting_down: std.atomic.Value(bool),
 
     transport: ?*Transport = null,
@@ -282,10 +281,10 @@ pub const Node = struct {
             .file_acks = utils.SafeHashMap(u64, *PendingFileAck).init(allocator),
             .file_requests = utils.SafeHashMap(u64, *utils.WaitGroup).init(allocator),
         };
-        node.proposal_ch = try zio.Channel(ProposalRequest).initAlloc(allocator, proposal_queue_capacity);
-        node.apply_callbacks = try zio.Channel(PendingApply).initAlloc(allocator, 1024);
-        node.event_ch = try zio.Channel(u8).initAlloc(allocator, 1);
-        node.inbound_ch = try zio.Channel(InboundMsg).initAlloc(allocator, 1024);
+        node.proposal_ch = try fiber.Channel(ProposalRequest).initAlloc(allocator, proposal_queue_capacity);
+        node.apply_callbacks = try fiber.Channel(PendingApply).initAlloc(allocator, 1024);
+        node.event_ch = try fiber.Channel(u8).initAlloc(allocator, 1);
+        node.inbound_ch = try fiber.Channel(InboundMsg).initAlloc(allocator, 1024);
         errdefer allocator.destroy(node);
         for (peers) |peer| {
             try node.peers.put(peer.id, peer);
@@ -466,11 +465,11 @@ pub const Node = struct {
     };
 
     const JoinCtx = struct {
-        done: zio.Channel(u8) = undefined,
+        done: fiber.Channel(u8) = undefined,
         status: CommitStatus = .committed,
 
         fn init(self: *JoinCtx, alloc: std.mem.Allocator) !void {
-            self.done = try zio.Channel(u8).initAlloc(alloc, 1);
+            self.done = try fiber.Channel(u8).initAlloc(alloc, 1);
         }
 
         fn deinit(self: *JoinCtx) void {
@@ -687,7 +686,7 @@ pub const Node = struct {
             while (true) {
                 if (!self.isLeader()) return error.NotLeader;
                 if (p.acks.count() + 1 >= self.quorum_size) break;
-                zio.sleep(zio.Duration.fromMilliseconds(10)) catch return error.Cancelled;
+                fiber.sleep(10);
             }
         }
     }
@@ -797,7 +796,7 @@ pub const Node = struct {
             var result = while (true) {
                 break self.log.entriesRange(.{ .lo = lo, .hi = last + 1, .ty = .conf }) catch |err| {
                     std.log.err("restoreConfState: entriesRange failed: {}, retrying...", .{err});
-                    zio.sleep(.fromSeconds(1)) catch return;
+                    fiber.sleep(1000);
                     continue;
                 };
             };
@@ -1466,7 +1465,7 @@ pub const Node = struct {
     /// commit) and are unaffected.
     pub fn proposeAndWaitForApply(self: *Node, data: []const u8, proposal_type: ProposalType) RaftError!void {
         std.debug.assert(proposal_type != .any);
-        const start_ms = utils.coarse.Clock.ms();
+        const start_ms = fiber.coarseMs();
         var ctx = WaitCtx{ .status = .committed };
         ctx.wg.init();
         ctx.wg.add(1);
@@ -1475,7 +1474,7 @@ pub const Node = struct {
             raft_log.err("proposeAndWaitForApply: wait for commit failed: {s}", .{@errorName(err)});
             return error.CommitFailed;
         };
-        const commit_ms = utils.coarse.Clock.ms();
+        const commit_ms = fiber.coarseMs();
         if (commit_ms - start_ms > 5_000) {
             raft_log.warn("proposeAndWaitForApply: commit phase slow type={s} ms={d}", .{
                 @tagName(proposal_type), commit_ms - start_ms,
@@ -1519,10 +1518,10 @@ pub const Node = struct {
         // client doesn't sit forever if the SM is genuinely stuck.
         if (self.state_machine) |sm| {
             if (proposal_type == .data and !sm.isReady()) {
-                const deadline = utils.coarse.Clock.ms() + 1000; // 1s
+                const deadline = fiber.coarseMs() + 1000; // 1s
                 while (!sm.isReady()) {
-                    if (utils.coarse.Clock.ms() >= deadline) return error.NotReady;
-                    zio.sleep(zio.Duration.fromMilliseconds(10)) catch return error.QueueClosed;
+                    if (fiber.coarseMs() >= deadline) return error.NotReady;
+                    fiber.sleep(10);
                 }
             }
         }
@@ -1558,7 +1557,7 @@ pub const Node = struct {
         // Sub-phase: propose_build — walk requests, validate + serialize each
         // into a LogEntryBuffer, register the apply callback. Pure CPU work
         // (no I/O); anything > 1 ms/batch points at zbuf encoding cost.
-        const t_build = utils.coarse.Clock.ms();
+        const t_build = fiber.coarseMs();
 
         var entries = std.ArrayList(zen.LogEntryBuffer).empty;
         defer {
@@ -1594,7 +1593,7 @@ pub const Node = struct {
                 }
                 // Reject add if addr is missing or unparseable.
                 if (ct == .add_voter or ct == .add_learner) {
-                    _ = zio.net.IpAddress.parseIpAndPort(cc.addr()) catch {
+                    _ = fiber.net.IpAddress.parseIpAndPort(cc.addr()) catch {
                         req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .invalid_addr);
                         continue;
                     };
@@ -1607,7 +1606,7 @@ pub const Node = struct {
                 }
 
                 if (ct == .update_addr) {
-                    _ = zio.net.IpAddress.parseIpAndPort(cc.addr()) catch {
+                    _ = fiber.net.IpAddress.parseIpAndPort(cc.addr()) catch {
                         req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .invalid_addr);
                         continue;
                     };
@@ -1688,7 +1687,7 @@ pub const Node = struct {
         // Sub-phase: propose_persist — DiskWAL.append batches the framed
         // records into one pwrite. The fdatasync is no longer issued here;
         // mainLoop spawns it in a fiber so it can overlap with broadcast.
-        const t_persist = utils.coarse.Clock.ms();
+        const t_persist = fiber.coarseMs();
         try self.log.append(entries.items);
         metrics.g().observePhase("log_append", t_persist);
 
@@ -1747,17 +1746,17 @@ pub const Node = struct {
         // a thread (see runtime.Sharing): mainLoop drives consensus and
         // applyLoop drains the apply queue; co-scheduling them on the same
         // thread serializes one behind the other and stalls Raft. Enforcement
-        // lands once we collapse to a single zio.Runtime + gain
-        // `zio.spawnOn(thread_idx)` upstream — today the markers are intent.
-        var g = runtime.Group(void).init(self.allocator, .raft);
+        // lands once fiber gains per-lane worker pinning — today the
+        // lane markers are intent, not hard placement.
+        var g = fiber.Group(void).init(self.allocator);
         defer g.deinit();
         try g.ensureTotalCapacity(6);
-        try g.spawn(.exclusive, tickLoop, .{ self, self.config.tick_interval_ms });
-        try g.spawn(.exclusive, mainLoop, .{ self, self.config.tick_interval_ms });
-        try g.spawn(.exclusive, applyLoop, .{self});
-        try g.spawn(.shared, callbackLoop, .{self});
-        try g.spawn(.shared, clockTickLoop, .{self});
-        try g.spawn(.shared, commitPersistLoop, .{self});
+        try g.spawn(.{ .lane = .raft }, tickLoop, .{ self, self.config.tick_interval_ms });
+        try g.spawn(.{ .lane = .raft }, mainLoop, .{ self, self.config.tick_interval_ms });
+        try g.spawn(.{ .lane = .raft }, applyLoop, .{self});
+        try g.spawn(.{ .lane = .raft }, callbackLoop, .{self});
+        try g.spawn(.{ .lane = .raft }, clockTickLoop, .{self});
+        try g.spawn(.{ .lane = .raft }, commitPersistLoop, .{self});
         g.wait();
     }
 
@@ -1830,7 +1829,7 @@ pub const Node = struct {
                         // (e.g. a batched forest.put). Lets us see whether
                         // the apply path is the bottleneck when commit
                         // outpaces apply.
-                        const t_apply = utils.coarse.Clock.ms();
+                        const t_apply = fiber.coarseMs();
                         const sm_entry = Entry{
                             .index = entry.index,
                             .term = entry.term,
@@ -1854,7 +1853,7 @@ pub const Node = struct {
                                     raft_log.err("apply idx={d}: {s}, retrying in 1ms", .{ entry.index, @errorName(err) });
                                 }
                                 if (self.isShuttingDown()) return;
-                                zio.sleep(zio.Duration.fromMilliseconds(1)) catch return;
+                                fiber.sleep(1);
                                 continue;
                             };
                             break;
@@ -1887,9 +1886,9 @@ pub const Node = struct {
 
     /// Tick loop: periodically signals event_ch to trigger raft processing.
     pub fn tickLoop(self: *Node, tick_interval_ms: u32) void {
-        const tick_dur = zio.Duration.fromMilliseconds(tick_interval_ms);
+        const tick_dur: u64 = tick_interval_ms;
         while (!self.isShuttingDown()) {
-            zio.sleep(tick_dur) catch return;
+            fiber.sleep(tick_dur);
             self.event_ch.trySend(1) catch {};
         }
     }
@@ -1906,9 +1905,9 @@ pub const Node = struct {
     /// The wait-for-commit doubles as a rate-limit: only one tick can be
     /// in flight at a time, so burst-piling under apply lag is impossible.
     pub fn clockTickLoop(self: *Node) void {
-        const poll = zio.Duration.fromMilliseconds(400);
+        const poll: u64 = 400;
         while (!self.isShuttingDown()) {
-            zio.sleep(poll) catch return;
+            fiber.sleep(poll);
             if (!self.isLeader()) continue;
             const last_ts = utils.hlc.HLC.fromU64(self.log.lastTimestamp());
             const wall_sec: u32 = @intCast(std.Io.Timestamp.now(utils.context.g().io, .real).toSeconds());
@@ -1932,7 +1931,7 @@ pub const Node = struct {
     /// processes proposals, advances state, and broadcasts to peers.
     pub fn mainLoop(self: *Node, tick_interval_ms: u32) void {
         const tick_ms: i64 = @as(i64, tick_interval_ms);
-        var last_tick: i64 = utils.coarse.Clock.ms();
+        var last_tick: i64 = fiber.coarseMs();
 
         while (!self.isShuttingDown()) {
             _ = self.event_ch.receive() catch return;
@@ -1941,7 +1940,7 @@ pub const Node = struct {
             // We observe even when the queue was empty: the histogram includes
             // a 0-bucket sample, which is information about how often the loop
             // ran without inbound work to do.
-            var t = utils.coarse.Clock.ms();
+            var t = fiber.coarseMs();
             while (self.inbound_ch.tryReceive()) |msg| {
                 defer self.allocator.free(msg.payload);
                 switch (msg.message_type) {
@@ -1959,7 +1958,7 @@ pub const Node = struct {
             // Phase: propose — drain proposal queue, build entries, persist,
             // register apply callbacks. Sub-phases ("propose_build" and
             // "propose_persist") are observed inside appendProposalsToLeaderLog.
-            t = utils.coarse.Clock.ms();
+            t = fiber.coarseMs();
             _ = self.processProposalRequests() catch {};
             metrics.g().observePhase("propose", t);
             const log_grew = self.log.lastIndex() > last_before;
@@ -1968,12 +1967,11 @@ pub const Node = struct {
             // broadcast (Raft paper §7 pipelining). `addEntries` already
             // populated cache + write_buf; the spawned `sync()` does the
             // pwrite (durable due to O_DSYNC) on a separate fiber.
-            var sync_handle = runtime.spawnOn(
-                .raft,
-                .shared,
+            var sync_handle = fiber.spawn(
+                .{ .lane = .raft },
                 syncLogTask,
                 .{self},
-            ) catch @panic("runtime.spawnOn syncLogTask");
+            ) catch @panic("fiber.spawn syncLogTask");
             // Tracks whether we still need to join the sync handle. Set to
             // false in the q==1 branch (where we wait early). We capture
             // this decision *before* advance(), since advance can apply
@@ -1984,7 +1982,7 @@ pub const Node = struct {
             // just-appended (unsynced) entries since the leader is sole
             // voter. Wait for sync before advance in that case.
             if (self.quorum_size == 1) {
-                t = utils.coarse.Clock.ms();
+                t = fiber.coarseMs();
                 sync_handle.join() catch |err| {
                     raft_log.err("node {d}: sync_handle.join (pre-advance) failed: {s}", .{ self.id, @errorName(err) });
                 };
@@ -1993,14 +1991,14 @@ pub const Node = struct {
             }
 
             // Phase: advance — advanceCommitIndex + applyConfChanges + notify.
-            t = utils.coarse.Clock.ms();
+            t = fiber.coarseMs();
             self.advance();
             metrics.g().observePhase("advance", t);
 
             const ci_advanced = self.commit_index.load() > ci_before;
 
             var heartbeat_due = false;
-            const now = utils.coarse.Clock.ms();
+            const now = fiber.coarseMs();
             if (now - last_tick >= tick_ms) {
                 heartbeat_due = self.tick() catch false;
                 last_tick = now;
@@ -2008,7 +2006,7 @@ pub const Node = struct {
 
             // Phase: broadcast — for multi-voter clusters, the WAL fsync
             // runs concurrently with these network sends.
-            t = utils.coarse.Clock.ms();
+            t = fiber.coarseMs();
             self.maybeBroadcast(heartbeat_due or ci_advanced or log_grew);
             metrics.g().observePhase("broadcast", t);
 
@@ -2017,7 +2015,7 @@ pub const Node = struct {
             // overlapped broadcast; positive when broadcast finished first
             // and we're still waiting on disk.
             if (sync_pending) {
-                t = utils.coarse.Clock.ms();
+                t = fiber.coarseMs();
                 sync_handle.join() catch |err| {
                     raft_log.err("node {d}: sync_handle.join (post-broadcast) failed: {s}", .{ self.id, @errorName(err) });
                 };
@@ -2050,10 +2048,10 @@ pub const Node = struct {
     /// as a no-op (no state-machine call), so this barrier doesn't do
     /// any redundant manifest work itself.
     pub fn waitForQuorum(self: *Node) RaftError!void {
-        const interval = zio.Duration.fromMilliseconds(50);
+        const interval: u64 = 50;
         while (!self.isShuttingDown()) {
             if (self.isLeader()) break;
-            zio.sleep(interval) catch return;
+            fiber.sleep(interval);
         }
         if (self.isShuttingDown()) return;
         try self.proposeAndWaitForApply(&.{}, .manifest);
@@ -2081,10 +2079,10 @@ pub const Node = struct {
     /// can replay (Raft's prior-term commitment rule). On crash, the
     /// staleness is bounded by ~1 s of entries; the rest is re-derived.
     pub fn commitPersistLoop(self: *Node) void {
-        const interval = zio.Duration.fromSeconds(1);
+        const interval: u64 = 1000;
         const min_advance: u64 = 100;
         while (!self.isShuttingDown()) {
-            zio.sleep(interval) catch return;
+            fiber.sleep(interval);
             const ci = self.commit_index.load();
             const persisted = self.log.hardState().commit_index;
             if (ci < persisted + min_advance) continue;
@@ -2438,8 +2436,8 @@ pub const Node = struct {
     /// Block the caller until this node's applied timestamp >= `target_ts`
     /// or the timeout expires. Returns `error.Timeout` if the deadline
     /// passes before catch-up.
-    pub fn waitForApplied(self: *Node, target_ts: u64, timeout: zio.Duration) !void {
-        return self.applied_ts.waitFor(target_ts, timeout);
+    pub fn waitForApplied(self: *Node, target_ts: u64, timeout_ms: u64) !void {
+        return self.applied_ts.waitFor(target_ts, timeout_ms);
     }
 
     fn failAllPendingCallbacks(self: *Node, status: CommitStatus) void {

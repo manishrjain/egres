@@ -1,8 +1,7 @@
 const std = @import("std");
-const zio = @import("zio");
 const raft = @import("raft");
 const zdb = @import("zdb");
-const runtime = @import("runtime");
+const fiber = @import("fiber");
 const proto = @import("protocol.zig");
 const m = @import("metrics");
 const flags = @import("flags");
@@ -234,7 +233,7 @@ pub const StorageImpl = struct {
         while (true) {
             node.fetchFiles(missing.items) catch |err| {
                 log.err("preAppend: fetchFiles failed: {s}, retrying", .{@errorName(err)});
-                zio.sleep(zio.Duration.fromMilliseconds(100)) catch return;
+                fiber.sleep(100);
                 continue;
             };
             break;
@@ -273,7 +272,7 @@ pub const ZdbServer = struct {
     /// proposal goes through Raft.
     storage: *StorageImpl,
     snapshot_cfg: *flags.Live(SnapshotCfg),
-    listen_addr: zio.net.IpAddress,
+    listen_addr: fiber.net.IpAddress,
     in_flight_mu: utils.TrackedMutex = .{},
     in_flight: std.ArrayList(InFlight) = .empty,
     /// Monotonic per-call ID for proposeCompaction so we can grep its
@@ -309,7 +308,7 @@ pub const ZdbServer = struct {
         snapshot_cfg: *flags.Live(SnapshotCfg),
         client_addr: []const u8,
     ) !ZdbServer {
-        const addr = try zio.net.IpAddress.parseIpAndPort(client_addr);
+        const addr = try fiber.net.IpAddress.parseIpAndPort(client_addr);
         return .{
             .allocator = allocator,
             .forest = forest,
@@ -389,9 +388,8 @@ pub const ZdbServer = struct {
 
         // Per-connection handlers run on .query, cancelled collectively on
         // shutdown so in-flight requests don't outlive the listener.
-        var g = runtime.Group(void).init(self.allocator, .query);
+        var g = fiber.Group(void).init(self.allocator);
         defer g.deinit();
-        defer g.cancel();
 
         var conn_id: u64 = 0;
         while (!self.node.isShuttingDown()) {
@@ -399,10 +397,9 @@ pub const ZdbServer = struct {
                 log.err("runClientLoop: accept failed: {}", .{err});
                 return;
             };
-            stream.socket.setNoDelay(true) catch {};
             conn_id += 1;
             log.info("accepted client connection #{d}", .{conn_id});
-            g.spawn(.shared, handleClient, .{ self, stream }) catch {
+            g.spawn(.{}, handleClient, .{ self, stream }) catch {
                 log.err("failed to spawn handler for connection #{d}", .{conn_id});
                 stream.close();
             };
@@ -430,18 +427,18 @@ pub const ZdbServer = struct {
         // cancel needed; `wait()` is enough. Background fibers don't need
         // `.exclusive` placement: they're allocator-bound and I/O-bound with
         // ample sleep windows, so co-scheduling on shared threads is fine.
-        var g = runtime.Group(void).init(self.allocator, .background);
+        var g = fiber.Group(void).init(self.allocator);
         defer g.deinit();
         g.ensureTotalCapacity(3 + n_compactors) catch |err| {
             log.err("runCompactionLoop: ensureTotalCapacity failed: {s}", .{@errorName(err)});
             return;
         };
 
-        g.spawn(.shared, runMemtableLoop, .{self}) catch |err| {
+        g.spawn(.{}, runMemtableLoop, .{self}) catch |err| {
             log.err("runCompactionLoop: spawn runMemtableLoop failed: {s}", .{@errorName(err)});
             return;
         };
-        g.spawn(.shared, runFlushLoop, .{self}) catch |err| {
+        g.spawn(.{}, runFlushLoop, .{self}) catch |err| {
             log.err("runCompactionLoop: spawn runFlushLoop failed: {s}", .{@errorName(err)});
             return;
         };
@@ -452,12 +449,12 @@ pub const ZdbServer = struct {
         // exactly the right behavior — multiple compactors on one
         // tree would race on level mutexes.
         for (0..n_compactors) |_| {
-            g.spawn(.shared, runLevelsLoop, .{self}) catch |err| {
+            g.spawn(.{}, runLevelsLoop, .{self}) catch |err| {
                 log.err("runCompactionLoop: spawn runLevelsLoop failed: {s}", .{@errorName(err)});
                 return;
             };
         }
-        g.spawn(.shared, runInFlightWatchdog, .{self}) catch |err| {
+        g.spawn(.{}, runInFlightWatchdog, .{self}) catch |err| {
             log.err("runCompactionLoop: spawn runInFlightWatchdog failed: {s}", .{@errorName(err)});
             return;
         };
@@ -471,11 +468,11 @@ pub const ZdbServer = struct {
     /// stuck compactions, flushes, splits, and newMemtable proposals
     /// generically — wherever the wedge is, the entry stops aging out.
     fn runInFlightWatchdog(self: *ZdbServer) void {
-        const poll = zio.Duration.fromSeconds(15);
+        const poll: u64 = 15000;
         const stuck_threshold_ms: i64 = 30_000;
         while (!self.node.isShuttingDown()) {
-            zio.sleep(poll) catch return;
-            const now_ms = utils.coarse.Clock.ms();
+            fiber.sleep(poll);
+            const now_ms = fiber.coarseMs();
             self.in_flight_mu.lockUncancelable(@src());
             defer self.in_flight_mu.unlock();
             for (self.in_flight.items) |it| {
@@ -522,7 +519,7 @@ pub const ZdbServer = struct {
             log.info("recovery: fetching {d} missing SST files from leader", .{missing.len});
             self.node.fetchFiles(missing) catch |err| {
                 log.warn("recovery: fetchFiles failed ({s}); retrying in 200 ms", .{@errorName(err)});
-                zio.sleep(zio.Duration.fromMilliseconds(200)) catch return;
+                fiber.sleep(200);
                 continue;
             };
         }
@@ -544,7 +541,7 @@ pub const ZdbServer = struct {
         };
         while (!self.node.isShuttingDown()) {
             const cfg = self.snapshot_cfg.snapshot();
-            zio.sleep(zio.Duration.fromSeconds(cfg.poll_interval_seconds)) catch return;
+            fiber.sleep(cfg.poll_interval_seconds * 1000);
             if (!self.node.isLeader()) continue;
             self.maybeProposeSnapshot() catch |err| {
                 log.warn("maybeProposeSnapshot: {s}", .{@errorName(err)});
@@ -722,26 +719,26 @@ pub const ZdbServer = struct {
     /// freeze fall out of the same condition, so there's no separate
     /// startup phase.
     fn runMemtableLoop(self: *ZdbServer) void {
-        const interval = zio.Duration.fromMilliseconds(100);
+        const interval: u64 = 100;
         while (!self.node.isShuttingDown()) {
             const needs = self.node.isLeader() and
                 (self.forest.memtables.currentId() == 0 or self.forest.shouldFreeze());
             if (!needs) {
-                zio.sleep(interval) catch return;
+                fiber.sleep(interval);
                 continue;
             }
             self.proposeNewMemtable() catch |err| {
                 log.err("proposeNewMemtable failed: {s}", .{@errorName(err)});
-                zio.sleep(interval) catch return;
+                fiber.sleep(interval);
             };
         }
     }
 
     fn runFlushLoop(self: *ZdbServer) void {
-        const interval = zio.Duration.fromMilliseconds(200);
+        const interval: u64 = 200;
         while (!self.node.isShuttingDown()) {
             if (!self.node.isLeader() or !self.forest.hasFrozenMemtables()) {
-                zio.sleep(interval) catch return;
+                fiber.sleep(interval);
                 continue;
             }
             self.proposeFlush() catch |err| {
@@ -762,14 +759,14 @@ pub const ZdbServer = struct {
     // two fibers ever pick the same tree concurrently (each tree
     // gets at most one in-flight compaction/split).
     fn runLevelsLoop(self: *ZdbServer) void {
-        const interval = zio.Duration.fromMilliseconds(500);
+        const interval: u64 = 500;
         while (!self.node.isShuttingDown()) {
             if (!self.node.isLeader()) {
-                zio.sleep(interval) catch return;
+                fiber.sleep(interval);
                 continue;
             }
             const target = self.pickAndReserveCompactionTarget() orelse {
-                zio.sleep(interval) catch return;
+                fiber.sleep(interval);
                 continue;
             };
             defer self.releaseCompactingTree(target.tree_id);
@@ -791,7 +788,7 @@ pub const ZdbServer = struct {
     }
 
     fn proposeNewMemtable(self: *ZdbServer) !void {
-        self.addInFlight(.{ .kind = .new_memtable, .tree_id = 0, .started_at_ms = utils.coarse.Clock.ms() });
+        self.addInFlight(.{ .kind = .new_memtable, .tree_id = 0, .started_at_ms = fiber.coarseMs() });
         defer self.removeInFlight(.new_memtable, 0, 0);
         const new_id = try self.forest.file_ids.allocate();
         const payload = try encodeManifestChange(self.allocator, 1, &.{}, &.{}, new_id);
@@ -808,7 +805,7 @@ pub const ZdbServer = struct {
         // part). buildFlush iterates the oldest immutable memtable; we
         // don't know the target tree(s) until changes return, so use
         // tree_id=0 as a "global" marker.
-        self.addInFlight(.{ .kind = .flush, .tree_id = 0, .started_at_ms = utils.coarse.Clock.ms() });
+        self.addInFlight(.{ .kind = .flush, .tree_id = 0, .started_at_ms = fiber.coarseMs() });
         defer self.removeInFlight(.flush, 0, 0);
 
         const result = try self.forest.buildFlush() orelse return;
@@ -839,13 +836,13 @@ pub const ZdbServer = struct {
             .src_level = @intCast(target.candidate.level),
             .dest_level = @intCast(@as(usize, target.candidate.level) + 1),
             .cid = cid,
-            .started_at_ms = utils.coarse.Clock.ms(),
+            .started_at_ms = fiber.coarseMs(),
         });
         defer self.removeInFlight(.compaction, target.tree_id, @intCast(target.candidate.level));
 
         const src = target.candidate.level;
         const dst: usize = @as(usize, src) + 1;
-        const t0 = utils.coarse.Clock.ms();
+        const t0 = fiber.coarseMs();
         log.info("compact cid={d} start tree={d} L{d}->L{d}", .{ cid, target.tree_id, src, dst });
 
         var changes = try target.tree.buildCompaction(src, &self.forest.file_ids);
@@ -854,17 +851,17 @@ pub const ZdbServer = struct {
             log.info("compact cid={d} build_done changes=0 (no-op)", .{cid});
             return;
         }
-        const t1 = utils.coarse.Clock.ms();
+        const t1 = fiber.coarseMs();
         log.info("compact cid={d} build_done changes={d} build_ms={d}", .{ cid, changes.items.len, t1 - t0 });
 
         try self.distributeNewFiles(changes.items);
-        const t2 = utils.coarse.Clock.ms();
+        const t2 = fiber.coarseMs();
         log.info("compact cid={d} distribute_done distribute_ms={d}", .{ cid, t2 - t1 });
 
         const payload = try encodeManifestChange(self.allocator, 3, changes.items, &.{}, 0);
         defer self.allocator.free(payload);
         try self.node.proposeAndWaitForApply(payload, .manifest);
-        const t3 = utils.coarse.Clock.ms();
+        const t3 = fiber.coarseMs();
         log.info("compact cid={d} done propose_ms={d} total_ms={d}", .{ cid, t3 - t2, t3 - t0 });
     }
 
@@ -873,7 +870,7 @@ pub const ZdbServer = struct {
         self.flush_split_mu.lockUncancelable(@src());
         defer self.flush_split_mu.unlock();
 
-        self.addInFlight(.{ .kind = .split, .tree_id = tree_id, .started_at_ms = utils.coarse.Clock.ms() });
+        self.addInFlight(.{ .kind = .split, .tree_id = tree_id, .started_at_ms = fiber.coarseMs() });
         defer self.removeInFlight(.split, tree_id, 0);
         // buildSplit allocates table_changes / tree_changes on the arena;
         // encodeManifestChange copies the bytes into a self-owned payload,
@@ -931,7 +928,7 @@ pub const ZdbServer = struct {
         try self.node.sendAndWaitForFileQuorum(file_ids.items);
     }
 
-    fn handleClient(self: *ZdbServer, stream: zio.net.Stream) void {
+    fn handleClient(self: *ZdbServer, stream: fiber.net.Stream) void {
         defer stream.close();
         var ops: u64 = 0;
         // One buffered reader per connection — protocol reads (command
@@ -1040,10 +1037,10 @@ pub const ZdbServer = struct {
             @as(u64, opts.l0_backpressure_max_us),
         );
         if (delay_us == 0) return;
-        zio.sleep(zio.Duration.fromMicroseconds(delay_us)) catch {};
+        fiber.sleep(delay_us / 1000);
     }
 
-    fn handleSet(self: *ZdbServer, stream: zio.net.Stream, req: proto.SetCmd) !void {
+    fn handleSet(self: *ZdbServer, stream: fiber.net.Stream, req: proto.SetCmd) !void {
         // Reject up-front if the destination namespace has no route table.
         // Otherwise the mutation is durably committed through Raft but
         // `buildFlush` will silently drop it (no tree to route to), and the
@@ -1107,7 +1104,7 @@ pub const ZdbServer = struct {
     /// reader into (key, value) pairs, encode as a single Mutations,
     /// propose once. Each token is hex-decoded if prefixed with `0x`,
     /// literal otherwise.
-    fn handleSetBatch(self: *ZdbServer, stream: zio.net.Stream, batch: proto.ParsedBatch) !void {
+    fn handleSetBatch(self: *ZdbServer, stream: fiber.net.Stream, batch: proto.ParsedBatch) !void {
         if (!self.forest.hasNamespace(batch.ns)) {
             try writeUnknownNamespace(stream, batch.ns);
             return;
@@ -1138,11 +1135,11 @@ pub const ZdbServer = struct {
         }
     }
 
-    fn handleGet(self: *ZdbServer, stream: zio.net.Stream, req: proto.GetCmd) !void {
+    fn handleGet(self: *ZdbServer, stream: fiber.net.Stream, req: proto.GetCmd) !void {
         // If the client sent a read_ts, wait for this node's apply_ts to reach
         // it (5s timeout). No read_ts → serve local applied state immediately.
         if (req.read_ts > 0) {
-            self.node.waitForApplied(req.read_ts, zio.Duration.fromSeconds(5)) catch {
+            self.node.waitForApplied(req.read_ts, 5000) catch {
                 try proto.writeErr(stream, "read_stale");
                 return;
             };
@@ -1169,7 +1166,7 @@ pub const ZdbServer = struct {
         }
     }
 
-    fn handleScan(self: *ZdbServer, stream: zio.net.Stream, req: proto.ScanCmd) !void {
+    fn handleScan(self: *ZdbServer, stream: fiber.net.Stream, req: proto.ScanCmd) !void {
         // Scan range = [start, end). Both bounds use ts=maxInt so the
         // primary-key compare comes first and same-primary versions
         // sort newest-first inside the bound. An empty primary on
@@ -1235,7 +1232,7 @@ pub const ZdbServer = struct {
         try w.flush();
     }
 
-    fn handleLocks(self: *ZdbServer, stream: zio.net.Stream) !void {
+    fn handleLocks(self: *ZdbServer, stream: fiber.net.Stream) !void {
         // Walks the intrusive registry in u/tracked_mutex.zig and emits one
         // line per registered mutex. Read while wedged to find the lock /
         // call site that's blocking everyone.
@@ -1243,10 +1240,10 @@ pub const ZdbServer = struct {
         defer body.deinit();
         try utils.tracked_mutex.dump(&body.writer);
         try body.writer.writeByte('\n');
-        try stream.writeAll(body.writer.buffered(), .none);
+        try stream.writeAll(body.writer.buffered());
     }
 
-    fn handleVfs(self: *ZdbServer, stream: zio.net.Stream) !void {
+    fn handleVfs(self: *ZdbServer, stream: fiber.net.Stream) !void {
         _ = self;
         // Pretty-printed snapshot of the global VFS bandwidth limiter,
         // counted in pages (multiply by VFS page size for bytes). P0
@@ -1270,7 +1267,7 @@ pub const ZdbServer = struct {
         try w.flush();
     }
 
-    fn handleConf(self: *ZdbServer, stream: zio.net.Stream, req: proto.ConfCmd) !void {
+    fn handleConf(self: *ZdbServer, stream: fiber.net.Stream, req: proto.ConfCmd) !void {
         const change_type: raft.ConfChangeType = switch (req.action) {
             .add => .add_learner,
             .to_voter => .to_voter,
@@ -1281,7 +1278,7 @@ pub const ZdbServer = struct {
 
         // Validate address for commands that require it.
         if (req.action == .add or req.action == .addr) {
-            _ = zio.net.IpAddress.parseIpAndPort(req.addr) catch {
+            _ = fiber.net.IpAddress.parseIpAndPort(req.addr) catch {
                 try proto.writeErr(stream, "invalid address");
                 return;
             };
@@ -1316,7 +1313,7 @@ pub const ZdbServer = struct {
         }
     }
 
-    fn handleRaft(self: *ZdbServer, stream: zio.net.Stream, req: proto.RaftCmd) !void {
+    fn handleRaft(self: *ZdbServer, stream: fiber.net.Stream, req: proto.RaftCmd) !void {
         if (req.sub == .entry) return self.handleRaftEntry(stream, req.lo, req.hi);
         // Best-effort snapshot of node + peer state. Races against an
         // in-flight conf change are possible (peers map mutated by
@@ -1385,14 +1382,14 @@ pub const ZdbServer = struct {
             }
         }
         try w.writeByte('\n');
-        try stream.writeAll(body.writer.buffered(), .none);
+        try stream.writeAll(body.writer.buffered());
     }
 
     /// Dump WAL entries [lo, hi] (inclusive) as one human-readable line each.
     /// Used for poking at the raft log when an apply error wedges progress
     /// at a known index. Out-of-range or missing entries become an error
     /// line so the caller can tell missing-vs-empty apart.
-    fn handleRaftEntry(self: *ZdbServer, stream: zio.net.Stream, lo: u64, hi: u64) !void {
+    fn handleRaftEntry(self: *ZdbServer, stream: fiber.net.Stream, lo: u64, hi: u64) !void {
         var body: std.Io.Writer.Allocating = .init(self.allocator);
         defer body.deinit();
         const w = &body.writer;
@@ -1400,7 +1397,7 @@ pub const ZdbServer = struct {
         var result = self.node.log.entriesRange(.{ .lo = lo, .hi = hi + 1 }) catch |err| {
             try w.print("err={s}\n", .{@errorName(err)});
             try w.writeByte('\n');
-            try stream.writeAll(body.writer.buffered(), .none);
+            try stream.writeAll(body.writer.buffered());
             return;
         };
         defer result.deinit();
@@ -1419,10 +1416,10 @@ pub const ZdbServer = struct {
             try w.print("idx={d} <missing>\n", .{expected});
         }
         try w.writeByte('\n');
-        try stream.writeAll(body.writer.buffered(), .none);
+        try stream.writeAll(body.writer.buffered());
     }
 
-    fn handleZdb(self: *ZdbServer, stream: zio.net.Stream, req: proto.ZdbCmd) !void {
+    fn handleZdb(self: *ZdbServer, stream: fiber.net.Stream, req: proto.ZdbCmd) !void {
         // Snapshot into a buffer so we write in a single syscall. Clients
         // read until '\n\n' so we always terminate the body with a blank line.
         var body: std.Io.Writer.Allocating = .init(self.allocator);
@@ -1442,7 +1439,7 @@ pub const ZdbServer = struct {
             .namespace => try self.forest.writeStats(&body.writer, .{ .scope = .{ .namespace = req.ns_id } }),
         }
         try body.writer.writeByte('\n');
-        try stream.writeAll(body.writer.buffered(), .none);
+        try stream.writeAll(body.writer.buffered());
     }
 
     /// Append a section listing in-flight flush/compaction/split builds —
@@ -1458,7 +1455,7 @@ pub const ZdbServer = struct {
             try w.print("\n  in-flight: (none)\n", .{});
             return;
         }
-        const now = utils.coarse.Clock.ms();
+        const now = fiber.coarseMs();
         try w.print("\n  in-flight:\n", .{});
         for (self.in_flight.items) |it| {
             const age_ms = now - it.started_at_ms;
@@ -1474,7 +1471,7 @@ pub const ZdbServer = struct {
         }
     }
 
-    fn handleNsCreate(self: *ZdbServer, stream: zio.net.Stream, req: proto.NsCreateCmd) !void {
+    fn handleNsCreate(self: *ZdbServer, stream: fiber.net.Stream, req: proto.NsCreateCmd) !void {
         if (!self.node.isLeader()) {
             const leader = self.node.getLeaderId() orelse 0;
             try proto.writeNotLeader(stream, leader);
@@ -1527,7 +1524,7 @@ fn onCommit(ctx_raw: *anyopaque, entry: raft.Entry, status: raft.CommitStatus) v
     ctx.wg.done();
 }
 
-fn writeUnknownNamespace(stream: zio.net.Stream, ns: u32) !void {
+fn writeUnknownNamespace(stream: fiber.net.Stream, ns: u32) !void {
     var buf: [64]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, "unknown namespace {d}", .{ns}) catch unreachable;
     try proto.writeErr(stream, msg);

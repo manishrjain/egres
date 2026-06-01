@@ -9,6 +9,7 @@ pub const coro = fb.coro;
 pub const default_stack_max = fb.default_stack_max;
 pub const default_stack_commit = fb.default_stack_commit;
 pub const Priority = fb.Priority;
+pub const Lane = fb.Lane;
 pub const Tag = fb.Tag;
 pub const State = fb.State;
 pub const YieldIntent = fb.YieldIntent;

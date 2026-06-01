@@ -1,5 +1,5 @@
 const std = @import("std");
-const zio = @import("zio");
+const fiber = @import("fiber");
 const node_mod = @import("node.zig");
 const serial_mod = @import("serial");
 const Serial = serial_mod.Serial;
@@ -51,9 +51,8 @@ pub fn requestJoin(
     node_id: NodeId,
     self_addr: []const u8,
 ) !zen.JoinResponseBuffer {
-    const addr = try zio.net.IpAddress.parseIpAndPort(leader_addr);
+    const addr = try fiber.net.IpAddress.parseIpAndPort(leader_addr);
     const conn = try addr.connect(.{});
-    conn.socket.setNoDelay(true) catch {};
 
     // Transport-level binary handshake.
     try Transport.sendHandshake(conn, cluster_id, node_id, .p0, .join);
@@ -140,7 +139,7 @@ pub fn joinCluster(
         }
 
         log.info("joinCluster: backing off {d}ms", .{backoff_ms});
-        zio.sleep(zio.Duration.fromMilliseconds(backoff_ms)) catch return error.Cancelled;
+        fiber.sleep(backoff_ms);
         backoff_ms = @min(backoff_ms * 2, 5_000);
     }
     return error.JoinFailed;

@@ -104,7 +104,7 @@ pub const FileIds = struct {
         const ctx = self.persist_ctx.?;
         const v = self.next.fetchAdd(1, .monotonic);
         while (v >= self.lease_high.load(.acquire)) {
-            try self.mu.lock(@src());
+            self.mu.lock(@src());
             defer self.mu.unlock();
             // Re-check under lock — another allocator may have extended.
             if (v < self.lease_high.load(.acquire)) break;
