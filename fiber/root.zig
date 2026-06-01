@@ -65,11 +65,21 @@ pub const Group = group_mod.Group;
 const watermark_mod = @import("watermark.zig");
 pub const Watermark = watermark_mod.Watermark;
 
-// From io.zig — I/O operations that cooperatively park.
+// From io.zig — timer-based sleep that cooperatively parks.
 const io = @import("io.zig");
 
 pub const sleep = io.sleep;
-pub const Stream = io.Stream;
-pub const Listener = io.Listener;
-pub const listen = io.listen;
-pub const connect = io.connect;
+
+// From fs.zig — file I/O that cooperatively parks (zio.File/Dir-compatible).
+pub const fs = @import("fs.zig");
+pub const File = fs.File;
+pub const Dir = fs.Dir;
+
+// From fsops.zig — blocking-op offload pool (fsync + fs metadata) that parks
+// the calling fiber and wakes it when a pool thread finishes the syscall.
+pub const fsops = @import("fsops.zig");
+
+// From net.zig — TCP networking with zio.net-compatible Stream/Server/
+// IpAddress and the std.Io.Reader/Writer socket adapters.
+pub const net = @import("net.zig");
+

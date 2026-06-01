@@ -23,6 +23,7 @@ const coarse = @import("coarse_clock.zig");
 const deadlines = @import("deadlines.zig");
 const spinlock = @import("spinlock.zig");
 const queue = @import("queue.zig");
+const fsops = @import("fsops.zig");
 
 /// Q32.32 fixed point: `ns_per_cycle * 2^32`. Set exactly once by
 /// `calibrateTsc` via CAS; zero means "not yet calibrated." This is
@@ -436,6 +437,11 @@ pub const InitOptions = struct {
     /// (which owns lead worker 0) is never empty. 0 (default) leaves the
     /// raft lane empty — `.raft` spawns then fall back to `.default`.
     raft_workers: usize = 0,
+
+    /// Threads in the blocking-I/O offload pool (`fsops`) used for fsync and
+    /// filesystem metadata syscalls. These run blocking ops off the fiber
+    /// workers so fibers keep executing. Clamped to a minimum of 1.
+    io_threads: usize = 4,
 };
 
 pub const Runtime = struct {
@@ -517,12 +523,20 @@ pub const Runtime = struct {
         self.clock = try CoarseClock.init();
         self.clock.bind(&self.workers[0].loop);
 
+        // Blocking-I/O offload pool (fsync + fs metadata). Started before we
+        // publish the singleton; no jobs arrive until fibers run.
+        try fsops.start(allocator, opts.io_threads);
+        errdefer fsops.stop();
+
         // Publish as the process singleton. There is exactly one runtime
         // alive at a time; `spawn` resolves it through `runtime()`.
         g_rt = self;
     }
 
     pub fn deinit(self: *Runtime) void {
+        // Stop the offload pool first: join every pool thread so none is
+        // mid-`wake()` into the runtime state we're about to free.
+        fsops.stop();
         for (self.fibers.items) |f| {
             f.deinit(self.allocator);
         }
