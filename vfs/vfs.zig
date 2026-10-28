@@ -64,12 +64,10 @@ pub const Mode = enum {
     memory, // read entire file into owned buffer
 };
 
-/// Who waits for whom at the limiter. P0 never waits: its subtract
-/// saturates. P1 sees the full bucket; P2 sees what P1's demand
-/// leaves, so an L0 backlog is cleared before deeper merges run.
-/// The I/O class of a read or write: the current fiber's context
-/// carries it (`fiber.ctx().prio`), so nothing passes it down.
-pub const Priority = fiber.IoPriority;
+/// The class of a read or write: which of the tenant's two buckets
+/// pays, foreground's filled first. The current fiber's context
+/// carries it (`fiber.ctx().class`), so nothing passes it down.
+pub const IoClass = fiber.IoClass;
 
 pub const IOKind = enum(u1) {
     read,
@@ -111,7 +109,6 @@ pub const FileHandle = struct {
         offset: u64,
         len: usize,
     ) !ReadResult {
-        const priority = fiber.ctx().prio;
         // In-memory: slice from owned buffer (no allocation, no bandwidth).
         if (self.owned_buf) |buf| {
             return .{
@@ -132,19 +129,12 @@ pub const FileHandle = struct {
         if (self.mapped) |mapped| {
             // MMAP: slice from mapped memory. Fault in pages under bandwidth
             // control so mmap I/O respects the same rate limits as pread.
-            var s = self.bw.spinner(priority, aligned_size, .read);
-            defer s.deinit();
+            self.bw.grant(aligned_size, .read);
+            // Touch one byte per page to trigger page faults.
             var sink: u8 = 0;
-            var total_touched: usize = 0;
-            while (true) {
-                const read_len = s.acquireBytes();
-                if (read_len == 0) break;
-                // Touch one byte per page to trigger page faults.
-                var pos: usize = total_touched;
-                while (pos < total_touched + read_len) : (pos += page_size) {
-                    sink ^= mapped[aligned_offset + pos];
-                }
-                total_touched += read_len;
+            var pos: usize = 0;
+            while (pos < aligned_size) : (pos += page_size) {
+                sink ^= mapped[aligned_offset + pos];
             }
             std.mem.doNotOptimizeAway(sink);
             return .{
@@ -160,15 +150,15 @@ pub const FileHandle = struct {
         errdefer allocator.free(buf);
 
         const f = self.file.?;
-        var s = self.bw.spinner(priority, aligned_size, .read);
-        defer s.deinit();
+        self.bw.grant(aligned_size, .read);
         var total_read: usize = 0;
-        while (true) {
-            const read_len = s.acquireBytes();
-            if (read_len == 0) break;
-            const n = try f.read(buf[total_read .. total_read + read_len], aligned_offset + total_read);
-            if (n == 0) break; // EOF
+        while (total_read < aligned_size) {
+            const rest = buf[total_read..];
+            const n = try f.read(rest, aligned_offset + total_read);
             total_read += n;
+            // A short read is the end of the file: one more at that
+            // offset is an EOF error, not zero bytes.
+            if (n < rest.len) break;
         }
 
         // It's possible that buf was set up for a bigger read, but the file ended before that.
@@ -222,25 +212,16 @@ pub const FileHandle = struct {
             std.debug.assert(offset % page_size == 0);
         }
 
-        var s = self.bw.spinner(fiber.ctx().prio, data.len, .write);
-        defer s.deinit();
+        self.bw.grant(data.len, .write);
         var written: usize = 0;
-        while (true) {
-            const chunk_len = s.acquireBytes();
-            if (chunk_len == 0) break;
-            var chunk_written: usize = 0;
-            while (chunk_written < chunk_len) {
-                const n = try f.write(data[written + chunk_written .. written + chunk_len], offset + written + chunk_written);
-                if (n == 0) return error.WriteFailed;
-                chunk_written += n;
-            }
-            written += chunk_len;
+        while (written < data.len) {
+            const n = try f.write(data[written..], offset + written);
+            if (n == 0) return error.WriteFailed;
+            written += n;
         }
-        // Defensive: the spinner accounts what we ASKED to grant, so a
-        // return of 0 means "fully granted". If for any reason `written`
-        // doesn't match `data.len` the caller has been silently lied to —
-        // surface as `error.ShortWrite` so the file isn't installed in the
-        // manifest as if it were complete.
+        // Every chunk was written in full above; a mismatch here would
+        // be a bug, surfaced as `error.ShortWrite` so the file is not
+        // installed in the manifest as if it were complete.
         if (written != data.len) return error.ShortWrite;
     }
 
@@ -276,9 +257,7 @@ var g_initialized = false;
 
 /// Returns the global VFS instance. Lazily initialized with a generous-but-
 /// finite default (1 TiB/s) — high enough to be effectively unthrottled
-/// for any realistic disk workload, low enough that `tryRefill`'s
-/// `elapsed_ms * pages_per_sec` arithmetic stays well within u64 even with
-/// the per-call elapsed clamp. Call `VFS.initGlobal()` to override.
+/// for any realistic disk workload. Call `VFS.initGlobal()` to override.
 pub fn g() *VFS {
     if (!g_initialized) {
         g_limiter = bandwidth.Limiter.init(.{ .bytes_per_sec = 1024 * 1024 * 1024 * 1024 });
@@ -343,11 +322,7 @@ pub const VFS = struct {
         {
             var total: usize = 0;
             for (requests) |r| total += r.len;
-            var s = bw.spinner(fiber.ctx().prio, total, .read);
-            defer s.deinit();
-            while (true) {
-                if (s.acquireBytes() == 0) break;
-            }
+            bw.grant(total, .read);
         }
 
         // One BatchOp + page-aligned buffer per request, heap-allocated from

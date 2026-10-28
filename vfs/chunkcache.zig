@@ -796,7 +796,7 @@ const Open = struct {
     /// Writes dirty record pages until closed, then once more.
     fn flushLoop(self: *Open) void {
         // Record writes are housekeeping, behind every reader.
-        fiber.ctx().prio = .p2;
+        fiber.ctx().class = .bg;
         const pg = self.a.alignedAlloc(
             u8,
             _vfs.page_alignment,

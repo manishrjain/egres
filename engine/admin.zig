@@ -117,7 +117,8 @@ pub const help_text =
     \\  locks                           dump every tracked mutex: holder src,
     \\                                  waiter count, last-waiter src
     \\  workers                         per-worker CPU histogram + imbalance
-    \\                                  ratio (work distribution across workers)
+    \\                                  ratio (work distribution across workers),
+    \\                                  and the coarse clock's gap histogram
     \\  profile cpu <secs> [hz] [top [N] | folded [lines]]
     \\                                  sample every worker's CPU for <secs>
     \\                                  (default 200 Hz); reply with pprof's
@@ -1184,11 +1185,8 @@ pub const AdminServer = struct {
         _ = self;
         // One section per device limiter, then the global VFS's (files
         // on no calibrated device), counted in pages (multiply by VFS page
-        // size for bytes). P0 always wins (saturating subtract — never
-        // blocks); P1 sees the full bucket; P2 sees `bucket -
-        // demand_p1`. If `available_p2` is 0 while compaction work is
-        // pending, P1 demand is starving P2 on that device — a likely
-        // culprit for L≥1 compaction wedges.
+        // size for bytes); then what every grant paid, process wide by
+        // class, which is the meter's and not any one device's.
         var buf: [4096]u8 = undefined;
         var sw = stream.writer(&buf);
         const w = &sw.interface;
@@ -1196,11 +1194,24 @@ pub const AdminServer = struct {
             try writeLimiter(w, d.path, d.vfs.bw);
         }
         try writeLimiter(w, "global", vfs.g().bw);
-        try w.print("  note: p0 is unbounded (saturating subtract)\n", .{});
+        try w.print("vfs grants (all devices):\n", .{});
+        for (&fiber.meter.stats[@intFromEnum(fiber.Kind.io)], 0..) |*wt, i| {
+            const grants = wt.grants.load(.monotonic);
+            const wait_ms = wt.wait_ms.load(.monotonic);
+            try w.print("  {s}: grants={d} wait_ms={d} mean_wait_us={d}\n", .{
+                class_names[i],
+                grants,
+                wait_ms,
+                wait_ms * 1000 / @max(grants, 1),
+            });
+        }
         // Clients read to the blank line.
         try w.writeByte('\n');
         try w.flush();
     }
+
+    /// `meter.stats` is indexed by `fiber.IoClass`.
+    const class_names = [_]String{ "fg", "bg" };
 
     fn writeLimiter(
         w: *std.Io.Writer,
@@ -1210,58 +1221,28 @@ pub const AdminServer = struct {
         const s = bw.status();
         try w.print("vfs bandwidth {s} (pages):\n", .{name});
         try w.print("  rate:          {d} pages/s\n", .{s.pages_per_sec});
-        try w.print("  bucket:        {d}\n", .{s.bucket});
-        try w.print("  demand_p1:     {d}\n", .{s.demand_p1});
-        try w.print("  available_p1:  {d}\n", .{s.available_p1});
-        try w.print("  available_p2:  {d}   (bucket - demand_p1)\n", .{
-            s.available_p2,
-        });
+        try w.print("  metered:       {}\n", .{s.metered});
         try w.print("  total_read:    {d}\n", .{s.total_read_pages});
         try w.print("  total_write:   {d}\n", .{s.total_write_pages});
-        // What each priority paid for the budget (`Limiter.stats`).
-        for (&bw.stats, 0..) |*wt, i| {
-            const grants = wt.grants.load(.monotonic);
-            const wait_us = wt.wait_us.load(.monotonic);
-            try w.print("  p{d}: grants={d} wait_us={d} timeouts={d}" ++
-                " mean_wait_us={d}\n", .{
-                i,                         grants,
-                wait_us,                   wt.timeouts.load(.monotonic),
-                wait_us / @max(grants, 1),
-            });
-        }
     }
 
-    /// The limiters' wait counters in Prometheus text, beside the zdb
+    /// The meter's io wait counters in Prometheus text, beside the zdb
     /// and raft registries, so the dashboard reads them the same way;
-    /// one series per device and priority.
+    /// one series per class, over every device.
     fn writeLimiterMetrics(w: *std.Io.Writer) !void {
         const names = [_]String{
             "vfs_bandwidth_grants_total",
             "vfs_bandwidth_wait_us_total",
-            "vfs_bandwidth_timeouts_total",
         };
         for (names) |n| try w.print("# TYPE {s} counter\n", .{n});
-        for (vfs.calibrate.devices()) |d| {
-            try writeLimiterSeries(w, &names, d.path, d.vfs.bw);
-        }
-        try writeLimiterSeries(w, &names, "global", vfs.g().bw);
-    }
-
-    fn writeLimiterSeries(
-        w: *std.Io.Writer,
-        names: []const String,
-        device: String,
-        bw: *const vfs.bandwidth.Limiter,
-    ) !void {
-        for (&bw.stats, 0..) |*wt, i| {
+        for (&fiber.meter.stats[@intFromEnum(fiber.Kind.io)], 0..) |*wt, i| {
             const vals = [_]u64{
                 wt.grants.load(.monotonic),
-                wt.wait_us.load(.monotonic),
-                wt.timeouts.load(.monotonic),
+                wt.wait_ms.load(.monotonic) * 1000,
             };
             for (names, vals) |n, val| {
-                try w.print("{s}{{device=\"{s}\",priority=\"p{d}\"}} {d}\n", .{
-                    n, device, i, val,
+                try w.print("{s}{{class=\"{s}\"}} {d}\n", .{
+                    n, class_names[i], val,
                 });
             }
         }
@@ -1530,6 +1511,9 @@ pub const AdminServer = struct {
                 try m.write(raft.metrics.g(), &body.writer);
                 try writeLimiterMetrics(&body.writer);
                 try self.writeChunkCacheMetrics(&body.writer);
+                // Driven from the workers' loop tops: a gap is how long
+                // all of them were away from it.
+                try utils.coarse_clock.writeGapMetrics(&body.writer);
             },
             .forest => {
                 try self.engine.forest.writeStats(&body.writer, .{ .scope = .forest });

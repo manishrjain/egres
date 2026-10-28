@@ -1,0 +1,307 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
+const std = @import("std");
+const fiber = @import("zfiber");
+const utils = @import("utils");
+const meter = fiber.meter;
+const Bucket = fiber.Bucket;
+const Resource = fiber.Resource;
+const Tenant = fiber.Tenant;
+const Tenants = fiber.Tenants;
+const Limit = Tenant.Limit;
+
+const expectEqual = std.testing.expectEqual;
+const expect = std.testing.expect;
+
+test "bucket: take goes as far below zero as the cost says" {
+    var b: Bucket = .{ .tokens = .init(100) };
+    b.take(30);
+    try expectEqual(70, b.balance());
+    b.take(1000);
+    try expectEqual(-930, b.balance());
+}
+
+test "bucket: fill pays the debt, stops at the cap, says what went in" {
+    var b: Bucket = .{ .tokens = .init(-50) };
+    try expectEqual(60, b.fill(60, 100));
+    try expectEqual(10, b.balance());
+    try expectEqual(90, b.fill(500, 100));
+    try expectEqual(100, b.balance());
+    try expectEqual(0, b.fill(500, 100));
+}
+
+test "resource: starts full, refills at the rate, caps at the burst" {
+    // 1000 units/s, 100 saved up: a tick's worth, in every bucket.
+    var r = Resource.init(1000, 100, 0);
+    try expectEqual(100, r.balance(.fg, 0));
+    try expectEqual(100, r.balance(.bg, 0));
+    r.take(.fg, 100, 0);
+    try expectEqual(0, r.balance(.fg, 0));
+
+    // 50 ms earns 50; a further 500 ms earns the cap, not 500.
+    try expectEqual(50, r.balance(.fg, 50));
+    try expectEqual(100, r.balance(.fg, 550));
+}
+
+test "resource: a window too short for one unit waits for the next" {
+    // 100 units/s: 1 ms earns 0.1, so nothing moves until 10 ms.
+    var r = Resource.init(100, 10, 0);
+    r.take(.fg, 10, 0);
+    try expectEqual(0, r.balance(.fg, 1));
+    try expectEqual(0, r.balance(.fg, 9));
+    try expectEqual(1, r.balance(.fg, 10));
+}
+
+test "resource: fg is filled first, debt and room, bg gets the rest" {
+    var r = Resource.init(1000, 100, 0);
+    r.take(.fg, 300, 0); // 200 in debt
+    r.take(.bg, 100, 0); // empty
+    // 100 ms earns 100: all of it to fg's debt.
+    try expectEqual(0, r.balance(.bg, 100));
+    try expectEqual(-100, r.balance(.fg, 100));
+    // 150 more: fg's debt, then fg's room; bg still waits.
+    try expectEqual(0, r.balance(.bg, 250));
+    try expectEqual(50, r.balance(.fg, 250));
+    try expectEqual(0, r.balance(.bg, 300));
+    try expectEqual(100, r.balance(.fg, 300));
+    // fg full: the next 100 are bg's.
+    try expectEqual(100, r.balance(.bg, 400));
+    try expectEqual(100, r.balance(.fg, 400));
+}
+
+test "resource: waitMs is the time the rate needs to pay the debt" {
+    var r = Resource.init(1000, 100, 0);
+    try expectEqual(0, r.waitMs(.fg));
+    r.take(.fg, 100, 0);
+    try expectEqual(0, r.waitMs(.fg));
+    r.take(.fg, 1, 0);
+    try expectEqual(1, r.waitMs(.fg));
+    r.take(.fg, 499, 0);
+    try expectEqual(500, r.waitMs(.fg));
+    r.setRate(1, 100);
+    try expectEqual(Resource.max_wait_ms, r.waitMs(.fg));
+    r.setRate(0, 0);
+    try expectEqual(Resource.idle_wait_ms, r.waitMs(.fg));
+}
+
+test "resource: a zero rate never refills" {
+    var r = Resource.init(0, 0, 0);
+    r.take(.fg, 10, 0);
+    try expectEqual(-10, r.balance(.fg, 10_000));
+    // A rate set later earns from the last refill, up to the burst.
+    r.setRate(1000, 100);
+    try expectEqual(100, r.balance(.fg, 10_100));
+}
+
+/// Millicores per core, the unit a plan is sold in.
+const vcpu: i64 = 1000;
+const gib: i64 = 1 << 30;
+
+/// This machine's ticks per second, one core's worth, as the runtime
+/// calibrated it.
+fn hz() i64 {
+    return @intCast(fiber.ticksPerSecond());
+}
+
+/// A 32-worker box, a device at 1M pages/s, 64 GiB for statements.
+const box: Limit = .{
+    .cpu_milli = 32 * vcpu,
+    .io_pages_per_s = 1_000_000,
+    .mem_bytes = 64 * gib,
+};
+
+fn plan(vcpus: i64) Limit {
+    return .{
+        .cpu_milli = vcpus * vcpu,
+        .io_pages_per_s = vcpus * 10_000,
+        .mem_bytes = vcpus * gib,
+    };
+}
+
+/// The tick takes the system tenant's spend since the last tick off
+/// the box, and every test in the binary charges the system's io
+/// through the limiter. A first tick this far from zero spreads the
+/// lifetime total over so long that nothing comes off; a later tick
+/// in a test checks cpu and memory, which only these tests touch, and
+/// bounds io from above.
+const t0: i64 = 1 << 40;
+
+test "tenants: one tenant alone gets the box" {
+    meter.capacity = box;
+    var ts = Tenants.init(std.testing.allocator, plan(1));
+    defer ts.deinit();
+
+    try expect(hz() > 0);
+    const a = try ts.get(1, t0);
+    try expectEqual(1, ts.count());
+    try expectEqual(hz(), a.cpu.rate.load(.monotonic));
+
+    ts.tick(t0);
+    try expectEqual(32 * hz(), a.cpu.rate.load(.monotonic));
+    try expectEqual(1_000_000, a.io.rate.load(.monotonic));
+    try expectEqual(64 * gib, a.mem_share.load(.monotonic));
+}
+
+test "tenants: the split is by limit, idle tenants are not in it" {
+    meter.capacity = box;
+    var ts = Tenants.init(std.testing.allocator, plan(1));
+    defer ts.deinit();
+
+    const large = try ts.get(1, t0);
+    const small = try ts.get(2, t0);
+    const idle = try ts.get(3, t0);
+    try ts.setLimit(1, plan(4), t0);
+    try expectEqual(large, try ts.get(1, t0));
+
+    // All three active: 4 + 1 + 1 = 6.
+    const cpu = 32 * hz();
+    ts.tick(t0);
+    try expectEqual(@divTrunc(cpu * 4, 6), large.cpu.rate.load(.monotonic));
+    try expectEqual(@divTrunc(cpu, 6), small.cpu.rate.load(.monotonic));
+    try expectEqual(@divTrunc(cpu, 6), idle.cpu.rate.load(.monotonic));
+
+    // The third goes idle: 4 + 1 = 5, and its own rate is left as is.
+    const later = t0 + Tenant.active_window_ms + 1;
+    large.charge(.cpu, .fg, 1, later);
+    small.touch(later);
+    ts.tick(later);
+    try expectEqual(@divTrunc(cpu * 4, 5), large.cpu.rate.load(.monotonic));
+    try expectEqual(@divTrunc(cpu, 5), small.cpu.rate.load(.monotonic));
+    try expectEqual(@divTrunc(cpu, 6), idle.cpu.rate.load(.monotonic));
+    try expect(large.io.rate.load(.monotonic) <= 800_000);
+    const mem = large.mem_share.load(.monotonic);
+    try expectEqual(@divTrunc(64 * gib * 4, 5), mem);
+}
+
+test "tenants: a sold-out box gives every tenant its number" {
+    meter.capacity = box;
+    var ts = Tenants.init(std.testing.allocator, plan(1));
+    defer ts.deinit();
+
+    // 4 large and 16 small: 16 + 16 = 32 vCPUs.
+    var id: u64 = 1;
+    while (id <= 4) : (id += 1) try ts.setLimit(id, plan(4), t0);
+    while (id <= 20) : (id += 1) _ = try ts.get(id, t0);
+    ts.tick(t0);
+    const large = try ts.get(1, t0);
+    const small = try ts.get(20, t0);
+    try expectEqual(4 * hz(), large.cpu.rate.load(.monotonic));
+    try expectEqual(hz(), small.cpu.rate.load(.monotonic));
+
+    // Oversold twice over: everyone is scaled down in proportion.
+    while (id <= 40) : (id += 1) _ = try ts.get(id, t0);
+    id = 21;
+    while (id <= 24) : (id += 1) try ts.setLimit(id, plan(4), t0);
+    ts.tick(t0);
+    try expectEqual(2 * hz(), large.cpu.rate.load(.monotonic));
+    try expectEqual(@divTrunc(hz(), 2), small.cpu.rate.load(.monotonic));
+}
+
+test "tenants: what the system spent comes off the box first" {
+    meter.capacity = box;
+    var ts = Tenants.init(std.testing.allocator, plan(1));
+    defer ts.deinit();
+    const a = try ts.get(1, t0);
+    ts.tick(t0);
+    try expectEqual(1_000_000, a.io.rate.load(.monotonic));
+
+    // Half the device over the next second, as the system: the
+    // tenant gets the other half, less whatever another test charged
+    // the system meanwhile, and the system never waited.
+    meter.system.charge(.io, .fg, 500_000, t0 + 500);
+    a.touch(t0 + 500);
+    ts.tick(t0 + 1000);
+    const io = a.io.rate.load(.monotonic);
+    try expect(io <= 500_000 and io >= 400_000);
+    try expectEqual(32 * hz(), a.cpu.rate.load(.monotonic));
+
+    // All of it and more: nothing left until the next tick.
+    meter.system.charge(.io, .fg, 5_000_000, t0 + 1500);
+    a.touch(t0 + 1500);
+    ts.tick(t0 + 2000);
+    try expectEqual(0, a.io.rate.load(.monotonic));
+    try expectEqual(32 * hz(), a.cpu.rate.load(.monotonic));
+}
+
+test "tenant: a charge moves the bucket, the totals and the stamp" {
+    var t = Tenant.init(7, plan(2), 0);
+    try expectEqual(2 * hz(), t.cpu.rate.load(.monotonic));
+    const burst = meter.burstFor(2 * hz());
+    try expectEqual(burst, t.cpu.bucket(.fg).balance());
+
+    // No floor: three bursts charged leave two owed.
+    t.charge(.cpu, .fg, burst * 3, 5);
+    try expectEqual(-2 * burst, t.cpu.bucket(.fg).balance());
+    try expectEqual(burst * 3, t.totals.cpu_ticks.load(.monotonic));
+    try expectEqual(5, t.last_active_ms.load(.monotonic));
+    try expect(t.isActive(5 + Tenant.active_window_ms - 1));
+    try expect(!t.isActive(5 + Tenant.active_window_ms));
+
+    t.charge(.io, .bg, 40, 6);
+    try expectEqual(40, t.totals.io_pages.load(.monotonic));
+    try expectEqual(meter.burstFor(20_000) - 40, t.io.bucket(.bg).balance());
+
+    t.holdMem(300);
+    t.holdMem(200);
+    t.releaseMem(400);
+    try expectEqual(100, t.mem_held.load(.monotonic));
+    try expectEqual(500, t.totals.mem_peak.load(.monotonic));
+    try expect(t.overMem());
+    t.mem_share.store(100, .monotonic);
+    try expect(!t.overMem());
+
+    t.touch(9);
+    t.failed();
+    try expectEqual(9, t.last_active_ms.load(.monotonic));
+    try expectEqual(1, t.totals.statements.load(.monotonic));
+    try expectEqual(1, t.totals.failed.load(.monotonic));
+}
+
+/// A tenant at 10_000 pages/s on the real coarse clock, since
+/// `acquire` reads it: a burst of 1000 pages, 100 ms of rate.
+fn ioTenant(id: u64) Tenant {
+    return Tenant.init(id, .{
+        .cpu_milli = vcpu,
+        .io_pages_per_s = 10_000,
+        .mem_bytes = gib,
+    }, utils.coarseMs());
+}
+
+test "acquire: fg is granted at once and pays its debt before the next" {
+    var t = ioTenant(8);
+    const grants = meter.statsFor(.io, .fg).grants.load(.monotonic);
+
+    // 3000 pages at once: 2000 owed, 200 ms at the rate.
+    const start = utils.coarseMs();
+    t.acquire(.io, .fg, 3000);
+    try expect(utils.coarseMs() - start < 50);
+    try expect(t.io.bucket(.fg).balance() <= -1900);
+
+    // The next waits the debt out. A lagging clock under load may
+    // sleep a little more, never less.
+    t.acquire(.io, .fg, 1);
+    const waited = utils.coarseMs() - start;
+    try expect(waited >= 150 and waited <= 1500);
+    try expect(t.totals.parked_ms.load(.monotonic) >= 150);
+    try expectEqual(3001, t.totals.io_pages.load(.monotonic));
+    try expect(meter.statsFor(.io, .fg).grants.load(.monotonic) >= grants + 2);
+}
+
+test "acquire: bg in debt waits until fg is full and its own debt paid" {
+    var t = ioTenant(9);
+
+    // bg has its burst from the start and takes one more: in debt by
+    // one. fg goes 2000 into debt.
+    t.acquire(.io, .bg, 1001);
+    try expect(t.io.bucket(.bg).balance() <= -1);
+    t.acquire(.io, .fg, 3000);
+
+    // fg's 2000 debt and 1000 room fill first, then bg's one: about
+    // 300 ms.
+    const start = utils.coarseMs();
+    t.acquire(.io, .bg, 1);
+    const waited = utils.coarseMs() - start;
+    try expect(waited >= 250 and waited <= 2000);
+    try expect(t.io.bucket(.fg).balance() >= 0);
+}

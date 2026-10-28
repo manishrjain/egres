@@ -751,7 +751,7 @@ pub const NextLog = struct {
     ) anyerror!LogFile {
         std.debug.assert(self.opts.prezero == .true);
         // The fill runs at the lowest I/O class, behind every commit.
-        fiber.ctx().prio = .p2;
+        fiber.ctx().class = .bg;
         if (is_spare) {
             if (self.reuse(fid)) |lf| {
                 return lf;

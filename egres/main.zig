@@ -517,6 +517,12 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
             io_cfg,
             std.fs.path.dirname(cache_cfg.disk_path) orelse ".",
         );
+    // The meter is for the store: the tenants split the device their
+    // data is on, the store's or the chunk cache's under s3, and only
+    // that device charges them. A WAL disk of its own is not metered.
+    const tenant_vfs = data_vfs orelse cache_vfs orelse wal_vfs;
+    tenant_vfs.bw.metered = true;
+    fiber.meter.capacity.io_pages_per_s = tenant_vfs.bw.pages_per_sec;
 
     log.info(
         "starting egres id={d} cluster={d} raft={s} admin={s} sql={s} " ++

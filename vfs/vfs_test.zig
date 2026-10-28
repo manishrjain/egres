@@ -221,10 +221,7 @@ test "bandwidth limiter deducts on read" {
     try writeTempFile(path, &data);
     defer deleteFileAbs(path) catch {};
 
-    // High rate so P0 grants everything, but we can observe token deduction.
     var limiter = bandwidth.Limiter.init(.{ .bytes_per_sec = 1_000_000 });
-    const pages_before = limiter.pages.load(.monotonic);
-
     var v = VFS.new(&limiter);
     const handle = try v.openFile(testing.allocator, path, .{ .mode = .direct });
     defer handle.close();
@@ -232,9 +229,8 @@ test "bandwidth limiter deducts on read" {
     const r = try handle.readAligned(testing.allocator, 0, 100);
     defer r.free();
 
-    const pages_after = limiter.pages.load(.monotonic);
-    // P0 read of 100 bytes (1 page) should deduct at least 1 page.
-    try testing.expect(pages_before - pages_after >= 1);
+    // A read of 100 bytes is one page on the device's count.
+    try testing.expectEqual(1, limiter.total_read_pages.load(.monotonic));
 }
 
 // ── 7. mmap open/close ──────────────────────────────────────────────
@@ -306,8 +302,6 @@ test "mmap enforces bandwidth limiter" {
     defer deleteFileAbs(path) catch {};
 
     var limiter = bandwidth.Limiter.init(.{ .bytes_per_sec = 1_000_000 });
-    const pages_before = limiter.pages.load(.monotonic);
-
     var v = VFS.new(&limiter);
     const handle = try v.openFile(testing.allocator, path, .{ .mode = .mmap });
     defer handle.close();
@@ -315,9 +309,19 @@ test "mmap enforces bandwidth limiter" {
     const r = try handle.readAligned(testing.allocator, 0, 100);
     defer r.free();
 
-    // mmap reads now go through the limiter — tokens consumed.
-    const pages_after = limiter.pages.load(.monotonic);
-    try testing.expect(pages_after < pages_before);
+    // mmap reads go through the limiter too.
+    try testing.expectEqual(1, limiter.total_read_pages.load(.monotonic));
+}
+
+/// A tenant at `pages_per_s` on this test fiber's context, so the
+/// metered limiter below charges it rather than the system, which
+/// never waits. The caller resets the context.
+fn tenantAt(id: u64, pages_per_s: i64) fiber.Tenant {
+    return fiber.Tenant.init(id, .{
+        .cpu_milli = 1000,
+        .io_pages_per_s = pages_per_s,
+        .mem_bytes = 1,
+    }, utils.coarseMs());
 }
 
 // ── 11. Read bandwidth enforcement ──────────────────────────────────
@@ -331,42 +335,33 @@ test "read bandwidth enforcement" {
     try writeTempFile(path, data);
     defer deleteFileAbs(path) catch {};
 
-    // Rate must be >= 1024*page_size so per-ms refill >= page_size
-    // (avoids alignToPage inflation). At 4 MB/s, reading 4 MB takes ~1s.
-    const rate = 1024 * page_size; // 4 MB/s
+    // The file is one second of the tenant's rate: the first read is
+    // granted at once and owed, the second waits the debt out.
+    var t = tenantAt(21, 1024);
+    const ctx = fiber.ctx();
+    ctx.tenant = &t;
+    defer ctx.tenant = &fiber.meter.system;
+    ctx.class = .bg;
+    defer ctx.class = .fg;
     var limiter = bandwidth.Limiter.init(.{
-        .bytes_per_sec = rate,
-        .timeout_ms = 5000,
-        .min_alloc_bytes = page_size,
+        .bytes_per_sec = 1024 * page_size,
     });
+    limiter.metered = true;
 
     var v = VFS.new(&limiter);
     const handle = try v.openFile(testing.allocator, path, .{ .mode = .direct });
     defer handle.close();
 
-    // Drain the initial bucket with a P0 read.
-    _ = blk: {
-        var s = limiter.spinner(.p0, rate, .read);
-        defer s.deinit();
-        while (true) {
-            if (s.acquireBytes() == 0) break;
-        }
-        break :blk;
-    };
-    try testing.expectEqual(@as(u64, 0), limiter.pages.load(.monotonic));
+    const first = try handle.readAligned(testing.allocator, 0, file_size);
+    defer first.free();
+    try testing.expectEqual(file_size, first.data.len);
 
-    // Time a P1 read of the full file — must wait for refill. The
-    // class comes from the fiber's context; P0 would be granted at once.
-    const ctx = fiber.ctx();
-    ctx.prio = .p1;
-    defer ctx.prio = .p0;
     const start = nowMs();
-    const r = try handle.readAligned(testing.allocator, 0, file_size);
-    defer r.free();
+    const second = try handle.readAligned(testing.allocator, 0, file_size);
+    defer second.free();
     const elapsed_ms = nowMs() - start;
-
-    try testing.expectEqual(file_size, r.data.len);
-    // At 4 MB/s, 4 MB should take ~1000ms. Allow wide range for CI variance.
+    try testing.expectEqual(file_size, second.data.len);
+    // About 900 ms of debt at the rate. Wide bounds for a loaded box.
     try testing.expect(elapsed_ms >= 500);
     try testing.expect(elapsed_ms <= 10000);
 }
@@ -384,16 +379,20 @@ test "write bandwidth enforcement" {
     try writeTempFile(path, data);
     defer deleteFileAbs(path) catch {};
 
-    // Rate must be >= 8192*page_size so (per-ms refill)/write_cost >= page_size.
-    // At 32 MB/s with write_cost=8, effective write rate ~4 MB/s.
-    // Writing 2 MB should take ~500ms.
-    const rate = 8192 * page_size; // 32 MB/s
+    // 8192 pages/s at a write cost of 8: the 512-page write costs
+    // 4096, half a second of the tenant's rate. The first is granted
+    // at once and owed, the second waits the debt out.
+    var t = tenantAt(22, 8192);
+    const ctx = fiber.ctx();
+    ctx.tenant = &t;
+    defer ctx.tenant = &fiber.meter.system;
+    ctx.class = .bg;
+    defer ctx.class = .fg;
     var limiter = bandwidth.Limiter.init(.{
-        .bytes_per_sec = rate,
+        .bytes_per_sec = 8192 * page_size,
         .write_cost = 8,
-        .timeout_ms = 5000,
-        .min_alloc_bytes = page_size,
     });
+    limiter.metered = true;
 
     // Open for writing (need a real fd, not O_DIRECT for writes on tmpfs).
     const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY }, 0);
@@ -407,111 +406,14 @@ test "write bandwidth enforcement" {
         .bw = &limiter,
     };
 
-    // Drain the bucket.
-    _ = blk: {
-        var s = limiter.spinner(.p0, rate, .read);
-        defer s.deinit();
-        while (true) {
-            if (s.acquireBytes() == 0) break;
-        }
-        break :blk;
-    };
-
-    // A P1 write, through the fiber's context: P0 is never throttled.
-    const ctx = fiber.ctx();
-    ctx.prio = .p1;
-    defer ctx.prio = .p0;
+    try fh.write(data, 0);
     const start = nowMs();
     try fh.write(data, 0);
     const elapsed_ms = nowMs() - start;
 
-    // Effective write rate ~4 MB/s. 2 MB should take ~500ms. Allow wide range.
+    // About 400 ms of debt at the rate. Wide bounds for a loaded box.
     try testing.expect(elapsed_ms >= 250);
     try testing.expect(elapsed_ms <= 5000);
-}
-
-// ── 13. P1 prioritized over P2 ──────────────────────────────────────
-
-const PriorityTestCtx = struct {
-    handle: vfs.FileHandle,
-    bytes_read: std.atomic.Value(u64),
-    finish_order: *std.atomic.Value(u32),
-    my_order: std.atomic.Value(u32),
-
-    fn readerFn(ctx: *PriorityTestCtx, priority: vfs.Priority) void {
-        fiber.ctx().prio = priority;
-        const r = ctx.handle.readAligned(
-            testing.allocator,
-            0,
-            128 * page_size,
-        ) catch return;
-        defer r.free();
-        ctx.bytes_read.store(@intCast(r.data.len), .monotonic);
-        // Record completion order: first finisher gets 0, second gets 1.
-        ctx.my_order.store(ctx.finish_order.fetchAdd(1, .seq_cst), .seq_cst);
-    }
-};
-
-test "P1 prioritized over P2" {
-    const path = "/tmp/vfs_test_bw_priority";
-    const file_size = 128 * page_size; // 512 KB
-    const data = try testing.allocator.alloc(u8, file_size);
-    defer testing.allocator.free(data);
-    @memset(data, 0xEF);
-    try writeTempFile(path, data);
-    defer deleteFileAbs(path) catch {};
-
-    // Rate >= 1024*page_size so per-ms refill >= page_size (no alignment inflation).
-    const rate = 4096 * page_size; // 16 MB/s
-    var limiter = bandwidth.Limiter.init(.{
-        .bytes_per_sec = rate,
-        .timeout_ms = 5000,
-        .min_alloc_bytes = page_size,
-    });
-
-    var v = VFS.new(&limiter);
-    const handle = try v.openFile(testing.allocator, path, .{ .mode = .direct });
-    defer handle.close();
-
-    // Drain the bucket so both threads must wait for refill.
-    _ = blk: {
-        var s = limiter.spinner(.p0, rate, .read);
-        defer s.deinit();
-        while (true) {
-            if (s.acquireBytes() == 0) break;
-        }
-        break :blk;
-    };
-
-    var finish_order = std.atomic.Value(u32).init(0);
-    var p1_ctx = PriorityTestCtx{ .handle = handle, .bytes_read = std.atomic.Value(u64).init(0), .finish_order = &finish_order, .my_order = std.atomic.Value(u32).init(99) };
-    var p2_ctx = PriorityTestCtx{ .handle = handle, .bytes_read = std.atomic.Value(u64).init(0), .finish_order = &finish_order, .my_order = std.atomic.Value(u32).init(99) };
-
-    // Launch P2 first, then P1 — P1 should still finish first.
-    var p2_handle = try fiber.spawn(
-        .{},
-        PriorityTestCtx.readerFn,
-        .{ &p2_ctx, .p2 },
-    );
-    // Small delay so P2 enters the wait loop first.
-    fiber.sleepMs(5);
-    var p1_handle = try fiber.spawn(
-        .{},
-        PriorityTestCtx.readerFn,
-        .{ &p1_ctx, .p1 },
-    );
-
-    p1_handle.join();
-    p2_handle.join();
-
-    // Both should have read the full file.
-    try testing.expectEqual(@as(u64, file_size), p1_ctx.bytes_read.load(.monotonic));
-    try testing.expectEqual(@as(u64, file_size), p2_ctx.bytes_read.load(.monotonic));
-
-    // P1 should have finished before P2.
-    const p1_order = p1_ctx.my_order.load(.seq_cst);
-    const p2_order = p2_ctx.my_order.load(.seq_cst);
-    try testing.expect(p1_order < p2_order);
 }
 
 // ── batchRead tests ─────────────────────────────────────────────────

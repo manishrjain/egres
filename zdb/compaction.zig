@@ -1035,11 +1035,11 @@ fn runPartition_(
 ) !Emitter.Result {
     const dest = job.dest_level;
 
-    // The job's I/O class: an L0 merge ahead of the rest. Its reads
+    // The job's I/O class: background, behind every user. Its reads
     // bypass the caches: each input is read once, and a hit must not
     // count as reuse.
     const ctx = fiber.ctx();
-    ctx.prio = if (job.src_level == 0) .p1 else .p2;
+    ctx.class = .bg;
     ctx.cache = .bypass;
 
     // --- one MergeIterator over the src tables + the partition's

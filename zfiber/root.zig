@@ -51,11 +51,22 @@ pub const dumpFibers = _rt.dumpFibers;
 pub const dumpWorkerCpu = _rt.dumpWorkerCpu;
 pub const profile = @import("profile.zig");
 pub const Ctx = _ctx.Ctx;
-pub const IoPriority = _ctx.IoPriority;
+pub const IoClass = _ctx.IoClass;
 pub const CachePolicy = _ctx.CachePolicy;
 pub const ctx = _ctx.current;
 pub const writeTraces = _ctx.writeTraces;
 pub const tscNsPerCycleQ32 = _rt.tscNsPerCycleQ32;
+pub const ticksPerSecond = _rt.ticksPerSecond;
+
+// Metering: the tenant a statement's cpu, io and memory are charged
+// to, with its resources and the policy (`Tenant.acquire`,
+// `Tenant.charge`) over them.
+pub const meter = @import("meter.zig");
+pub const Bucket = meter.Bucket;
+pub const Resource = meter.Resource;
+pub const Kind = meter.Kind;
+pub const Tenant = meter.Tenant;
+pub const Tenants = meter.Tenants;
 
 // Lower-level data structure used by `Deadlines`.
 pub const heap = @import("heap.zig");

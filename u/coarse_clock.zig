@@ -47,6 +47,7 @@
 //! clock only stops when the whole runtime is idle.
 
 const std = @import("std");
+const m = @import("metrics");
 const context = @import("context.zig");
 
 pub const ClockKind = enum { monotonic, realtime };
@@ -94,8 +95,43 @@ pub fn update() void {
     const now = timestampNow(.realtime, .millis);
     const last = cached_ms.load(.monotonic);
     if (last < now) {
-        _ = cached_ms.cmpxchgWeak(last, now, .acquire, .monotonic);
+        if (cached_ms.cmpxchgWeak(last, now, .acquire, .monotonic) == null and
+            last != 0) recordGap(now - last);
     }
+}
+
+/// How long the clock went undriven: the store that moves it records
+/// the gap it closed, in ms. A gap is at least 1, the normal case,
+/// and the buckets are exclusive upper bounds, so the first holds the
+/// 1 ms gaps. Over a few ms while the runtime is busy means every
+/// worker sat in a long slice; an idle runtime shows up here too, so
+/// it is read against the load at the time. Once per ms at most, so
+/// the cost is nothing.
+const gap_bounds_ms: []const u64 = &.{ 2, 5, 10, 50, 100 };
+pub var gap_hist = m.Histogram(u64, gap_bounds_ms).init(
+    "coarse_clock_gap_ms",
+    .{},
+    .{},
+);
+/// The largest gap seen, which a histogram loses.
+pub var gap_max = m.Gauge(i64).init("coarse_clock_gap_max_ms", .{}, .{});
+/// The gauge only stores; this is what a new gap is compared with. A
+/// statistic: two racing stores may keep the smaller, never a wrong
+/// one.
+var max_gap_ms: std.atomic.Value(i64) = .init(0);
+
+pub fn recordGap(gap_ms: i64) void {
+    gap_hist.observe(@intCast(gap_ms));
+    if (gap_ms > max_gap_ms.load(.monotonic)) {
+        max_gap_ms.store(gap_ms, .monotonic);
+        gap_max.set(gap_ms);
+    }
+}
+
+/// Both series in Prometheus text.
+pub fn writeGapMetrics(w: *std.Io.Writer) !void {
+    try gap_hist.write(w);
+    try gap_max.write(w);
 }
 
 /// Coarse wall-clock milliseconds since the Unix epoch. One atomic

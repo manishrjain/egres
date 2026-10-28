@@ -1329,8 +1329,9 @@ fn spawn_(
     // outlives it and its records go there; a detached fiber has no
     // such bound and records nothing.
     if (currentFiberOrNull()) |parent| {
-        f.ctx.prio = parent.ctx.prio;
+        f.ctx.class = parent.ctx.class;
         f.ctx.cache = parent.ctx.cache;
+        f.ctx.tenant = parent.ctx.tenant;
         if (!detached) {
             f.ctx.parent = parent.ctx.parent orelse
                 if (parent.ctx.arena != null) &parent.ctx else null;
@@ -1735,6 +1736,16 @@ inline fn cyclesToNs(cycles: u64) u64 {
 /// hardware's TSC frequency (`tsc_hz ≈ 2^32 / factor * 1e9`).
 pub fn tscNsPerCycleQ32() u64 {
     return tsc_ns_per_cycle_q32.load(.acquire);
+}
+
+/// The tick counter's rate, ticks per second, from the calibration:
+/// one core's worth of cpu, the unit a tenant's cpu is metered in.
+/// Zero before `Runtime.init` has calibrated.
+pub fn ticksPerSecond() u64 {
+    const factor = tscNsPerCycleQ32();
+    if (factor == 0) return 0;
+    const one: u128 = 1;
+    return @intCast((one << 32) * std.time.ns_per_s / factor);
 }
 
 fn calibrateTsc() void {

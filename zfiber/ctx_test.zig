@@ -69,7 +69,7 @@ fn nestedHelper() void {
 
 fn noteClass(out: *std.atomic.Value(u8)) void {
     fiber.ctx().record("detached", .{});
-    out.store(@intFromEnum(fiber.ctx().prio), .release);
+    out.store(@intFromEnum(fiber.ctx().class), .release);
 }
 
 test "ctx: helpers record into the statement, a detached fiber does not" {
@@ -87,13 +87,13 @@ test "ctx: helpers record into the statement, a detached fiber does not" {
     try std.testing.expectEqual(2, qctx.records.items.len);
 
     // A detached fiber inherits the I/O class but records nowhere.
-    qctx.prio = .p2;
-    defer qctx.prio = .p0;
+    qctx.class = .bg;
+    defer qctx.class = .fg;
     var seen: std.atomic.Value(u8) = .init(255);
     try fiber.spawnDetached(.{}, noteClass, .{&seen});
     while (seen.load(.acquire) == 255) fiber.sleepMs(1);
     try std.testing.expectEqual(
-        @intFromEnum(fiber.IoPriority.p2),
+        @intFromEnum(fiber.IoClass.bg),
         seen.load(.acquire),
     );
     try std.testing.expectEqual(2, qctx.records.items.len);

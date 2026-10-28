@@ -241,9 +241,9 @@ pub fn createIndex(
     // The backfill's reads and table writes queue behind users' I/O.
     // The fiber's own context: helpers copy the class at spawn.
     const ctx = fiber.ctx();
-    const prev_prio = ctx.prio;
-    ctx.prio = .p2;
-    defer ctx.prio = prev_prio;
+    const prev_class = ctx.class;
+    ctx.class = .bg;
+    defer ctx.class = prev_class;
 
     var rows = build.scan() catch |err| return build.fail("backfill", err);
     build.install(&rows) catch |err| return build.fail("install", err);

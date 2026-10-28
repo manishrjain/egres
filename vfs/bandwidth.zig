@@ -1,264 +1,79 @@
 // Copyright 2026 Manish R Jain
 // SPDX-License-Identifier: Apache-2.0
 
+//! A device's bandwidth: who waits is the meter's business, through
+//! `acquire` on the calling fiber's tenant. What is here is the disk
+//! half only: bytes to pages, a write's cost in pages, and the
+//! device's calibrated rate. The meter is for the store: the one
+//! limiter whose device holds the tenants' data is `metered` and its
+//! rate is the io capacity; every other device, a WAL or chunk cache
+//! disk of its own, only counts.
+
 const std = @import("std");
 const fiber = @import("zfiber");
-const utils = @import("utils");
 const _vfs = @import("vfs.zig");
 
 pub const Config = struct {
     bytes_per_sec: u64, // bytes per second
     write_cost: u8 = 4, // write multiplier - each write costs k * read cost.
-    timeout_ms: u64 = 100, // After this timeout, provide min_alloc.
-    min_alloc_bytes: u64 = 8 * _vfs.page_size, // default: write_cost (8) * page_size
-};
-
-/// How long a grant that finds the bucket short sleeps before it looks
-/// again; each such sleep is charged to its priority's `wait_us`.
-const sleep_ms = 2;
-
-/// Atomically subtract `n` from `v`, clamping at zero.
-fn atomicSaturatingSub(v: *std.atomic.Value(u64), n: u64) void {
-    while (true) {
-        const old = v.load(.monotonic);
-        if (v.cmpxchgWeak(old, old -| n, .release, .monotonic) == null) return;
-    }
-}
-
-/// Represents an ongoing I/O operation with bandwidth tracking.
-/// Not thread-safe — must be used from a single thread/coroutine.
-pub const Spinner = struct {
-    limiter: *Limiter,
-    priority: _vfs.Priority,
-    kind: _vfs.IOKind,
-    rem_pages: u64, // pages still needed (rounded up)
-    rem_bytes: u64, // exact bytes still needed
-
-    /// Returns next chunk of granted bytes.
-    /// Blocks until pages are available for this priority.
-    /// Returns 0 ONLY when remaining is fully satisfied — spinner is done.
-    pub fn acquireBytes(self: *Spinner) usize {
-        if (self.rem_bytes == 0) return 0;
-
-        const wm: u64 = if (self.kind == .write) self.limiter.conf.write_cost else 1;
-        // Pass `wm` as `factor` so the limiter only grants a multiple of
-        // it. Two reasons: (a) divide-by-wm below is exact — no fractional
-        // cost-units that get floored to 0 actual pages (the silent
-        // truncation footgun); (b) we don't drain the bucket beyond what
-        // we'll actually use (granting 9 cost-units to write 1 page means
-        // 1 cost-unit was wasted).
-        const granted_pages = self.acquireFromLimiter(self.rem_pages * wm, wm) / wm;
-        self.deductPages(granted_pages);
-        const counter = switch (self.kind) {
-            .read => &self.limiter.total_read_pages,
-            .write => &self.limiter.total_write_pages,
-        };
-        _ = counter.fetchAdd(granted_pages, .monotonic);
-
-        const granted_bytes = granted_pages * _vfs.page_size;
-        // On the last chunk, rem_bytes may be less than granted_bytes.
-        // Return exactly what's left, so caller gets exactly how much they asked for.
-        const result = @min(self.rem_bytes, granted_bytes);
-        self.rem_bytes -= result;
-        return result;
-    }
-
-    /// Update remaining and demand_p1 after a grant.
-    fn deductPages(self: *Spinner, pages: u64) void {
-        self.rem_pages -|= pages;
-        if (self.priority == .p1) {
-            atomicSaturatingSub(&self.limiter.demand_p1, pages);
-        }
-    }
-
-    /// Acquire raw pages (in cost units). Handles priority, blocking, timeout.
-    /// Caller is responsible for cost/page conversion. The returned grant
-    /// is always a multiple of `factor` and at least `factor` itself.
-    /// `pages` (the request) MUST already be a multiple of `factor` — the
-    /// caller has paid that price by quantizing its own request.
-    ///
-    /// Why a factor (not just a min): callers convert cost-units back to
-    /// real pages via `granted / factor`. A non-multiple grant has dead
-    /// cost-units that flooring throws away, depleting the bucket without
-    /// doing more I/O for the caller. Worse, before this change a grant of
-    /// `< factor` floored to 0 pages, the spinner reported "done", and
-    /// `vfs.write` silently truncated the file.
-    fn acquireFromLimiter(self: *Spinner, pages: u64, factor: u64) u64 {
-        std.debug.assert(factor >= 1);
-        std.debug.assert(pages % factor == 0); // caller's responsibility
-
-        const limiter = self.limiter;
-        const start = utils.coarseMs();
-        const stats = &limiter.stats[@intFromEnum(self.priority)];
-        _ = stats.grants.fetchAdd(1, .monotonic);
-
-        while (true) {
-            limiter.tryRefill();
-            const cur = limiter.pages.load(.monotonic);
-
-            // Compute how many pages this priority can see.
-            const available = switch (self.priority) {
-                .p0 => pages, // P0 always gets full grant (saturating subtract).
-                .p1 => cur,
-                .p2 => cur -| limiter.demand_p1.load(.monotonic),
-            };
-
-            // Quantize down to a multiple of `factor` — this is the actual
-            // grant we'd hand back. If quantizing yields 0 the bucket
-            // can't satisfy a single unit of caller-useful work; sleep and
-            // retry until it can (or timeout).
-            const raw_want = @min(pages, available);
-            const want = (raw_want / factor) * factor;
-
-            if (want == 0 and self.priority != .p0) {
-                const timeout_ms: i64 = @intCast(limiter.conf.timeout_ms);
-                if (utils.coarseMs() - start >= timeout_ms) {
-                    // Timeout fallback: round min_alloc_pages up to the
-                    // factor so the result is still a usable multiple.
-                    _ = stats.timeouts.fetchAdd(1, .monotonic);
-                    const fallback = limiter.min_alloc_pages;
-                    return ((fallback + factor - 1) / factor) * factor;
-                }
-                // Only a sleep is a wait, charged at what was asked for:
-                // a grant that never sleeps charges nothing, and an
-                // oversleep under load goes uncounted.
-                fiber.sleepMs(sleep_ms);
-                _ = stats.wait_us.fetchAdd(
-                    sleep_ms * std.time.us_per_ms,
-                    .monotonic,
-                );
-                continue;
-            }
-
-            if (self.priority == .p0) {
-                // P0: saturating subtract, always succeeds. `want` already
-                // == pages here (which is a multiple of factor by precondition).
-                atomicSaturatingSub(&limiter.pages, want);
-                return want;
-            }
-
-            if (limiter.pages.cmpxchgWeak(cur, cur - want, .monotonic, .monotonic) == null) {
-                return want;
-            }
-            // CAS failed — another thread grabbed pages, retry.
-        }
-    }
-
-    pub fn deinit(self: *Spinner) void {
-        // Clear any remaining demand from the P1 counter.
-        if (self.priority == .p1 and self.rem_pages > 0) {
-            atomicSaturatingSub(&self.limiter.demand_p1, self.rem_pages);
-        }
-    }
 };
 
 pub const Limiter = struct {
-    pages: std.atomic.Value(u64), // token bucket in page units
-    last_refill: std.atomic.Value(i64), // monotonic millis
-    demand_p1: std.atomic.Value(u64), // sum of all active P1 spinners' remaining (pages)
     /// Cumulative pages ever granted across the process lifetime,
-    /// split by IOKind. Incremented at each spinner grant; never
+    /// split by IOKind. Incremented at each grant; never
     /// decremented. Useful as a sanity check against the rate limit
     /// and against the expected on-disk footprint.
-    total_read_pages: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    total_write_pages: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    pages_per_sec: u64,
-    min_alloc_pages: u64,
+    total_read_pages: std.atomic.Value(i64) = .init(0),
+    total_write_pages: std.atomic.Value(i64) = .init(0),
+    /// In the meter's i64; the config's bytes are the u64 edge.
+    pages_per_sec: i64,
+    /// Set at startup on the tenants' device; startup only, so a
+    /// plain field.
+    metered: bool = false,
     conf: Config,
-    /// What the budget cost each priority: grants asked for, the
-    /// microseconds they slept waiting for pages in all, and the grants
-    /// that gave up waiting and took `min_alloc_pages` (`timeout_ms`). A
-    /// nonzero P1 wait says the WAL and flushes were held by the
-    /// limiter; the brake has `zdb_write_backpressure_ms` for the
-    /// same question on the write path.
-    stats: [3]Stats = .{ .{}, .{}, .{} },
-
-    pub const Stats = struct {
-        grants: std.atomic.Value(u64) = .init(0),
-        wait_us: std.atomic.Value(u64) = .init(0),
-        timeouts: std.atomic.Value(u64) = .init(0),
-    };
 
     /// Snapshot of the live limiter state, all counted in pages
-    /// (multiply by `vfs.page_size` for bytes). `available_p2` shows
-    /// what a P2 spinner would actually see right now after
-    /// subtracting P1 demand — if it's 0 while compaction is pending,
-    /// P1 demand is starving P2.
+    /// (multiply by `vfs.page_size` for bytes).
     pub const Status = struct {
-        pages_per_sec: u64,
-        bucket: u64,
-        demand_p1: u64,
-        available_p1: u64,
-        available_p2: u64,
-        total_read_pages: u64,
-        total_write_pages: u64,
+        pages_per_sec: i64,
+        metered: bool,
+        total_read_pages: i64,
+        total_write_pages: i64,
     };
 
     pub fn status(self: *const Limiter) Status {
-        const cur = self.pages.load(.monotonic);
-        const dp1 = self.demand_p1.load(.monotonic);
         return .{
             .pages_per_sec = self.pages_per_sec,
-            .bucket = cur,
-            .demand_p1 = dp1,
-            .available_p1 = cur,
-            .available_p2 = cur -| dp1,
+            .metered = self.metered,
             .total_read_pages = self.total_read_pages.load(.monotonic),
             .total_write_pages = self.total_write_pages.load(.monotonic),
         };
     }
 
     pub fn init(config: Config) Limiter {
-        const pps = config.bytes_per_sec / _vfs.page_size;
         return .{
-            .pages = std.atomic.Value(u64).init(pps),
-            .last_refill = std.atomic.Value(i64).init(utils.coarseMs()),
-            .demand_p1 = std.atomic.Value(u64).init(0),
-            .pages_per_sec = pps,
-            .min_alloc_pages = @max(config.min_alloc_bytes / _vfs.page_size, 1),
+            .pages_per_sec = @intCast(config.bytes_per_sec / _vfs.page_size),
             .conf = config,
         };
     }
 
-    /// Create a spinner for an I/O operation at the given priority.
-    pub fn spinner(self: *Limiter, priority: _vfs.Priority, bytes: usize, kind: _vfs.IOKind) Spinner {
-        const pages: u64 = std.mem.alignForward(u64, @intCast(bytes), _vfs.page_size) / _vfs.page_size;
-        if (priority == .p1) {
-            _ = self.demand_p1.fetchAdd(pages, .release);
+    /// Pays for the whole request before the I/O starts, at the
+    /// calling fiber's class and tenant, waiting as the meter says. A
+    /// write costs `write_cost` pages per page.
+    pub fn grant(self: *Limiter, bytes: usize, kind: _vfs.IOKind) void {
+        if (bytes == 0) return;
+        const wm: i64 = if (kind == .write) self.conf.write_cost else 1;
+        const pages: i64 = @intCast(
+            std.math.divCeil(usize, bytes, _vfs.page_size) catch unreachable,
+        );
+        if (self.metered) {
+            const ctx = fiber.ctx();
+            ctx.tenant.acquire(.io, ctx.class, pages * wm);
         }
-        return .{
-            .limiter = self,
-            .priority = priority,
-            .kind = kind,
-            .rem_pages = pages,
-            .rem_bytes = @intCast(bytes),
+        const counter = switch (kind) {
+            .read => &self.total_read_pages,
+            .write => &self.total_write_pages,
         };
-    }
-
-    /// Try to refill the bucket. CAS on last_refill ensures only one thread
-    /// wins per time window — losers skip and proceed to page deduction.
-    fn tryRefill(self: *Limiter) void {
-        const old_refill = self.last_refill.load(.monotonic);
-        const now = utils.coarseMs();
-        const elapsed_ms = now - old_refill;
-        if (elapsed_ms <= 0) return;
-
-        // Clamp elapsed to one second: the bucket caps at `pages_per_sec`
-        // anyway (one second's worth of capacity), so longer gaps add no
-        // more pages — and clamping prevents `elapsed * pages_per_sec`
-        // from overflowing u64 on long pauses or extreme rate configs.
-        const elapsed: u64 = @min(@as(u64, @intCast(elapsed_ms)), 1_000);
-        const added = elapsed * self.pages_per_sec / 1_000;
-        if (added == 0) return;
-
-        // Race to claim this refill window.
-        if (self.last_refill.cmpxchgStrong(old_refill, now, .monotonic, .monotonic) != null) return;
-
-        // We won — add pages, capped at rate.
-        while (true) {
-            const old_pages = self.pages.load(.monotonic);
-            const new_pages = @min(old_pages + added, self.pages_per_sec);
-            if (self.pages.cmpxchgWeak(old_pages, new_pages, .monotonic, .monotonic) == null) break;
-        }
+        _ = counter.fetchAdd(pages, .monotonic);
     }
 };

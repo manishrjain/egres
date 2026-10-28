@@ -39,3 +39,36 @@ test "CoarseClock: ms() is stable across many cheap reads" {
         fiber.yield();
     }
 }
+
+test "CoarseClock: a gap lands in the first bound it fits under" {
+    const clock = utils.coarse_clock;
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+
+    // Bounds 2, 5, 10, 50, 100 exclusive, then over: 1 goes under 2,
+    // 3 under 5, 51 under 100, and the max is the largest seen.
+    clock.recordGap(1);
+    clock.recordGap(2);
+    clock.recordGap(3);
+    clock.recordGap(51);
+    try clock.writeGapMetrics(&w);
+    const text = w.buffered();
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        text,
+        "# TYPE coarse_clock_gap_ms histogram\n",
+    ));
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text,
+        "coarse_clock_gap_ms_bucket{le=\"+Inf\"} ",
+    ) != null);
+    // The clock runs under every test, so other gaps may be counted
+    // too; only the max is exact enough to check, and only its floor.
+    // Past the TYPE line, which names the gauge too.
+    const max_key = "\ncoarse_clock_gap_max_ms ";
+    const max_at = std.mem.indexOf(u8, text, max_key).?;
+    const max_str = std.mem.trimEnd(u8, text[max_at + max_key.len ..], "\n");
+    const max = try std.fmt.parseInt(i64, max_str, 10);
+    try std.testing.expect(max >= 51);
+}

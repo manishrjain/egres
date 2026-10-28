@@ -225,6 +225,8 @@ fn makeModules(
     utils.addIncludePath(b.path("."));
     utils.addIncludePath(b.path("third_party/lz4/lib"));
     utils.addIncludePath(b.path("third_party/zstd/lib"));
+    // The coarse clock keeps its gap histogram as a metric.
+    utils.addImport("metrics", metrics);
 
     const flags = makeModule(b, target, optimize, "u/flags.zig");
     flags.addImport("utils", utils);
@@ -827,6 +829,11 @@ fn addZioBench(
     utils.addIncludePath(b.path("."));
     utils.addIncludePath(b.path("third_party/lz4/lib"));
     utils.addIncludePath(b.path("third_party/zstd/lib"));
+    const metrics = b.dependency("metrics", .{
+        .target = target,
+        .optimize = opt,
+    }).module("metrics");
+    utils.addImport("metrics", metrics);
     fiber.addImport("utils", utils);
 
     const exe = b.addExecutable(.{

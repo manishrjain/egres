@@ -42,6 +42,8 @@ const _shutdown = @import("shutdown.zig");
 const _clock = @import("utils").coarse_clock;
 const _date = @import("utils").date;
 const Spinlock = @import("spinlock.zig").Spinlock;
+const _meter = @import("meter.zig");
+const Tenant = _meter.Tenant;
 
 const String = @import("utils").String;
 
@@ -62,13 +64,9 @@ pub const Record = struct {
     at_us: u64,
 };
 
-/// The I/O class of the work under a context: the bandwidth limiter
-/// (vfs/bandwidth) serves the lower number first.
-pub const IoPriority = enum(u2) {
-    p0, // what a user waits on: the WAL, and queries' reads
-    p1, // L0 compaction, flushes and their uploads
-    p2, // L1+ compaction, log file prezero
-};
+/// The class of the work under a context, foreground or background:
+/// what every shared rate is split by (meter.zig).
+pub const IoClass = @import("meter.zig").IoClass;
 
 /// Whether the block and chunk caches serve and keep the reads made
 /// under a context. A compaction streams each block once: keeping
@@ -96,8 +94,12 @@ pub const Ctx = struct {
     /// What every read and write on the fiber runs as; vfs and the
     /// caches look them up with `current()`, nothing passes them. A
     /// fiber sets its own; a spawn copies the spawner's.
-    prio: IoPriority = .p0,
+    class: IoClass = .fg,
     cache: CachePolicy = .use,
+    /// Who the fiber's cpu, io and memory are charged to: the session
+    /// sets it from its database once at connect, a spawn copies it,
+    /// and until then it is the system's, which is never short.
+    tenant: *Tenant = &_meter.system,
     /// The statement this fiber helps, set at spawn for a joinable
     /// fiber: `record` forwards to it. The spawner's frame joins the
     /// helper, so the root outlives it. Null on a root and on a fiber
@@ -131,7 +133,7 @@ pub const Ctx = struct {
         self.start_unix_us = _clock.timestampNow(.realtime, .micros);
         self.start_mono_us = _clock.timestampNow(.monotonic, .micros);
         self.records = .empty;
-        self.prio = .p0;
+        self.class = .fg;
         self.cache = .use;
     }
 
