@@ -85,6 +85,20 @@ test "resource: waitMs is the time the rate needs to pay the debt" {
     try expectEqual(Resource.idle_wait_ms, r.waitMs(.fg));
 }
 
+test "resource: bg's wait counts the room fg is filled to first" {
+    var r = Resource.init(1000, 100, 0);
+    // bg one in debt with fg full: one unit, one ms.
+    r.take(.bg, 101, 0);
+    try expectEqual(1, r.waitMs(.bg));
+    // fg 50 short of full: those 50 come first.
+    r.take(.fg, 50, 0);
+    try expectEqual(51, r.waitMs(.bg));
+    // fg 200 in debt: its debt, its burst, then bg's one.
+    r.take(.fg, 250, 0);
+    try expectEqual(301, r.waitMs(.bg));
+    try expectEqual(200, r.waitMs(.fg));
+}
+
 test "resource: a zero rate never refills" {
     var r = Resource.init(0, 0, 0);
     r.take(.fg, 10, 0);
@@ -120,12 +134,12 @@ fn plan(vcpus: i64) Limit {
 }
 
 /// The tick takes the system tenant's spend since the last tick off
-/// the box, and every test in the binary charges the system's io
-/// through the limiter. A first tick this far from zero spreads the
-/// lifetime total over so long that nothing comes off; a later tick
-/// in a test checks cpu and memory, which only these tests touch, and
-/// bounds io from above.
-const t0: i64 = 1 << 40;
+/// the box, and every test in the binary charges the system: io
+/// through the limiter, cpu for every fiber step. A first tick this
+/// far from zero spreads the lifetime total over so long that it
+/// truncates to nothing; a later tick in a test checks memory, which
+/// only these tests touch, and bounds cpu and io from above.
+const t0: i64 = 1 << 60;
 
 test "tenants: one tenant alone gets the box" {
     meter.capacity = box;
@@ -166,8 +180,8 @@ test "tenants: the split is by limit, idle tenants are not in it" {
     large.charge(.cpu, .fg, 1, later);
     small.touch(later);
     ts.tick(later);
-    try expectEqual(@divTrunc(cpu * 4, 5), large.cpu.rate.load(.monotonic));
-    try expectEqual(@divTrunc(cpu, 5), small.cpu.rate.load(.monotonic));
+    try near(large.cpu.rate.load(.monotonic), @divTrunc(cpu * 4, 5));
+    try near(small.cpu.rate.load(.monotonic), @divTrunc(cpu, 5));
     try expectEqual(@divTrunc(cpu, 6), idle.cpu.rate.load(.monotonic));
     try expect(large.io.rate.load(.monotonic) <= 800_000);
     const mem = large.mem_share.load(.monotonic);
@@ -193,9 +207,17 @@ test "tenants: a sold-out box gives every tenant its number" {
     while (id <= 40) : (id += 1) _ = try ts.get(id, t0);
     id = 21;
     while (id <= 24) : (id += 1) try ts.setLimit(id, plan(4), t0);
-    ts.tick(t0);
-    try expectEqual(2 * hz(), large.cpu.rate.load(.monotonic));
-    try expectEqual(@divTrunc(hz(), 2), small.cpu.rate.load(.monotonic));
+    ts.tick(t0 + Tenant.active_window_ms - 1);
+    try near(large.cpu.rate.load(.monotonic), 2 * hz());
+    try near(small.cpu.rate.load(.monotonic), @divTrunc(hz(), 2));
+}
+
+/// A cpu share from a tick after the first: the number, less the
+/// share of what the other tests' fibers charged the system between
+/// the two ticks. That is microseconds of a window a second long, so
+/// well under a sixteenth.
+fn near(got: i64, want: i64) !void {
+    try expect(got <= want and got > want - @divTrunc(want, 16));
 }
 
 test "tenants: what the system spent comes off the box first" {
@@ -214,14 +236,14 @@ test "tenants: what the system spent comes off the box first" {
     ts.tick(t0 + 1000);
     const io = a.io.rate.load(.monotonic);
     try expect(io <= 500_000 and io >= 400_000);
-    try expectEqual(32 * hz(), a.cpu.rate.load(.monotonic));
+    try near(a.cpu.rate.load(.monotonic), 32 * hz());
 
     // All of it and more: nothing left until the next tick.
     meter.system.charge(.io, .fg, 5_000_000, t0 + 1500);
     a.touch(t0 + 1500);
     ts.tick(t0 + 2000);
     try expectEqual(0, a.io.rate.load(.monotonic));
-    try expectEqual(32 * hz(), a.cpu.rate.load(.monotonic));
+    try near(a.cpu.rate.load(.monotonic), 32 * hz());
 }
 
 test "tenant: a charge moves the bucket, the totals and the stamp" {
@@ -247,9 +269,6 @@ test "tenant: a charge moves the bucket, the totals and the stamp" {
     t.releaseMem(400);
     try expectEqual(100, t.mem_held.load(.monotonic));
     try expectEqual(500, t.totals.mem_peak.load(.monotonic));
-    try expect(t.overMem());
-    t.mem_share.store(100, .monotonic);
-    try expect(!t.overMem());
 
     t.touch(9);
     t.failed();
@@ -304,4 +323,101 @@ test "acquire: bg in debt waits until fg is full and its own debt paid" {
     const waited = utils.coarseMs() - start;
     try expect(waited >= 250 and waited <= 2000);
     try expect(t.io.bucket(.fg).balance() >= 0);
+}
+
+/// A tenant on the real clock whose cpu is `milli` millicores.
+fn cpuTenant(id: u64, milli: i64) Tenant {
+    return Tenant.init(id, .{
+        .cpu_milli = milli,
+        .io_pages_per_s = 1_000_000,
+        .mem_bytes = gib,
+    }, utils.coarseMs());
+}
+
+/// Spins for `ms` on the fiber's own stack, never yielding. On the
+/// system clock: the coarse one is advanced by the worker loop, which
+/// a spinning fiber keeps from running.
+fn burn(ms: i64) void {
+    const until = utils.timestampNow(.monotonic, .millis) + ms;
+    while (utils.timestampNow(.monotonic, .millis) < until) {
+        std.atomic.spinLoopHint();
+    }
+}
+
+test "cpu: the worker loop charges each step to the fiber's tenant" {
+    var t = cpuTenant(20, 32 * vcpu);
+    const ctx = fiber.ctx();
+    ctx.tenant = &t;
+    defer ctx.tenant = &meter.system;
+
+    // A step is charged when it ends: after a yield the spin before
+    // it is on the tenant, at about one core's rate.
+    burn(20);
+    fiber.yield();
+    const after_step = t.totals.cpu_ticks.load(.monotonic);
+    try expect(after_step > 0);
+
+    // A yield point charges the step so far without ending it.
+    burn(20);
+    try ctx.maybeYield();
+    try expect(t.totals.cpu_ticks.load(.monotonic) > after_step);
+    const ticks = t.totals.cpu_ticks.load(.monotonic);
+    const spent = @divTrunc(ticks * 1000, hz());
+    try expect(spent >= 35 and spent <= 400);
+    try expect(t.cpu.bucket(.fg).balance() < t.cpu.burst.load(.monotonic));
+}
+
+test "cpu: maybeYield parks a tenant in debt until its rate covers it" {
+    // A tenth of a core: 100 ms of cpu a second, a burst of 10 ms.
+    var t = cpuTenant(21, 100);
+    const ctx = fiber.ctx();
+    ctx.tenant = &t;
+    defer ctx.tenant = &meter.system;
+
+    // 40 ms of cpu on a 10 ms burst, charged by the yield itself:
+    // about 30 ms in debt, 300 ms at the rate, paid there.
+    burn(40);
+    const start = utils.coarseMs();
+    try ctx.maybeYield();
+    const waited = utils.coarseMs() - start;
+    try expect(waited >= 200 and waited <= 2000);
+    try expect(t.cpu.bucket(.fg).balance() >= 0);
+    try expect(t.totals.parked_ms.load(.monotonic) >= 200);
+
+    // Out of debt, the next yield is free.
+    const again = utils.coarseMs();
+    try ctx.maybeYield();
+    try expect(utils.coarseMs() - again < 50);
+}
+
+test "payForMem: a tenant over its share waits only under pressure" {
+    var t = Tenant.init(41, meter.default_limit, 0);
+    t.mem_share.store(1000, .monotonic);
+    t.holdMem(2000);
+    defer t.releaseMem(2000);
+
+    // Over the share with the cache still able to give: no wait.
+    meter.mem_pressure.store(false, .monotonic);
+    var start = utils.coarseMs();
+    try t.payForMem();
+    try expect(utils.coarseMs() - start < 50);
+
+    // Under pressure: waits the bound out, then refuses.
+    meter.mem_wait_ms = 100;
+    defer meter.mem_wait_ms = 5000;
+    meter.mem_pressure.store(true, .monotonic);
+    defer meter.mem_pressure.store(false, .monotonic);
+    start = utils.coarseMs();
+    try std.testing.expectError(error.MemShare, t.payForMem());
+    // The coarse clock can read a ms under the sleeps it measures.
+    const waited = utils.coarseMs() - start;
+    try expect(waited >= 90 and waited <= 2000);
+    try expect(t.totals.parked_ms.load(.monotonic) >= 100);
+
+    // Room given back meanwhile: admitted.
+    t.releaseMem(1500);
+    defer t.holdMem(1500);
+    try t.payForMem();
+    // The system never waits.
+    try meter.system.payForMem();
 }

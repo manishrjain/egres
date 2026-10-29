@@ -274,7 +274,7 @@ PANELS = [
         ('egres_governor_total_bytes', "total (live)"),
         ('egres_jemalloc_resident_bytes', "jemalloc resident"),
         ('egres_cgroup_memory_max_bytes', "cgroup cap"),
-    ], fill=0, desc="The cache cap is the total (--cache total_bytes, live "
+    ], fill=0, desc="The cache cap is the total (--memory total_bytes, live "
                     "bytes) less the margin, the recent peak of what the "
                     "rest of egres holds. jemalloc resident is what the "
                     "cgroup charges for the heap; the gap above live is "

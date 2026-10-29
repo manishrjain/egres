@@ -15,7 +15,7 @@ test "governor: the margin rises to what the rest holds at once" {
         1,
     );
     defer cache.deinit();
-    var gov = Governor.init(48 * gib, &cache);
+    var gov = Governor.init(48 * gib, &cache, null);
     gov.ratio.cur = 1.0; // no allocator overhead: live target = total
 
     // Little held elsewhere: the margin stays at its floor.
@@ -37,7 +37,7 @@ test "governor: the margin falls back over minutes" {
         1,
     );
     defer cache.deinit();
-    var gov = Governor.init(48 * gib, &cache);
+    var gov = Governor.init(48 * gib, &cache, null);
     gov.ratio.cur = 1.0;
     _ = gov.nextCap(20 * gib);
 
@@ -60,7 +60,7 @@ test "governor: the ratio rises at once and falls back as the margin does" {
         1,
     );
     defer cache.deinit();
-    var gov = Governor.init(66 * gib, &cache);
+    var gov = Governor.init(66 * gib, &cache, null);
 
     // Unmeasured: the default ratio, so 60 GiB of live bytes.
     try std.testing.expectEqual(engine.governor.Ratio.default, gov.ratio.cur);
@@ -84,6 +84,27 @@ test "governor: the ratio rises at once and falls back as the margin does" {
     try std.testing.expect(gov.ratio.cur < 1.2 and gov.ratio.cur > 1.19);
     for (0..6000) |_| gov.ratio.update();
     try std.testing.expect(gov.ratio.cur >= 1.05 and gov.ratio.cur < 1.051);
+}
+
+test "governor: the statement pool is a share of the live target" {
+    var cache = try zdb.cache.ShardedCache(u128).init(
+        std.testing.allocator,
+        1 << 20,
+        1,
+    );
+    defer cache.deinit();
+    var gov = Governor.init(48 * gib, &cache, null);
+    gov.query_share = 0.25;
+    gov.ratio.cur = 1.0;
+    try expectNear(12 * gib, gov.queryPool());
+
+    // The pool follows the live target, not the cache's cap: 48 / 1.2
+    // live, a quarter of it for statements, whatever the margin.
+    gov.ratio.measured = 1.2;
+    gov.ratio.update();
+    try expectNear(10 * gib, gov.queryPool());
+    _ = gov.nextCap(30 * gib);
+    try expectNear(10 * gib, gov.queryPool());
 }
 
 /// `got` within a KiB of `want`: the ratio divides in floating point.

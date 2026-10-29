@@ -94,6 +94,7 @@ pub const sqlstate = struct {
     pub const active_sql_transaction: [5]u8 = .{ '2', '5', '0', '0', '1' };
     pub const in_failed_sql_transaction: [5]u8 = .{ '2', '5', 'P', '0', '2' };
     pub const admin_shutdown: [5]u8 = .{ '5', '7', 'P', '0', '1' };
+    pub const out_of_memory: [5]u8 = .{ '5', '3', '2', '0', '0' };
 };
 
 /// Severity strings used in ErrorResponse 'S' / 'V' fields. FATAL is

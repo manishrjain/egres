@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const log = std.log.scoped(.fiber);
+const _meter = @import("meter.zig");
 const builtin = @import("builtin");
 const xev = @import("xev");
 const _fb = @import("fiber.zig");
@@ -144,6 +145,9 @@ pub const Worker = struct {
     /// TSC reading when this worker last finished a fiber step; the
     /// pre-park poll runs only within a millisecond of it.
     last_work_ticks: u64 = 0,
+    /// TSC reading up to which the running step is charged to its
+    /// fiber's tenant: the step's start, moved by each `settleCpu`.
+    charged_ticks: u64 = 0,
     /// Wake-path counters, worker-private (only this worker writes them;
     /// `dumpWorkerCpu` reads them racily). Together they say whether an
     /// idle peer is actually told about work — see `WakeStats`.
@@ -339,7 +343,8 @@ pub const Worker = struct {
             // and moving it moves its next I/O completion too — that
             // ping-pong ran at ~3 migrations per statement under pgbench.
             const vlen = vq.len();
-            if ((!rt.steal_lone and vlen < 2) or vlen <= sq.len()) continue;
+            const lone = rt.steal_lone.load(.monotonic);
+            if ((!lone and vlen < 2) or vlen <= sq.len()) continue;
 
             var scratch: [steal_chunk]*Fiber = undefined;
             var moved = false;
@@ -437,7 +442,8 @@ pub const Worker = struct {
     /// meanwhile; that ends the poll too, since the claim comes with a
     /// thief +1 we must go and honour. true = something to do.
     fn pollBeforePark(self: *Worker, rt: *Runtime) bool {
-        const budget_ns = rt.prepark_poll_us * std.time.ns_per_us;
+        const budget_ns =
+            rt.prepark_poll_us.load(.monotonic) * std.time.ns_per_us;
         const start = readTicks();
         self.loop.run(.no_wait) catch {};
         while (true) {
@@ -618,6 +624,24 @@ pub const Worker = struct {
         return false;
     }
 
+    /// Charges the step's ticks since `charged_ticks` to the fiber's
+    /// tenant, in the tick counter's unit its cpu limit was converted
+    /// to, and moves the mark. Once at the end of every step, and from
+    /// `Ctx.maybeYield` so a long step pays per batch, not when it
+    /// finally parks. Returns the reading.
+    pub fn chargeCpu(self: *Worker, f: *Fiber) u64 {
+        const now = readTicks();
+        const ticks = now -| self.charged_ticks;
+        self.charged_ticks = now;
+        if (ticks > 0) f.ctx.tenant.charge(
+            .cpu,
+            f.ctx.class,
+            @intCast(ticks),
+            _coarse.ms(),
+        );
+        return now;
+    }
+
     pub fn runMain(self: *Worker) void {
         // The one legitimate site that writes the thread-local. Reads go
         // through `currentWorkerOrNull()`; here we own it directly.
@@ -678,6 +702,7 @@ pub const Worker = struct {
             //    the only work-*finding* step, taken only when we run dry.
 
             const enter = readTicks();
+            self.charged_ticks = enter;
             if (cyclesToNs(enter -% self.last_coarse_clock_ticks) >= std.time.ns_per_ms) {
                 // Advance the coarse clock at most once per ms (TSC-gated, no
                 // syscall on the fast path). `enter` is reused for CPU
@@ -694,7 +719,7 @@ pub const Worker = struct {
                 if (self.is_thief) _ = self.exitThiefAndNotify(rt, true);
 
                 const finished = self.runFiber(f);
-                const exit = readTicks();
+                const exit = self.chargeCpu(f);
                 self.last_work_ticks = exit;
                 // Skip the reading if the counter went backwards (thread
                 // migrated mid-step to a CPU with a slightly behind TSC).
@@ -785,7 +810,8 @@ pub const Worker = struct {
             //    wake (and a C-state exit on a pinned core) costs more than
             //    that. Poll the completion ring for a short while first.
             const since_work = cyclesToNs(readTicks() -% self.last_work_ticks);
-            if (rt.prepark_poll_us > 0 and since_work < std.time.ns_per_ms and
+            if (rt.prepark_poll_us.load(.monotonic) > 0 and
+                since_work < std.time.ns_per_ms and
                 self.pollBeforePark(rt))
             {
                 self.wake_stats.poll_hits += 1;
@@ -957,15 +983,16 @@ pub const Runtime = struct {
     /// by each worker at the top of `runMain`.
     pin_workers: bool = true,
 
-    /// Tunables a host may set after `init` and before load (plain
-    /// fields; workers read them on every pass). `steal_lone`: a thief
+    /// Tunables a host sets through `apply`, read by every worker on
+    /// every pass. `steal_lone`: a thief
     /// may take a victim's only ready fiber (false: it waits for a ring
     /// of 2+, see `trySteal`). `prepark_poll_us`: how long, in
     /// microseconds, a worker that ran a fiber within the last
     /// millisecond polls its completion ring before blocking; 0 = block
-    /// at once (see `Worker.pollBeforePark`).
-    steal_lone: bool = false,
-    prepark_poll_us: u64 = 20,
+    /// at once (see `Worker.pollBeforePark`). Atomics: `apply` stores
+    /// them from the governor's fiber while every worker reads.
+    steal_lone: std.atomic.Value(bool) = .init(false),
+    prepark_poll_us: std.atomic.Value(u64) = .init(20),
 
     /// Contiguous worker-id range each lane owns. A `len == 0` lane
     /// falls back to `.default` (see `effectiveLaneIdx`).
@@ -978,6 +1005,48 @@ pub const Runtime = struct {
     /// `notifyIdlePeer`); workers cap themselves at half the lane (see
     /// `becomeThief`).
     num_thieves: [Lane.count]ThiefCount = @splat(.{}),
+
+    /// The `--runtime` flags: the tunables and the cpu statements
+    /// may consume in all. Applied by `apply`, at startup and then every
+    /// governor tick, so a live change takes effect within a tick.
+    pub const Cfg = struct {
+        steal_lone: bool = false,
+        poll_us: u64 = 20,
+        cpu_milli: i64 = 0,
+
+        pub const docs = .{
+            .self = "Fiber scheduler tunables (see zfiber runtime.zig)" ++
+                " and the cpu statements may consume. The tunables'" ++
+                " defaults are the measured best on a 32-thread box" ++
+                " (pgbench select-only at 1 and 8 clients).",
+            .steal_lone = "A thief may take a worker's only ready fiber." ++
+                " When false it waits for a ring of 2+, so a fiber about" ++
+                " to run on its own worker is not bounced between" ++
+                " workers.",
+            .poll_us = "Microseconds a worker that had work within the" ++
+                " last ms polls its completion ring before blocking. 0 =" ++
+                " block at once; above ~100 the spinning starts to cost" ++
+                " writes.",
+            .cpu_milli = "Millicores the statements of every database" ++
+                " may consume between them, 1000 per core, paid in ticks" ++
+                " at their yields; the worker threads stay one per core." ++
+                " 0 = every worker of the statements' lane.",
+        };
+    };
+
+    /// Sets the tunables and the meter's cpu capacity from `cfg`.
+    pub fn apply(self: *Runtime, cfg: Cfg) void {
+        self.steal_lone.store(cfg.steal_lone, .monotonic);
+        self.prepark_poll_us.store(cfg.poll_us, .monotonic);
+        const workers: i64 = @intCast(self.laneWorkers(.default));
+        const milli = if (cfg.cpu_milli > 0) cfg.cpu_milli else workers * 1000;
+        if (milli != _meter.capacity.cpu_milli) {
+            log.info("cpu capacity {d} milli on {d} workers", .{
+                milli, workers,
+            });
+            _meter.capacity.cpu_milli = milli;
+        }
+    }
 
     pub fn init(self: *Runtime, allocator: std.mem.Allocator, opts: InitOptions) !void {
         // num_workers == 0 means "auto" → the CPU core count.
@@ -1001,8 +1070,8 @@ pub const Runtime = struct {
         self.stopping = .init(false);
         self.steal_enabled = opts.steal;
         self.pin_workers = opts.pin_workers;
-        self.steal_lone = opts.steal_lone;
-        self.prepark_poll_us = opts.prepark_poll_us;
+        self.steal_lone = .init(opts.steal_lone);
+        self.prepark_poll_us = .init(opts.prepark_poll_us);
         self.idle = .{ .{}, .{} };
         self.num_thieves = @splat(.{});
 
@@ -1118,6 +1187,12 @@ pub const Runtime = struct {
     pub fn stop(self: *Runtime) void {
         self.stopping.store(true, .release);
         for (self.workers) |*w| w.wake_async.notify() catch {};
+    }
+
+    /// Workers serving `lane`, the default lane's when it has none of
+    /// its own: the cores a tenant's cpu share is cut from.
+    pub fn laneWorkers(self: *Runtime, lane: Lane) usize {
+        return self.lane_ranges[self.effectiveLaneIdx(lane)].len;
     }
 
     /// Effective lane index for `lane`: itself when it owns workers, else

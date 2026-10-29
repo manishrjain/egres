@@ -75,14 +75,14 @@ autovacuum_max_workers = 4
 
 # A server: ports, the database the workload lives in, its config.
 SERVERS = {
-    # `cache` is the server's --cache flag body ("total_bytes=.."); empty
+    # `memory` is the server's --memory flag body ("total_bytes=.."); empty
     # leaves the server's default (90% of RAM or of the cgroup cap).
     # `store` is the --store body; empty means the run's data dir
     # ("dir_path=<data>"), an s3 body ("s3_endpoint=..;s3_bucket=..")
     # puts the SSTs on an object store, with AWS_ACCESS_KEY_ID and
     # AWS_SECRET_ACCESS_KEY taken from this process's environment.
     "egres": {"sql_port": 3210, "admin_port": 5210, "dbname": "egres",
-              "zdb_extra": "num_compactors=8", "cache": "", "store": ""},
+              "zdb_extra": "num_compactors=8", "memory": "", "store": ""},
     "postgres": {"port": 5434, "dbname": "bench", "conf": PG_CONF},
 }
 
@@ -371,8 +371,8 @@ def start_egres(run: Run):
         f"--store={store}", f"--wal=dir={run.wal}"]
     if srv["zdb_extra"]:
         cmd.append(f"--zdb={srv['zdb_extra']}")
-    if srv["cache"]:
-        cmd.append(f"--cache={srv['cache']}")
+    if srv["memory"]:
+        cmd.append(f"--memory={srv['memory']}")
     with open(run.server_log, "w") as log:
         proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL,

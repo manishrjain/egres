@@ -84,32 +84,17 @@ const RaftCfg = struct {
     };
 };
 
-/// `--cache` — the memory Egres may hold, resident: what the allocator
-/// holds, as the cgroup and `top` count it. `total_bytes` defaults to 90%
-/// of the memory this process may use (host RAM, or the cgroup limit
-/// under Docker and Kubernetes); the tenth is for the WAL's page cache,
-/// the kernel and thread stacks. The cache governor measures the
-/// allocator's overhead and gives the SST block cache what the rest of
-/// the process leaves under it.
-const CacheCfg = struct {
-    total_bytes: u64 = 0,
-    disk_path: String = "",
-    disk_bytes: u64 = 0,
+/// `--disk-cache` — the local-disk chunk cache for an s3 remote.
+const DiskCacheCfg = struct {
+    path: String = "",
+    capacity_bytes: u64 = 0,
     chunk_bytes: u64 = 0,
 
     pub const docs = .{
-        .self = "Cache memory and the local-disk chunk cache for an s3" ++
-            " remote. The memory budget is a cap, not a reservation:" ++
-            " memory is used as blocks are read.",
-        .total_bytes = "The overall memory Egres aims to hold, resident." ++
-            " 0 = 90% of host RAM or of the cgroup limit. The" ++
-            " block cache is auto-resized based on what the rest of the" ++
-            " process uses and the allocator's measured overhead. Set it" ++
-            " on a host shared with other processes.",
-        .disk_path = "Slot file of the chunk cache: pages of SSTs" ++
-            " fetched from an s3 remote, kept on local disk. Empty =" ++
-            " no disk cache.",
-        .disk_bytes = "Chunk cache capacity.",
+        .self = "Pages of SSTs fetched from an s3 remote, kept on local" ++
+            " disk.",
+        .path = "The slot file. Empty = no disk cache.",
+        .capacity_bytes = "What the slot file holds at most.",
         .chunk_bytes = "Chunk size: what a miss fetches from the remote" ++
             " and the unit of eviction, a power of two from 8KiB to" ++
             " 8MiB, fixed when the slot file is created. 0 = 128KiB.",
@@ -367,23 +352,6 @@ const WalCfg = struct {
     };
 };
 
-const RuntimeCfg = struct {
-    steal_lone: bool = false,
-    poll_us: u64 = 20,
-
-    pub const docs = .{
-        .self = "Fiber scheduler tunables (see zfiber runtime.zig). The" ++
-            " defaults are the measured best on a 32-thread box (pgbench" ++
-            " select-only at 1 and 8 clients).",
-        .steal_lone = "A thief may take a worker's only ready fiber. When" ++
-            " false it waits for a ring of 2+, so a fiber about to run on" ++
-            " its own worker is not bounced between workers.",
-        .poll_us = "Microseconds a worker that had work within the last ms" ++
-            " polls its completion ring before blocking. 0 = block at once;" ++
-            " above ~100 the spinning starts to cost writes.",
-    };
-};
-
 fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     flags.initGlobal(allocator);
     defer flags.deinitGlobal();
@@ -392,9 +360,19 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     const live_shutdown = try flags.g().register("shutdown", ShutdownCfg);
     const live_zdb = try flags.g().register("zdb", zdb.config.Config);
     const live_store = try flags.g().register("store", StoreCfg);
-    const live_cache = try flags.g().register("cache", CacheCfg);
+    const live_memory = try flags.g().register(
+        "memory",
+        engine.governor.Cfg,
+    );
+    const live_disk_cache = try flags.g().register(
+        "disk-cache",
+        DiskCacheCfg,
+    );
     const live_snapshot = try flags.g().register("snapshot", engine.SnapshotCfg);
-    const live_runtime = try flags.g().register("runtime", RuntimeCfg);
+    const live_runtime = try flags.g().register(
+        "runtime",
+        fiber.Runtime.Cfg,
+    );
     const live_wal = try flags.g().register("wal", WalCfg);
     const live_io = try flags.g().register("io", zdb.vfs.calibrate.Cfg);
 
@@ -438,16 +416,21 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     const shutdown_cfg = live_shutdown.cur();
     const zdb_cfg = live_zdb.cur();
     const store_cfg = live_store.cur();
-    const cache_cfg = live_cache.cur();
-    const runtime_cfg = live_runtime.cur();
+    const memory_cfg = live_memory.cur();
+    const disk_cache_cfg = live_disk_cache.cur();
     const wal_cfg = live_wal.cur();
     const io_cfg = live_io.cur();
-    // Scheduler tunables: the runtime is already up (main), so set them
-    // on it directly, before any listener spawns a connection fiber.
-    fiber.runtime().steal_lone = runtime_cfg.steal_lone;
-    fiber.runtime().prepark_poll_us = runtime_cfg.poll_us;
+    // The runtime is already up (main): its flags go on it directly,
+    // before any listener spawns a connection fiber. The governor
+    // re-applies them every tick.
+    fiber.runtime().apply(live_runtime.cur());
     if (raft_cfg.id == 0 or wal_cfg.dir.len == 0) {
         log.err("--raft requires id (>0); --wal requires dir", .{});
+        usage(allocator);
+        std.process.exit(1);
+    }
+    if (!(memory_cfg.query_ratio > 0 and memory_cfg.query_ratio <= 1)) {
+        log.err("--memory query_ratio must be in (0, 1]", .{});
         usage(allocator);
         std.process.exit(1);
     }
@@ -509,13 +492,13 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
         try calibrate.deviceVfs(allocator, io_cfg, store_cfg.dir_path)
     else
         null;
-    const cache_vfs = if (cache_cfg.disk_path.len == 0)
+    const cache_vfs = if (disk_cache_cfg.path.len == 0)
         null
     else
         try calibrate.deviceVfs(
             allocator,
             io_cfg,
-            std.fs.path.dirname(cache_cfg.disk_path) orelse ".",
+            std.fs.path.dirname(disk_cache_cfg.path) orelse ".",
         );
     // The meter is for the store: the tenants split the device their
     // data is on, the store's or the chunk cache's under s3, and only
@@ -548,9 +531,9 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
             .prefix = store_cfg.s3_prefix,
             .region = store_cfg.s3_region,
             .cache = .{
-                .path = cache_cfg.disk_path,
-                .capacity_bytes = cache_cfg.disk_bytes,
-                .chunk_bytes = cache_cfg.chunk_bytes,
+                .path = disk_cache_cfg.path,
+                .capacity_bytes = disk_cache_cfg.capacity_bytes,
+                .chunk_bytes = disk_cache_cfg.chunk_bytes,
                 .vfs = cache_vfs,
             },
         });
@@ -625,10 +608,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     // open table. With blocks cached decompressed here, tables open
     // O_DIRECT: the page cache would otherwise hold the same data twice.
     const mem = utils.host.memory();
-    const total: u64 = if (cache_cfg.total_bytes > 0)
-        cache_cfg.total_bytes
-    else
-        mem.bytes / 10 * 9;
+    const total = engine.governor.resolveTotal(memory_cfg.total_bytes);
     // Starts at the cap the governor's first tick would set.
     const start_cap = engine.governor.startCap(total);
     var block_cache = try zdb.cache.ShardedCache(u128).init(
@@ -643,7 +623,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
         zdb.table.table.block_cache = null;
         zdb.table.table.read_mode = .default;
     }
-    engine.governor.init(total, &block_cache);
+    engine.governor.init(total, &block_cache, live_memory);
     log.info(
         "block cache governed under total {d} MiB resident (host " ++
             "memory {d} MiB via {s}); sst reads direct",
@@ -675,6 +655,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
         node,
         forest,
         live_snapshot,
+        live_runtime,
     );
     defer deinitWithLog("engine", eng);
 

@@ -37,6 +37,16 @@
 //! rate: unused share moves between tenants at the tick, not through
 //! the buckets.
 //!
+//! Memory is held, not spent, so it has no bucket: the tick gives
+//! each active tenant a share of `capacity.mem_bytes`, the statement
+//! pool, and a tenant holding more than its share waits
+//! (`payForMem`) only while the pool is full or the cache can give
+//! nothing back (`mem_pressure`, the governor's word). Any other time
+//! it just runs and the cache shrinks. The wait is bounded, since a
+//! waiting statement can hold a lock a running one needs, and ends
+//! in a refusal. A single statement past `query_mem_bytes` is refused
+//! at its next yield.
+//!
 //! Time is the caller's: every call takes `now_ms`, a monotonic
 //! millisecond clock, so all of it is testable and the runtime passes
 //! its coarse clock. A resource is lock free: a CAS on `last_ms` picks one
@@ -173,19 +183,23 @@ pub const Resource = struct {
     }
 
     /// Milliseconds until the rate has paid the class's debt, at least
-    /// 1 and at most `max_wait_ms`; 0 when there is none. For bg this
-    /// is a floor: bg earns only what fg leaves, so a waiter asks
-    /// again after the sleep.
+    /// 1 and at most `max_wait_ms`; 0 when there is none. The rate
+    /// fills the buckets before this one first, so their room is in
+    /// the sum: bg sleeps once for fg to fill, not once per unit.
     pub fn waitMs(self: *Resource, class: IoClass) u64 {
-        const need = -self.bucket(class).tokens.load(.monotonic);
-        if (need <= 0) return 0;
+        const own = self.bucket(class).tokens.load(.monotonic);
+        if (own >= 0) return 0;
 
         const rate = self.rate.load(.monotonic);
         if (rate <= 0) return idle_wait_ms;
 
+        const cap = self.burst.load(.monotonic);
+        var need: i128 = -own;
+        for (self.buckets[0..@intFromEnum(class)]) |*ahead| {
+            need += @max(cap - ahead.tokens.load(.monotonic), 0);
+        }
         // `need` units at `rate` per second, in whole ms, rounded up.
-        const units_ms = @as(i128, need) * 1000;
-        const ms = std.math.divCeil(i128, units_ms, rate) catch unreachable;
+        const ms = std.math.divCeil(i128, need * 1000, rate) catch unreachable;
         return @intCast(@min(ms, max_wait_ms));
     }
 };
@@ -197,9 +211,8 @@ pub const Tenant = struct {
     cpu: Resource,
     /// Pages; a write costs the device's write cost in pages.
     io: Resource,
-    /// Live bytes in the tenant's statement arenas, and the bytes the
-    /// last tick gave it: over the share while the process is at its
-    /// target, a statement waits.
+    /// Live bytes held by the tenant's contexts, and the bytes the last
+    /// tick gave it: over the share under pressure, a statement waits.
     mem_held: std.atomic.Value(i64) = .init(0),
     mem_share: std.atomic.Value(i64) = .init(0),
     last_active_ms: std.atomic.Value(i64),
@@ -298,11 +311,25 @@ pub const Tenant = struct {
         _ = self.mem_held.fetchSub(n, .monotonic);
     }
 
-    /// Over the memory share, the tick's number; the caller adds "and
-    /// the process is at its target".
+    /// Over the memory share, the tick's number, while the cache can
+    /// give nothing back.
     pub fn overMem(self: *const Tenant) bool {
-        return self.mem_held.load(.monotonic) >
-            self.mem_share.load(.monotonic);
+        return mem_pressure.load(.monotonic) and
+            self.mem_held.load(.monotonic) > self.mem_share.load(.monotonic);
+    }
+
+    /// Room for a statement: waits while the tenant is over its share
+    /// under pressure, at most `mem_wait_ms`, then refuses. Polls: a
+    /// waiter exists only under pressure, and a wake on every release
+    /// would cost more than a sleep this short.
+    pub fn payForMem(self: *Tenant) error{MemShare}!void {
+        var waited: u64 = 0;
+        while (self.overMem()) {
+            if (waited >= mem_wait_ms) return error.MemShare;
+            sleepMs(mem_poll_ms);
+            waited += mem_poll_ms;
+            _ = self.totals.parked_ms.fetchAdd(mem_poll_ms, .monotonic);
+        }
     }
 
     pub fn failed(self: *Tenant) void {
@@ -382,20 +409,51 @@ pub var system: Tenant = .{
     .limit = .{ .cpu_milli = 1, .io_pages_per_s = 1, .mem_bytes = 1 },
     .cpu = Resource.init(never_short, never_short, 0),
     .io = Resource.init(never_short, never_short, 0),
+    .mem_share = .init(never_short),
     .last_active_ms = .init(0),
 };
 const never_short: i64 = 1 << 62;
 
 /// The box, in a limit's units: the default lane's workers in
 /// millicores, the pages per second of the device the tenants' data
-/// is on, and the bytes left for statements once the cache is at its
-/// floor. Each owner sets its own at startup, before the first tick;
-/// zero until then, a sold-out box.
+/// is on, and the statement pool, `--memory query_ratio` of the live
+/// target. Main sets cpu and io at startup; the governor sets memory
+/// every tick. Zero until then, a sold-out box.
 pub var capacity: Tenant.Limit = .{
     .cpu_milli = 0,
     .io_pages_per_s = 0,
     .mem_bytes = 0,
 };
+
+/// The pool is full, or the cache is at its floor: a tenant over its
+/// share waits. The governor's, each tick.
+pub var mem_pressure: std.atomic.Value(bool) = .init(false);
+
+/// Live bytes held by every `Ctx`, all tenants: against the pool,
+/// for the governor.
+pub var mem_held_total: std.atomic.Value(i64) = .init(0);
+
+/// A statement's live bytes past which its next yield refuses it;
+/// 0 = no cap. `--memory query_bytes`, written by the governor's
+/// fiber and read at every statement's yield.
+pub var query_mem_bytes: std.atomic.Value(i64) = .init(0);
+
+/// How long `payForMem` waits for room before the statement is
+/// refused.
+pub var mem_wait_ms: u64 = 5000;
+const mem_poll_ms: u64 = 2;
+
+/// Every tenant's limit until one is set for it, so they weigh the
+/// same; the units matter once a limit can differ.
+pub const default_limit: Tenant.Limit = .{
+    .cpu_milli = 1000,
+    .io_pages_per_s = 25_000,
+    .mem_bytes = 1 << 30,
+};
+
+/// The process's tenants, ticked by the cache governor, on the
+/// runtime's allocator from the first session on.
+pub var tenants: Tenants = .{ .default_limit = default_limit };
 
 /// One tick's worth of a rate: what a bucket holds at most.
 pub fn burstFor(rate: i64) i64 {
@@ -403,10 +461,12 @@ pub fn burstFor(rate: i64) i64 {
 }
 
 /// Every tenant the process has seen, by id, and the tick that sets
-/// their rates. Made on first use with the default limit.
+/// their rates. Each is made on first sight with the default limit.
 pub const Tenants = struct {
-    alloc: std.mem.Allocator,
-    map: std.AutoHashMap(u64, *Tenant),
+    /// Null until the first `get`, which takes the runtime's: a global
+    /// has no allocator to name at comptime. A test gives its own.
+    alloc: ?std.mem.Allocator = null,
+    map: std.AutoHashMapUnmanaged(u64, *Tenant) = .empty,
     /// Readers share `map`: a lookup, and the tick, which writes only
     /// the tenants' atomics. A writer holds it alone: the insert of a
     /// new tenant, and a new limit, a plain field the tick reads.
@@ -428,19 +488,17 @@ pub const Tenants = struct {
     /// How often `tick` runs, the governor's cadence.
     pub const tick_ms: i64 = 100;
 
-    pub fn init(alloc: std.mem.Allocator, default_limit: Limit) Tenants {
-        return .{
-            .alloc = alloc,
-            .map = std.AutoHashMap(u64, *Tenant).init(alloc),
-            .default_limit = default_limit,
-        };
+    pub fn init(alloc: std.mem.Allocator, limit: Limit) Tenants {
+        limit.assertPositive();
+        return .{ .alloc = alloc, .default_limit = limit };
     }
 
     pub fn deinit(self: *Tenants) void {
+        const alloc = self.alloc orelse return;
         var it = self.map.valueIterator();
-        while (it.next()) |t| self.alloc.destroy(t.*);
-        self.map.deinit();
-        self.active.deinit(self.alloc);
+        while (it.next()) |t| alloc.destroy(t.*);
+        self.map.deinit(alloc);
+        self.active.deinit(alloc);
     }
 
     /// The tenant for `id`, made with the default limit on first sight.
@@ -454,9 +512,11 @@ pub const Tenants = struct {
         // under the write lock settles it.
         self.lock.lock(@src());
         defer self.lock.unlock();
-        const gop = try self.map.getOrPut(id);
+        if (self.alloc == null) self.alloc = _rt.runtime().allocator;
+        const alloc = self.alloc.?;
+        const gop = try self.map.getOrPut(alloc, id);
         if (!gop.found_existing) {
-            const t = try self.alloc.create(Tenant);
+            const t = try alloc.create(Tenant);
             t.* = Tenant.init(id, self.default_limit, now_ms);
             gop.value_ptr.* = t;
         }
@@ -503,7 +563,7 @@ pub const Tenants = struct {
         while (it.next()) |t| {
             if (!t.*.isActive(now_ms)) continue;
             // Out of memory: the rates stay what the last tick set.
-            self.active.append(self.alloc, t.*) catch return;
+            self.active.append(self.alloc.?, t.*) catch return;
 
             sum.cpu_milli += t.*.limit.cpu_milli;
             sum.io_pages_per_s += t.*.limit.io_pages_per_s;

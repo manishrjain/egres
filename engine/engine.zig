@@ -403,6 +403,7 @@ pub const Engine = struct {
     /// The raft event-loop runtime (owned).
     raft_rt: raft.RaftRuntime,
     snapshot_cfg: *flags.Live(SnapshotCfg),
+    runtime_cfg: *flags.Live(fiber.Runtime.Cfg),
     in_flight_mu: fiber.Mutex(.tracked) = .{},
     in_flight: std.ArrayList(InFlight) = .empty,
     /// Monotonic per-call ID for proposeCompaction so we can grep its
@@ -439,6 +440,7 @@ pub const Engine = struct {
         node: *raft.Node,
         forest: *Forest,
         snapshot_cfg: *flags.Live(SnapshotCfg),
+        runtime_cfg: *flags.Live(fiber.Runtime.Cfg),
     ) !*Engine {
         const self = try allocator.create(Engine);
         errdefer allocator.destroy(self);
@@ -455,6 +457,7 @@ pub const Engine = struct {
             .sm = undefined,
             .raft_rt = raft.RaftRuntime.init(allocator, node),
             .snapshot_cfg = snapshot_cfg,
+            .runtime_cfg = runtime_cfg,
             .bg = fiber.Group(void).init(allocator),
         };
         self.sm = self.storage_impl.asStateMachine();
@@ -500,10 +503,19 @@ pub const Engine = struct {
 
     /// Sizes the block cache from the rest of the process's memory
     /// (`governor.Governor.tick`), ten times a second: live bytes pass
-    /// the total by at most what 100 ms allocates past the margin.
+    /// the total by at most what 100 ms allocates past the margin. The
+    /// `--runtime` flags are applied when their version moves, before
+    /// the tick, so a live change reaches the tenants' tick that
+    /// follows; the governor reads its own.
     fn runGovernor(self: *Engine) void {
         const gov = _governor.g().?;
+        var applied: ?u64 = null;
         while (!self.node.isShuttingDown()) {
+            const version = self.runtime_cfg.version();
+            if (applied != version) {
+                fiber.runtime().apply(self.runtime_cfg.cur());
+                applied = version;
+            }
             gov.tick();
             if (self.node.shutdown.waitForStart(.shutdown, 100)) return;
         }

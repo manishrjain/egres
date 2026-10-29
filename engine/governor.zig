@@ -5,7 +5,7 @@
 //! the process holds, so the cache takes the memory nothing else needs
 //! and gives it back when something does.
 //!
-//! `total` (`--cache total_bytes`) is the memory the process may hold as
+//! `total` (`--memory total_bytes`) is the memory the process may hold as
 //! the allocator holds it: resident, what the cgroup charges. The
 //! program counts its own live bytes (the counting allocator); the
 //! allocator holds more on top (size-class rounding, freed pages not
@@ -18,7 +18,10 @@
 const std = @import("std");
 const zdb = @import("zdb");
 const galloc = @import("galloc");
+const fiber = @import("zfiber");
 const utils = @import("raft").utils;
+const flags = @import("flags");
+const log = std.log.scoped(.governor);
 
 const BlockCache = zdb.cache.ShardedCache(u128);
 
@@ -76,13 +79,55 @@ pub const Ratio = struct {
     }
 };
 
+/// `--memory`: the budget and what statements may take of it. Every
+/// field is live: `Governor.apply` takes the current value before each
+/// tick, so a change moves the cap on the next one.
+pub const Cfg = struct {
+    total_bytes: u64 = 0,
+    query_ratio: f64 = 0.5,
+    query_bytes: i64 = 0,
+
+    pub const docs = .{
+        .self = "The memory budget and what statements may take of it." ++
+            " The budget is a cap, not a reservation: memory is used" ++
+            " as blocks are read.",
+        .total_bytes = "The overall memory Egres aims to hold, resident." ++
+            " 0 = 90% of host RAM or of the cgroup limit. The" ++
+            " block cache is auto-resized based on what the rest of the" ++
+            " process uses and the allocator's measured overhead. Set it" ++
+            " on a host shared with other processes.",
+        .query_ratio = "The fraction of the memory budget statements may" ++
+            " hold in all; past it a database over its share waits for" ++
+            " room, then its statement is refused. The cache takes" ++
+            " what statements leave.",
+        .query_bytes = "Bytes one statement may hold before it is" ++
+            " refused, any database. 0 = no cap.",
+    };
+};
+
+/// `total_bytes` as a budget: itself, or 90% of what the host or the
+/// cgroup allows when zero. The tenth is for the WAL's page cache, the
+/// kernel and thread stacks.
+pub fn resolveTotal(total_bytes: u64) u64 {
+    if (total_bytes > 0) return total_bytes;
+    return utils.host.memory().bytes / 10 * 9;
+}
+
 pub const Governor = struct {
-    /// The memory the process may hold, resident (`--cache total_bytes`).
+    /// The memory the process may hold, resident (`--memory total_bytes`).
     total: u64,
     /// Kept for what the process holds outside the cache: the recent
     /// peak of it, never under `min_margin`.
     margin: u64 = min_margin,
     ratio: Ratio = .{},
+    /// What statements may hold in all, as a fraction of the live
+    /// target (`--memory query_ratio`).
+    query_share: f64 = 0.5,
+    /// The `--memory` flags, applied when their version moves; null
+    /// in a test, which sets the fields itself.
+    live: ?*flags.Live(Cfg),
+    /// The version of `live` last applied; none before the first tick.
+    applied: ?u64 = null,
     ticks: u32 = 0,
     knob: Knob,
 
@@ -95,15 +140,48 @@ pub const Governor = struct {
     /// stats refreshes them, cheap once a second, not every tick.
     const ratio_every_ticks = 10;
 
-    pub fn init(total: u64, cache: *BlockCache) Governor {
-        const gov: Governor = .{ .total = total, .knob = Knob.init(cache) };
+    pub fn init(
+        total: u64,
+        cache: *BlockCache,
+        live: ?*flags.Live(Cfg),
+    ) Governor {
+        const gov: Governor = .{
+            .total = total,
+            .live = live,
+            .knob = Knob.init(cache),
+        };
         gov.storeLimit();
         return gov;
+    }
+
+    /// Takes the `--memory` flags: the total, the statements' share
+    /// and the per-statement cap. A ratio outside (0, 1] cannot be
+    /// refused where it was set, so it is left unapplied and said.
+    fn apply(self: *Governor, cfg: Cfg) void {
+        const total = resolveTotal(cfg.total_bytes);
+        if (total != self.total) {
+            log.info("total {d} MiB, was {d} MiB", .{
+                total >> 20, self.total >> 20,
+            });
+            self.total = total;
+        }
+        if (cfg.query_ratio > 0 and cfg.query_ratio <= 1)
+            self.query_share = cfg.query_ratio
+        else
+            utils.logEvery(.warn, 60, "--memory query_ratio {d} is not in" ++
+                " (0, 1]: keeping {d}", .{ cfg.query_ratio, self.query_share });
+        fiber.meter.query_mem_bytes.store(cfg.query_bytes, .monotonic);
     }
 
     /// The live bytes the process may hold: `total` over the ratio.
     pub fn liveTarget(self: *const Governor) u64 {
         return self.ratio.liveFor(self.total);
+    }
+
+    /// The statement pool: `query_share` of the live target.
+    pub fn queryPool(self: *const Governor) u64 {
+        const live: f64 = @floatFromInt(self.liveTarget());
+        return @intFromFloat(live * self.query_share);
     }
 
     /// Allocations past the live target are counted, for `mem`.
@@ -125,8 +203,17 @@ pub const Governor = struct {
     }
 
     /// Reads the counters, moves the ratio and the margin, and applies
-    /// the cap.
+    /// the cap. Then the tenants' tick: the statement pool is their
+    /// memory capacity, and a tenant over its share waits while the
+    /// pool is full or the cache is at its floor with nothing to give.
     pub fn tick(self: *Governor) void {
+        if (self.live) |l| {
+            const version = l.version();
+            if (self.applied != version) {
+                self.apply(l.cur());
+                self.applied = version;
+            }
+        }
         const live = utils.context.counting().live_bytes.load(.monotonic);
         if (self.ticks % ratio_every_ticks == 0)
             self.ratio.measure(live, self.total / 4);
@@ -147,6 +234,18 @@ pub const Governor = struct {
                 cap >> 20, self.margin >> 20, self.ratio.cur,
             });
         }
+
+        const meter = fiber.meter;
+        const held: u64 = @intCast(
+            @max(meter.mem_held_total.load(.monotonic), 0),
+        );
+        const pool = self.queryPool();
+        meter.capacity.mem_bytes = @intCast(pool);
+        meter.mem_pressure.store(
+            held >= pool or cap <= min_cap,
+            .monotonic,
+        );
+        meter.tenants.tick(utils.coarseMs());
     }
 };
 
@@ -165,8 +264,8 @@ var installed: bool = false;
 /// Installs the process's governor over `cache`: the engine runs its
 /// ticks once started and `mem` prints it. The cache must outlive the
 /// engine (`main` waits on it before the cache is freed).
-pub fn init(total: u64, cache: *BlockCache) void {
-    global = Governor.init(total, cache);
+pub fn init(total: u64, cache: *BlockCache, live: *flags.Live(Cfg)) void {
+    global = Governor.init(total, cache, live);
     installed = true;
 }
 

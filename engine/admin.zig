@@ -43,7 +43,15 @@ pub const Command = union(enum) {
     workers: WorkersCmd,
     profile: ProfileCmd,
     traces: TracesCmd,
+    flag: FlagCmd,
     help: HelpCmd,
+};
+
+/// `flag <group> <key=value ...>`: a live change to one flag group,
+/// in the command line's syntax for the values.
+pub const FlagCmd = struct {
+    group: String,
+    input: String,
 };
 
 pub const VfsCmd = struct {};
@@ -119,6 +127,9 @@ pub const help_text =
     \\  workers                         per-worker CPU histogram + imbalance
     \\                                  ratio (work distribution across workers),
     \\                                  and the coarse clock's gap histogram
+    \\  flag <group> <key=value ...>    a live change to one flag group, as
+    \\                                  on the command line; a field fixed
+    \\                                  at startup is refused
     \\  profile cpu <secs> [hz] [top [N] | folded [lines]]
     \\                                  sample every worker's CPU for <secs>
     \\                                  (default 200 Hz); reply with pprof's
@@ -617,6 +628,11 @@ pub fn parseLine(line: String) !Command {
                 return error.InvalidArg;
         }
         return .{ .traces = req };
+    } else if (std.mem.eql(u8, cmd, "flag")) {
+        const group = it.next() orelse return error.MissingArg;
+        const input = it.rest();
+        if (input.len == 0) return error.MissingArg;
+        return .{ .flag = .{ .group = group, .input = input } };
     } else if (std.mem.eql(u8, cmd, "help")) {
         return .{ .help = .{} };
     } else {
@@ -889,6 +905,9 @@ pub const AdminServer = struct {
                 .traces => |req| {
                     self.handleTraces(stream, req) catch return;
                 },
+                .flag => |req| {
+                    handleFlag(stream, req) catch return;
+                },
                 .help => {
                     proto.writeHelp(stream) catch return;
                 },
@@ -1125,6 +1144,16 @@ pub const AdminServer = struct {
         try stream.writeAll(body.writer.buffered());
     }
 
+    /// The flags package parses and installs the change; a bad value or
+    /// a fixed field is the client's mistake, answered as ERR.
+    fn handleFlag(stream: fiber.net.Stream, req: proto.FlagCmd) !void {
+        flags.g().update(req.group, req.input) catch |err| {
+            return proto.writeErr(stream, @errorName(err));
+        };
+        log.info("flag {s} {s}", .{ req.group, req.input });
+        return proto.writeOk(stream);
+    }
+
     fn handleWorkers(self: *AdminServer, stream: fiber.net.Stream) !void {
         // Per-worker accumulated CPU time as a histogram, plus a max/avg
         // imbalance ratio (1.0 == perfectly balanced). Shows how evenly the
@@ -1311,7 +1340,7 @@ pub const AdminServer = struct {
         try memLine(w, "other live", other, "");
         if (_governor.g()) |gov| {
             try w.print("governor:\n", .{});
-            try memLine(w, "total", gov.total, "--cache total_bytes, resident");
+            try memLine(w, "total", gov.total, "--memory total_bytes, resident");
             try w.print("  ratio:        {d:.3}   (resident per live " ++
                 "byte, recent peak; last {d:.3})\n", .{
                 gov.ratio.cur, gov.ratio.measured,

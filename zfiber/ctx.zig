@@ -32,11 +32,15 @@
 //!
 //! A context is also where a statement is interruptible: its loops call
 //! `maybeYield` once per batch, and every policy that stops or paces a
-//! statement (the shutdown's stop stage today; cancel and a per-tenant
-//! budget later) delivers through that one call, so the loops never
-//! learn about any of them.
+//! statement (the shutdown's stop stage, the tenant's cpu share and
+//! the statement's memory cap today; cancel later) delivers through
+//! that one call, so the loops never learn about any of them. The
+//! statement's memory is what its arenas hold from `allocator`,
+//! counted here and on the tenant.
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
+const Alignment = std.mem.Alignment;
 const _rt = @import("runtime.zig");
 const _shutdown = @import("shutdown.zig");
 const _clock = @import("utils").coarse_clock;
@@ -97,9 +101,13 @@ pub const Ctx = struct {
     class: IoClass = .fg,
     cache: CachePolicy = .use,
     /// Who the fiber's cpu, io and memory are charged to: the session
-    /// sets it from its database once at connect, a spawn copies it,
-    /// and until then it is the system's, which is never short.
+    /// sets it from its database at connect (`Handler.onStartup`), a
+    /// spawn copies it, and until then it is the system's, which is
+    /// never short.
     tenant: *Tenant = &_meter.system,
+    /// Live bytes in the statement's arenas, on the root: a helper's
+    /// allocations count here too. Checked against the cap at a yield.
+    mem_held: std.atomic.Value(i64) = .init(0),
     /// The statement this fiber helps, set at spawn for a joinable
     /// fiber: `record` forwards to it. The spawner's frame joins the
     /// helper, so the root outlives it. Null on a root and on a fiber
@@ -115,18 +123,24 @@ pub const Ctx = struct {
     /// Never written.
     pub var bg: Ctx = .{};
 
-    /// Begins a statement on this context, the current fiber's: copies
-    /// the head of `name` (the statement text) into a fresh arena,
-    /// resets the I/O class, and counts the statement as in flight on
-    /// the installed Shutdown (`Shutdown.enterCtx`). Refused once the
-    /// process is draining. Needs a running runtime, whose allocator
-    /// backs the arena.
-    pub fn start(self: *Ctx, name: String) YieldError!void {
+    /// Begins a statement on this context, the current fiber's: waits
+    /// for the tenant's memory (`Tenant.payForMem`) unless the session is
+    /// inside a transaction block, whose statements release what it
+    /// holds; copies the head of `name` (the statement text) into a
+    /// fresh arena, resets the I/O class, counts the statement as in
+    /// flight on the installed Shutdown (`Shutdown.enterCtx`) and on
+    /// its tenant, which is active in the tick's split from here.
+    /// Refused once the process is draining. Needs a running runtime,
+    /// whose allocator backs the arena.
+    pub fn start(self: *Ctx, name: String, in_txn: bool) YieldError!void {
         std.debug.assert(self.arena == null and self.parent == null);
+        if (!in_txn) try self.tenant.payForMem();
         if (_shutdown.installed()) |sd| {
             if (!sd.enterCtx()) return error.Shutdown;
             self.counted = true;
         }
+
+        self.tenant.touch(_clock.ms());
         self.arena = std.heap.ArenaAllocator.init(_rt.runtime().allocator);
         const head = name[0..@min(name.len, name_max)];
         self.name = self.arena.?.allocator().dupe(u8, head) catch "";
@@ -139,13 +153,14 @@ pub const Ctx = struct {
 
     /// Ends the statement: either hands the name and records to the
     /// sampler or frees them, and leaves the context as a fresh
-    /// fiber's. Must run on the fiber that started it, after its
-    /// helpers are joined.
+    /// fiber's but for the tenant, which is the connection's. Must run
+    /// on the fiber that started it, after its helpers are joined.
     pub fn finish(self: *Ctx) void {
         var arena = self.arena.?;
         if (self.counted) _shutdown.installed().?.leaveCtx();
         if (!offer(self, arena, self.elapsedUs())) arena.deinit();
-        self.* = .{};
+        const tenant = self.tenant;
+        self.* = .{ .tenant = tenant };
     }
 
     /// The context the records go to: the statement's, through
@@ -178,26 +193,67 @@ pub const Ctx = struct {
         ) catch return;
     }
 
+    /// `n` bytes an arena of the statement took from, or gave back
+    /// to, `allocator`: on the statement, its tenant and the process.
+    pub fn holdMem(self: *Ctx, n: i64) void {
+        _ = self.root().mem_held.fetchAdd(n, .monotonic);
+        self.tenant.holdMem(n);
+        _ = _meter.mem_held_total.fetchAdd(n, .monotonic);
+    }
+
+    pub fn releaseMem(self: *Ctx, n: i64) void {
+        _ = self.root().mem_held.fetchSub(n, .monotonic);
+        self.tenant.releaseMem(n);
+        _ = _meter.mem_held_total.fetchSub(n, .monotonic);
+    }
+
+    /// The runtime's allocator, counted on this context: what every
+    /// statement arena is made on. What it hands out is held by the
+    /// statement and its tenant until given back, which the arena does
+    /// before the statement ends. An arena asks per chunk, so the
+    /// count is cheap and a little coarse.
+    pub fn allocator(self: *Ctx) Allocator {
+        return .{ .ptr = self, .vtable = &mem_vtable };
+    }
+
+    /// A statement arena on `allocator`: the caller's to deinit.
+    pub fn newArena(self: *Ctx) std.heap.ArenaAllocator {
+        return .init(self.allocator());
+    }
+
     pub fn elapsedUs(self: *const Ctx) u64 {
         const now = _clock.timestampNow(.monotonic, .micros);
         return @intCast(@max(0, now - self.start_mono_us));
     }
 
-    pub const YieldError = error{Shutdown};
+    /// `MemShare`: the tenant waited its bound for memory and is still
+    /// over its share. `MemLimit`: the statement is past the cap. Both
+    /// are the statement's, answered as out of memory.
+    pub const YieldError = error{ Shutdown, MemShare, MemLimit };
 
     /// The statement's yield point: a loop calls this once per batch or
     /// block of work, and the runtime may pause the statement here or
-    /// decline to resume it, which comes back as the error. Today it
-    /// only asks whether the process is stopping (`Shutdown.startShutdown`)
-    /// and never parks; the pause is what a cancel or a CPU budget will
-    /// add. The drain stage before the stop is not an interrupt: a
+    /// decline to resume it, which comes back as the error. It asks
+    /// whether the process is stopping (`Shutdown.startShutdown`) and
+    /// whether the statement holds more than `query_mem_bytes`, then
+    /// charges the cpu since the last settle to the tenant and pays
+    /// its debt: a bucket below zero parks the fiber until the rate
+    /// has covered it. Cancel will come through here too. The drain
+    /// stage before the stop is not an interrupt: a
     /// running statement gets the grace period to finish on its own,
     /// only `start` refuses new ones. Callers must treat this as a
     /// blocking call: no spinlock held across it.
     pub fn maybeYield(self: *Ctx) YieldError!void {
-        _ = self;
-        const sd = _shutdown.installed() orelse return;
-        if (sd.isStopping()) return error.Shutdown;
+        if (_shutdown.installed()) |sd| {
+            if (sd.isStopping()) return error.Shutdown;
+        }
+        const cap = _meter.query_mem_bytes.load(.monotonic);
+        if (cap > 0 and self.root().mem_held.load(.monotonic) > cap)
+            return error.MemLimit;
+        if (_rt.currentWorkerOrNull()) |w| {
+            if (w.current_fiber) |f| _ = w.chargeCpu(f);
+        }
+        self.tenant.pay(.cpu, self.class);
     }
 };
 
@@ -206,6 +262,66 @@ pub const Ctx = struct {
 pub fn current() *Ctx {
     const f = _rt.currentFiberOrNull() orelse return &Ctx.bg;
     return &f.ctx;
+}
+
+/// The allocator's data pointer is the context, so a chunk is counted
+/// on the context that made the arena wherever it is taken; `Ctx.bg`
+/// counts nothing.
+const mem_vtable: Allocator.VTable = .{
+    .alloc = memAlloc,
+    .resize = memResize,
+    .remap = memRemap,
+    .free = memFree,
+};
+
+fn memCtx(ptr: *anyopaque) *Ctx {
+    return @ptrCast(@alignCast(ptr));
+}
+
+fn memHeld(ptr: *anyopaque, old_len: usize, new_len: usize) void {
+    const ctx = memCtx(ptr);
+    if (ctx == &Ctx.bg) return;
+    if (new_len >= old_len)
+        ctx.holdMem(@intCast(new_len - old_len))
+    else
+        ctx.releaseMem(@intCast(old_len - new_len));
+}
+
+fn memAlloc(ptr: *anyopaque, len: usize, al: Alignment, ra: usize) ?[*]u8 {
+    const p = _rt.runtime().allocator.rawAlloc(len, al, ra) orelse return null;
+    memHeld(ptr, 0, len);
+    return p;
+}
+
+fn memResize(
+    ptr: *anyopaque,
+    memory: []u8,
+    al: Alignment,
+    new_len: usize,
+    ra: usize,
+) bool {
+    if (!_rt.runtime().allocator.rawResize(memory, al, new_len, ra))
+        return false;
+    memHeld(ptr, memory.len, new_len);
+    return true;
+}
+
+fn memRemap(
+    ptr: *anyopaque,
+    memory: []u8,
+    al: Alignment,
+    new_len: usize,
+    ra: usize,
+) ?[*]u8 {
+    const p = _rt.runtime().allocator.rawRemap(memory, al, new_len, ra) orelse
+        return null;
+    memHeld(ptr, memory.len, new_len);
+    return p;
+}
+
+fn memFree(ptr: *anyopaque, memory: []u8, al: Alignment, ra: usize) void {
+    _rt.runtime().allocator.rawFree(memory, al, ra);
+    memHeld(ptr, memory.len, 0);
 }
 
 /// A finished statement kept by the sampler. Owns its arena, which

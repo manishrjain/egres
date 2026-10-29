@@ -54,7 +54,7 @@ sets=(
     --set "clients=$CLIENTS"
     --set "secs=$WORKLOAD_SECS"
     --set "runs=1"
-    --set "server.cache=total_bytes=$CACHE"
+    --set "server.memory=total_bytes=$CACHE"
     --set "server.zdb_extra=num_compactors=$COMPACTORS"
 )
 

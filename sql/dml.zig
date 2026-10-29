@@ -53,7 +53,7 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
         .table_id = table_id,
     };
 
-    var arena = std.heap.ArenaAllocator.init(eng.allocator);
+    var arena = fiber.ctx().newArena();
     defer arena.deinit();
     const arloc = arena.allocator();
 
@@ -178,7 +178,7 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
         .table_id = table_id,
     };
 
-    var arena = std.heap.ArenaAllocator.init(eng.allocator);
+    var arena = fiber.ctx().newArena();
     defer arena.deinit();
     const arloc = arena.allocator();
 
@@ -269,7 +269,7 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
         .namespace = ns,
         .table_id = table_id,
     };
-    var arena = std.heap.ArenaAllocator.init(eng.allocator);
+    var arena = fiber.ctx().newArena();
     defer arena.deinit();
     const arloc = arena.allocator();
 
@@ -354,7 +354,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
         .namespace = ns,
         .table_id = table_id,
     };
-    var arena = std.heap.ArenaAllocator.init(eng.allocator);
+    var arena = fiber.ctx().newArena();
     defer arena.deinit();
     const arloc = arena.allocator();
 
@@ -526,7 +526,7 @@ pub fn describeSelect(
         .table_id = table_id,
     };
 
-    var arena = std.heap.ArenaAllocator.init(eng.allocator);
+    var arena = fiber.ctx().newArena();
     defer arena.deinit();
     const arloc = arena.allocator();
 
@@ -582,7 +582,7 @@ pub fn selectRow(
     state: *pgwire.ConnState,
     sr: _parse.SelectRow,
 ) !void {
-    if (self.mode == .simple) try describeSelectRow(self, state, sr);
+    if (self.mode == .simple) try describeSelectRow(state, sr);
     const emit = (sr.limit orelse 1) > 0;
     if (emit) {
         var dw = try state.beginDataRow(@intCast(sr.cells.len));
@@ -609,11 +609,10 @@ pub fn selectRow(
 /// its target and typed by its constant, the widest of its kind. An
 /// untyped NULL is text, as Postgres resolves it.
 pub fn describeSelectRow(
-    self: *Handler,
     state: *pgwire.ConnState,
     sr: _parse.SelectRow,
 ) !void {
-    var arena = std.heap.ArenaAllocator.init(self.srv.engine.allocator);
+    var arena = fiber.ctx().newArena();
     defer arena.deinit();
     const fields = try arena.allocator().alloc(
         pgwire.FieldDescription,
@@ -1144,6 +1143,7 @@ fn replyRunErr(
         // A yield point stopped the scan: the serve loop ends the
         // session with the FATAL, so no reply here.
         error.Shutdown => err,
+        error.MemLimit => _server.replyMemLimit(state),
         error.ReadBelowMinRead => _server.replySnapshotTooOld(state),
         else => {
             log.err(

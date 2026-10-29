@@ -79,8 +79,8 @@ test "limiter: a tenant pays fg's debt first, then bg's" {
     const fg_waited = utils.coarseMs() - start;
     try expect(fg_waited >= 150 and fg_waited <= 1500);
 
-    // bg: its burst and one more at once, then the next waits for fg
-    // to fill and its own page: about 100 ms.
+    // bg: its burst and one more at once, then the next sleeps once
+    // for fg to fill and its own page: about 100 ms.
     ctx.class = .bg;
     defer ctx.class = .fg;
     start = utils.coarseMs();

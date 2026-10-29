@@ -83,3 +83,17 @@ test "readToken: odd-length hex returns error.BadHex" {
 // Throughput benchmark (was here as a `test "readToken: benchmark parse
 // throughput"`) is now in `engine/admin_bench.zig` and runs via
 // `zig build bench`.
+
+test "parseLine: flag takes the group and the rest of the line" {
+    const cmd = try proto.parseLine("flag runtime cpu_milli=4000 poll_us=0");
+    try std.testing.expectEqualStrings("runtime", cmd.flag.group);
+    try std.testing.expectEqualStrings(
+        "cpu_milli=4000 poll_us=0",
+        cmd.flag.input,
+    );
+    try std.testing.expectError(
+        error.MissingArg,
+        proto.parseLine("flag runtime"),
+    );
+    try std.testing.expectError(error.MissingArg, proto.parseLine("flag"));
+}

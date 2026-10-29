@@ -76,10 +76,13 @@ pub const Shutdown = struct {
 
     /// Start first (idempotent) so the watcher's next poll sees it and
     /// exits, then join it — nothing stays parked on freed state.
+    /// An installed instance uninstalls itself: a `maybeYield` after
+    /// this must not find a freed one.
     pub fn deinit(self: *Shutdown) void {
         self.startShutdown();
         if (self.watcher) |*h| h.join();
         self.wm.deinit();
+        _ = process_shutdown.cmpxchgStrong(self, null, .seq_cst, .seq_cst);
     }
 
     /// Begin shutdown: flip `isStopping` and wake every waiter. Idempotent.

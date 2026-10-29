@@ -355,10 +355,12 @@ const max_parsed = 256;
 /// sent it), no ReadyForQuery (Sync's), and an error drops the rest
 /// of the batch (ext_failed).
 pub const Handler = struct {
+    pub const Mode = enum { simple, extended };
+
     srv: *Server,
     /// Which protocol the statement in flight came in on. Set by the
     /// two entry points (onQuery, onExecute) before runStatement.
-    mode: enum { simple, extended } = .simple,
+    mode: Mode = .simple,
     /// The Bind values for the statement in flight (Execute), empty
     /// for a simple query. Every `$n` a statement carries resolves
     /// here (parse.litToValue).
@@ -487,24 +489,22 @@ pub const Handler = struct {
         switch (ev) {
             .startup_complete => |params| try self.onStartup(state, params),
             .query => |sql| {
-                const qctx = fiber.ctx();
-                try qctx.start(sql);
-                defer qctx.finish();
+                if (!try self.startCtx(state, sql, .simple))
+                    return state.endCommand();
+                defer fiber.ctx().finish();
 
                 try self.onQuery(state, sql);
                 try state.endCommand();
             },
             .execute => |ctx| {
-                const qctx = fiber.ctx();
-                try qctx.start(ctx.sql);
-                defer qctx.finish();
+                if (!try self.startCtx(state, ctx.sql, .extended)) return;
+                defer fiber.ctx().finish();
 
                 try self.onExecute(state, ctx);
             },
             .describe => |ctx| {
-                const qctx = fiber.ctx();
-                try qctx.start(ctx.sql);
-                defer qctx.finish();
+                if (!try self.startCtx(state, ctx.sql, .extended)) return;
+                defer fiber.ctx().finish();
 
                 try self.onDescribe(state, ctx);
             },
@@ -525,12 +525,41 @@ pub const Handler = struct {
         self.srv.engine.allocator.destroy(t);
     }
 
+    /// Starts the statement's context, or answers the tenant's memory
+    /// refusal, out of memory, and skips the statement: false. In the
+    /// extended protocol the rest of the batch is skipped to the Sync.
+    fn startCtx(
+        self: *Handler,
+        state: *pgwire.ConnState,
+        sql: String,
+        mode: Mode,
+    ) !bool {
+        fiber.ctx().start(sql, self.txn != null) catch |err| switch (err) {
+            error.MemShare => {
+                try replyMemShare(state);
+                if (mode == .extended) state.ext_failed = true;
+                return false;
+            },
+            else => return err,
+        };
+        return true;
+    }
+
     pub fn onStartup(self: *Handler, state: *pgwire.ConnState, params: pgwire.proto.StartupParams) !void {
         _ = state;
         const requested = params.database orelse "";
         self.namespace = self.srv.engine.forest.manifest.lookupNamespace(
             if (requested.len > 0) requested else default_database,
         ) orelse 0;
+        // The database is the tenant: every statement on this fiber is
+        // charged to it from here. A name that resolved to nothing
+        // stays on the system's, and is refused per statement anyway.
+        if (self.namespace != 0) {
+            fiber.ctx().tenant = try fiber.meter.tenants.get(
+                self.namespace,
+                utils.coarseMs(),
+            );
+        }
     }
 
     /// The session's namespace if it still exists, else a SQL error and null.
@@ -604,7 +633,7 @@ pub const Handler = struct {
         // Parse into an arena: the Stmt borrows its strings from the
         // libpg_query tree, and the arena reclaims all of it — tree and
         // borrowed statement alike — when this scope ends.
-        var arena = std.heap.ArenaAllocator.init(self.srv.engine.allocator);
+        var arena = fiber.ctx().newArena();
         defer arena.deinit();
         const stmt = _parse.statement(arena.allocator(), sql_text) catch
             return replySyntaxError(state);
@@ -655,7 +684,7 @@ pub const Handler = struct {
         fiber.ctx().record("bound {d} params", .{ctx.params.len});
         const needed = stmt.paramCount();
         if (needed != ctx.params.len) {
-            var arena = std.heap.ArenaAllocator.init(self.srv.engine.allocator);
+            var arena = fiber.ctx().newArena();
             defer arena.deinit();
             const msg = try std.fmt.allocPrint(
                 arena.allocator(),
@@ -694,7 +723,7 @@ pub const Handler = struct {
         if (self.txn) |t| if (t.failed) return replyFailedBlock(state);
         switch (stmt) {
             .select => |sel| try _dml.describeSelect(self, state, sel),
-            .select_row => |sr| try _dml.describeSelectRow(self, state, sr),
+            .select_row => |sr| try _dml.describeSelectRow(state, sr),
             else => try state.sendNoData(),
         }
     }
@@ -956,7 +985,7 @@ pub const Handler = struct {
             state.tx_status = .idle;
         }
         if (commit and !t.failed) {
-            var arena = std.heap.ArenaAllocator.init(self.srv.engine.allocator);
+            var arena = fiber.ctx().newArena();
             defer arena.deinit();
             if (!try self.commitOrReply(state, arena.allocator(), t, "commit", "txn")) return;
             return state.sendCommandComplete("COMMIT");
@@ -1055,6 +1084,26 @@ pub fn replyError(state: *pgwire.ConnState, msg: String) !void {
 
 pub fn replyErrorCode(state: *pgwire.ConnState, code: [5]u8, msg: String) !void {
     try state.sendError(.{ .code = code, .message = msg });
+}
+
+/// The tenant waited its bound for memory and is still over its share
+/// (`Tenant.payForMem`): the statement did not start.
+fn replyMemShare(state: *pgwire.ConnState) !void {
+    return replyErrorCode(
+        state,
+        pgwire.sqlstate.out_of_memory,
+        "out of memory: the database is over its memory share",
+    );
+}
+
+/// The statement holds more than the per-statement cap
+/// (`--memory query_bytes`): a yield point stopped it.
+pub fn replyMemLimit(state: *pgwire.ConnState) !void {
+    return replyErrorCode(
+        state,
+        pgwire.sqlstate.out_of_memory,
+        "out of memory: the statement is over its memory limit",
+    );
 }
 
 /// A read was refused as below the read floor
