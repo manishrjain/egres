@@ -1,0 +1,5 @@
+/target/
+/store/
+/.lein-*
+/checkouts/
+/runs/

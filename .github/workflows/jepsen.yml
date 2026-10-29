@@ -1,0 +1,79 @@
+# The Jepsen matrix (tests/jepsen/matrix.sh) nightly and by hand: a
+# ReleaseSafe Egres, the harness's unit tests, then every case of the
+# matrix in sequence, 60 seconds each with kills and pauses, against a
+# server on the runner. Linux only; the harness needs Leiningen and
+# Graphviz, and the Mac runner adds nothing the Linux one lacks here.
+# The matrix logs and Jepsen's store, without the server's WAL and
+# SST files, are the job's artifact either way.
+name: jepsen
+
+on:
+  schedule:
+    # 3 am PST; an hour later on the clock during PDT.
+    - cron: '0 11 * * *'
+  workflow_dispatch:
+
+jobs:
+  jepsen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # The same key as ci.yml, so the allocator archive is a cache hit.
+      - uses: actions/cache@v6
+        with:
+          path: .deps
+          key: >-
+            deps-${{ runner.os }}-${{
+            hashFiles('build.zig', 'scripts/bootstrap-*.sh') }}
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: DeLaGuardo/setup-clojure@13
+        with:
+          lein: 2.11.2
+
+      # Jepsen, Elle and pgjdbc from project.clj, fetched once per
+      # change to it.
+      - uses: actions/cache@v6
+        with:
+          path: ~/.m2/repository
+          key: m2-${{ hashFiles('tests/jepsen/project.clj') }}
+
+      # Elle renders anomaly graphs through dot.
+      - name: Install Graphviz
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q graphviz
+
+      - name: Matrix
+        env:
+          DURATION: 60
+        run: tests/jepsen/matrix.sh
+
+      # Jepsen's `current` and `latest` are symlinks to run dirs; the
+      # upload follows symlinks, so without the exclusions each run
+      # would be in the artifact up to three times. The server's data
+      # files are the bulk of a run and say nothing a history does not.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jepsen
+          path: |
+            tests/jepsen/runs
+            tests/jepsen/store
+            !tests/jepsen/store/current
+            !tests/jepsen/store/current/**
+            !tests/jepsen/store/**/latest
+            !tests/jepsen/store/**/latest/**
+            !tests/jepsen/store/**/server/wal/**
+            !tests/jepsen/store/**/server/sst/**
+          if-no-files-found: ignore

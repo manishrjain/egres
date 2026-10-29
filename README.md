@@ -56,6 +56,10 @@ server over pgwire with `psql`; `scripts/prepush.sh` is the gate a push
 to main passes, and CI runs both on every push. The conventions the
 code follows are in [AGENTS.md](AGENTS.md).
 
+[Jepsen tests](tests/jepsen/README.md) check snapshot isolation over pgwire,
+including process crashes and pauses. See the
+[SQL compatibility notes](tests/jepsen/SQL-COMPATIBILITY.md).
+
 ## AI Policy
 
 Most of the Egres code base was written using AI agents: Claude Opus and then
@@ -69,4 +73,6 @@ before it is considered.
 ## License
 
 Apache License 2.0, see [LICENSE](LICENSE). Every source file carries
-an SPDX header; `third_party/` keeps its own licenses.
+an SPDX header. `third_party/` and the
+[Jepsen harness](tests/jepsen/LICENSE-NOTES.md) (EPL-2.0) keep their
+own licenses.
