@@ -62,19 +62,23 @@ test "sql.value: Type.fromName resolves DDL type names" {
     try testing.expect(Type.fromName("") == null);
 }
 
-test "sql.value: parseValue coerces literals and rejects unsupported types" {
-    try testing.expectEqual(@as(i32, -7), (try value.parseValue(.int4, "-7")).int4);
-    try testing.expectEqual(@as(u64, 42), (try value.parseValue(.uint8, "42")).uint8);
-    try testing.expectEqual(true, (try value.parseValue(.bool_, "t")).bool_);
-    try testing.expectEqual(false, (try value.parseValue(.bool_, "FALSE")).bool_);
-    try testing.expectEqual(@as(f64, 1.5), (try value.parseValue(.float8, "1.5")).float8);
-    try testing.expectEqualStrings("hi", (try value.parseValue(.text, "hi")).text);
+test "sql.value: textToValue reads literals and rejects unsupported types" {
+    const toValue = value.textToValue;
+    try testing.expectEqual(@as(i32, -7), (try toValue(.int4, "-7")).int4);
+    try testing.expectEqual(@as(u64, 42), (try toValue(.uint8, "42")).uint8);
+    try testing.expectEqual(true, (try toValue(.bool_, "t")).bool_);
+    try testing.expectEqual(false, (try toValue(.bool_, "FALSE")).bool_);
+    try testing.expectEqual(
+        @as(f64, 1.5),
+        (try toValue(.float8, "1.5")).float8,
+    );
+    try testing.expectEqualStrings("hi", (try toValue(.text, "hi")).text);
     // Bad numeric / bool → error (executor maps to 22P02).
-    try testing.expectError(error.InvalidCharacter, value.parseValue(.int4, "nope"));
-    try testing.expectError(error.InvalidBool, value.parseValue(.bool_, "maybe"));
+    try testing.expectError(error.InvalidCharacter, toValue(.int4, "nope"));
+    try testing.expectError(error.InvalidBool, toValue(.bool_, "maybe"));
     // Types this slice can't parse.
-    try testing.expectError(error.UnsupportedType, value.parseValue(.time, "10:00"));
-    try testing.expectError(error.UnsupportedType, value.parseValue(.uuid, "x"));
+    try testing.expectError(error.UnsupportedType, toValue(.time, "10:00"));
+    try testing.expectError(error.UnsupportedType, toValue(.uuid, "x"));
 }
 
 test "sql.value: timestamps parse from and format to Postgres text" {
@@ -99,7 +103,7 @@ test "sql.value: timestamps parse from and format to Postgres text" {
     };
     for (cases) |c| {
         try testing.expectEqual(c.us, try date.parseTimestamp(c.text, false));
-        const cell = try value.parseValue(.timestamp, c.text);
+        const cell = try value.textToValue(.timestamp, c.text);
         try testing.expectEqual(c.us, cell.timestamp);
     }
     // A zone offset shifts a timestamptz to UTC; a plain timestamp
@@ -119,7 +123,7 @@ test "sql.value: timestamps parse from and format to Postgres text" {
         sep12 + two_hours,
         try date.parseTimestamp(noon_plus2, false),
     );
-    const tz_cell = try value.parseValue(.timestamptz, noon_plus2);
+    const tz_cell = try value.textToValue(.timestamptz, noon_plus2);
     try testing.expectEqual(sep12, tz_cell.timestamptz);
 
     const bad = [_]String{
@@ -155,7 +159,7 @@ test "sql.value: timestamps parse from and format to Postgres text" {
     };
     for (out) |c| {
         var w = std.Io.Writer.fixed(&buf);
-        try value.formatValue(&w, null, c.v);
+        try value.valueToText(&w, null, c.v);
         try testing.expectEqualStrings(c.want, w.buffered());
     }
     // Round trip every day of a leap year and its neighbours.
@@ -169,7 +173,7 @@ test "sql.value: timestamps parse from and format to Postgres text" {
     }
 }
 
-test "sql.value: formatValue renders text-format output" {
+test "sql.value: valueToText renders text-format output" {
     var buf: [64]u8 = undefined;
     const cases = [_]struct { v: value.Value, want: String }{
         .{ .v = .{ .int4 = -7 }, .want = "-7" },
@@ -180,7 +184,7 @@ test "sql.value: formatValue renders text-format output" {
     };
     for (cases) |c| {
         var w = std.Io.Writer.fixed(&buf);
-        try value.formatValue(&w, null, c.v);
+        try value.valueToText(&w, null, c.v);
         try testing.expectEqualStrings(c.want, w.buffered());
     }
 }
@@ -199,7 +203,7 @@ test "sql.value: pgTypeOid widens unsigned ints" {
     try testing.expectEqual(pgwire.oid.timestamptz, tstz);
 }
 
-/// A string column of `ty` and length `n` for the coerceString cases.
+/// A string column of `ty` and length `n` for the fitString cases.
 fn strCol(ty: value.Type, n: ?u32) sql.table.Column {
     return .{
         .column_id = 1,
@@ -211,11 +215,11 @@ fn strCol(ty: value.Type, n: ?u32) sql.table.Column {
     };
 }
 
-test "sql.value: coerceString strips, counts codepoints, and rejects" {
+test "sql.value: fitString strips, counts codepoints, and rejects" {
     const cs = struct {
         fn cs(text: String, ty: value.Type, n: ?u32) !String {
             const col = strCol(ty, n);
-            return value.coerceString(text, &col);
+            return value.fitString(text, &col);
         }
     }.cs;
     // bpchar: trailing spaces stripped, then counted; excess that is only
@@ -243,7 +247,7 @@ test "sql.value: coerceString strips, counts codepoints, and rejects" {
     try testing.expectError(error.InvalidUtf8, cs("a\xff", .varchar, 5));
 }
 
-test "sql.value: formatValue pads a char(n) cell to n codepoints" {
+test "sql.value: valueToText pads a char(n) cell to n codepoints" {
     var buf: [16]u8 = undefined;
     var col = sql.table.Column{
         .column_id = 1,
@@ -254,20 +258,20 @@ test "sql.value: formatValue pads a char(n) cell to n codepoints" {
         .type_mod = 5,
     };
     var w: std.Io.Writer = .fixed(&buf);
-    try value.formatValue(&w, &col, .{ .text = "ab" });
+    try value.valueToText(&w, &col, .{ .text = "ab" });
     try testing.expectEqualStrings("ab   ", w.buffered());
     col.type_mod = 6;
     w = .fixed(&buf);
-    try value.formatValue(&w, &col, .{ .text = "héllo" });
+    try value.valueToText(&w, &col, .{ .text = "héllo" });
     try testing.expectEqualStrings("héllo ", w.buffered());
     col.type_mod = 3;
     w = .fixed(&buf);
-    try value.formatValue(&w, &col, .{ .text = "abcdef" }); // never truncates
+    try value.valueToText(&w, &col, .{ .text = "abcdef" }); // never truncates
     try testing.expectEqualStrings("abcdef", w.buffered());
     // A text column of the same value is not padded.
     col.ty = .text;
     w = .fixed(&buf);
-    try value.formatValue(&w, &col, .{ .text = "ab" });
+    try value.valueToText(&w, &col, .{ .text = "ab" });
     try testing.expectEqualStrings("ab", w.buffered());
 }
 
@@ -284,7 +288,7 @@ test "sql.value: string types share cells, OIDs and modifiers differ" {
     try testing.expectEqual(Type.bpchar, Type.fromName("bpchar").?);
     try testing.expectEqual(Type.bpchar, Type.fromName("char").?);
     try testing.expectEqual(Type.text, Type.fromName("varchar").?);
-    const v = try value.parseValue(.bpchar, "abc");
+    const v = try value.textToValue(.bpchar, "abc");
     try testing.expectEqualStrings("abc", v.text);
 }
 
@@ -305,7 +309,7 @@ test "sql.value: date parses and prints as YYYY-MM-DD" {
     try testing.expectError(error.InvalidTimestamp, date.parseDate("1996/03/13"));
     try testing.expectError(error.InvalidTimestamp, date.parseDate(""));
 
-    const v = try value.parseValue(.date, "1996-03-13");
+    const v = try value.textToValue(.date, "1996-03-13");
     try testing.expectEqual(@as(i32, 9568), v.date);
     try testing.expectEqual(pgwire.oid.date, value.pgTypeOid(.date));
 
@@ -313,7 +317,7 @@ test "sql.value: date parses and prints as YYYY-MM-DD" {
     const cases = [_]String{ "1970-01-01", "1969-12-31", "1996-03-13", "2000-02-29", "2024-12-31", "0001-01-01", "9999-12-31" };
     for (cases) |text| {
         var w: std.Io.Writer = .fixed(&buf);
-        try value.formatValue(&w, null, .{ .date = try date.parseDate(text) });
+        try value.valueToText(&w, null, .{ .date = try date.parseDate(text) });
         try testing.expectEqualStrings(text, w.buffered());
     }
 }

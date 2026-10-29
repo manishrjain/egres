@@ -23,11 +23,11 @@ A statement Egres recognises but does not run yet returns a Postgres error with 
 | Extended query protocol (`Parse`, `Bind`, `Describe`, `Execute`, `Close`, `Sync`, `Flush`) | Yes | Each session caches its parsed statements by SQL text. |
 | `$1`-style parameters | Yes | In `WHERE`, `SET` and `VALUES`, up to `$65535`. |
 | Parameters in text format | Yes | Any column type. |
-| Parameters in binary format | Partial | `bool`, `int2`, `int4`, `int8`, `float4`, `float8`. |
+| Parameters in binary format | Partial | Decoded by the type declared at `Parse`: `bool`, `int2`, `int4`, `int8`, `float4`, `float8`, `bytea`, `uuid`, `text`, `varchar`, `char`. An integer assigns to any numeric column, range-checked; a float to a float column; a float into an integer column is `42804`. A binary value with no declared type is `0A000`. |
 | Parameter type inference at `Parse` | Not&nbsp;yet | The server echoes the OIDs the client sent. |
 | Result columns in text format | Yes | |
 | Result columns in binary format | Not&nbsp;yet | |
-| Portal row limits (`Execute` with a row count) | Not&nbsp;yet | |
+| Portal row limits (`Execute` with a row count) | Partial | A result within the limit completes; a larger one returns `PortalSuspended` after the limit, and the next `Execute` on that portal is `0A000`. Covers JDBC's one-row `Execute` for statements it expects no rows from. |
 | Empty query | Yes | `EmptyQueryResponse`, as in Postgres. |
 | TLS | Not&nbsp;yet | `SSLRequest` is answered with `N`; clients with `sslmode=prefer` or `disable` continue over plain TCP. |
 | Authentication | Not&nbsp;yet | Every connection is accepted. |
@@ -38,7 +38,7 @@ A statement Egres recognises but does not run yet returns a Postgres error with 
 | Cursors, `PREPARE` as a statement | Not&nbsp;yet | |
 | `NoticeResponse` | Not&nbsp;yet | |
 
-The default SQL port is `3210`. The database `egres` exists from the first boot, and a session that names no database lands in it. `psql` reports the server version as `13.0`, the protocol version Egres speaks. The clients used in the quickstart and the benchmarks are `psql` and `pgbench`.
+The default SQL port is `3210`. The database `egres` exists from the first boot, and a session that names no database lands in it. `psql` reports the server version as `16.0 (Egres <tag>)`: the Postgres release Egres presents, which clients read for the features to use, then the Egres release tag. `SHOW egres_version` returns the tag alone, `dev` for a build without one. The clients used in the quickstart and the benchmarks are `psql` and `pgbench`.
 
 ## Statements
 
@@ -65,7 +65,7 @@ The default SQL port is `3210`. The database `egres` exists from the first boot,
 | `SAVEPOINT`, `PREPARE TRANSACTION` | Not&nbsp;yet | |
 | DDL inside a transaction block | Not&nbsp;yet | Returns `25001`. Each DDL statement runs as its own transaction. |
 | `SET`, `RESET` | Yes | Any parameter, accepted and ignored. |
-| `SHOW` | Not&nbsp;yet | |
+| `SHOW` | Partial | The connection's `ParameterStatus` settings, `transaction_isolation` and `default_transaction_isolation` (`repeatable read`), `transaction_read_only`, `search_path`, `max_identifier_length`. Any other parameter is `42704`; `SHOW ALL` too. |
 | `EXPLAIN`, `ANALYZE` | Not&nbsp;yet | |
 | `VACUUM` | Not&nbsp;applicable | See [No VACUUM](design/no-vacuum.md). |
 | `CREATE FUNCTION`, `CREATE PROCEDURE`, `DO` (user-defined functions and procedures) | Not&nbsp;yet | |
@@ -132,7 +132,8 @@ CREATE TABLE [IF NOT EXISTS] name (
 |---|---|---|
 | `PRIMARY KEY` on one column | Yes | One per table. |
 | `UNIQUE` on one column | Yes | `NULL` is allowed, and two `NULL`s do not collide, as in Postgres. |
-| `NOT NULL`, `DEFAULT`, `CHECK`, `REFERENCES`, `GENERATED` | Not&nbsp;yet | |
+| `NOT NULL` | Yes | Enforced on `INSERT` and `UPDATE` (`23502`). The `PRIMARY KEY` column is `NOT NULL`. |
+| `DEFAULT`, `CHECK`, `REFERENCES`, `GENERATED` | Not&nbsp;yet | |
 | Table-level constraints: `PRIMARY KEY (a, b)`, `UNIQUE (a, b)`, `FOREIGN KEY` | Not&nbsp;yet | |
 | `char(n)`, `varchar(n)` length modifiers | Yes | Up to 10,485,760, as in Postgres. A bare `char` is `char(1)`; a bare `varchar` is `text`. |
 | Length modifiers on other types | Not&nbsp;yet | |
@@ -185,7 +186,8 @@ Assignments in `SET` follow Postgres: any integer into any numeric column with a
 | `CURRENT_TIMESTAMP`, `LOCALTIMESTAMP` | Partial | In `INSERT ... VALUES`, into a `timestamp` or `timestamptz` column; the transaction's start time, as in Postgres. In `WHERE` or `SET`: not yet. |
 | `+`, `-`, `*`, `/`, `%` on numeric types, unary minus | Yes | In `UPDATE ... SET`, over literals, parameters and columns of the same row. |
 | `\|\|` on strings | Yes | In `UPDATE ... SET`. |
-| `now()`, casts, string and date functions, `COALESCE`, `CASE`, every other function and operator | Not&nbsp;yet | |
+| A cast of a constant: `'6'::int8`, `CAST('x' AS text)` | Partial | In `VALUES`, `WHERE`, `SET` and a `SELECT` without `FROM`. The constant is typed by the column it meets, as a bare literal is; the named type is not checked. pgjdbc in simple query mode inlines every bind parameter this way. |
+| `now()`, casts of columns and expressions, string and date functions, `COALESCE`, `CASE`, every other function and operator | Not&nbsp;yet | |
 | User-defined functions, in SQL or any other language | Not&nbsp;yet | |
 
 ## Extensions

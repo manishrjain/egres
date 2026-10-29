@@ -75,6 +75,8 @@ pub const Column = struct {
     pkey_position: ?u16,
     /// `char(n)` / `varchar(n)` length; null otherwise (schema.LogicalColumn).
     type_mod: ?u32 = null,
+    /// NOT NULL, the PRIMARY KEY column included (schema.LogicalColumn).
+    not_null: bool = false,
 
     /// The row-key pseudo-column (`egid_column`).
     pub fn isEgid(self: *const Column) bool {
@@ -278,9 +280,7 @@ pub fn loadColumnRows(
     var all: std.ArrayList(_schema.LogicalColumn) = .empty;
     var scratch: _value.Row = .{}; // reused across catalog rows
     while (try cur.next()) |item| {
-        // Decode all seven catalog cells (column_id order = SELECT *).
-        // TODO: How do we know the version of the row, and whether the
-        // physical schema corresponds to that version?
+        // Decode every catalog cell (column_id order = SELECT *).
         const val = item.newest().value;
         try _row.unmarshalRow(arloc, catalog_ps, val, &.{}, &scratch);
         var lc = (try _catalog.decodeColumn(&scratch)).column;
@@ -330,6 +330,7 @@ pub fn loadTableSchema(
             .ty = lc.ty,
             .pkey_position = lc.pkey_position,
             .type_mod = lc.type_mod,
+            .not_null = lc.not_null,
         });
     }
     const columns = try cols.toOwnedSlice(a);

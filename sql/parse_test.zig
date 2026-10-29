@@ -4,6 +4,7 @@
 const std = @import("std");
 const testing = std.testing;
 const sql = @import("sql");
+const pgwire = @import("pgwire");
 const String = sql.value.String;
 const parse = sql.parse;
 
@@ -164,13 +165,71 @@ test "sql.parse: CREATE TABLE char(n) and varchar(n) carry their length" {
     try testing.expectError(error.SyntaxError, parse.statement(alloc, "CREATE TABLE t (a char(1,2));"));
 }
 
+test "sql.parse: NOT NULL is a column constraint; the PRIMARY KEY implies it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const stmt = try parse.statement(
+        arena.allocator(),
+        "CREATE TABLE t (a int PRIMARY KEY, b text NOT NULL, " ++
+            "c int NULL, d int);",
+    );
+    const cols = stmt.create_table.columns;
+    try testing.expectEqual(@as(usize, 4), cols.len);
+    try testing.expect(cols[0].not_null and cols[0].pkey);
+    try testing.expect(cols[1].not_null and !cols[1].pkey);
+    try testing.expect(!cols[2].not_null);
+    try testing.expect(!cols[3].not_null);
+}
+
+test "sql.parse: a cast constant is the constant (pgjdbc simple mode)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const sel = try parse.statement(
+        alloc,
+        "SELECT val FROM t WHERE sk = '6'::int8;",
+    );
+    const eq = sel.select.where.?.eq;
+    try testing.expectEqualStrings("6", eq.literal.str);
+    const ins = try parse.statement(
+        alloc,
+        "INSERT INTO t (id, val) VALUES (CAST('7' AS int8), 'x'::text);",
+    );
+    try testing.expectEqualStrings("7", ins.insert.rows[0][0].str);
+    try testing.expectEqualStrings("x", ins.insert.rows[0][1].str);
+    const upd = try parse.statement(
+        alloc,
+        "UPDATE t SET val = val || ',1'::text WHERE id = '6'::int8;",
+    );
+    const rhs = upd.update.sets[0].value.binop.rhs.*;
+    try testing.expectEqualStrings(",1", rhs.literal.str);
+    const row = try parse.statement(alloc, "SELECT 1::int8;");
+    try testing.expectEqual(@as(i64, 1), row.select_row.cells[0].value.int);
+    // A cast of anything but a constant is still not a literal.
+    const bad = try parse.statement(alloc, "SELECT a FROM t WHERE a = b::int8;");
+    try testing.expect(bad == .invalid);
+}
+
+test "sql.parse: SHOW names its parameter; SET and RESET are accepted" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const iso = try parse.statement(alloc, "SHOW TRANSACTION ISOLATION LEVEL;");
+    try testing.expectEqualStrings("transaction_isolation", iso.show_var.name);
+    const style = try parse.statement(alloc, "SHOW DateStyle;");
+    try testing.expectEqualStrings("datestyle", style.show_var.name);
+    try testing.expect(try parse.statement(alloc, "SHOW ALL;") == .show_var);
+    try testing.expect(try parse.statement(alloc, "SET x = 1;") == .set_var);
+    try testing.expect(try parse.statement(alloc, "RESET x;") == .reset_var);
+}
+
 test "sql.parse: CREATE TABLE semantic rejections carry a reason" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const alloc = arena.allocator();
     const cases = [_]struct { sql: String, needle: String }{
-        .{ .sql = "CREATE TABLE t (a int NOT NULL);", .needle = "and UNIQUE" },
+        .{ .sql = "CREATE TABLE t (a int CHECK (a > 0));", .needle = "NOT NULL" },
         .{ .sql = "CREATE TABLE t (a serial);", .needle = "serial" },
         .{ .sql = "CREATE TABLE t (a int, b int, PRIMARY KEY (a, b));", .needle = "table-level" },
         .{ .sql = "CREATE TABLE t (a int primary key, b int primary key);", .needle = "multiple PRIMARY KEY" },
@@ -771,7 +830,7 @@ test "sql.parse: UPDATE rejections carry a reason" {
         .{ .sql = "WITH x AS (SELECT 1) UPDATE t SET a = 1;", .needle = "WITH" },
         .{ .sql = "UPDATE t SET a = DEFAULT;", .needle = "SET value" },
         .{ .sql = "UPDATE t SET a = now();", .needle = "SET value" },
-        .{ .sql = "UPDATE t SET a = '1'::int;", .needle = "SET value" },
+        .{ .sql = "UPDATE t SET a = (SELECT 1);", .needle = "SET value" },
         .{ .sql = "UPDATE t SET (a, b) = (1, 2);", .needle = "SET value" },
         .{ .sql = "UPDATE t SET a = a AND b;", .needle = "SET value" },
         .{ .sql = "UPDATE t SET a = a ^ 2;", .needle = "supported" },
@@ -912,31 +971,62 @@ test "sql.parse: Params bind $n text and binary values to a column" {
     const lit = try parse.litToValue(a, .{ .int = 7 }, &col, text);
     try expectEqual(Value{ .int4 = 7 }, lit);
 
-    // Binary values decode through pgwire.binary for the six
-    // primitives; any other column type has no decoder (0A000).
+    // Binary values decode by the type the client declared, then
+    // take the column's type: an int4 into an int4 column as is, an
+    // int8 into an int4 column range-checked, an int4 into a float8
+    // column as a float, a declared text into any column parsed as a
+    // text-format value is. A float into an integer column is refused
+    // rather than rounded; an undeclared type has no decoder (0A000).
     var f8_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &f8_bytes, @bitCast(@as(f64, 1.5)), .big);
     const minus_two = [_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe };
+    const big = [_]u8{ 0, 0, 0, 1, 0, 0, 0, 0 };
+    const oid = pgwire.oid;
     const binary = parse.Params{
         .values = &.{
             &.{ 0, 0, 0, 42 }, &.{1}, &minus_two, &f8_bytes, "hi", &.{ 0, 42 },
+            &big,              "12",
         },
-        .formats = &.{ 1, 1, 1, 1, 1, 1 },
+        .formats = &.{ 1, 1, 1, 1, 1, 1, 1, 1 },
+        .oids = &.{
+            oid.int4, oid.bool_,   oid.int8, oid.float8, oid.text, oid.int2,
+            oid.int8, oid.varchar,
+        },
     };
     try expectEqual(Value{ .int4 = 42 }, try bindParam(binary, 1, .int4, null));
     const flag = try bindParam(binary, 2, .bool_, null);
     try expectEqual(Value{ .bool_ = true }, flag);
     try expectEqual(Value{ .int8 = -2 }, try bindParam(binary, 3, .int8, null));
+    try expectEqual(Value{ .int4 = -2 }, try bindParam(binary, 3, .int4, null));
+    const widened = try bindParam(binary, 3, .float8, null);
+    try expectEqual(Value{ .float8 = -2.0 }, widened);
+    try expectError(error.IntOutOfRange, bindParam(binary, 3, .uint4, null));
     const float = try bindParam(binary, 4, .float8, null);
     try expectEqual(Value{ .float8 = 1.5 }, float);
-    try expectError(error.UnsupportedType, bindParam(binary, 5, .text, null));
-    // The wrong width for the column's type.
-    try expectError(error.BadLength, bindParam(binary, 6, .int4, null));
+    const narrowed = try bindParam(binary, 4, .float4, null);
+    try expectEqual(Value{ .float4 = 1.5 }, narrowed);
+    try expectError(error.TypeMismatch, bindParam(binary, 4, .int8, null));
+    try expectError(error.TypeMismatch, bindParam(binary, 2, .int4, null));
+    const str = try bindParam(binary, 5, .text, null);
+    try testing.expectEqualStrings("hi", str.text);
+    try expectEqual(Value{ .int8 = 42 }, try bindParam(binary, 6, .int8, null));
+    try expectError(error.IntOutOfRange, bindParam(binary, 7, .int4, null));
+    try expectEqual(Value{ .int4 = 12 }, try bindParam(binary, 8, .int4, null));
+    // The wrong width for the declared type.
+    const short = parse.Params{
+        .values = &.{ &.{ 0, 42 }, &.{ 0, 0, 0, 1 } },
+        .formats = &.{ 1, 1 },
+        .oids = &.{oid.int4},
+    };
+    try expectError(error.BadLength, bindParam(short, 1, .int4, null));
+    // No declared type: the bytes cannot be read.
+    try expectError(error.UnsupportedType, bindParam(short, 2, .int4, null));
 
     // A per-param format list decides per value.
     const mixed = parse.Params{
         .values = &.{ "7", &.{ 0, 0, 0, 8 } },
         .formats = &.{ 0, 1 },
+        .oids = &.{ oid.int4, oid.int4 },
     };
     try expectEqual(Value{ .int4 = 7 }, try bindParam(mixed, 1, .int4, null));
     try expectEqual(Value{ .int4 = 8 }, try bindParam(mixed, 2, .int4, null));

@@ -19,11 +19,11 @@ fn col(id: u32, name: String, ty: Type, added: u16, dropped: ?u16) LogicalColumn
     };
 }
 
-test "sql.catalog: the fixed catalog schema has the eight expected columns" {
+test "sql.catalog: the fixed catalog schema has the nine expected columns" {
     const alloc = testing.allocator;
     var cps = try sql.compile(alloc, catalog.logical_schema, catalog.logical_schema.current_version);
     defer cps.deinit(alloc);
-    try testing.expectEqual(@as(usize, 8), cps.columns.len);
+    try testing.expectEqual(@as(usize, 9), cps.columns.len);
     try testing.expectEqual(@as(u16, 1), cps.n_varlen); // only `name` is varlen
 }
 
@@ -42,6 +42,7 @@ test "sql.catalog: a table's logical schema round-trips through catalog rows" {
         col(5, "code", .bpchar, 2, null), // char(8)
     };
     original[0].pkey_position = 1;
+    original[0].not_null = true;
     original[4].type_mod = 8;
 
     // The catalog's own (fixed) physical schema, compiled once.
@@ -88,6 +89,7 @@ test "sql.catalog: a table's logical schema round-trips through catalog rows" {
         try testing.expectEqual(want.dropped_in_version, got.dropped_in_version);
         try testing.expectEqual(want.pkey_position, got.pkey_position);
         try testing.expectEqual(want.type_mod, got.type_mod);
+        try testing.expectEqual(want.not_null, got.not_null);
     }
 
     // Reconstructing the schema derives current_version = highest add/drop = 3.

@@ -57,7 +57,9 @@ jobs:
 
       # The bootstrap compiles jemalloc with `zig cc` for this target.
       - name: Build
-        run: zig build -Drelease -Dtarget=${{ env.ZIG_TARGET }}
+        run: >-
+          zig build -Drelease -Dtarget=${{ env.ZIG_TARGET }}
+          -Dversion=${{ github.ref_name }}
 
       # The floor is only real if nothing pulled in a newer symbol.
       - name: Check the glibc floor and that the binary runs
@@ -109,7 +111,9 @@ jobs:
 
       # The bootstrap compiles jemalloc with `zig cc` for this target.
       - name: Build
-        run: zig build -Drelease -Dtarget=${{ env.ZIG_TARGET }}
+        run: >-
+          zig build -Drelease -Dtarget=${{ env.ZIG_TARGET }}
+          -Dversion=${{ github.ref_name }}
 
       # The binary's own minimum macOS, as the loader enforces it.
       - name: Check the macOS floor and that the binary runs

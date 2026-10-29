@@ -84,6 +84,13 @@ pub fn build(b: *std.Build) void {
         .ReleaseFast
     else
         b.standardOptimizeOption(.{});
+    // The release tag, baked in by the release workflow: what the SQL
+    // front end announces as `egres_version`. Any other build is `dev`.
+    const version = b.option(
+        []const u8,
+        "version",
+        "Release tag announced to SQL clients as egres_version",
+    ) orelse "dev";
     // A non-native target gets its own jemalloc build and install dir
     // (see scripts/bootstrap-jemalloc.sh); the native one stays where
     // it is.
@@ -105,6 +112,9 @@ pub fn build(b: *std.Build) void {
     );
 
     const mods = makeModules(b, target, optimize);
+    const build_opts = b.addOptions();
+    build_opts.addOption([]const u8, "version", version);
+    mods.pgwire.addImport("build_options", build_opts.createModule());
     const regen_buffers_step = addRegenAllBuffers(b, optimize);
     const bootstrap_jemalloc = b.addSystemCommand(&.{
         "bash",

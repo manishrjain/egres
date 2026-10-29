@@ -170,11 +170,12 @@ pub fn bindNode(
 
 /// A literal as a cell: of `target`'s type when there is one
 /// (parse.litToValue), else the widest cell of its own kind — int8,
-/// float8, text. A `$n` under an operator has only its text to go
-/// by, and is read the way an unknown-typed literal would be: an
-/// integer, else a float, else text (`abalance + $1` computes in
-/// int8 and is range-checked on assignment). (A non-literal item
-/// never parses — parseExpr rejects it.)
+/// float8, text. A `$n` under an operator is its declared type when
+/// it came in binary; a text one has only its text to go by, and is
+/// read the way an unknown-typed literal would be: an integer, else a
+/// float, else text (`abalance + $1` computes in int8 and is
+/// range-checked on assignment). (A non-literal item never parses —
+/// parseExpr rejects it.)
 fn literalValue(
     arloc: std.mem.Allocator,
     lit: _parse.Literal,
@@ -204,11 +205,11 @@ fn literalValue(
         .bool_ => |b| .{ .bool_ = b },
         .null_value => .null_value,
         .param => |n| {
-            const text = params.rawText(n) catch |err| switch (err) {
+            const v = params.untyped(n) catch |err| switch (err) {
                 error.UnsupportedType => return error.UnsupportedValue,
-                error.UnboundParam => return error.InvalidValue,
+                else => return error.InvalidValue,
             };
-            return untypedText(text orelse return .null_value);
+            return if (v == .text) untypedText(v.text) else v;
         },
         // parseExpr yields neither: a SET value is a constant or a
         // column, never a value function.
@@ -218,7 +219,7 @@ fn literalValue(
 
 /// A numeric literal under an operator, from the text the scanner kept.
 /// An integer too wide for int4 arrives as float TEXT; it stays an
-/// integer when it parses as one (as parseValue does for a root
+/// integer when it parses as one (as textToValue does for a root
 /// literal).
 fn numberFromText(text: String) BindError!Value {
     if (std.fmt.parseInt(i64, text, 10)) |n| return .{ .int8 = n } else |_| {}
@@ -425,7 +426,7 @@ fn floatOp(op: Op, x: f64, y: f64) EvalError!f64 {
 /// Assign a computed scalar to `target`: integers with a range check,
 /// an int into a float widened, an f64 into a float4 narrowed
 /// (overflow → FloatOutOfRange), text through the column's string
-/// rules (value.coerceString: `char(n)` stripped, lengths checked).
+/// rules (value.fitString: `char(n)` stripped, lengths checked).
 /// Any other pairing never binds.
 fn coerceScalar(s: Scalar, target: *const Column) EvalError!Value {
     switch (target.ty) {
@@ -444,7 +445,7 @@ fn coerceScalar(s: Scalar, target: *const Column) EvalError!Value {
             return .{ .float4 = narrow };
         },
         .text, .bpchar, .varchar => return .{
-            .text = try _value.coerceString(s.text, target),
+            .text = try _value.fitString(s.text, target),
         },
         else => unreachable,
     }

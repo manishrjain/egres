@@ -60,8 +60,8 @@ expect "duplicate CREATE errors" "already exists" psql "$E" -X -c "CREATE TABLE 
 expect "IF NOT EXISTS is quiet" "CREATE TABLE" psql "$E" -X -c "CREATE TABLE IF NOT EXISTS t (id int);"
 
 # --- semantic rejections carry reasons + 0A000 ------------------------------
-expect "NOT NULL rejected" "column constraints" \
-    psql "$E" -X -c "CREATE TABLE u (a int NOT NULL);"
+expect "CHECK rejected" "column constraints" \
+    psql "$E" -X -c "CREATE TABLE u (a int CHECK (a > 0));"
 expect "serial rejected by name" "serial" psql "$E" -X -c "CREATE TABLE u (a serial);"
 expect "composite pkey rejected" "table-level" psql "$E" -X -c "CREATE TABLE u (a int, b int, PRIMARY KEY (a, b));"
 

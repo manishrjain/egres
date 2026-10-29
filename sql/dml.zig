@@ -122,10 +122,12 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
             )) orelse return;
         }
 
+        for (tbl.columns) |*col| {
+            if (values[col.pos] == .null_value and col.not_null)
+                return replyNullViolation(state, arloc, ins.table, col);
+        }
         for (tbl.indexes) |*idx| {
             const cell = values[idx.column.pos];
-            if (cell == .null_value and idx.column.pkey_position != null)
-                return replyPkeyNull(state);
             // A building index gets no entries from DML: nothing reads
             // it yet, and its build merges in every row written
             // meanwhile (index_ddl.zig).
@@ -196,6 +198,7 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
         .state = state,
         .tbl = tbl,
         .outs = proj.cols,
+        .limit = self.max_rows,
     };
 
     // One loop for both kinds of plan. Plain SELECT streams each fill
@@ -228,9 +231,16 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
     // that has sent nothing. An empty result still gets its description.
     // On the extended path it is Describe's to send (describeSelect),
     // never Execute's.
+    // Execute's row limit: the rows that fit go out, and a row left
+    // over suspends the portal instead of completing it, as Postgres
+    // does (the client resumes there; here the next Execute on the
+    // portal is refused, pgwire.ConnState). A result that fits
+    // completes normally — a driver that asks for one row of a
+    // statement it expects no rows from gets its CommandComplete.
     var first = true;
     var count: u64 = 0;
-    while (true) {
+    var suspended = false;
+    outer: while (true) {
         // An executor error is a read failure — replied; an emit
         // error is a wire error — surfaced to the serve loop.
         const valid = plan.root.next(&ctx, batch) catch |err|
@@ -247,11 +257,18 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
             continue;
         }
         var it = batch.selected();
-        while (it.next()) |row| try emitter.emit(row);
+        while (it.next()) |row| {
+            if (emitter.full()) {
+                suspended = true;
+                break :outer;
+            }
+            try emitter.emit(row);
+        }
     }
     // count(*) is one row — which only LIMIT 0 drops.
     if (is_count and (sel.limit orelse 1) > 0) try emitter.emitCount(count);
 
+    if (suspended) return state.sendPortalSuspended();
     try state.sendCommandComplete(try std.fmt.allocPrint(arloc, "SELECT {d}", .{emitter.count}));
 }
 
@@ -453,8 +470,8 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
         for (sets) |*set| {
             set.val = set.node.eval(arloc, tbl, item, set.target) catch |err|
                 return replyEvalErr(state, arloc, err, set.target);
-            if (set.val == .null_value and set.target.pkey_position != null)
-                return replyPkeyNull(state);
+            if (set.val == .null_value and set.target.not_null)
+                return replyNullViolation(state, arloc, up.table, set.target);
             const idx = set.index orelse continue;
             const old = try idx.keys(arloc, tbl.parseCol(item, idx.column));
             const new = try idx.keys(arloc, set.val);
@@ -710,6 +727,13 @@ pub const RowEmitter = struct {
     /// The projection — egid is a column too (table.egid_column).
     outs: []const *const _table.Column,
     count: u64 = 0,
+    /// Execute's row limit; 0 = none.
+    limit: u32 = 0,
+
+    /// Whether the limit's rows are all out.
+    pub fn full(self: *const RowEmitter) bool {
+        return self.limit != 0 and self.count >= self.limit;
+    }
 
     /// Project and send one row — each output cell decoded on its own
     /// (O(1) each, Table.read), no full-row decode.
@@ -720,7 +744,7 @@ pub const RowEmitter = struct {
             if (v == .null_value) {
                 try dw.writeNull();
             } else {
-                try _value.formatValue(try dw.beginColumn(), col, v);
+                try _value.valueToText(try dw.beginColumn(), col, v);
                 dw.endColumn();
             }
         }
@@ -732,7 +756,7 @@ pub const RowEmitter = struct {
     pub fn emitCount(self: *RowEmitter, count: u64) !void {
         var dw = try self.state.beginDataRow(1);
         const w = try dw.beginColumn();
-        try _value.formatValue(w, null, .{ .int8 = @intCast(count) });
+        try _value.valueToText(w, null, .{ .int8 = @intCast(count) });
         dw.endColumn();
         try dw.finish();
         self.count += 1;
@@ -826,6 +850,24 @@ fn coerceLiteral(
         },
         error.InvalidUtf8 => {
             try replyInvalidUtf8(state);
+            return null;
+        },
+        error.TypeMismatch => {
+            try replyErrorCode(
+                state,
+                pgwire.sqlstate.datatype_mismatch,
+                "parameter type does not match column type",
+            );
+            return null;
+        },
+        // A number the column cannot hold: parsed from text (Overflow)
+        // or cast from a wider binary parameter.
+        error.Overflow, error.IntOutOfRange, error.FloatOutOfRange => {
+            try replyErrorCode(
+                state,
+                pgwire.sqlstate.numeric_value_out_of_range,
+                "value is out of range for column type",
+            );
             return null;
         },
         else => {
@@ -1107,13 +1149,24 @@ fn replyUniqueViolation(state: *pgwire.ConnState) !bool {
     return false;
 }
 
-/// NULL into the PRIMARY KEY column, by INSERT or UPDATE: 23502. Any
-/// other unique index takes NULL as "no entry" (NULLS DISTINCT).
-fn replyPkeyNull(state: *pgwire.ConnState) !void {
+/// NULL into a NOT NULL column (the PRIMARY KEY included), by INSERT
+/// or UPDATE: 23502, in Postgres's wording. A unique index takes NULL
+/// as "no entry" (NULLS DISTINCT); only the constraint refuses it.
+fn replyNullViolation(
+    state: *pgwire.ConnState,
+    a: std.mem.Allocator,
+    table_name: String,
+    col: *const _table.Column,
+) !void {
     return replyErrorCode(
         state,
         pgwire.sqlstate.not_null_violation,
-        "null value in primary key column violates not-null constraint",
+        try std.fmt.allocPrint(
+            a,
+            "null value in column \"{s}\" of relation \"{s}\" " ++
+                "violates not-null constraint",
+            .{ col.name, table_name },
+        ),
     );
 }
 

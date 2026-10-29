@@ -1110,8 +1110,11 @@ pub const Node = struct {
             kv.value_ptr.last_index = 0;
         }
 
-        // On bootstrap (first leader election, no conf changes yet), register
-        // ourselves via a conf change so joiners learn our address from the log.
+        // The term's first entry, queued for the loop to append. On
+        // bootstrap it is the self-add conf change, so joiners learn
+        // our address from the log; after that an empty entry, as the
+        // paper's no-op: a leader commits prior-term entries only
+        // behind one of its own, and nothing else is sure to propose.
         if (self.log.lastIndex() == 0) {
             raft_log.info("node {d}: bootstrap self-add as voter with addr={s}", .{ self.id, self.config.listen_addr });
             self.proposeConfChange(.{
@@ -1120,6 +1123,12 @@ pub const Node = struct {
                 .addr = self.config.listen_addr,
             }, null) catch |err| {
                 raft_log.err("node {d}: bootstrap self-add failed: {s}", .{ self.id, @errorName(err) });
+            };
+        } else {
+            self.propose(&.{}, .manifest, null) catch |err| {
+                raft_log.err("node {d}: term no-op failed: {s}", .{
+                    self.id, @errorName(err),
+                });
             };
         }
 
@@ -2175,10 +2184,11 @@ pub const Node = struct {
         return @intCast(self.peers.count() + 1);
     }
 
-    /// Block until we're the leader, then propose a no-op .manifest
-    /// entry and wait for it to apply. By Raft's prior-term commitment
-    /// rule, the no-op (a current-term entry) commits + applies every
-    /// prior entry in the WAL. Callers that need a fully-applied state
+    /// Block until we're the leader, then propose an empty .manifest
+    /// entry and wait for it to apply. It is appended behind the
+    /// term's no-op from `becomeLeader`, so by Raft's prior-term
+    /// commitment rule every prior entry in the WAL is committed and
+    /// applied before it. Callers that need a fully-applied state
     /// machine before they start working — e.g. compactors that
     /// fetchAdd `next_file_id` for new SSTs — call this first to avoid
     /// claiming an id that an unapplied WAL-tail entry already used.

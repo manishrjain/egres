@@ -26,6 +26,8 @@ const utils = @import("utils");
 const String = utils.String;
 const _proto = @import("proto.zig");
 const _types = @import("types.zig");
+/// `-Dversion`: the release tag, or `dev`.
+const egres_version: String = @import("build_options").version;
 
 pub const Phase = enum {
     /// Awaiting the very first frame (Startup3 / SSLRequest / etc.).
@@ -51,6 +53,11 @@ pub const Statement = struct {
 /// A portal bound to a statement by Bind. Owned by the registry.
 pub const Portal = struct {
     stmt_name: []u8,
+    /// An Execute stopped at its row limit with rows left. Postgres
+    /// resumes such a portal on the next Execute; here the next
+    /// Execute is refused, since the statement's cursor is gone with
+    /// it. A Bind to the same name replaces the portal.
+    suspended: bool = false,
     /// Per-param raw bytes; null = SQL NULL. The interpretation
     /// (text vs binary) is dictated by `param_formats`, which is
     /// expanded out per-param so handlers don't have to redo the
@@ -74,11 +81,17 @@ pub const ExecuteCtx = struct {
     /// param's bytes according to its format — see
     /// `pgwire.binary` for the primitive binary decoders.
     param_formats: []const i16,
+    /// The parameter types the client declared in Parse, by position;
+    /// shorter than `params` (or empty) when it left them to the
+    /// backend, and 0 for an individual unspecified one. A binary
+    /// value is decoded by its declared type.
+    param_oids: []const u32,
     /// One format code per result column. Wire conventions: empty
     /// means "all text"; length 1 means "apply to every column";
     /// otherwise per-column. We pass the raw shape through so the
     /// handler can mirror the spec rather than expanding here.
     result_formats: []const i16,
+    /// The Execute's row limit; 0 = every row.
     max_rows: u32,
 };
 
@@ -136,7 +149,11 @@ pub const Config = struct {
     backend_secret: u32 = 0,
     /// Sent in ParameterStatus messages right after AuthenticationOk.
     /// libpq will pick these up and use them to format input/output.
-    server_version: String = "13.0",
+    /// The server version is the Postgres release Egres presents:
+    /// clients parse the leading number to pick their code paths and
+    /// read nothing past it, as with a vendor suffix on Postgres.
+    server_version: String = "16.0 (Egres " ++ egres_version ++ ")",
+    egres_version: String = egres_version,
     server_encoding: String = "UTF8",
     client_encoding: String = "UTF8",
     date_style: String = "ISO, MDY",
@@ -206,6 +223,10 @@ pub const ConnState = struct {
     /// Registry of portals by name. Empty string is the unnamed
     /// portal, overwritten on each Bind to "".
     portals: std.StringHashMapUnmanaged(Portal) = .{},
+    /// The name of the portal the current Execute runs, the map's own
+    /// key (valid until that portal is dropped), so sendPortalSuspended
+    /// can mark it.
+    exec_portal: String = "",
     /// Once an error fires inside an ext-query batch, every Parse/
     /// Bind/Execute/Describe/Close after it is silently dropped
     /// until Sync, per Postgres protocol §4.1.4. Cleared on Sync.
@@ -265,6 +286,7 @@ pub const ConnState = struct {
             self.freePortal(e.value_ptr);
         }
         self.portals.clearRetainingCapacity();
+        self.exec_portal = "";
     }
 
     /// Drop a single statement and any portals derived from it.
@@ -292,6 +314,8 @@ pub const ConnState = struct {
     fn dropPortal(self: *ConnState, name: String) void {
         if (self.portals.fetchRemove(name)) |kv| {
             var portal = kv.value;
+            // exec_portal is this key's slice; never leave it dangling.
+            if (self.exec_portal.ptr == kv.key.ptr) self.exec_portal = "";
             self.alloc.free(kv.key);
             self.freePortal(&portal);
         }
@@ -388,6 +412,7 @@ pub const ConnState = struct {
             // `standard_conforming_strings=on`.
             const announce = [_]struct { k: String, v: String }{
                 .{ .k = "server_version", .v = self.cfg.server_version },
+                .{ .k = "egres_version", .v = self.cfg.egres_version },
                 .{ .k = "server_encoding", .v = self.cfg.server_encoding },
                 .{ .k = "client_encoding", .v = self.cfg.client_encoding },
                 .{ .k = "DateStyle", .v = self.cfg.date_style },
@@ -673,13 +698,21 @@ pub const ConnState = struct {
             );
             return null;
         };
-        const portal = self.portals.get(e.portal_name) orelse {
+        const entry = self.portals.getEntry(e.portal_name) orelse {
             try self.extError(
                 "Execute references unknown portal",
                 _types.sqlstate.internal_error,
             );
             return null;
         };
+        const portal = entry.value_ptr.*;
+        if (portal.suspended) {
+            try self.extError(
+                "resuming a suspended portal is not supported",
+                _types.sqlstate.feature_not_supported,
+            );
+            return null;
+        }
         const stmt = self.statements.get(portal.stmt_name) orelse {
             // Should be unreachable since Bind validates the
             // statement name, but defensively close out.
@@ -691,10 +724,12 @@ pub const ConnState = struct {
         };
 
         self.phase = .in_query;
+        self.exec_portal = entry.key_ptr.*;
         return .{ .execute = .{
             .sql = stmt.sql,
             .params = @ptrCast(portal.params),
             .param_formats = portal.param_formats,
+            .param_oids = stmt.param_oids,
             .result_formats = portal.result_formats,
             .max_rows = e.max_rows,
         } };
@@ -836,6 +871,15 @@ pub const ConnState = struct {
 
     pub fn sendEmptyQueryResponse(self: *ConnState) StateError!void {
         try _proto.encodeEmptyQueryResponse(self.out);
+    }
+
+    /// PortalSuspended ('s') in place of CommandComplete: the Execute's
+    /// row limit was reached with rows left. The portal is marked so
+    /// the next Execute on it is refused rather than restarted.
+    pub fn sendPortalSuspended(self: *ConnState) StateError!void {
+        if (self.portals.getPtr(self.exec_portal)) |portal|
+            portal.suspended = true;
+        try _proto.encodePortalSuspended(self.out);
     }
 
     pub fn sendError(self: *ConnState, f: _proto.ErrorField) StateError!void {

@@ -115,8 +115,10 @@ pub const Pred = union(enum) {
 pub const BindError = error{
     UndefinedColumn,
     InvalidValue,
-    /// A binary-format `$n` for a column type with no binary decoder.
+    /// A binary-format `$n` of a declared type with no binary decoder.
     UnsupportedValue,
+    /// A binary-format `$n` of a type the column cannot take.
+    TypeMismatch,
     EgidZero,
     OutOfMemory,
 };
@@ -142,6 +144,7 @@ pub fn bindNode(
                 // every stored cell is at most n codepoints.
                 error.StringTooLong => return .never,
                 error.UnsupportedType => return error.UnsupportedValue,
+                error.TypeMismatch => return error.TypeMismatch,
                 else => return error.InvalidValue,
             };
             // The egid IS the row key. Its column is uint8, so a
@@ -195,6 +198,11 @@ pub fn bind(
                 state,
                 pgwire.sqlstate.feature_not_supported,
                 "unsupported value or column type",
+            ),
+            error.TypeMismatch => try replyErrorCode(
+                state,
+                pgwire.sqlstate.datatype_mismatch,
+                "parameter type does not match column type",
             ),
             error.EgidZero => try replyErrorCode(
                 state,

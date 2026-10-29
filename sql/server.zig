@@ -226,10 +226,10 @@ pub const Server = struct {
             .forgetTable(table_key.table_id);
     }
 
-    /// Reserve the next egid for a table (leader path). newTxn already ran
-    /// the catch-up barrier, so `next_egid` reflects the applied committed
-    /// tail (onDataApplied only advances it) — the id handed out is past
-    /// every committed row.
+    /// Reserve the next egid for a table (leader path). runDml already
+    /// ran the catch-up barrier (ddlReady), so `next_egid` reflects
+    /// the applied committed tail (onDataApplied only advances it) — the
+    /// id handed out is past every committed row.
     pub fn allocEgid(self: *Server, table_key: zdb.kv.TableKey) !u64 {
         return self.allocEgidIn(
             try self.database(table_key.namespace),
@@ -250,6 +250,11 @@ pub const Server = struct {
     }
 
     pub fn runListener(self: *Server) void {
+        // No SQL before apply has passed the WAL tail from boot: a
+        // statement answered earlier comes from the pre-crash state, and
+        // a refused connection is what clients already retry on.
+        self.engine.waitForBootCatchUp();
+        if (self.engine.node.isShuttingDown()) return;
         const listener = self.listen_addr.listen(.{ .reuse_address = true }) catch |err| {
             log.err("listen failed: {s}", .{@errorName(err)});
             return;
@@ -365,6 +370,9 @@ pub const Handler = struct {
     /// for a simple query. Every `$n` a statement carries resolves
     /// here (parse.litToValue).
     params: _parse.Params = .{},
+    /// Execute's row limit for the statement in flight; 0 = every
+    /// row, always so for a simple query.
+    max_rows: u32 = 0,
     /// Parsed statements by SQL text, for the extended protocol: a
     /// prepared statement is parsed once per session, and the
     /// unnamed statement re-sent with the same text hits the same
@@ -570,11 +578,12 @@ pub const Handler = struct {
         return null;
     }
 
-    /// Catch-up barrier for DDL: this node must be a CAUGHT-UP leader
-    /// (see Engine.catchUp), else it replies and returns false — DDL's
-    /// leader-side name-uniqueness checks are only sound on one. Callers
-    /// hold ddl_mu across it; the barrier itself takes no lock. (DML gets
-    /// its freshness best-effort in newTxn, not here.)
+    /// Barrier for leader-side work: this node must be a CAUGHT-UP
+    /// leader (see Engine.catchUp), else it replies and returns false.
+    /// DDL's name-uniqueness checks are only sound on one, and DML's
+    /// egid counters and oracle cover the prior-term WAL tail only once
+    /// it is applied. DDL callers hold ddl_mu across it; the barrier
+    /// itself takes no lock.
     pub fn ddlReady(self: *Handler, state: *pgwire.ConnState) !bool {
         self.srv.engine.catchUp() catch |err| {
             switch (err) {
@@ -587,6 +596,83 @@ pub const Handler = struct {
             return false;
         };
         return true;
+    }
+
+    /// The settings SHOW answers, by their Postgres names (matched
+    /// without case, as the GUC lookup does): the connection's own
+    /// ParameterStatus values, and the transaction settings, which
+    /// are fixed — every txn runs at snapshot isolation, which is
+    /// what Postgres calls REPEATABLE READ. A driver reads
+    /// `transaction_isolation` to learn the level BEGIN gave it. The
+    /// result's name is the canonical spelling, which names the
+    /// output column.
+    const Setting = struct { name: String, value: String };
+    fn setting(state: *pgwire.ConnState, name: String) ?Setting {
+        const snapshot = "repeatable read";
+        const cfg = state.cfg;
+        const fixed = [_]Setting{
+            .{ .name = "transaction_isolation", .value = snapshot },
+            .{ .name = "default_transaction_isolation", .value = snapshot },
+            .{ .name = "transaction_read_only", .value = "off" },
+            .{ .name = "default_transaction_read_only", .value = "off" },
+            .{ .name = "server_version", .value = cfg.server_version },
+            .{ .name = "egres_version", .value = cfg.egres_version },
+            .{ .name = "server_encoding", .value = cfg.server_encoding },
+            .{ .name = "client_encoding", .value = cfg.client_encoding },
+            .{ .name = "DateStyle", .value = cfg.date_style },
+            .{ .name = "TimeZone", .value = cfg.timezone },
+            .{ .name = "IntervalStyle", .value = cfg.interval_style },
+            .{ .name = "integer_datetimes", .value = "on" },
+            .{ .name = "standard_conforming_strings", .value = "on" },
+            .{ .name = "is_superuser", .value = "off" },
+            .{
+                .name = "session_authorization",
+                .value = cfg.session_authorization,
+            },
+            .{ .name = "application_name", .value = "" },
+            .{ .name = "search_path", .value = "\"$user\", public" },
+            .{ .name = "max_identifier_length", .value = "63" },
+        };
+        for (fixed) |candidate| {
+            if (std.ascii.eqlIgnoreCase(candidate.name, name))
+                return candidate;
+        }
+        return null;
+    }
+
+    /// SHOW: one row of one text column named after the parameter,
+    /// the RowDescription on the simple path (Describe's on the
+    /// extended one), then "SHOW". An unknown parameter is 42704,
+    /// as in Postgres.
+    fn showVar(
+        self: *Handler,
+        state: *pgwire.ConnState,
+        show: _parse.Show,
+    ) !void {
+        const found = setting(state, show.name) orelse
+            return replyUnknownSetting(state, show.name);
+        if (self.mode == .simple) try describeShow(state, show);
+        var dw = try state.beginDataRow(1);
+        try (try dw.beginColumn()).writeAll(found.value);
+        dw.endColumn();
+        try dw.finish();
+        try state.sendCommandComplete("SHOW");
+    }
+
+    fn describeShow(state: *pgwire.ConnState, show: _parse.Show) !void {
+        const found = setting(state, show.name) orelse
+            return replyUnknownSetting(state, show.name);
+        try state.sendRowDescription(&.{.{ .name = found.name }});
+    }
+
+    fn replyUnknownSetting(state: *pgwire.ConnState, name: String) !void {
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(
+            &buf,
+            "unrecognized configuration parameter \"{s}\"",
+            .{name},
+        ) catch "unrecognized configuration parameter";
+        return replyErrorCode(state, pgwire.sqlstate.undefined_object, msg);
     }
 
     /// A statement (or Describe) ended: any error inside an open block
@@ -643,18 +729,25 @@ pub const Handler = struct {
 
     /// The extended protocol's Execute: the portal's statement, parsed
     /// once per session (cachedStatement), run with its Bind values as
-    /// `params`. Sync sends ReadyForQuery; an error here drops every
-    /// message before it (ext_failed). What Execute cannot do yet is
-    /// refused up front: a row limit (PortalSuspended and resuming a
-    /// portal) and binary result columns.
+    /// `params` and its row limit as `max_rows`. Sync sends
+    /// ReadyForQuery; an error here drops every message before it
+    /// (ext_failed). Binary result columns are refused up front.
     pub fn onExecute(
         self: *Handler,
         state: *pgwire.ConnState,
         ctx: pgwire.ExecuteCtx,
     ) !void {
         self.mode = .extended;
-        self.params = .{ .values = ctx.params, .formats = ctx.param_formats };
-        defer self.params = .{};
+        self.params = .{
+            .values = ctx.params,
+            .formats = ctx.param_formats,
+            .oids = ctx.param_oids,
+        };
+        self.max_rows = ctx.max_rows;
+        defer {
+            self.params = .{};
+            self.max_rows = 0;
+        }
 
         state.error_sent = false;
         defer self.failBlockOnError(state);
@@ -662,18 +755,10 @@ pub const Handler = struct {
             state.ext_failed = true;
         };
 
-        const unsupported = pgwire.sqlstate.feature_not_supported;
-        if (ctx.max_rows != 0) {
-            return replyErrorCode(
-                state,
-                unsupported,
-                "portal row limits are not supported",
-            );
-        }
         for (ctx.result_formats) |format| if (format != 0) {
             return replyErrorCode(
                 state,
-                unsupported,
+                pgwire.sqlstate.feature_not_supported,
                 "binary result format is not supported",
             );
         };
@@ -724,6 +809,7 @@ pub const Handler = struct {
         switch (stmt) {
             .select => |sel| try _dml.describeSelect(self, state, sel),
             .select_row => |sr| try _dml.describeSelectRow(state, sr),
+            .show_var => |show| try describeShow(state, show),
             else => try state.sendNoData(),
         }
     }
@@ -775,6 +861,7 @@ pub const Handler = struct {
             .rollback_txn => try self.endTxn(state, false),
             .set_var => try state.sendCommandComplete("SET"),
             .reset_var => try state.sendCommandComplete("RESET"),
+            .show_var => |show| try self.showVar(state, show),
             .invalid => |msg| try replyErrorCode(state, pgwire.sqlstate.feature_not_supported, msg),
             .unsupported => try replyError(state, "unsupported statement"),
         }
@@ -789,18 +876,21 @@ pub const Handler = struct {
     /// the handler committed it — which keeps its locks held until the
     /// commit has applied.
     fn runDml(self: *Handler, state: *pgwire.ConnState, stmt: _parse.Stmt) !void {
-        // A write can only commit on the leader — reject it up front
-        // rather than scanning, locking, and failing at propose. Reads
-        // run on any node (newTxn sets read_ts best-effort), but FOR
-        // UPDATE takes row locks and bumps against the oracle — leader-
-        // local state — so it is gated like a write. Re-routing to the
-        // leader is future work.
+        // A write can only commit on a caught-up leader — reject it up
+        // front rather than scanning, locking, and failing at propose,
+        // and wait out the prior-term WAL tail first: until it is
+        // applied, next_egid and the oracle miss rows committed before
+        // a crash, and a txn that began in the election window carries
+        // the new term without having waited in newTxn. Reads run on
+        // any node (newTxn sets read_ts best-effort), but FOR UPDATE
+        // takes row locks and bumps against the oracle — leader-local
+        // state — so it is gated like a write. Re-routing to the leader
+        // is future work.
         switch (stmt) {
-            .insert, .delete, .update => if (!self.srv.engine.node.isLeader())
-                return replyError(state, "not the leader"),
+            .insert, .delete, .update => if (!try self.ddlReady(state))
+                return,
             .select => |sel| if (sel.for_update and
-                !self.srv.engine.node.isLeader())
-                return replyError(state, "not the leader"),
+                !try self.ddlReady(state)) return,
             else => {},
         }
         // Each restart re-raises the floor to a fresh, strictly higher
@@ -878,9 +968,18 @@ pub const Handler = struct {
 
     pub fn newTxn(self: *Handler, ns: u64) !*_txn.Txn {
         const eng = self.srv.engine;
+        // The term is read before anything that can park — the barrier,
+        // and sessionDb, which builds the Database on first use — so an
+        // election during BEGIN leaves the txn in the old term, where
+        // the term check aborts it, rather than in the new one with a
+        // snapshot that predates the recovered WAL tail.
+        const term = eng.node.current_term;
         // Best-effort catch-up: a leader waits out its committed tail
         // (once per term) so read_ts covers it; a non-leader keeps what
-        // it has rather than erroring here.
+        // it has rather than erroring here. Not a guarantee: a BEGIN
+        // between the term bump and become-leader skips it yet carries
+        // the new term, which is why leader-side work gates on
+        // ddlReady instead.
         eng.catchUp() catch {};
         // Database first, read_ts second: a commit applying between
         // the two lands in this database's now-existing oracle, so a
@@ -892,7 +991,7 @@ pub const Handler = struct {
             eng.allocator,
             self.srv.next_txn_id.fetchAdd(1, .monotonic),
             eng.node.appliedTs(),
-            eng.node.current_term,
+            term,
             db,
             eng.forest,
         );

@@ -67,7 +67,7 @@ Use any Postgres client. With `psql`, connect to the database `egres`, which exi
 
 ```sh
 $ psql -h localhost -p 3210 -d egres
-psql (18.6, server 13.0)
+psql (18.6, server 16.0 (Egres v0.2610.0))
 Type "help" for help.
 
 egres=>

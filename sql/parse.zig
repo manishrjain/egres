@@ -25,9 +25,10 @@ const Column = @import("table.zig").Column;
 
 const String = _value.String;
 
-/// One parsed `name type [PRIMARY KEY | UNIQUE]` column. `name` is
-/// borrowed. A PRIMARY KEY column is unique too, but `unique` marks
-/// only a bare UNIQUE constraint: the PK gets its own index.
+/// One parsed `name type [PRIMARY KEY | UNIQUE | NOT NULL]` column.
+/// `name` is borrowed. A PRIMARY KEY column is unique too, but
+/// `unique` marks only a bare UNIQUE constraint: the PK gets its own
+/// index. It is NOT NULL too, and `not_null` does say so.
 pub const ColumnDef = struct {
     name: String,
     ty: _value.Type,
@@ -35,6 +36,7 @@ pub const ColumnDef = struct {
     type_mod: ?u32 = null,
     pkey: bool = false,
     unique: bool = false,
+    not_null: bool = false,
 };
 
 pub const CreateTable = struct {
@@ -74,7 +76,7 @@ pub const DropIndex = struct {
 };
 
 /// One VALUES cell, still untyped: coerced to its column's Type at execute
-/// (value.parseValue). `str`/`float` borrow their bytes. `unsupported` is a
+/// (value.textToValue). `str`/`float` borrow their bytes. `unsupported` is a
 /// non-literal item (DEFAULT, an expression) the executor rejects.
 pub const Literal = union(enum) {
     int: i64,
@@ -242,6 +244,13 @@ pub const CreateDatabase = struct {
     source: ?String = null, // borrowed
 };
 
+/// SHOW `name`: the parameter as the client spelled it (lowercased by
+/// the grammar unless quoted); `SHOW TRANSACTION ISOLATION LEVEL` and
+/// the other keyword forms arrive under their parameter names.
+pub const Show = struct {
+    name: String, // borrowed
+};
+
 pub const Stmt = union(enum) {
     create_database: CreateDatabase,
     drop_database: String, // database name (borrowed)
@@ -263,6 +272,9 @@ pub const Stmt = union(enum) {
     /// SET TRANSACTION is ignored the way BEGIN's modes are.
     set_var,
     reset_var,
+    /// SHOW of one parameter: the server answers from its fixed
+    /// settings (server.showVar).
+    show_var: Show,
     invalid: String, // recognized but rejected; reason
     unsupported,
 
@@ -307,6 +319,8 @@ pub fn statement(alloc: std.mem.Allocator, sql: String) parser.ParseError!Stmt {
     if (parser.cast(c.UpdateStmt, node)) |s| return parseUpdate(alloc, s);
     if (parser.cast(c.TransactionStmt, node)) |s| return parseTransaction(s);
     if (parser.cast(c.VariableSetStmt, node)) |s| return parseSet(s);
+    if (parser.cast(c.VariableShowStmt, node)) |s|
+        return .{ .show_var = .{ .name = try dup(alloc, s.name) } };
     return .unsupported;
 }
 
@@ -359,6 +373,17 @@ fn relname(
 ) parser.ParseError!String {
     if (rv == null) return "";
     return dup(alloc, rv.*.relname);
+}
+
+/// The constant `p` is, seeing through one cast of a constant to a
+/// type (`'6'::int8`, `CAST('x' AS text)`): the form a driver inlines a
+/// bound value in when it cannot send it as a parameter (pgjdbc in
+/// simple query mode). The named type is not used: the column the
+/// constant meets types it, as it does a bare literal.
+fn constant(p: ?*anyopaque) ?*c.A_Const {
+    if (parser.cast(c.A_Const, p)) |ac| return ac;
+    const tc = parser.cast(c.TypeCast, p) orelse return null;
+    return parser.cast(c.A_Const, tc.arg);
 }
 
 /// A constant as a Literal, its text copied. Integers past int32 arrive
@@ -447,14 +472,19 @@ fn parseCreateTable(
 
         var pkey = false;
         var unique = false;
+        var not_null = false;
         for (parser.items(cd.constraints)) |ccell| {
             const con = parser.cast(c.Constraint, ccell.ptr_value) orelse
                 return .unsupported;
             switch (con.contype) {
                 c.CONSTR_PRIMARY => pkey = true,
                 c.CONSTR_UNIQUE => unique = true,
+                c.CONSTR_NOTNULL => not_null = true,
+                // An explicit NULL is the default, spelled out.
+                c.CONSTR_NULL => {},
                 else => return invalid(
-                    "only PRIMARY KEY and UNIQUE column constraints are supported",
+                    "only PRIMARY KEY, UNIQUE and NOT NULL column " ++
+                        "constraints are supported",
                 ),
             }
         }
@@ -463,6 +493,7 @@ fn parseCreateTable(
                 return invalid("multiple PRIMARY KEY columns are not supported");
             pkey_seen = true;
             unique = false; // the PK index already enforces it
+            not_null = true;
         }
 
         try columns.append(alloc, .{
@@ -471,6 +502,7 @@ fn parseCreateTable(
             .type_mod = type_mod,
             .pkey = pkey,
             .unique = unique,
+            .not_null = not_null,
         });
     }
 
@@ -668,7 +700,7 @@ fn valueLiteral(
     alloc: std.mem.Allocator,
     p: ?*anyopaque,
 ) parser.ParseError!Literal {
-    if (parser.cast(c.A_Const, p)) |ac| return literalFrom(alloc, ac);
+    if (constant(p)) |ac| return literalFrom(alloc, ac);
     const svf = parser.cast(c.SQLValueFunction, p) orelse return .unsupported;
     // The precision forms (CURRENT_TIMESTAMP(3)) keep the full µs;
     // LOCALTIMESTAMP is the same instant on a UTC-only server.
@@ -685,57 +717,83 @@ fn valueLiteral(
 pub const Params = struct {
     values: []const ?String = &.{},
     formats: []const i16 = &.{},
+    /// The types the client declared in Parse, by position; may be
+    /// shorter than `values`, and 0 is "unspecified".
+    oids: []const u32 = &.{},
 
     /// `$index` as a cell of `col`. A text value takes the path a
     /// quoted literal takes — column-typed parsing, the string types'
-    /// length rules; a binary one decodes through pgwire.binary for
-    /// the six primitives it covers and is `error.UnsupportedType`
-    /// for every other column type. An index past what Bind supplied
-    /// is `error.UnboundParam` (the runner checks the count first, so
-    /// only a bug reaches it).
+    /// length rules — whatever type the client declared, as Postgres
+    /// reads an unknown-typed literal. A binary value is decoded by
+    /// its declared type (`binaryValue`) and then assigned to the
+    /// column's (value.valueToColumn): a driver sends an int8 for a
+    /// bigint column and an int4 for an int one, and a column of
+    /// another width or kind takes it the way SET assigns a number.
+    /// An index past what Bind supplied is `error.UnboundParam` (the
+    /// runner checks the count first, so only a bug reaches it).
     pub fn toValue(self: Params, index: u16, col: *const Column) !_value.Value {
         if (index == 0 or index > self.values.len) return error.UnboundParam;
 
         const bytes = self.values[index - 1] orelse return .null_value;
-        if (self.isBinary(index)) return binaryValue(col.ty, bytes);
+        if (self.isBinary(index)) {
+            const typed = try self.binaryValue(index, bytes);
+            return _value.valueToColumn(typed, col);
+        }
         if (col.ty.isString())
-            return .{ .text = try _value.coerceString(bytes, col) };
-        return _value.parseValue(col.ty, bytes);
+            return .{ .text = try _value.fitString(bytes, col) };
+        return _value.textToValue(col.ty, bytes);
     }
 
-    /// `$index`'s bytes as bound, null for SQL NULL, with no column to
-    /// type them (a placeholder under a SET operator). Text only: a
-    /// binary value has no type to decode with, `error.UnsupportedType`.
-    pub fn rawText(self: Params, index: u16) !?String {
+    /// `$index` with no column to type it (a placeholder under a SET
+    /// operator): a binary value as its declared type, a text value as
+    /// `.text` for the caller to read (expr.literalValue reads a
+    /// number when it is one), null for SQL NULL.
+    pub fn untyped(self: Params, index: u16) !_value.Value {
         if (index == 0 or index > self.values.len) return error.UnboundParam;
-        if (self.isBinary(index)) return error.UnsupportedType;
-        return self.values[index - 1];
+        const bytes = self.values[index - 1] orelse return .null_value;
+        if (self.isBinary(index)) return self.binaryValue(index, bytes);
+        return .{ .text = bytes };
     }
 
     fn isBinary(self: Params, index: u16) bool {
         return index <= self.formats.len and self.formats[index - 1] == 1;
     }
+
+    /// A binary-format value as a cell of the type the client declared
+    /// for `$index`: the primitives pgwire.binary decodes, bytea and
+    /// uuid (raw bytes), and the string types (their binary format is
+    /// the text itself). A declared type with no decoder here, or none
+    /// declared, is `error.UnsupportedType`: the bytes cannot be read.
+    fn binaryValue(self: Params, index: u16, bytes: String) !_value.Value {
+        const binary = pgwire.binary;
+        const oid: u32 = if (index <= self.oids.len)
+            self.oids[index - 1]
+        else
+            0;
+        return switch (oid) {
+            pgwire.oid.bool_ => .{ .bool_ = try binary.decodeBool(bytes) },
+            pgwire.oid.int2 => .{ .int2 = try binary.decodeInt2(bytes) },
+            pgwire.oid.int4 => .{ .int4 = try binary.decodeInt4(bytes) },
+            pgwire.oid.int8 => .{ .int8 = try binary.decodeInt8(bytes) },
+            pgwire.oid.float4 => .{ .float4 = try binary.decodeFloat4(bytes) },
+            pgwire.oid.float8 => .{ .float8 = try binary.decodeFloat8(bytes) },
+            pgwire.oid.bytea => .{ .bytea = bytes },
+            pgwire.oid.uuid => if (bytes.len == 16)
+                .{ .uuid = bytes[0..16].* }
+            else
+                error.BadLength,
+            pgwire.oid.text, pgwire.oid.varchar, pgwire.oid.bpchar => .{
+                .text = bytes,
+            },
+            else => error.UnsupportedType,
+        };
+    }
 };
 
-/// A binary-format parameter as a cell of `ty`: the six primitives
-/// pgwire.binary decodes; anything else has no decoder here.
-fn binaryValue(ty: _value.Type, bytes: String) !_value.Value {
-    const binary = pgwire.binary;
-    return switch (ty) {
-        .bool_ => .{ .bool_ = try binary.decodeBool(bytes) },
-        .int2 => .{ .int2 = try binary.decodeInt2(bytes) },
-        .int4 => .{ .int4 = try binary.decodeInt4(bytes) },
-        .int8 => .{ .int8 = try binary.decodeInt8(bytes) },
-        .float4 => .{ .float4 = try binary.decodeFloat4(bytes) },
-        .float8 => .{ .float8 = try binary.decodeFloat8(bytes) },
-        else => error.UnsupportedType,
-    };
-}
-
-/// Coerce a parsed literal to a cell of `col`, reusing value.parseValue
+/// Coerce a parsed literal to a cell of `col`, reusing value.textToValue
 /// by rendering non-string literals to text first (int/bool stringified
 /// into `a`, so a text-typed column can borrow it). A string column goes
-/// through value.coerceString with its length. NULL passes through; a
+/// through value.fitString with its length. NULL passes through; a
 /// non-literal item is `error.UnsupportedLiteral`; a `$n` is the bound
 /// value (Params.toValue).
 pub fn litToValue(
@@ -757,8 +815,8 @@ pub fn litToValue(
         .bool_ => |b| if (b) "t" else "f",
     };
     if (col.ty.isString())
-        return .{ .text = try _value.coerceString(text, col) };
-    return _value.parseValue(col.ty, text);
+        return .{ .text = try _value.fitString(text, col) };
+    return _value.textToValue(col.ty, text);
 }
 
 /// A parsed WHERE tree or a rejection reason (borrowed).
@@ -854,7 +912,7 @@ fn parseWhere(
             return .{ .invalid = try badParamMsg(alloc, pr.number) };
         return .{ .where = .{ .eq = .{ .column = column, .literal = lit } } };
     }
-    const ac = parser.cast(c.A_Const, ae.rexpr) orelse
+    const ac = constant(ae.rexpr) orelse
         return ParsedWhere.reject("WHERE right side must be a literal");
     const lit = try literalFrom(alloc, ac);
     if (lit == .unsupported)
@@ -895,7 +953,7 @@ fn parseExpr(
     params: *ParamTally,
     p: ?*c.Node,
 ) parser.ParseError!ParsedExpr {
-    if (parser.cast(c.A_Const, p)) |ac| {
+    if (constant(p)) |ac| {
         const lit = try literalFrom(arloc, ac);
         if (lit == .unsupported)
             return ParsedExpr.reject("unsupported literal in SET");
@@ -1079,7 +1137,7 @@ fn parseSelectRow(
     for (targets, cells) |t, *cell| {
         const rt = parser.cast(c.ResTarget, t.ptr_value) orelse
             return .unsupported;
-        const ac = parser.cast(c.A_Const, rt.val) orelse
+        const ac = constant(rt.val) orelse
             return invalid("only constants are supported without a FROM");
         const lit = try literalFrom(alloc, ac);
         if (lit == .unsupported)

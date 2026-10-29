@@ -382,6 +382,34 @@ expect "SELECT 1 LIMIT 0" "(0 rows)" q "SELECT 1 LIMIT 0;"
 expect "a function without FROM errors" "constants" q "SELECT now();"
 expect "SET is accepted" "SET" q "SET extra_float_digits = 3;"
 expect "RESET is accepted" "RESET" q "RESET ALL;"
+# SHOW: the isolation a driver asks about, the connection's settings
+# under their canonical names, and 42704 for anything else.
+expect "SHOW TRANSACTION ISOLATION LEVEL" "repeatable read" v \
+    "SHOW TRANSACTION ISOLATION LEVEL;"
+expect "SHOW names its column" "transaction_isolation" q \
+    "SHOW transaction_isolation;"
+expect "SHOW datestyle value" "ISO, MDY" v "SHOW datestyle;"
+expect "SHOW datestyle canonical name" " DateStyle " q "SHOW datestyle;"
+expect "SHOW unknown parameter" "unrecognized configuration parameter" q \
+    "SHOW no_such_setting;"
+
+# --- NOT NULL: omitted, literal and SET NULL are 23502 -------------------
+# The error names the column; a nullable column still takes NULL.
+q "CREATE TABLE nn (id int4 PRIMARY KEY, sk int4 NOT NULL, v text);" >/dev/null
+expect "NOT NULL: full row inserts" "INSERT 0 1" q \
+    "INSERT INTO nn (id, sk, v) VALUES (1, 1, 'a');"
+expect "NOT NULL: nullable column takes NULL" "INSERT 0 1" q \
+    "INSERT INTO nn (id, sk) VALUES (2, 2);"
+expect "NOT NULL: omitted column rejected" 'column "sk"' q \
+    "INSERT INTO nn (id, v) VALUES (3, 'c');"
+expect "NOT NULL: literal NULL rejected" 'column "sk"' q \
+    "INSERT INTO nn (id, sk, v) VALUES (3, NULL, 'c');"
+expect "NOT NULL: SET NULL rejected" 'violates not-null' q \
+    "UPDATE nn SET sk = NULL WHERE id = 1;"
+expect "NOT NULL: SET NULL on nullable column" "UPDATE 1" q \
+    "UPDATE nn SET v = NULL WHERE id = 1;"
+expect "NOT NULL: rejected rows never landed" "2" v "SELECT count(*) FROM nn;"
+q "DROP TABLE nn;" >/dev/null
 
 # --- extended query protocol: psql 18's \bind, \parse, \bind_named --------
 # `\bind` sends Parse (unnamed) + Bind + Describe(portal) + Execute + Sync,

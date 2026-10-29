@@ -1466,6 +1466,34 @@ pub const Engine = struct {
         self.catchup_term.store(term, .release);
     }
 
+    /// Block until this node has applied every entry its WAL holds
+    /// now, or shutdown starts. Every entry up to the tail was
+    /// acknowledged before the restart; the new term's first entry
+    /// commits it, or a leader with a longer log truncates it. Until
+    /// apply passes it the state machine answers from before the
+    /// crash — a committed table "does not exist", a committed row is
+    /// absent — so the SQL listener waits here. The tail is read once:
+    /// re-read, it would chase a write stream. The target is clamped to
+    /// the log's end on every pass, so a truncated tail, which never
+    /// applies here, stops being waited for.
+    pub fn waitForBootCatchUp(self: *Engine) void {
+        const boot_tail = self.node.log.lastTimestamp();
+        while (!self.node.isShuttingDown()) {
+            const log_end = self.node.log.lastTimestamp();
+            const target = @min(boot_tail, log_end);
+            self.node.waitForApplied(target, 1000) catch {
+                utils.logEvery(
+                    .info,
+                    5,
+                    "startup: applied ts {d} behind boot tail {d}",
+                    .{ self.node.appliedTs(), target },
+                );
+                continue;
+            };
+            return;
+        }
+    }
+
     /// Register a front-end's commit-stream hook (see ApplyObserver). Call once
     /// at startup, before eng.start(), so no applied entry is missed.
     pub fn setApplyObserver(self: *Engine, obs: ApplyObserver) void {

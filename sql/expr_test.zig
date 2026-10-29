@@ -4,6 +4,7 @@
 const std = @import("std");
 const testing = std.testing;
 const sql = @import("sql");
+const pgwire = @import("pgwire");
 const String = sql.value.String;
 const zdb = @import("zdb");
 
@@ -289,15 +290,20 @@ test "sql.expr: bind — a $n is typed by its column, or by its text" {
         fx.bindWith("a = a * $4", text),
     );
 
-    // A binary value under an operator has no type to decode with.
+    // A binary value is its declared type, at the root (cast to the
+    // column: an int8 into the int4 column) and under an operator.
+    // With no declared type its bytes cannot be read.
     const binary = sql.parse.Params{
-        .values = &.{&.{ 0, 0, 0, 5 }},
-        .formats = &.{1},
+        .values = &.{ &.{ 0, 0, 0, 0, 0, 0, 0, 5 }, &.{ 0, 0, 0, 5 } },
+        .formats = &.{ 1, 1 },
+        .oids = &.{pgwire.oid.int8},
     };
     const typed = try fx.bindWith("a = $1", binary);
     try testing.expectEqual(Value{ .int4 = 5 }, typed.root.value);
+    const under = try fx.bindWith("a = a + $1", binary);
+    try testing.expectEqual(Value{ .int8 = 5 }, under.root.binop.rhs.value);
     try testing.expectError(
         error.UnsupportedValue,
-        fx.bindWith("a = a + $1", binary),
+        fx.bindWith("a = a + $2", binary),
     );
 }

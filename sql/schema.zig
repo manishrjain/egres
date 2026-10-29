@@ -25,7 +25,7 @@ const Type = _value.Type;
 /// logical schema's column. The codec uses only the layout-relevant subset
 /// (column_id, ty, lifetime) and never reads `name`, but a logical column
 /// intrinsically has one, and name→column_id resolution reads it here.
-/// (nullability / defaults will join it as the catalog lands.)
+/// (defaults will join it as the catalog lands.)
 pub const LogicalColumn = struct {
     /// Stable identity, monotonic, never reused. Drives layout ordering.
     column_id: u32,
@@ -48,6 +48,9 @@ pub const LogicalColumn = struct {
     /// every other type (bare `varchar` is `.text`, so null too).
     /// Layout-irrelevant: all three string types store the same bytes.
     type_mod: ?u32 = null,
+    /// NOT NULL: INSERT and UPDATE refuse a NULL cell. Set for a
+    /// PRIMARY KEY column too. Layout-irrelevant.
+    not_null: bool = false,
 
     /// Live at version v iff added by v and not yet dropped at v.
     pub inline fn liveAt(self: LogicalColumn, v: u16) bool {

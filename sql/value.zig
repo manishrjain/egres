@@ -14,7 +14,7 @@ const pgwire = @import("pgwire");
 const utils = @import("utils");
 const date = utils.date;
 /// The runtime column (table.zig imports this file too; Zig allows the
-/// cycle). formatValue takes it because a char(n) cell is a plain text
+/// cycle). valueToText takes it because a char(n) cell is a plain text
 /// value and only the column knows to pad it.
 const Column = @import("table.zig").Column;
 
@@ -229,9 +229,9 @@ pub const Row = struct {
 /// date/timestamp parse failures surface as errors (the executor maps them
 /// to 22P02); types this slice can't parse (time, interval, uuid) return
 /// `error.UnsupportedType` (→ 0A000).
-pub fn parseValue(ty: Type, text: String) !Value {
+pub fn textToValue(ty: Type, text: String) !Value {
     return switch (ty) {
-        .bool_ => .{ .bool_ = try parseBool(text) },
+        .bool_ => .{ .bool_ = try textToBool(text) },
         .int2 => .{ .int2 = try std.fmt.parseInt(i16, text, 10) },
         .int4 => .{ .int4 = try std.fmt.parseInt(i32, text, 10) },
         .int8 => .{ .int8 = try std.fmt.parseInt(i64, text, 10) },
@@ -249,7 +249,7 @@ pub fn parseValue(ty: Type, text: String) !Value {
     };
 }
 
-fn parseBool(text: String) !bool {
+fn textToBool(text: String) !bool {
     // Postgres accepts several spellings; cover the common ones.
     if (eqlAny(text, &.{ "t", "true", "1", "yes", "on" })) return true;
     if (eqlAny(text, &.{ "f", "false", "0", "no", "off" })) return false;
@@ -268,7 +268,7 @@ fn eqlAny(text: String, options: []const String) bool {
 /// never a continuation byte, so the strip needs no decoding) and, like
 /// `varchar`, refuses more than n codepoints. A `bpchar` value whose
 /// excess is only spaces is accepted. The result is a subslice of `s`.
-pub fn coerceString(
+pub fn fitString(
     s: String,
     col: *const Column,
 ) error{ InvalidUtf8, StringTooLong }!String {
@@ -284,7 +284,7 @@ pub fn coerceString(
     return out;
 }
 
-/// Codepoints in valid UTF-8 (`coerceString` validated it).
+/// Codepoints in valid UTF-8 (`fitString` validated it).
 fn countCodepoints(s: String) usize {
     return std.unicode.utf8CountCodepoints(s) catch unreachable;
 }
@@ -303,7 +303,7 @@ fn writePadded(w: *std.Io.Writer, s: String, n: u32) !void {
 /// stripped and comes back padded to the column's length. null (a computed
 /// cell such as count(*)) renders the value as is. The caller emits SQL
 /// NULL as `proto.DataValue.null_value` and never passes it here.
-pub fn formatValue(w: *std.Io.Writer, col: ?*const Column, v: Value) !void {
+pub fn valueToText(w: *std.Io.Writer, col: ?*const Column, v: Value) !void {
     if (col) |c| if (c.ty == .bpchar) {
         return writePadded(w, v.text, c.type_mod orelse 1);
     };
@@ -335,6 +335,63 @@ pub fn formatValue(w: *std.Io.Writer, col: ?*const Column, v: Value) !void {
     }
 }
 
+/// Assign a typed cell to `col`, as Bind does with a binary parameter
+/// whose declared type is not the column's: the same type passes (a
+/// string through the column's length rule); any integer goes into any
+/// number, range-checked (`error.IntOutOfRange`); a float into a float
+/// (`error.FloatOutOfRange` when float4 cannot hold it); text is parsed
+/// as the column's type, as a text-format parameter is. A float into an
+/// integer column, and every other pairing, is `error.TypeMismatch`,
+/// as Postgres refuses an assignment it would have to round or cannot
+/// make at all. NULL passes.
+pub fn valueToColumn(v: Value, col: *const Column) !Value {
+    const from = v.ty() orelse return v;
+    if (v == .text) {
+        if (col.ty.isString())
+            return .{ .text = try fitString(v.text, col) };
+        return textToValue(col.ty, v.text);
+    }
+    if (from == col.ty) return v;
+    if (from.isInteger()) {
+        const n: i128 = switch (v) {
+            inline .int2, .int4, .int8, .uint2, .uint4, .uint8 => |x| x,
+            else => unreachable,
+        };
+        return switch (col.ty) {
+            .int2 => .{ .int2 = try fitInt(i16, n) },
+            .int4 => .{ .int4 = try fitInt(i32, n) },
+            .int8 => .{ .int8 = try fitInt(i64, n) },
+            .uint2 => .{ .uint2 = try fitInt(u16, n) },
+            .uint4 => .{ .uint4 = try fitInt(u32, n) },
+            .uint8 => .{ .uint8 = try fitInt(u64, n) },
+            .float4 => .{ .float4 = @floatFromInt(n) },
+            .float8 => .{ .float8 = @floatFromInt(n) },
+            else => error.TypeMismatch,
+        };
+    }
+    if (from.isFloat()) {
+        const f: f64 = switch (v) {
+            inline .float4, .float8 => |x| x,
+            else => unreachable,
+        };
+        return switch (col.ty) {
+            .float8 => .{ .float8 = f },
+            .float4 => {
+                const narrow: f32 = @floatCast(f);
+                if (std.math.isInf(narrow) and !std.math.isInf(f))
+                    return error.FloatOutOfRange;
+                return .{ .float4 = narrow };
+            },
+            else => error.TypeMismatch,
+        };
+    }
+    return error.TypeMismatch;
+}
+
+fn fitInt(comptime T: type, n: i128) error{IntOutOfRange}!T {
+    return std.math.cast(T, n) orelse error.IntOutOfRange;
+}
+
 /// Equality of two cells (same type expected — the caller coerces the filter
 /// literal to the column's type first). NULL equals only NULL.
 pub fn valuesEqual(x: Value, y: Value) bool {
@@ -352,7 +409,7 @@ pub fn valuesEqual(x: Value, y: Value) bool {
 /// The Postgres OID advertised for a column of this type. Unsigned integers
 /// widen to the smallest signed pg type that holds them (uint2→int4,
 /// uint4→int8, uint8→numeric); types without a dedicated OID here are sent as
-/// text (formatValue renders them).
+/// text (valueToText renders them).
 pub fn pgTypeOid(ty: Type) pgwire.Oid {
     return switch (ty) {
         .bool_ => pgwire.oid.bool_,
