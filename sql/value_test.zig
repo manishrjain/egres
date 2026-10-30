@@ -30,6 +30,7 @@ test "sql.value: fixedWidth and isVarlen per type" {
     try testing.expectEqual(@as(?u8, null), Type.bpchar.fixedWidth());
     try testing.expectEqual(@as(?u8, null), Type.varchar.fixedWidth());
     try testing.expectEqual(@as(?u8, null), Type.bytea.fixedWidth());
+    try testing.expectEqual(@as(?u8, null), Type.vector.fixedWidth());
 
     try testing.expect(!Type.int4.isVarlen());
     try testing.expect(!Type.timestamptz.isVarlen());
@@ -37,6 +38,7 @@ test "sql.value: fixedWidth and isVarlen per type" {
     try testing.expect(!Type.uuid.isVarlen());
     try testing.expect(Type.text.isVarlen());
     try testing.expect(Type.bytea.isVarlen());
+    try testing.expect(Type.vector.isVarlen());
 }
 
 test "sql.value: Type.fromName resolves DDL type names" {
@@ -53,6 +55,7 @@ test "sql.value: Type.fromName resolves DDL type names" {
     try testing.expectEqual(@as(?Type, .text), Type.fromName("text"));
     try testing.expectEqual(@as(?Type, .text), Type.fromName("varchar"));
     try testing.expectEqual(@as(?Type, .bytea), Type.fromName("bytea"));
+    try testing.expectEqual(@as(?Type, .vector), Type.fromName("vector"));
     try testing.expectEqual(@as(?Type, .date), Type.fromName("date"));
     try testing.expectEqual(@as(?Type, .timestamptz), Type.fromName("timestamptz"));
     try testing.expectEqual(@as(?Type, .uuid), Type.fromName("uuid"));
@@ -60,6 +63,31 @@ test "sql.value: Type.fromName resolves DDL type names" {
     try testing.expect(Type.fromName("serial") == null);
     try testing.expect(Type.fromName("numeric") == null);
     try testing.expect(Type.fromName("") == null);
+}
+
+test "sql.value: vectors parse, validate, and format as pgvector text" {
+    const alloc = testing.allocator;
+    const vector = try value.parseVector(alloc, "[1, -2.5, 3e1]", 3);
+    defer alloc.free(vector.vector);
+    try testing.expectEqual(@as(usize, 12), vector.vector.len);
+
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try value.formatValue(&w, null, vector);
+    try testing.expectEqualStrings("[1,-2.5,30]", w.buffered());
+
+    try testing.expectError(
+        error.VectorDimensionMismatch,
+        value.parseVector(alloc, "[1,2]", 3),
+    );
+    try testing.expectError(
+        error.NonFiniteVector,
+        value.parseVector(alloc, "[NaN,2,3]", 3),
+    );
+    try testing.expectError(
+        error.InvalidVector,
+        value.parseVector(alloc, "1,2,3", 3),
+    );
 }
 
 test "sql.value: parseValue coerces literals and rejects unsupported types" {
