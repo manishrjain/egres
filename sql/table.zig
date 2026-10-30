@@ -73,7 +73,7 @@ pub const Column = struct {
     name: String,
     ty: _value.Type,
     pkey_position: ?u16,
-    /// `char(n)` / `varchar(n)` length; null otherwise (schema.LogicalColumn).
+    /// `char(n)` / `varchar(n)` length or `vector(n)` dimension; null otherwise.
     type_mod: ?u32 = null,
 
     /// The row-key pseudo-column (`egid_column`).

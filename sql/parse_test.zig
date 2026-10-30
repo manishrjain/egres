@@ -164,6 +164,28 @@ test "sql.parse: CREATE TABLE char(n) and varchar(n) carry their length" {
     try testing.expectError(error.SyntaxError, parse.statement(alloc, "CREATE TABLE t (a char(1,2));"));
 }
 
+test "sql.parse: CREATE TABLE vector(n) carries and bounds its dimension" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const ct = try parse.statement(alloc, "CREATE TABLE t (v vector(768));");
+    try testing.expectEqual(sql.Type.vector, ct.create_table.columns[0].ty);
+    try testing.expectEqual(@as(?u32, 768), ct.create_table.columns[0].type_mod);
+
+    const cases = [_]struct { sql: String, needle: String }{
+        .{ .sql = "CREATE TABLE t (v vector);", .needle = "requires a dimension" },
+        .{ .sql = "CREATE TABLE t (v vector(0));", .needle = "at least 1" },
+        .{ .sql = "CREATE TABLE t (v vector(4097));", .needle = "cannot exceed" },
+    };
+    for (cases) |case| {
+        const stmt = try parse.statement(alloc, case.sql);
+        try testing.expect(stmt == .invalid);
+        try testing.expect(std.mem.indexOf(u8, stmt.invalid, case.needle) != null);
+    }
+}
+
 test "sql.parse: CREATE TABLE semantic rejections carry a reason" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);

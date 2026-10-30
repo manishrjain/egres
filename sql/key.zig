@@ -91,11 +91,11 @@ pub fn encodeIndexKey(
     const start = out.items.len;
     switch (v) {
         .null_value => try out.append(a, tag_null),
-        .interval => return error.Unencodable,
+        .interval, .vector => return error.Unencodable,
         else => {
             try out.append(a, tag_value);
             switch (v) {
-                .null_value, .interval => unreachable,
+                .null_value, .interval, .vector => unreachable,
                 .bool_ => |b| try out.append(a, @intFromBool(b)),
                 inline .int2,
                 .int4,
