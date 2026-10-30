@@ -67,6 +67,9 @@ pub const Type = enum {
     /// `varchar(n)`: text with a length check on the way in. Bare
     /// `varchar` is `.text`.
     varchar,
+    /// `vector(n)`: n finite float32 values, stored as little-endian bits.
+    /// The dimension lives in the column's `type_mod`, not in each row.
+    vector,
 
     /// Byte width of a fixed-width type, or null for a varlen type.
     pub inline fn fixedWidth(self: Type) ?u8 {
@@ -76,7 +79,7 @@ pub const Type = enum {
             .int4, .uint4, .float4, .date => 4,
             .int8, .uint8, .float8, .time, .timestamp, .timestamptz => 8,
             .interval, .uuid => 16,
-            .text, .bytea, .bpchar, .varchar => null,
+            .text, .bytea, .bpchar, .varchar, .vector => null,
         };
     }
 
@@ -137,6 +140,7 @@ pub const Type = enum {
 
     /// The largest `char(n)` / `varchar(n)` Postgres accepts.
     pub const max_type_mod: u32 = 10_485_760;
+    pub const max_vector_dimensions: u32 = 4096;
 };
 
 /// A Postgres interval: months + days + microseconds kept separate (a
@@ -171,6 +175,9 @@ pub const Value = union(enum) {
     uuid: [16]u8,
     text: String,
     bytea: String,
+    /// Contiguous little-endian IEEE-754 float32 bit patterns. Keeping this
+    /// as bytes avoids alignment assumptions when it is borrowed from a row.
+    vector: String,
 
     /// The cell's type, or null for SQL NULL. Every non-null tag is
     /// named exactly as its Type.
@@ -245,8 +252,39 @@ pub fn parseValue(ty: Type, text: String) !Value {
         .timestamp => .{ .timestamp = try date.parseTimestamp(text, false) },
         .timestamptz => .{ .timestamptz = try date.parseTimestamp(text, true) },
         .date => .{ .date = try date.parseDate(text) },
-        .time, .interval, .uuid => error.UnsupportedType,
+        .time, .interval, .uuid, .vector => error.UnsupportedType,
     };
+}
+
+/// Parse pgvector's text form into the on-disk float32 representation. The
+/// caller supplies the column dimension because it belongs to schema metadata.
+pub fn parseVector(
+    alloc: std.mem.Allocator,
+    text: String,
+    dimensions: u32,
+) !Value {
+    if (text.len < 2 or text[0] != '[' or text[text.len - 1] != ']')
+        return error.InvalidVector;
+
+    const byte_len = std.math.mul(usize, dimensions, 4) catch
+        return error.VectorDimensionMismatch;
+    const out = try alloc.alloc(u8, byte_len);
+    errdefer alloc.free(out);
+    var fields = std.mem.splitScalar(u8, text[1 .. text.len - 1], ',');
+    var count: u32 = 0;
+    while (fields.next()) |field| {
+        if (count >= dimensions) return error.VectorDimensionMismatch;
+        const part = std.mem.trim(u8, field, " \t\r\n");
+        if (part.len == 0) return error.InvalidVector;
+        const number = try std.fmt.parseFloat(f32, part);
+        if (std.math.isNan(number) or std.math.isInf(number))
+            return error.NonFiniteVector;
+        const start = @as(usize, count) * 4;
+        std.mem.writeInt(u32, out[start..][0..4], @bitCast(number), .little);
+        count += 1;
+    }
+    if (count != dimensions) return error.VectorDimensionMismatch;
+    return .{ .vector = out };
 }
 
 fn parseBool(text: String) !bool {
@@ -312,6 +350,7 @@ pub fn formatValue(w: *std.Io.Writer, col: ?*const Column, v: Value) !void {
         .null_value => {}, // caller handles null out-of-band
         .bool_ => |b| try w.writeAll(if (b) "t" else "f"),
         .text, .bytea => |s| try w.writeAll(s),
+        .vector => |bytes| try formatVector(w, bytes),
         // Every numeric payload renders via {d}; `inline` binds the capture
         // to each tag's concrete type. time/interval/uuid can't be inserted
         // this slice, so a live value never actually reaches those tags —
@@ -335,6 +374,17 @@ pub fn formatValue(w: *std.Io.Writer, col: ?*const Column, v: Value) !void {
     }
 }
 
+fn formatVector(w: *std.Io.Writer, bytes: String) !void {
+    std.debug.assert(bytes.len % 4 == 0);
+    try w.writeByte('[');
+    for (0..bytes.len / 4) |i| {
+        if (i != 0) try w.writeByte(',');
+        const bits = std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little);
+        try w.print("{d}", .{@as(f32, @bitCast(bits))});
+    }
+    try w.writeByte(']');
+}
+
 /// Equality of two cells (same type expected — the caller coerces the filter
 /// literal to the column's type first). NULL equals only NULL.
 pub fn valuesEqual(x: Value, y: Value) bool {
@@ -343,6 +393,7 @@ pub fn valuesEqual(x: Value, y: Value) bool {
         .null_value => true,
         .text => std.mem.eql(u8, x.text, y.text),
         .bytea => std.mem.eql(u8, x.bytea, y.bytea),
+        .vector => std.mem.eql(u8, x.vector, y.vector),
         .uuid => std.mem.eql(u8, &x.uuid, &y.uuid),
         .interval => std.meta.eql(x.interval, y.interval),
         inline else => |v, tag| v == @field(y, @tagName(tag)),
@@ -367,7 +418,7 @@ pub fn pgTypeOid(ty: Type) pgwire.Oid {
         .date => pgwire.oid.date,
         .bpchar => pgwire.oid.bpchar,
         .varchar => pgwire.oid.varchar,
-        .text, .bytea, .time, .interval, .uuid => pgwire.oid.text,
+        .text, .bytea, .time, .interval, .uuid, .vector => pgwire.oid.text,
     };
 }
 

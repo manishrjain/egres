@@ -92,6 +92,25 @@ test "sql.row: end-to-end — logical schema, compile, marshal, read all back" {
     try testing.expectEqualSlices(u8, &avatar, r.at(12).bytea);
 }
 
+test "sql.row: vector payload round-trips without changing float32 bits" {
+    const alloc = testing.allocator;
+    const columns = [_]LogicalColumn{col(1, .vector)};
+    const logical = sql.LogicalSchema{ .columns = &columns, .current_version = 1 };
+    var ps = try sql.compile(alloc, logical, 1);
+    defer ps.deinit(alloc);
+
+    const vector = try sql.value.parseVector(alloc, "[0.1,-2,3.25]", 3);
+    defer alloc.free(vector.vector);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    const bytes = try sql.marshalRow(alloc, &ps, &.{vector}, &buf);
+
+    var row: sql.Row = .{};
+    defer row.deinit(alloc);
+    try sql.unmarshalRow(alloc, &ps, bytes, &.{}, &row);
+    try testing.expectEqualSlices(u8, vector.vector, row.at(0).vector);
+}
+
 test "sql.row: empty projection selects every column in column_id order" {
     const alloc = testing.allocator;
     const cols = [_]LogicalColumn{ col(1, .int4), col(2, .text), col(3, .bool_) };
