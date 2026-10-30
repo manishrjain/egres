@@ -421,7 +421,8 @@ fn parseCreateTable(
         var type_mod: ?u32 = null;
         if (typmods.len > 0) {
             const is_varchar = std.mem.eql(u8, tyname, "varchar");
-            if (ty != .bpchar and !is_varchar)
+            const is_vector = ty == .vector;
+            if (ty != .bpchar and !is_varchar and !is_vector)
                 return invalidFmt(alloc, "type modifier is not allowed for type \"{s}\"", .{tyname});
             const ac = if (typmods.len == 1)
                 parser.cast(c.A_Const, typmods[0].ptr_value)
@@ -436,6 +437,9 @@ fn parseCreateTable(
             const n = ac.?.val.ival.ival;
             if (n < 1)
                 return invalidFmt(alloc, "length for type {s} must be at least 1", .{tyname});
+            if (is_vector and n > _value.Type.max_vector_dimensions)
+                return invalidFmt(alloc, "dimensions for type vector cannot exceed {d}", //
+                    .{_value.Type.max_vector_dimensions});
             if (n > _value.Type.max_type_mod)
                 return invalidFmt(alloc, "length for type {s} cannot exceed {d}", //
                     .{ tyname, _value.Type.max_type_mod });
@@ -443,6 +447,8 @@ fn parseCreateTable(
             if (is_varchar) ty = .varchar;
         } else if (ty == .bpchar) {
             type_mod = 1;
+        } else if (ty == .vector) {
+            return invalid("vector requires a dimension");
         }
 
         var pkey = false;
@@ -693,13 +699,20 @@ pub const Params = struct {
     /// for every other column type. An index past what Bind supplied
     /// is `error.UnboundParam` (the runner checks the count first, so
     /// only a bug reaches it).
-    pub fn toValue(self: Params, index: u16, col: *const Column) !_value.Value {
+    pub fn toValue(
+        self: Params,
+        alloc: std.mem.Allocator,
+        index: u16,
+        col: *const Column,
+    ) !_value.Value {
         if (index == 0 or index > self.values.len) return error.UnboundParam;
 
         const bytes = self.values[index - 1] orelse return .null_value;
         if (self.isBinary(index)) return binaryValue(col.ty, bytes);
         if (col.ty.isString())
             return .{ .text = try _value.coerceString(bytes, col) };
+        if (col.ty == .vector)
+            return _value.parseVector(alloc, bytes, col.type_mod orelse 0);
         return _value.parseValue(col.ty, bytes);
     }
 
@@ -751,13 +764,15 @@ pub fn litToValue(
         // a position without a transaction time (SET, WHERE) never
         // produces it.
         .current_timestamp => return error.UnsupportedLiteral,
-        .param => |n| return params.toValue(n, col),
+        .param => |n| return params.toValue(a, n, col),
         .str, .float => |s| s,
         .int => |n| try std.fmt.allocPrint(a, "{d}", .{n}),
         .bool_ => |b| if (b) "t" else "f",
     };
     if (col.ty.isString())
         return .{ .text = try _value.coerceString(text, col) };
+    if (col.ty == .vector)
+        return _value.parseVector(a, text, col.type_mod orelse 0);
     return _value.parseValue(col.ty, text);
 }
 

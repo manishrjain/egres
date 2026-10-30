@@ -162,6 +162,7 @@ fn readValue(ps: *const PhysicalSchema, buffer: String, col: ColumnLayout) Value
         .uuid => .{ .uuid = buffer[off..][0..16].* },
         .text, .bpchar, .varchar => .{ .text = varlenSlice(ps, buffer, col) },
         .bytea => .{ .bytea = varlenSlice(ps, buffer, col) },
+        .vector => .{ .vector = varlenSlice(ps, buffer, col) },
     };
 }
 
@@ -196,13 +197,13 @@ fn writeFixed(dst: []u8, val: Value) void {
             std.mem.writeInt(i32, dst[12..16], v.months, .little);
         },
         .uuid => |v| @memcpy(dst[0..16], &v),
-        .null_value, .text, .bytea => unreachable, // null handled by caller; varlen not fixed
+        .null_value, .text, .bytea, .vector => unreachable, // null handled by caller; varlen not fixed
     }
 }
 
 inline fn varlenBytes(val: Value) String {
     return switch (val) {
-        .text, .bytea => |b| b,
+        .text, .bytea, .vector => |b| b,
         else => unreachable, // only varlen payloads reach here
     };
 }

@@ -44,8 +44,8 @@ pub const LogicalColumn = struct {
     /// stored so the catalog fully describes the table. u16 leaves room
     /// for composite keys — today only 1 is ever written.
     pkey_position: ?u16 = null,
-    /// The declared length of a `char(n)` / `varchar(n)` column, null for
-    /// every other type (bare `varchar` is `.text`, so null too).
+    /// The declared length of a `char(n)` / `varchar(n)` column, or the
+    /// dimension of a `vector(n)` column; null for every other type.
     /// Layout-irrelevant: all three string types store the same bytes.
     type_mod: ?u32 = null,
 

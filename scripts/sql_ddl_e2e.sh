@@ -459,6 +459,16 @@ expect "char(1,2) is a syntax error" "syntax error" psql "$E" -X -c "CREATE TABL
 expect "length on text rejected" "not allowed for type" psql "$E" -X -c "CREATE TABLE cn3 (a text(4));"
 expect "DROP char(n) table" "DROP TABLE" psql "$E" -X -c "DROP TABLE cn;"
 
+# --- VECTOR(n): pgwire text input, validation, and output ------------------
+expect "VECTOR(n) column" "CREATE TABLE" \
+    psql "$E" -X -c "CREATE TABLE vectors (id int PRIMARY KEY, embedding vector(3));"
+expect "vector text round-trip" "[0.1,-2,3.25]" \
+    psql "$E" -X -At -c "INSERT INTO vectors VALUES (1, '[0.1,-2,3.25]'); SELECT embedding FROM vectors WHERE id = 1;"
+expect "wrong vector dimension rejected" "VectorDimensionMismatch" \
+    psql "$E" -X -c "INSERT INTO vectors VALUES (2, '[1,2]');"
+expect "non-finite vector rejected" "NonFiniteVector" \
+    psql "$E" -X -c "INSERT INTO vectors VALUES (3, '[NaN,0,0]');"
+
 # --- no unexpected server-side errors ---------------------------------------
 if grep -qE '^[^ ]+ ERROR ' "$LOG"; then bad "server log has errors"; else ok "server log clean"; fi
 
