@@ -40,13 +40,13 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Alignment = std.mem.Alignment;
 const _rt = @import("runtime.zig");
 const _shutdown = @import("shutdown.zig");
 const _clock = @import("utils").coarse_clock;
 const _date = @import("utils").date;
 const Spinlock = @import("spinlock.zig").Spinlock;
 const _meter = @import("meter.zig");
+const _counting = @import("counting.zig");
 const Tenant = _meter.Tenant;
 
 const String = @import("utils").String;
@@ -104,7 +104,7 @@ pub const Ctx = struct {
     /// sets it from its database at connect (`Handler.onStartup`), a
     /// spawn copies it, and until then it is the system's, which is
     /// never short.
-    tenant: *Tenant = &_meter.system,
+    tenant: *Tenant = &_meter.shared,
     /// Live bytes in the statement's arenas, on the root: a helper's
     /// allocations count here too. Checked against the cap at a yield.
     mem_held: std.atomic.Value(i64) = .init(0),
@@ -194,17 +194,18 @@ pub const Ctx = struct {
     }
 
     /// `n` bytes an arena of the statement took from, or gave back
-    /// to, `allocator`: on the statement, its tenant and the process.
+    /// to, `allocator`: on the statement and on its tenant, which
+    /// counts the process's. `bg` counts nothing.
     pub fn holdMem(self: *Ctx, n: i64) void {
+        if (self == &Ctx.bg) return;
         _ = self.root().mem_held.fetchAdd(n, .monotonic);
         self.tenant.holdMem(n);
-        _ = _meter.mem_held_total.fetchAdd(n, .monotonic);
     }
 
     pub fn releaseMem(self: *Ctx, n: i64) void {
+        if (self == &Ctx.bg) return;
         _ = self.root().mem_held.fetchSub(n, .monotonic);
         self.tenant.releaseMem(n);
-        _ = _meter.mem_held_total.fetchSub(n, .monotonic);
     }
 
     /// The runtime's allocator, counted on this context: what every
@@ -213,7 +214,7 @@ pub const Ctx = struct {
     /// before the statement ends. An arena asks per chunk, so the
     /// count is cheap and a little coarse.
     pub fn allocator(self: *Ctx) Allocator {
-        return .{ .ptr = self, .vtable = &mem_vtable };
+        return .{ .ptr = self, .vtable = _counting.vtable(Ctx) };
     }
 
     /// A statement arena on `allocator`: the caller's to deinit.
@@ -264,64 +265,27 @@ pub fn current() *Ctx {
     return &f.ctx;
 }
 
-/// The allocator's data pointer is the context, so a chunk is counted
-/// on the context that made the arena wherever it is taken; `Ctx.bg`
-/// counts nothing.
-const mem_vtable: Allocator.VTable = .{
-    .alloc = memAlloc,
-    .resize = memResize,
-    .remap = memRemap,
-    .free = memFree,
+/// Who holds what an allocator hands out.
+pub const MemOwner = enum {
+    /// The statement on the current fiber, and through it its tenant:
+    /// counted against the per-query cap, released when the statement
+    /// ends. What a statement's arenas are made on.
+    ctx,
+    /// The current fiber's tenant alone, for work done on its behalf
+    /// off any statement: a compaction of its trees. Never held
+    /// against a statement.
+    tenant,
 };
 
-fn memCtx(ptr: *anyopaque) *Ctx {
-    return @ptrCast(@alignCast(ptr));
-}
-
-fn memHeld(ptr: *anyopaque, old_len: usize, new_len: usize) void {
-    const ctx = memCtx(ptr);
-    if (ctx == &Ctx.bg) return;
-    if (new_len >= old_len)
-        ctx.holdMem(@intCast(new_len - old_len))
-    else
-        ctx.releaseMem(@intCast(old_len - new_len));
-}
-
-fn memAlloc(ptr: *anyopaque, len: usize, al: Alignment, ra: usize) ?[*]u8 {
-    const p = _rt.runtime().allocator.rawAlloc(len, al, ra) orelse return null;
-    memHeld(ptr, 0, len);
-    return p;
-}
-
-fn memResize(
-    ptr: *anyopaque,
-    memory: []u8,
-    al: Alignment,
-    new_len: usize,
-    ra: usize,
-) bool {
-    if (!_rt.runtime().allocator.rawResize(memory, al, new_len, ra))
-        return false;
-    memHeld(ptr, memory.len, new_len);
-    return true;
-}
-
-fn memRemap(
-    ptr: *anyopaque,
-    memory: []u8,
-    al: Alignment,
-    new_len: usize,
-    ra: usize,
-) ?[*]u8 {
-    const p = _rt.runtime().allocator.rawRemap(memory, al, new_len, ra) orelse
-        return null;
-    memHeld(ptr, memory.len, new_len);
-    return p;
-}
-
-fn memFree(ptr: *anyopaque, memory: []u8, al: Alignment, ra: usize) void {
-    _rt.runtime().allocator.rawFree(memory, al, ra);
-    memHeld(ptr, memory.len, 0);
+/// The runtime's allocator, counted on `owner` as of the current
+/// fiber. The owner is fixed in the allocator: a chunk comes off it
+/// wherever it is freed.
+pub fn allocator(owner: MemOwner) Allocator {
+    const ctx = current();
+    return switch (owner) {
+        .ctx => ctx.allocator(),
+        .tenant => ctx.tenant.allocator(),
+    };
 }
 
 /// A finished statement kept by the sampler. Owns its arena, which

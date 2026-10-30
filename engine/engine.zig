@@ -1083,6 +1083,20 @@ pub const Engine = struct {
             };
             defer job.tree.release();
             defer job.tree.releaseJob(job.cand);
+            // The job is the tree's database's work, charged to its
+            // tenant, by the fibers the build spawns too. The class is
+            // the job's: foreground from L0, as the partitions run.
+            const ctx = fiber.ctx();
+            ctx.tenant = fiber.meter.tenants.get(
+                job.key.namespace,
+                utils.coarseMs(),
+            ) catch &fiber.meter.shared;
+            ctx.class = zdb.compaction.classFor(job.cand.level);
+
+            defer {
+                ctx.tenant = &fiber.meter.shared;
+                ctx.class = .fg;
+            }
             // The candidate's job is a split when the tree has outgrown
             // `Config.splitBytes`, its Lmax target plus the levels above
             // it. updateCompactCandidate sets this in the apply path

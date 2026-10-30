@@ -125,7 +125,7 @@ test "ctx: a statement counts on the tenant, which outlives it" {
     var t = fiber.Tenant.init(31, meter.default_limit, 0);
     const qctx = fiber.ctx();
     qctx.tenant = &t;
-    defer qctx.tenant = &meter.system;
+    defer qctx.tenant = &meter.shared;
 
     try qctx.start("select 1", false);
     try std.testing.expectEqual(1, t.totals.statements.load(.monotonic));
@@ -144,7 +144,7 @@ test "ctx: a statement's arenas count on it and its tenant, to the cap" {
     var t = fiber.Tenant.init(32, meter.default_limit, 0);
     const qctx = fiber.ctx();
     qctx.tenant = &t;
-    defer qctx.tenant = &meter.system;
+    defer qctx.tenant = &meter.shared;
     try qctx.start("select 1", false);
     defer qctx.finish();
     var arena = qctx.newArena();

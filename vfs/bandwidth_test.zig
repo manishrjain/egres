@@ -26,7 +26,7 @@ test "limiter: only a metered device charges the fiber's tenant" {
     var t = tenantAt(11, 1_000_000);
     const ctx = fiber.ctx();
     ctx.tenant = &t;
-    defer ctx.tenant = &fiber.meter.system;
+    defer ctx.tenant = &fiber.meter.shared;
 
     var limiter = Limiter.init(.{
         .bytes_per_sec = 1_000_000 * page_size,
@@ -51,8 +51,8 @@ test "limiter: only a metered device charges the fiber's tenant" {
     try expect(limiter.status().metered);
 }
 
-test "limiter: the system tenant never waits" {
-    try expectEqual(&fiber.meter.system, fiber.ctx().tenant);
+test "limiter: the shared tenant never waits" {
+    try expectEqual(&fiber.meter.shared, fiber.ctx().tenant);
     // One page a second, and a thousand asked for twice over.
     var limiter = Limiter.init(.{ .bytes_per_sec = page_size });
     limiter.metered = true;
@@ -67,7 +67,7 @@ test "limiter: a tenant pays fg's debt first, then bg's" {
     var t = tenantAt(12, 1000);
     const ctx = fiber.ctx();
     ctx.tenant = &t;
-    defer ctx.tenant = &fiber.meter.system;
+    defer ctx.tenant = &fiber.meter.shared;
     var limiter = Limiter.init(.{ .bytes_per_sec = 1000 * page_size });
     limiter.metered = true;
 

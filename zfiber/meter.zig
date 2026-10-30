@@ -22,11 +22,11 @@
 //! the units a plan is sold in. The policy looks at the tenant's own
 //! buckets and nothing else: `pay` waits on them, `charge` and `take`
 //! draw on them. Work no session resolved, the WAL, the manifest,
-//! raft, runs as the `system` tenant, which never waits and only
+//! raft, runs as the `shared` tenant, which never waits and only
 //! counts what it spent.
 //!
 //! The `Tenants` set turns the limits into rates once a tick. What the
-//! system spent since the last tick comes off `capacity` first, and
+//! shared tenant spent since the last tick comes off `capacity` first, and
 //! the active tenants split the rest by the fair-share rule:
 //!
 //!     rate_i = left × limit_i / Σ limit_j over the active tenants
@@ -57,6 +57,7 @@
 
 const std = @import("std");
 const _rt = @import("runtime.zig");
+const _counting = @import("counting.zig");
 const _clock = @import("utils").coarse_clock;
 const sleepMs = @import("deadlines.zig").sleepMs;
 
@@ -153,7 +154,7 @@ pub const Resource = struct {
         const rate = self.rate.load(.monotonic);
         if (rate <= 0) return;
 
-        // The system's rate is 2^62: the product needs the width, and
+        // The shared tenant's rate is 2^62: the product needs the width, and
         // the clamp is what `fill` saturates on.
         const wide = @divTrunc(@as(i128, elapsed) * rate, 1000);
         const earned: i64 = @intCast(@min(wide, std.math.maxInt(i64)));
@@ -211,8 +212,9 @@ pub const Tenant = struct {
     cpu: Resource,
     /// Pages; a write costs the device's write cost in pages.
     io: Resource,
-    /// Live bytes held by the tenant's contexts, and the bytes the last
-    /// tick gave it: over the share under pressure, a statement waits.
+    /// Live bytes held by the tenant's statements and the compactions
+    /// of its trees, and the bytes the last tick gave it: over the
+    /// share under pressure, a statement waits.
     mem_held: std.atomic.Value(i64) = .init(0),
     mem_share: std.atomic.Value(i64) = .init(0),
     last_active_ms: std.atomic.Value(i64),
@@ -299,16 +301,24 @@ pub const Tenant = struct {
         _ = self.totals.statements.fetchAdd(1, .monotonic);
     }
 
-    /// A statement arena grew or shrank. The peak is a statistic: two
-    /// racing updates may lose one, never the balance.
+    /// `n` bytes taken from, or given back to, an allocator counted
+    /// on the tenant: its own held and peak, and the process total.
     pub fn holdMem(self: *Tenant, n: i64) void {
         const held = self.mem_held.fetchAdd(n, .monotonic) + n;
-        if (held > self.totals.mem_peak.load(.monotonic))
-            self.totals.mem_peak.store(held, .monotonic);
+        _ = self.totals.mem_peak.fetchMax(held, .monotonic);
+        _ = mem_held_total.fetchAdd(n, .monotonic);
     }
 
     pub fn releaseMem(self: *Tenant, n: i64) void {
         _ = self.mem_held.fetchSub(n, .monotonic);
+        _ = mem_held_total.fetchSub(n, .monotonic);
+    }
+
+    /// The runtime's allocator, counted on the tenant alone: for work
+    /// done on its behalf off any statement, a compaction of its
+    /// trees. Not held against any statement's cap.
+    pub fn allocator(self: *Tenant) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = _counting.vtable(Tenant) };
     }
 
     /// Over the memory share, the tick's number, while the cache can
@@ -334,6 +344,17 @@ pub const Tenant = struct {
 
     pub fn failed(self: *Tenant) void {
         _ = self.totals.failed.fetchAdd(1, .monotonic);
+    }
+
+    /// The cpu rate in millicores, for a reader: ticks per second over
+    /// the counter's rate. 0 before the counter is calibrated.
+    pub fn cpuRateMilli(self: *Tenant) i64 {
+        return _rt.ticksTo(self.cpu.rate.load(.monotonic), .ms);
+    }
+
+    /// A cpu balance as milliseconds of a core, for a reader.
+    pub fn cpuBalanceMs(self: *Tenant, class: IoClass) i64 {
+        return _rt.ticksTo(self.cpu.bucket(class).balance(), .ms);
     }
 
     /// The policy, for cpu and io alike, over the tenant's own buckets
@@ -399,12 +420,12 @@ pub fn statsFor(kind: Kind, class: IoClass) *Stats {
     return &stats[@intFromEnum(kind)][@intFromEnum(class)];
 }
 
-/// The system's tenant, id 0: the default on every Ctx, and what the
+/// The shared tenant, id 0: the default on every Ctx, and what the
 /// WAL, the manifest, raft and anything no session resolved runs as.
 /// Its buckets are never short: the rate is as large as a balance
 /// allows, and it is not in the `Tenants` map. Its totals are what
 /// the tick takes off the box before the tenants split it.
-pub var system: Tenant = .{
+pub var shared: Tenant = .{
     .id = 0,
     .limit = .{ .cpu_milli = 1, .io_pages_per_s = 1, .mem_bytes = 1 },
     .cpu = Resource.init(never_short, never_short, 0),
@@ -429,8 +450,8 @@ pub var capacity: Tenant.Limit = .{
 /// share waits. The governor's, each tick.
 pub var mem_pressure: std.atomic.Value(bool) = .init(false);
 
-/// Live bytes held by every `Ctx`, all tenants: against the pool,
-/// for the governor.
+/// Live bytes every tenant holds, the shared one included: against
+/// the pool, the governor's pressure flag.
 pub var mem_held_total: std.atomic.Value(i64) = .init(0);
 
 /// A statement's live bytes past which its next yield refuses it;
@@ -477,9 +498,9 @@ pub const Tenants = struct {
     /// second pass over the map could find one the sum left out.
     /// Scratch of the one fiber that ticks; keeps its capacity.
     active: std.ArrayList(*Tenant) = .empty,
-    /// The system's totals at the last tick, by `Kind`, and when it
+    /// The shared tenant's totals at the last tick, by `Kind`, and when it
     /// was: what it spent since is off the box this tick.
-    system_at_tick: [kinds]i64 = @splat(0),
+    shared_at_tick: [kinds]i64 = @splat(0),
     last_tick_ms: i64 = 0,
 
     const Limit = Tenant.Limit;
@@ -538,7 +559,16 @@ pub const Tenants = struct {
         return self.map.count();
     }
 
-    /// Splits `capacity`, less what the system spent since the last
+    /// `f(arg, tenant)` for every tenant, under the shared lock: the
+    /// admin's lines and metrics. Nothing in `f` may take a tenant.
+    pub fn forEach(self: *Tenants, arg: anytype, comptime f: anytype) !void {
+        self.lock.lockShared(@src());
+        defer self.lock.unlockShared();
+        var it = self.map.valueIterator();
+        while (it.next()) |t| try f(arg, t.*);
+    }
+
+    /// Splits `capacity`, less what the shared tenant spent since the last
     /// tick, among the active tenants by their limits, and sets each
     /// one's rates and memory share. An idle tenant keeps its last
     /// rates: it is not in the sum, and it has nothing to spend them
@@ -583,11 +613,11 @@ pub const Tenants = struct {
         }
     }
 
-    /// `cap` less the system's spend since the last tick as a rate:
-    /// what the tenants split, zero when the system took it all.
+    /// `cap` less the shared tenant's spend since the tick as a rate:
+    /// what the tenants split, zero when the shared tenant took it all.
     fn left(self: *Tenants, kind: Kind, cap: i64, elapsed_ms: i64) i64 {
-        const at_tick = &self.system_at_tick[@intFromEnum(kind)];
-        const total = system.total(kind).load(.monotonic);
+        const at_tick = &self.shared_at_tick[@intFromEnum(kind)];
+        const total = shared.total(kind).load(.monotonic);
         const used = total - at_tick.*;
         at_tick.* = total;
         const rate = @divTrunc(@as(i128, used) * 1000, elapsed_ms);

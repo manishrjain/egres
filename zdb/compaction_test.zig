@@ -100,6 +100,12 @@ test "l0MergeRun: 0 turns L0 to L0 compaction off" {
     try std.testing.expectEqual(no_run, l0MergeRun(opts, &tables));
 }
 
+test "classFor: a job from L0 is foreground, below it background" {
+    try std.testing.expectEqual(.fg, compaction.classFor(0));
+    try std.testing.expectEqual(.bg, compaction.classFor(1));
+    try std.testing.expectEqual(.bg, compaction.classFor(5));
+}
+
 test "config: a tree needs at least two levels" {
     const two: Config = .{ .max_levels = 2 };
     try two.validate();

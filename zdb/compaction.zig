@@ -774,6 +774,13 @@ fn moveDown(
     return changes;
 }
 
+/// The I/O class a job from `src_level` runs at: foreground from L0,
+/// since a full L0 stalls the flush and so the writes, like the flush
+/// itself; background below, behind every user.
+pub fn classFor(src_level: usize) fiber.IoClass {
+    return if (src_level == 0) .fg else .bg;
+}
+
 /// The inputs and the shape of one compaction's output.
 pub const MergeJob = struct {
     src_level: usize,
@@ -820,8 +827,9 @@ fn partitions(
         .table_id = self.tableId(),
     };
     const window = self.live.cur().compaction_window_bytes;
+    const tloc = fiber.allocator(.tenant);
     for (bot, bot_iters) |e, *it| {
-        it.* = TableIterator.init(self.allocator, e.table, table_key);
+        it.* = TableIterator.init(tloc, e.table, table_key);
         it.window_bytes = window;
     }
     const n = @min(@max(max, 1), @max(bot.len, 1), out.len);
@@ -874,9 +882,11 @@ pub fn mergeAndWrite(
     const opts = self.live.cur();
 
     // The bottom iterators outlive the fibers: each partition's merge
-    // releases its own at deinit, the slice is freed here after.
-    const bot_iters = try self.allocator.alloc(TableIterator, job.bot.len);
-    defer self.allocator.free(bot_iters);
+    // releases its own at deinit, the slice is freed here after. The
+    // job's buffers are held by the tenant this fiber runs as.
+    const tloc = fiber.allocator(.tenant);
+    const bot_iters = try tloc.alloc(TableIterator, job.bot.len);
+    defer tloc.free(bot_iters);
 
     var part_buf: [max_compaction_fibers]Partition = undefined;
     const parts = partitions(
@@ -1035,11 +1045,10 @@ fn runPartition_(
 ) !Emitter.Result {
     const dest = job.dest_level;
 
-    // The job's I/O class: background, behind every user. Its reads
-    // bypass the caches: each input is read once, and a hit must not
-    // count as reuse.
+    // The job's I/O class, and the caches bypassed: each input is read
+    // once, and a hit must not count as reuse.
     const ctx = fiber.ctx();
-    ctx.class = .bg;
+    ctx.class = classFor(job.src_level);
     ctx.cache = .bypass;
 
     // --- one MergeIterator over the src tables + the partition's
@@ -1047,11 +1056,12 @@ fn runPartition_(
     // release until the merge takes it over. ---
     var part_bot = part.bot;
     const n_iters = job.src.len + 1;
-    const all_iters = self.allocator.alloc(Iterator, n_iters) catch |err| {
+    const tloc = fiber.allocator(.tenant);
+    const all_iters = tloc.alloc(Iterator, n_iters) catch |err| {
         part_bot.deinit();
         return err;
     };
-    defer self.allocator.free(all_iters);
+    defer tloc.free(all_iters);
 
     const table_key: TableKey = .{
         .namespace = self.namespace,
@@ -1059,14 +1069,14 @@ fn runPartition_(
     };
     const window = self.live.cur().compaction_window_bytes;
     for (job.src, 0..) |e, i| {
-        var it = TableIterator.init(self.allocator, e.table, table_key);
+        var it = TableIterator.init(tloc, e.table, table_key);
         it.window_bytes = window;
         all_iters[i] = .{ .table = it };
     }
     all_iters[job.src.len] = .{ .concat = part_bot };
 
     // The merge takes every iterator over, the concat included.
-    var merge = MergeIterator.init(self.allocator, all_iters) catch |err| {
+    var merge = MergeIterator.init(tloc, all_iters) catch |err| {
         for (all_iters) |*it| it.deinit();
         return err;
     };

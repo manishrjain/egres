@@ -1739,11 +1739,28 @@ test "forest: meta survives put, flush to L0, compaction, and get" {
     // Builder, so meta has to survive the merge iterator and the re-encode.
     const tree = f.getTree(1, 0) orelse return error.TestExpectedTree;
     defer tree.release();
+    // The partitions inherit this fiber's tenant and, from L0, run
+    // foreground: with this fiber on bg, a charge on fg is theirs.
+    var tenant = fiber.Tenant.init(7, fiber.meter.default_limit, 0);
+    const ctx = fiber.ctx();
+    ctx.tenant = &tenant;
+    ctx.class = .bg;
+    defer {
+        ctx.tenant = &fiber.meter.shared;
+        ctx.class = .fg;
+    }
     var comp = try buildCompaction(tree, 0);
     defer comp.deinit(alloc);
     // Guard against the compaction being a silent no-op, which would make the
     // assertions below vacuous.
     try std.testing.expect(comp.items.len > 0);
+    try std.testing.expect(
+        tenant.cpu.bucket(.fg).balance() < tenant.cpu.burst.load(.monotonic),
+    );
+    // Its iterators and builder were the tenant's while the job ran,
+    // and are all given back by its end.
+    try std.testing.expect(tenant.totals.mem_peak.load(.monotonic) > 0);
+    try std.testing.expectEqual(0, tenant.mem_held.load(.monotonic));
     try tree.applyCompaction(1, comp.items);
 
     // Every row is still here: compaction preserves meta but never acts on it,

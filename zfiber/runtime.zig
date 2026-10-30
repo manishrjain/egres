@@ -45,13 +45,13 @@ const io_submit_batch: usize = 4;
 /// Q32.32 fixed point: `ns_per_cycle * 2^32`. Set exactly once by
 /// `calibrateTsc` via CAS; zero means "not yet calibrated." This is
 /// the global source of truth — each worker copies it into
-/// `tsc_factor_tls` once at run() entry so the hot-path `cyclesToNs`
+/// `tsc_factor_tls` once at run() entry so the hot-path `ticksTo`
 /// avoids the atomic load on every dispatch.
 var tsc_ns_per_cycle_q32: std.atomic.Value(u64) = .init(0);
 
 /// Per-worker copy of `tsc_ns_per_cycle_q32`. Loaded once at the top
 /// of `Worker.run`; read non-atomically in the hot path. Stays 0 on
-/// non-Linux (calibration short-circuits) — `cyclesToNs` then yields
+/// non-Linux (calibration short-circuits) — `ticksTo` then yields
 /// 0 and `cpu_total_ns` stays at zero. Safe because the global is
 /// set before any worker starts (Runtime.init → calibrateTsc →
 /// allocate workers → workers.run).
@@ -453,7 +453,7 @@ pub const Worker = struct {
                 self.loop.run(.no_wait) catch {};
                 continue;
             }
-            const spent = cyclesToNs(readTicks() -% start);
+            const spent = ticksTo(readTicks() -% start, .ns);
             if (spent >= budget_ns) return false;
             std.atomic.spinLoopHint();
         }
@@ -654,7 +654,7 @@ pub const Worker = struct {
 
         // Seed this worker thread's TSC conversion factor from the
         // global once (set during Runtime.init by calibrateTsc).
-        // After this, `cyclesToNs` reads `tsc_factor_tls` without an
+        // After this, `ticksTo` reads `tsc_factor_tls` without an
         // atomic load on every dispatch.
         tsc_factor_tls = tsc_ns_per_cycle_q32.load(.acquire);
 
@@ -703,7 +703,8 @@ pub const Worker = struct {
 
             const enter = readTicks();
             self.charged_ticks = enter;
-            if (cyclesToNs(enter -% self.last_coarse_clock_ticks) >= std.time.ns_per_ms) {
+            const since_clock = enter -% self.last_coarse_clock_ticks;
+            if (ticksTo(since_clock, .ns) >= std.time.ns_per_ms) {
                 // Advance the coarse clock at most once per ms (TSC-gated, no
                 // syscall on the fast path). `enter` is reused for CPU
                 // accounting below, so the per-iteration cost is a subtract +
@@ -723,7 +724,7 @@ pub const Worker = struct {
                 self.last_work_ticks = exit;
                 // Skip the reading if the counter went backwards (thread
                 // migrated mid-step to a CPU with a slightly behind TSC).
-                const cycNs = cyclesToNs(exit -| enter);
+                const cycNs = ticksTo(exit -| enter, .ns);
                 f.cpu_total_ns +%= cycNs;
                 self.cpu_total_ns +%= cycNs;
 
@@ -756,7 +757,7 @@ pub const Worker = struct {
 
                 if (completionsReady(&self.loop) > 0 or
                     pendingSubmissions(&self.loop) >= io_submit_batch or
-                    cyclesToNs(enter -% self.last_pump_ticks) >= std.time.ns_per_ms)
+                    ticksTo(enter -% self.last_pump_ticks, .ms) >= 1)
                 {
                     self.loop.run(.no_wait) catch {};
                     self.last_pump_ticks = enter;
@@ -809,7 +810,8 @@ pub const Worker = struct {
             //    are likely microseconds away, and a park plus the kernel
             //    wake (and a C-state exit on a pinned core) costs more than
             //    that. Poll the completion ring for a short while first.
-            const since_work = cyclesToNs(readTicks() -% self.last_work_ticks);
+            const since_work =
+                ticksTo(readTicks() -% self.last_work_ticks, .ns);
             if (rt.prepark_poll_us.load(.monotonic) > 0 and
                 since_work < std.time.ns_per_ms and
                 self.pollBeforePark(rt))
@@ -1732,9 +1734,9 @@ inline fn completionsReady(loop: *xev.Loop) usize {
     return 0;
 }
 
-/// and aarch64 this is a cycle count needing `cyclesToNs` to convert.
+/// and aarch64 this is a cycle count needing `ticksTo` to convert.
 /// Other architectures fall back to `monoNs()` (which is already in
-/// nanoseconds — `cyclesToNs` is the identity in that branch).
+/// nanoseconds — `ticksTo` is the identity in that branch).
 inline fn readTicks() u64 {
     return switch (comptime builtin.cpu.arch) {
         .x86_64 => blk: {
@@ -1777,22 +1779,29 @@ fn monoNsUseRarely() i64 {
     };
 }
 
-/// Convert a tick delta to nanoseconds using the per-worker cached
-/// factor (`tsc_factor_tls`, populated once at `Worker.run` entry).
-/// Returns 0 if the factor hasn't been seeded — either calibration
-/// short-circuited on a non-Linux build or `cyclesToNs` was called
-/// outside a worker thread (which shouldn't happen in normal use).
-inline fn cyclesToNs(cycles: u64) u64 {
-    return switch (comptime builtin.cpu.arch) {
+pub const TimeUnit = enum { ns, ms };
+
+/// A tick delta in `unit`, by the per-worker cached factor
+/// (`tsc_factor_tls`, populated once at `Worker.run` entry), in the
+/// caller's integer type with its sign: a debt in ticks is a debt in
+/// ms. 0 when the factor is not seeded: calibration short-circuited
+/// on a non-Linux build, or a call off a worker thread.
+pub inline fn ticksTo(ticks: anytype, comptime unit: TimeUnit) @TypeOf(ticks) {
+    const T = @TypeOf(ticks);
+    const ns: T = switch (comptime builtin.cpu.arch) {
         .x86_64, .aarch64 => blk: {
             const factor = tsc_factor_tls;
             if (factor == 0) break :blk 0;
-            // u128 intermediate prevents overflow for multi-second
-            // cycle deltas (would otherwise overflow u64 around ~1.4s
-            // on a 3 GHz TSC).
-            break :blk @intCast((@as(u128, cycles) *% @as(u128, factor)) >> 32);
+            // i128 holds the product for multi-second deltas, and a
+            // division, not a shift, truncates a negative toward zero.
+            const wide = @as(i128, ticks) * @as(i128, factor);
+            break :blk @intCast(@divTrunc(wide, 1 << 32));
         },
-        else => cycles,
+        else => ticks,
+    };
+    return switch (unit) {
+        .ns => ns,
+        .ms => @divTrunc(ns, std.time.ns_per_ms),
     };
 }
 

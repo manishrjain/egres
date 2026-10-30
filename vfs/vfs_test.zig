@@ -340,7 +340,7 @@ test "read bandwidth enforcement" {
     var t = tenantAt(21, 1024);
     const ctx = fiber.ctx();
     ctx.tenant = &t;
-    defer ctx.tenant = &fiber.meter.system;
+    defer ctx.tenant = &fiber.meter.shared;
     ctx.class = .bg;
     defer ctx.class = .fg;
     var limiter = bandwidth.Limiter.init(.{
@@ -385,7 +385,7 @@ test "write bandwidth enforcement" {
     var t = tenantAt(22, 8192);
     const ctx = fiber.ctx();
     ctx.tenant = &t;
-    defer ctx.tenant = &fiber.meter.system;
+    defer ctx.tenant = &fiber.meter.shared;
     ctx.class = .bg;
     defer ctx.class = .fg;
     var limiter = bandwidth.Limiter.init(.{

@@ -133,8 +133,8 @@ fn plan(vcpus: i64) Limit {
     };
 }
 
-/// The tick takes the system tenant's spend since the last tick off
-/// the box, and every test in the binary charges the system: io
+/// The tick takes the shared tenant's spend since the last tick off
+/// the box, and every test in the binary charges the shared tenant: io
 /// through the limiter, cpu for every fiber step. A first tick this
 /// far from zero spreads the lifetime total over so long that it
 /// truncates to nothing; a later tick in a test checks memory, which
@@ -213,14 +213,34 @@ test "tenants: a sold-out box gives every tenant its number" {
 }
 
 /// A cpu share from a tick after the first: the number, less the
-/// share of what the other tests' fibers charged the system between
+/// share of what the other tests' fibers charged the shared tenant between
 /// the two ticks. That is microseconds of a window a second long, so
 /// well under a sixteenth.
 fn near(got: i64, want: i64) !void {
     try expect(got <= want and got > want - @divTrunc(want, 16));
 }
 
-test "tenants: what the system spent comes off the box first" {
+test "tenant: an allocator of its own counts on it and the process" {
+    var t = Tenant.init(41, meter.default_limit, 0);
+    const ctx = fiber.ctx();
+    ctx.tenant = &t;
+    defer ctx.tenant = &meter.shared;
+    const ctx_held = ctx.mem_held.load(.monotonic);
+
+    // The fiber's tenant owns it; nothing lands on the statement.
+    const tloc = fiber.allocator(.tenant);
+    try expectEqual(@as(*anyopaque, @ptrCast(&t)), tloc.ptr);
+    const buf = try tloc.alloc(u8, 64 * 1024);
+    try expectEqual(64 * 1024, t.mem_held.load(.monotonic));
+    try expectEqual(64 * 1024, t.totals.mem_peak.load(.monotonic));
+    try expectEqual(ctx_held, ctx.mem_held.load(.monotonic));
+
+    tloc.free(buf);
+    try expectEqual(0, t.mem_held.load(.monotonic));
+    try expectEqual(64 * 1024, t.totals.mem_peak.load(.monotonic));
+}
+
+test "tenants: what the shared tenant spent comes off the box first" {
     meter.capacity = box;
     var ts = Tenants.init(std.testing.allocator, plan(1));
     defer ts.deinit();
@@ -228,10 +248,10 @@ test "tenants: what the system spent comes off the box first" {
     ts.tick(t0);
     try expectEqual(1_000_000, a.io.rate.load(.monotonic));
 
-    // Half the device over the next second, as the system: the
+    // Half the device over the next second, as the shared tenant: the
     // tenant gets the other half, less whatever another test charged
-    // the system meanwhile, and the system never waited.
-    meter.system.charge(.io, .fg, 500_000, t0 + 500);
+    // the shared tenant meanwhile, which never waited.
+    meter.shared.charge(.io, .fg, 500_000, t0 + 500);
     a.touch(t0 + 500);
     ts.tick(t0 + 1000);
     const io = a.io.rate.load(.monotonic);
@@ -239,7 +259,7 @@ test "tenants: what the system spent comes off the box first" {
     try near(a.cpu.rate.load(.monotonic), 32 * hz());
 
     // All of it and more: nothing left until the next tick.
-    meter.system.charge(.io, .fg, 5_000_000, t0 + 1500);
+    meter.shared.charge(.io, .fg, 5_000_000, t0 + 1500);
     a.touch(t0 + 1500);
     ts.tick(t0 + 2000);
     try expectEqual(0, a.io.rate.load(.monotonic));
@@ -348,7 +368,7 @@ test "cpu: the worker loop charges each step to the fiber's tenant" {
     var t = cpuTenant(20, 32 * vcpu);
     const ctx = fiber.ctx();
     ctx.tenant = &t;
-    defer ctx.tenant = &meter.system;
+    defer ctx.tenant = &meter.shared;
 
     // A step is charged when it ends: after a yield the spin before
     // it is on the tenant, at about one core's rate.
@@ -372,7 +392,7 @@ test "cpu: maybeYield parks a tenant in debt until its rate covers it" {
     var t = cpuTenant(21, 100);
     const ctx = fiber.ctx();
     ctx.tenant = &t;
-    defer ctx.tenant = &meter.system;
+    defer ctx.tenant = &meter.shared;
 
     // 40 ms of cpu on a 10 ms burst, charged by the yield itself:
     // about 30 ms in debt, 300 ms at the rate, paid there.
@@ -418,6 +438,6 @@ test "payForMem: a tenant over its share waits only under pressure" {
     t.releaseMem(1500);
     defer t.holdMem(1500);
     try t.payForMem();
-    // The system never waits.
-    try meter.system.payForMem();
+    // The shared tenant never waits.
+    try meter.shared.payForMem();
 }

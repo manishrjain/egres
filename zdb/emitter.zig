@@ -179,7 +179,7 @@ pub const VersionTracker = struct {
         chain: Item,
     ) !void {
         const opts = &e.opts;
-        const alloc = e.tree.allocator;
+        const alloc = e.allocator;
         const have_state = hasTerminal(chain);
         const n_deltas = chain.versions.len() - @intFromBool(have_state);
 
@@ -349,6 +349,11 @@ pub const Emitter = struct {
     };
 
     tree: *Tree,
+    /// The runtime's allocator counted on the tenant the job runs as:
+    /// the tree's for a compaction, the shared one for a flush. Every
+    /// buffer of the merge is on it; the result's changes are the
+    /// tree's, since the caller frees them.
+    allocator: std.mem.Allocator,
     /// The tunables when the job started: one snapshot for the whole
     /// merge, read per key by the rollup policy.
     opts: _config.Config,
@@ -379,12 +384,14 @@ pub const Emitter = struct {
             .codec = opts.codecFor(dest),
             .kind = tree.kind,
         };
+        const allocator = fiber.allocator(.tenant);
         return .{
             .tree = tree,
-            .bld = Builder.init(tree.allocator, cfg),
-            .group = fiber.Group(?FlushResult).init(tree.allocator),
+            .allocator = allocator,
+            .bld = Builder.init(allocator, cfg),
+            .group = fiber.Group(?FlushResult).init(allocator),
             .inflight = try fiber.Channel(void).initAlloc(
-                tree.allocator,
+                allocator,
                 max_inflight,
             ),
             .file_sz = if (dest == 0)
@@ -397,7 +404,7 @@ pub const Emitter = struct {
             // levels could still contain a version that an early
             // tombstone would otherwise resurrect.
             .tracker = VersionTracker.init(
-                tree.allocator,
+                allocator,
                 snapshot_ts,
                 dest == @as(usize, opts.max_levels) - 1,
             ),

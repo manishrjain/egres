@@ -97,3 +97,8 @@ test "parseLine: flag takes the group and the rest of the line" {
     );
     try std.testing.expectError(error.MissingArg, proto.parseLine("flag"));
 }
+
+test "parseLine: tenants takes no arguments" {
+    const cmd = try proto.parseLine("tenants");
+    try std.testing.expect(cmd == .tenants);
+}

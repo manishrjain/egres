@@ -44,8 +44,11 @@ pub const Command = union(enum) {
     profile: ProfileCmd,
     traces: TracesCmd,
     flag: FlagCmd,
+    tenants: TenantsCmd,
     help: HelpCmd,
 };
+
+pub const TenantsCmd = struct {};
 
 /// `flag <group> <key=value ...>`: a live change to one flag group,
 /// in the command line's syntax for the values.
@@ -120,6 +123,9 @@ pub const help_text =
     \\  raft entry <N>                  dump WAL entry N (one human-readable line)
     \\  raft entry <lo> <hi>            dump WAL entries [lo, hi], one per line
     \\  vfs                             VFS bandwidth limiter snapshot
+    \\  tenants                         the meter: the box's capacity, then
+    \\                                  every tenant's rates, balances,
+    \\                                  memory and lifetime totals
     \\  mem                             memory as egres sees it (live bytes,
     \\                                  cache, tables) and as the allocator does
     \\  locks                           dump every tracked mutex: holder src,
@@ -613,6 +619,8 @@ pub fn parseLine(line: String) !Command {
         return .{ .raft = .{ .sub = .entry, .lo = lo, .hi = hi } };
     } else if (std.mem.eql(u8, cmd, "vfs")) {
         return .{ .vfs = .{} };
+    } else if (std.mem.eql(u8, cmd, "tenants")) {
+        return .{ .tenants = .{} };
     } else if (std.mem.eql(u8, cmd, "mem")) {
         return .{ .mem = .{} };
     } else if (std.mem.eql(u8, cmd, "locks")) {
@@ -889,6 +897,9 @@ pub const AdminServer = struct {
                 },
                 .vfs => {
                     self.handleVfs(stream) catch return;
+                },
+                .tenants => {
+                    self.handleTenants(stream) catch return;
                 },
                 .mem => {
                     self.handleMem(stream) catch return;
@@ -1277,6 +1288,138 @@ pub const AdminServer = struct {
         }
     }
 
+    /// The meter, one line for the box and one per tenant, the shared
+    /// first: rates and balances as the tick set and the work drew
+    /// them, memory against the share, and the lifetime totals.
+    fn handleTenants(self: *AdminServer, stream: fiber.net.Stream) !void {
+        var body: std.Io.Writer.Allocating = .init(self.engine.allocator);
+        defer body.deinit();
+        const w = &body.writer;
+        const meter = fiber.meter;
+        try w.print("capacity: cpu {d} milli, io {d} pages/s, pool {d} MiB" ++
+            ", held {d} MiB, pressure {}\n", .{
+            meter.capacity.cpu_milli,
+            meter.capacity.io_pages_per_s,
+            meter.capacity.mem_bytes >> 20,
+            meter.mem_held_total.load(.monotonic) >> 20,
+            meter.mem_pressure.load(.monotonic),
+        });
+        try writeTenantLine(w, &meter.shared);
+        try meter.tenants.forEach(w, writeTenantLine);
+        try w.writeByte('\n');
+        try stream.writeAll(body.writer.buffered());
+    }
+
+    fn writeTenantLine(w: *std.Io.Writer, t: *fiber.Tenant) !void {
+        const now = utils.coarseMs();
+        if (t == &fiber.meter.shared)
+            try w.print("shared:", .{})
+        else
+            try w.print("tenant {d}: active={}", .{ t.id, t.isActive(now) });
+        try w.print(" cpu rate={d}m fg={d}ms bg={d}ms" ++
+            " io rate={d}/s fg={d} bg={d}" ++
+            " mem held={d} share={d} peak={d}" ++
+            " | cpu_ticks={d} io_pages={d} parked={d}ms" ++
+            " stmts={d} failed={d}\n", .{
+            t.cpuRateMilli(),
+            t.cpuBalanceMs(.fg),
+            t.cpuBalanceMs(.bg),
+            t.io.rate.load(.monotonic),
+            t.io.bucket(.fg).balance(),
+            t.io.bucket(.bg).balance(),
+            t.mem_held.load(.monotonic),
+            t.mem_share.load(.monotonic),
+            t.totals.mem_peak.load(.monotonic),
+            t.totals.cpu_ticks.load(.monotonic),
+            t.totals.io_pages.load(.monotonic),
+            t.totals.parked_ms.load(.monotonic),
+            t.totals.statements.load(.monotonic),
+            t.totals.failed.load(.monotonic),
+        });
+    }
+
+    /// The meter in Prometheus text: the box's gauges, then each
+    /// tenant's series labelled by id, the shared one as "shared".
+    fn writeTenantMetrics(w: *std.Io.Writer) !void {
+        const meter = fiber.meter;
+        const held = meter.mem_held_total.load(.monotonic);
+        const pressure = meter.mem_pressure.load(.monotonic);
+        const Metric = struct { String, i64 };
+        const box = [_]Metric{
+            .{ "egres_meter_capacity_cpu_milli", meter.capacity.cpu_milli },
+            .{ "egres_meter_capacity_io_pages", meter.capacity.io_pages_per_s },
+            .{ "egres_meter_pool_bytes", meter.capacity.mem_bytes },
+            .{ "egres_meter_mem_held_bytes", held },
+            .{ "egres_meter_mem_pressure", @intFromBool(pressure) },
+        };
+        for (box) |mt| {
+            try w.print("# TYPE {s} gauge\n{s} {d}\n", .{
+                mt[0], mt[0], mt[1],
+            });
+        }
+        for (tenant_gauges) |n| try w.print("# TYPE {s} gauge\n", .{n});
+        for (tenant_counters) |n| try w.print("# TYPE {s} counter\n", .{n});
+        try writeTenantSeries(w, &meter.shared);
+        try meter.tenants.forEach(w, writeTenantSeries);
+    }
+
+    const tenant_gauges = [_]String{
+        "egres_tenant_active",
+        "egres_tenant_cpu_rate_milli",
+        "egres_tenant_io_rate_pages",
+        "egres_tenant_mem_held_bytes",
+        "egres_tenant_mem_share_bytes",
+        "egres_tenant_mem_peak_bytes",
+    };
+    const tenant_counters = [_]String{
+        "egres_tenant_cpu_ticks_total",
+        "egres_tenant_io_pages_total",
+        "egres_tenant_parked_ms_total",
+        "egres_tenant_statements_total",
+        "egres_tenant_failed_total",
+    };
+
+    fn writeTenantSeries(w: *std.Io.Writer, t: *fiber.Tenant) !void {
+        var id_buf: [24]u8 = undefined;
+        const id: String = if (t == &fiber.meter.shared)
+            "shared"
+        else
+            try std.fmt.bufPrint(&id_buf, "{d}", .{t.id});
+        const now = utils.coarseMs();
+        const gauges = [_]i64{
+            @intFromBool(t.isActive(now)),
+            t.cpuRateMilli(),
+            t.io.rate.load(.monotonic),
+            t.mem_held.load(.monotonic),
+            t.mem_share.load(.monotonic),
+            t.totals.mem_peak.load(.monotonic),
+        };
+        const counters = [_]i64{
+            t.totals.cpu_ticks.load(.monotonic),
+            t.totals.io_pages.load(.monotonic),
+            @intCast(t.totals.parked_ms.load(.monotonic)),
+            @intCast(t.totals.statements.load(.monotonic)),
+            @intCast(t.totals.failed.load(.monotonic)),
+        };
+        for (tenant_gauges, gauges) |n, val| {
+            try w.print("{s}{{tenant=\"{s}\"}} {d}\n", .{ n, id, val });
+        }
+        for (tenant_counters, counters) |n, val| {
+            try w.print("{s}{{tenant=\"{s}\"}} {d}\n", .{ n, id, val });
+        }
+        // The balances by class, negative in debt: cpu in ms of a core,
+        // io in pages.
+        for (class_names, 0..) |cls, i| {
+            const class: fiber.IoClass = @enumFromInt(i);
+            try w.print("egres_tenant_cpu_balance_ms{{tenant=\"{s}\"," ++
+                "class=\"{s}\"}} {d}\n", .{ id, cls, t.cpuBalanceMs(class) });
+            try w.print("egres_tenant_io_balance_pages{{tenant=\"{s}\"," ++
+                "class=\"{s}\"}} {d}\n", .{
+                id, cls, t.io.bucket(class).balance(),
+            });
+        }
+    }
+
     /// The chunk cache's counters in Prometheus text; nothing when
     /// there is no slot file.
     fn writeChunkCacheMetrics(
@@ -1539,6 +1682,7 @@ pub const AdminServer = struct {
                 try m.write(zdb.metrics.g(), &body.writer);
                 try m.write(raft.metrics.g(), &body.writer);
                 try writeLimiterMetrics(&body.writer);
+                try writeTenantMetrics(&body.writer);
                 try self.writeChunkCacheMetrics(&body.writer);
                 // Driven from the workers' loop tops: a gap is how long
                 // all of them were away from it.
