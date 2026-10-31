@@ -50,7 +50,7 @@
                         ";client_port=" (+ 2 (:port test)))
                    (str "--store=dir_path=" (io/file dir "sst"))
                    (str "--wal=dir=" (io/file dir "wal"))
-                   "--cache=total_bytes=536870912"]
+                   "--memory=total-bytes=536870912"]
           process (-> (ProcessBuilder. ^java.util.List command)
                       (.redirectErrorStream true)
                       (.redirectOutput

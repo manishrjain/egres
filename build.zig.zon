@@ -17,11 +17,11 @@
             .url = "https://github.com/karlseguin/metrics.zig/archive/1621f82e7ecf2b3dddf5730bf52761af354a7080.tar.gz",
             .hash = "metrics-0.0.0-W7G4eJOgAQDBacPAeqGCaY8gV7zuddUQyikGNq7nDPds",
         },
-        // Our fork's `egres` branch: upstream 9ce8e8e plus one kqueue
-        // fix the macOS build needs (the commit message has the why).
+        // Our fork's egres branch: upstream 9ce8e8e plus three kqueue
+        // fixes the macOS build needs (the commit messages have the why).
         .xev = .{
-            .url = "https://github.com/manishrjain/libxev/archive/a17c233be025cfefbc5f25f84872663cdd2ec9e9.tar.gz",
-            .hash = "libxev-0.0.0-86vtcxEUFADjhjYZ-vs_yVMJPAwUhhDchs_NfLl0rnqh",
+            .url = "https://github.com/manishrjain/libxev/archive/ca88a68bbc46433c52c61cc3d662a8accd83629b.tar.gz",
+            .hash = "libxev-0.0.0-86vtc6AUFACrj-acGvCQvT4Ww5_AvJ4rU4HRMCbf-DhY",
         },
         .zroar = .{
             .url = "https://github.com/manishrjain/zroar/archive/refs/tags/0.2608.1.tar.gz",

@@ -752,7 +752,9 @@ fn appMain(eng: *engine.Engine, admin_srv: *engine.AdminServer, sql_srv: *sql.Se
     // fibers to drain.
     node.shutdown.startShutdown();
     log.info("shutting down...", .{});
+    fiber.spawnDetached(.{}, shutdownWatchdog, .{eng.allocator}) catch {};
     eng.wait();
+    stop_done.store(true, .release);
     // The loops are gone, so nothing will resolve a proposal still in
     // flight: fail them now, then let every statement the grace cut off
     // run its error path and exit while the databases it holds pointers
@@ -762,6 +764,30 @@ fn appMain(eng: *engine.Engine, admin_srv: *engine.AdminServer, sql_srv: *sql.Se
         log.warn("{d} statements still in flight at exit", .{
             node.shutdown.activeCtxs(),
         });
+}
+
+/// Set once every engine fiber has exited; `shutdownWatchdog` reads it.
+var stop_done = std.atomic.Value(bool).init(false);
+
+/// The loops and listeners exit within a second of the stop. When they
+/// have not after ten, the parked fibers go to the log with their
+/// traces: the admin listener, the usual way to that dump, is gone by
+/// then, and a stop that hangs is otherwise opaque.
+fn shutdownWatchdog(allocator: std.mem.Allocator) void {
+    fiber.sleepMs(10_000);
+    if (stop_done.load(.acquire)) return;
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    fiber.dumpFibers(fiber.runtime(), &aw.writer) catch |err| {
+        log.err("shutdown stalled; fiber dump failed: {s}", .{
+            @errorName(err),
+        });
+        return;
+    };
+    log.err("shutdown stalled for 10 s; parked fibers:\n{s}", .{
+        aw.writer.buffered(),
+    });
 }
 
 fn runJoin(args: *const Args, allocator: std.mem.Allocator) void {

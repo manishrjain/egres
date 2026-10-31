@@ -250,6 +250,7 @@ pub const Server = struct {
     }
 
     pub fn runListener(self: *Server) void {
+        defer log.info("sql listener exiting (shutdown)", .{});
         // No SQL before apply has passed the WAL tail from boot: a
         // statement answered earlier comes from the pre-crash state, and
         // a refused connection is what clients already retry on.
