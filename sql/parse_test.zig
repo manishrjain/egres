@@ -829,7 +829,7 @@ test "sql.parse: UPDATE rejections carry a reason" {
         .{ .sql = "UPDATE t SET a = 1 RETURNING id;", .needle = "RETURNING" },
         .{ .sql = "WITH x AS (SELECT 1) UPDATE t SET a = 1;", .needle = "WITH" },
         .{ .sql = "UPDATE t SET a = DEFAULT;", .needle = "SET value" },
-        .{ .sql = "UPDATE t SET a = now();", .needle = "SET value" },
+        .{ .sql = "UPDATE t SET a = now();", .needle = "not supported" },
         .{ .sql = "UPDATE t SET a = (SELECT 1);", .needle = "SET value" },
         .{ .sql = "UPDATE t SET (a, b) = (1, 2);", .needle = "SET value" },
         .{ .sql = "UPDATE t SET a = a AND b;", .needle = "SET value" },
@@ -1122,4 +1122,43 @@ test "sql.parse: WHERE comparisons carry their operator, the column left" {
     try testing.expectEqual(parse.CmpOp.ge, and2[1].not.cmp.op);
     try testing.expectEqual(@as(u16, 2), and2[1].not.cmp.literal.param);
     try testing.expectEqual(@as(u16, 2), p.select.param_count);
+}
+
+test "sql.parse: CONCAT and COALESCE in SET are calls over SET values" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const up = try parse.statement(
+        alloc,
+        "UPDATE t SET val = CONCAT(val, ',', $1), n = COALESCE(n, 0) + 1 " ++
+            "WHERE id = $2;",
+    );
+    const concat = up.update.sets[0].value.call;
+    try testing.expectEqualStrings("concat", concat.func.name);
+    try testing.expectEqual(@as(usize, 3), concat.args.len);
+    try testing.expectEqualStrings("val", concat.args[0].column);
+    try testing.expectEqualStrings(",", concat.args[1].literal.str);
+    try testing.expectEqual(@as(u16, 1), concat.args[2].literal.param);
+    const plus = up.update.sets[1].value.binop;
+    const coalesce = plus.lhs.call;
+    try testing.expectEqualStrings("coalesce", coalesce.func.name);
+    try testing.expectEqual(@as(usize, 2), coalesce.args.len);
+    try testing.expectEqual(@as(i64, 0), coalesce.args[1].literal.int);
+    try testing.expectEqual(@as(u16, 2), up.update.param_count);
+
+    // Any other function, and the aggregate forms, carry a reason.
+    const cases = [_]struct { sql: String, needle: String }{
+        .{ .sql = "UPDATE t SET a = now();", .needle = "now() is not supported" },
+        .{ .sql = "UPDATE t SET a = concat();", .needle = "at least 1 argument" },
+        .{ .sql = "UPDATE t SET a = concat(DISTINCT a);", .needle = "aggregate" },
+        .{ .sql = "UPDATE t SET a = concat(a) OVER ();", .needle = "aggregate" },
+        .{ .sql = "UPDATE t SET a = concat((SELECT 1));", .needle = "SET value" },
+    };
+    for (cases) |case| {
+        const stmt = try parse.statement(alloc, case.sql);
+        try testing.expect(stmt == .invalid);
+        try testing.expect(std.mem.indexOf(u8, stmt.invalid, case.needle) != null);
+    }
 }

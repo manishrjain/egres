@@ -57,7 +57,7 @@ The default SQL port is `3210`. The database `egres` exists from the first boot,
 | `INSERT ... VALUES` | Yes | Multi-row `VALUES` and an explicit column list. |
 | `INSERT ... SELECT`, `DEFAULT VALUES`, `DEFAULT` as a value, `ON CONFLICT`, `RETURNING` | Not&nbsp;yet | |
 | `SELECT` | Partial | See [Queries](#queries). |
-| `UPDATE ... SET ... [WHERE]` | Yes | `SET` takes a literal, a parameter, a column, or `+ - * / % \|\|` over them. |
+| `UPDATE ... SET ... [WHERE]` | Yes | `SET` takes a literal, a parameter, a column, `CONCAT(...)`, `COALESCE(...)`, or `+ - * / % \|\|` over them. `CONCAT` skips NULL arguments and renders numbers as text. |
 | `UPDATE ... FROM`, `RETURNING`, `WITH` | Not&nbsp;yet | |
 | `DELETE FROM t [WHERE]` | Yes | Without `WHERE` it deletes every row. |
 | `DELETE ... USING`, `RETURNING`, `WITH` | Not&nbsp;yet | |

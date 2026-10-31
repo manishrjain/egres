@@ -307,3 +307,48 @@ test "sql.expr: bind — a $n is typed by its column, or by its text" {
         fx.bindWith("a = a + $2", binary),
     );
 }
+
+test "sql.expr: CONCAT renders and skips NULL, COALESCE takes the first value" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const arloc = arena.allocator();
+    var fx = try Fixture.init(arloc);
+    defer fx.tbl.deinit();
+    const row = try sampleRow(&fx);
+
+    // a = 5, b = "ab", c = 2.5; every kind renders, NULL is skipped.
+    try testing.expectEqualStrings(
+        "ab,5|2.5",
+        (try fx.eval("b = CONCAT(b, ',', a, NULL, '|', c)", row)).text,
+    );
+    try testing.expectEqualStrings(
+        "x",
+        (try fx.eval("b = CONCAT(NULL, 'x')", row)).text,
+    );
+    // CONCAT of nothing but NULLs is the empty string, not NULL.
+    try testing.expectEqualStrings(
+        "",
+        (try fx.eval("b = CONCAT(NULL, NULL)", row)).text,
+    );
+    try testing.expectEqualStrings(
+        "ab",
+        (try fx.eval("b = COALESCE(NULL, b, 'z')", row)).text,
+    );
+    try testing.expectEqual(Value{ .int4 = 5 }, try fx.eval("a = COALESCE(a, 0)", row));
+    try testing.expectEqual(Value{ .int4 = 7 }, try fx.eval("a = COALESCE(NULL, 7)", row));
+    try testing.expectEqual(Value{ .float8 = 2.5 }, try fx.eval("c = COALESCE(c, 1)", row));
+    try testing.expectEqual(Value.null_value, try fx.eval("a = COALESCE(NULL, NULL)", row));
+    // A call is an operand like any other.
+    try testing.expectEqual(Value{ .int4 = 6 }, try fx.eval("a = COALESCE(a, 0) + 1", row));
+    try testing.expectEqualStrings(
+        "ab!",
+        (try fx.eval("b = CONCAT(b) || '!'", row)).text,
+    );
+
+    // COALESCE's arguments are of one kind; both calls take only what
+    // a Scalar holds; the result must fit the target.
+    try testing.expectError(error.NoSuchOperator, fx.bind("b = COALESCE(b, a)"));
+    try testing.expectError(error.TypeMismatch, fx.bind("a = CONCAT(a, b)"));
+    try testing.expectError(error.TypeMismatch, fx.bind("a = COALESCE(c, 1)"));
+}

@@ -236,6 +236,21 @@ SELECT count(*) FROM ex WHERE n > 50;
 ROLLBACK;"
 expect "index range: rolled back value gone" "0" \
     v "SELECT count(*) FROM ex WHERE n > 50;"
+expect "SET s = CONCAT(s, ',', n)" "UPDATE 1" \
+    q "UPDATE ex SET s = CONCAT(s, ',', n) WHERE s = 'b';"
+expect "CONCAT renders a number" "b,3" v "SELECT s FROM ex WHERE n = 3;"
+expect "CONCAT skips NULL" "UPDATE 1" \
+    q "UPDATE ex SET s = CONCAT('x', NULL, s, f) WHERE n = 3;"
+expect "NULL-skipping concat visible" "xb,35" v "SELECT s FROM ex WHERE n = 3;"
+expect "SET f = COALESCE(f, m)" "UPDATE 1" \
+    q "UPDATE ex SET f = COALESCE(f, m) WHERE n = 4;"
+expect "COALESCE took the second" "30" v "SELECT f FROM ex WHERE n = 4;"
+expect "COALESCE of a parameter" "UPDATE 1" \
+    q "UPDATE ex SET m = COALESCE(NULL, m + 1, 0) WHERE n = 4;"
+expect "COALESCE arithmetic visible" "31" v "SELECT m FROM ex WHERE n = 4;"
+expect "COALESCE mixes kinds refused" "operator does not exist" \
+    q "UPDATE ex SET s = COALESCE(s, n);"
+q "UPDATE ex SET s = 'b' WHERE n = 3;" >/dev/null # the legs below find it by name
 expect "division by zero" "division by zero" \
     q "UPDATE ex SET n = n / 0 WHERE s = 'b';"
 expect "integer overflow" "out of range" \
@@ -245,7 +260,7 @@ expect "no || with a number" "operator does not exist" \
     q "UPDATE ex SET s = s || n;"
 expect "float into int refused" "does not match" q "UPDATE ex SET n = n * 1.5;"
 expect "text into int refused" "does not match" q "UPDATE ex SET n = s;"
-expect "function in SET rejected" "SET value" q "UPDATE ex SET n = now();"
+expect "other function in SET rejected" "not supported" q "UPDATE ex SET n = now();"
 expect "unknown column in SET expr" "does not exist" \
     q "UPDATE ex SET n = zz + 1;"
 expect "failed statements changed nothing" "3" \

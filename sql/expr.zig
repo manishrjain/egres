@@ -4,14 +4,15 @@
 //! SET value expressions over stored rows. `SetNode` is the resolved
 //! form of one `column = expr` assignment — parse.Expr with its
 //! columns bound to the table, its literals typed, and its operators
-//! type-checked — and `SetNode.eval` computes it against one row's
-//! pre-image. The pred.zig pattern: `bindNode` is pure and reports an
+//! and calls type-checked — and `SetNode.eval` computes it against one
+//! row's pre-image. The pred.zig pattern: `bindNode` is pure and reports an
 //! error set, `bind` adds the client-facing error mapping.
 
 const std = @import("std");
 const pgwire = @import("pgwire");
 const zdb = @import("zdb");
 
+const _funcs = @import("funcs.zig");
 const _parse = @import("parse.zig");
 const _table = @import("table.zig");
 const _value = @import("value.zig");
@@ -24,6 +25,7 @@ const Table = _table.Table;
 const Value = _value.Value;
 const Type = _value.Type;
 const Op = _parse.Expr.Op;
+const Func = _funcs.Func;
 
 /// A SET value bound to its table: parse.Expr with its leaves
 /// resolved — a literal is a typed cell, a column is the table's —
@@ -40,12 +42,19 @@ pub const SetNode = union(enum) {
     value: Value,
     column: *const Column,
     binop: BinOp,
+    call: CallNode,
 
     pub const BinOp = struct {
         op: Op,
         lhs: *const SetNode,
         rhs: *const SetNode,
         /// What the operator yields (resultType), fixed at bind.
+        ty: ?Type,
+    };
+    pub const CallNode = struct {
+        func: *const Func,
+        args: []const *const SetNode,
+        /// What the call yields (Func.resultType), fixed at bind.
         ty: ?Type,
     };
 
@@ -57,6 +66,7 @@ pub const SetNode = union(enum) {
             .value => |v| v.ty(),
             .column => |col| col.ty,
             .binop => |b| b.ty,
+            .call => |call| call.ty,
         };
     }
 
@@ -85,7 +95,7 @@ pub const SetNode = union(enum) {
             .value => |v| if (v == .null_value or v.ty() == target.ty) return v,
             .column => |col| if (col.ty == target.ty and col.type_mod == target.type_mod)
                 return tbl.parseCol(item, col),
-            .binop => {},
+            .binop, .call => {},
         }
         const result = try self.scalar(arloc, tbl, item) orelse
             return .null_value;
@@ -111,6 +121,22 @@ pub const SetNode = union(enum) {
                 const l = lhs orelse return null;
                 const r = rhs orelse return null;
                 return try applyOp(arloc, b.op, l, r);
+            },
+            .call => |call| {
+                // Every argument first, as for an operator: PG raises
+                // on `COALESCE(NULL, 1/0)` too.
+                const vals = try arloc.alloc(?Scalar, call.args.len);
+                for (call.args, vals) |arg, *val|
+                    val.* = try arg.scalar(arloc, tbl, item);
+                switch (call.func.eval) {
+                    .strict => |f| {
+                        const plain = try arloc.alloc(Scalar, vals.len);
+                        for (vals, plain) |val, *slot|
+                            slot.* = val orelse return null;
+                        return try f(arloc, plain);
+                    },
+                    .lax => |f| return try f(arloc, vals),
+                }
             },
         }
     }
@@ -159,6 +185,18 @@ pub fn bindNode(
                 .lhs = lhs,
                 .rhs = rhs,
                 .ty = try resultType(b.op, lhs.ty(), rhs.ty()),
+            } };
+        },
+        .call => |call| {
+            const args = try arloc.alloc(*const SetNode, call.args.len);
+            for (call.args, args) |arg, *slot|
+                slot.* = try bindNode(arloc, tbl, arg, null, params);
+            const tys = try arloc.alloc(?Type, args.len);
+            for (args, tys) |arg, *t| t.* = arg.ty();
+            node.* = .{ .call = .{
+                .func = call.func,
+                .args = args,
+                .ty = try call.func.resultType(tys),
             } };
         },
     }
@@ -338,7 +376,7 @@ pub const EvalError = error{
 
 /// What a subtree evaluates to before assignment. Integers of every
 /// width compute as i128, floats as f64.
-const Scalar = union(enum) { int: i128, float: f64, text: String };
+pub const Scalar = union(enum) { int: i128, float: f64, text: String };
 
 /// A cell as an operand; null = SQL NULL. Only the types bind admits
 /// reach here.

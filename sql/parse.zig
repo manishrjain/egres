@@ -20,6 +20,7 @@
 const std = @import("std");
 const pgwire = @import("pgwire");
 const parser = pgwire.parser;
+const _funcs = @import("funcs.zig");
 const _value = @import("value.zig");
 const Column = @import("table.zig").Column;
 
@@ -267,9 +268,11 @@ pub const Expr = union(enum) {
     literal: Literal,
     column: String, // borrowed
     binop: BinOp,
+    call: Call,
 
     pub const Op = enum { add, sub, mul, div, mod, concat };
     pub const BinOp = struct { op: Op, lhs: *const Expr, rhs: *const Expr };
+    pub const Call = struct { func: *const _funcs.Func, args: []const Expr };
 };
 
 /// One SET assignment: `column = expr`.
@@ -1015,10 +1018,11 @@ fn opFrom(name: String) ?Expr.Op {
     };
 }
 
-/// Parse a SET value: a literal, a `$n`, a column, or `+ - * / % ||`
-/// over them, recursively. Anything else (a function, a cast, a
-/// subquery, DEFAULT, another operator) yields a clean `.invalid`
-/// reason; only OOM propagates. Each child lands in one arena cell.
+/// Parse a SET value: a literal, a `$n`, a column, CONCAT or COALESCE
+/// of SET values, or `+ - * / % ||` over them, recursively. Anything
+/// else (another function, a cast, a subquery, DEFAULT, another
+/// operator) yields a clean `.invalid` reason; only OOM propagates.
+/// Each child lands in one arena cell.
 fn parseExpr(
     arloc: std.mem.Allocator,
     params: *ParamTally,
@@ -1040,9 +1044,29 @@ fn parseExpr(
             return ParsedExpr.reject("unsupported column reference in SET");
         return .{ .expr = .{ .column = column } };
     }
+    if (parser.cast(c.FuncCall, p)) |fc| {
+        const name = funcName(fc) orelse "";
+        const func = _funcs.byName(name) orelse return .{
+            .invalid = try std.fmt.allocPrint(
+                arloc,
+                "function {s}() is not supported in SET",
+                .{name},
+            ),
+        };
+        if (fc.agg_star or fc.agg_distinct or fc.agg_filter != null or
+            fc.over != null or fc.agg_order != null)
+        {
+            return ParsedExpr.reject(
+                "aggregate forms are not supported in SET",
+            );
+        }
+        return parseCall(arloc, params, func, fc.args);
+    }
+    if (parser.cast(c.CoalesceExpr, p)) |ce|
+        return parseCall(arloc, params, &_funcs.coalesce, ce.args);
     const ae = parser.cast(c.A_Expr, p) orelse return ParsedExpr.reject(
-        "SET value must be a literal, a column, or an operator " ++
-            "expression over them",
+        "SET value must be a literal, a column, CONCAT or COALESCE, " ++
+            "or an operator expression over them",
     );
     const bad_op = "only + - * / % || are supported in SET";
     const op = opFrom(operatorOf(ae) orelse "") orelse
@@ -1068,6 +1092,48 @@ fn parseExpr(
         else => return ParsedExpr.reject(bad_op),
     }
     return .{ .expr = .{ .binop = .{ .op = op, .lhs = lhs, .rhs = rhs } } };
+}
+
+/// A call of `func` on `list`, each argument a SET value, as many as
+/// the function takes.
+fn parseCall(
+    arloc: std.mem.Allocator,
+    params: *ParamTally,
+    func: *const _funcs.Func,
+    list: [*c]c.List,
+) parser.ParseError!ParsedExpr {
+    const cells = parser.items(list);
+    if (!func.takes(cells.len)) return .{
+        .invalid = try std.fmt.allocPrint(
+            arloc,
+            "function {s}() takes {s}{d} argument{s}",
+            .{
+                func.name,
+                if (func.max_args == null) "at least " else "",
+                func.min_args,
+                if (func.min_args == 1) "" else "s",
+            },
+        ),
+    };
+    const args = try arloc.alloc(Expr, cells.len);
+    for (cells, args) |cell, *arg| {
+        const node = parser.asNode(cell.ptr_value);
+        arg.* = switch (try parseExpr(arloc, params, node)) {
+            .expr => |e| e,
+            .invalid => |msg| return .{ .invalid = msg },
+        };
+    }
+    return .{ .expr = .{ .call = .{ .func = func, .args = args } } };
+}
+
+/// The unqualified name of a function call, lowercased by the grammar
+/// unless it was quoted.
+fn funcName(fc: *const c.FuncCall) ?String {
+    const n = parser.items(fc.funcname).len;
+    if (n == 0) return null;
+    const s = parser.cast(c.String, parser.nodeAt(fc.funcname, n - 1)) orelse
+        return null;
+    return parser.str(s.sval);
 }
 
 /// SELECT [cols|*|count(*)] FROM one_table [WHERE ...] [FOR UPDATE]
@@ -1235,11 +1301,8 @@ fn parseSet(vs: *const c.VariableSetStmt) Stmt {
 /// Whether a target's function call is exactly `count(*)`: no
 /// arguments, no DISTINCT, no FILTER, no OVER.
 fn isCountStar(fc: *const c.FuncCall) bool {
-    const n = parser.items(fc.funcname).len;
-    if (n == 0) return false;
-    const s = parser.cast(c.String, parser.nodeAt(fc.funcname, n - 1)) orelse
-        return false;
-    return std.mem.eql(u8, parser.str(s.sval), "count") and fc.agg_star and
+    const name = funcName(fc) orelse return false;
+    return std.mem.eql(u8, name, "count") and fc.agg_star and
         fc.args == null and !fc.agg_distinct and
         fc.agg_filter == null and fc.over == null;
 }
