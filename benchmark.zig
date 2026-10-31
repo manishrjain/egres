@@ -43,7 +43,7 @@ const Args = struct {
         .value_size = "Value size in bytes.",
         .namespaces = "Spread traffic across N namespaces; each must already" ++
             " exist (ns create <id>). Keys hash deterministically: k → (k %" ++
-            " namespaces) + 1.",
+            " namespaces) + 17.",
         .verify_clients = "Concurrent read-verifier fibers active during" ++
             " load phase (0 disables).",
         .batch_size = "Writes per set-batch proposal (1 = no batching)." ++
@@ -54,10 +54,15 @@ const Args = struct {
     };
 };
 
+/// The first namespace the benchmark writes to. Namespaces below 16 are
+/// reserved and 16 is the `egres` database genesis creates, so the
+/// benchmark's own start after it.
+pub const first_bench_namespace: u32 = 17;
+
 /// Map a key id to its namespace. Deterministic so writers and verifiers
 /// addressing the same key agree on the target namespace.
 fn nsFor(key_id: u64, namespaces: u32) u32 {
-    return @intCast((key_id % @as(u64, namespaces)) + 1);
+    return @intCast((key_id % @as(u64, namespaces)) + first_bench_namespace);
 }
 
 fn usage(alloc: std.mem.Allocator) void {

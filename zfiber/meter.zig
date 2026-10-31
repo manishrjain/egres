@@ -16,13 +16,15 @@
 //! it here. No floor anywhere: a 1 GB read on a 100 MB/s share holds
 //! that tenant for ten seconds.
 //!
-//! A `Tenant` is what one database's statements are charged to: a
-//! resource per kind (cpu in the machine's ticks, io in pages), a
-//! balance for memory, the lifetime totals, and a `Limit`, its size in
-//! the units a plan is sold in. The policy looks at the tenant's own
-//! buckets and nothing else: `pay` waits on them, `charge` and `take`
-//! draw on them. Work no session resolved, the WAL, the manifest,
-//! raft, runs as the `shared` tenant, which never waits and only
+//! A `Tenant` is what one customer tenant's work is charged to, keyed
+//! by the tenant's id, whatever database it touches: a resource per
+//! kind (cpu in the machine's ticks, io in pages), a balance for
+//! memory, the lifetime totals, and a `Limit`, its size in the units a
+//! plan is sold in. The policy looks at the tenant's own buckets and
+//! nothing else: `pay` waits on them, `charge` and `take` draw on them.
+//! The system's own work, the WAL, the manifest, raft, logins and the
+//! reserved namespaces, runs as `shared`, meter id 0, which is the
+//! system's account rather than a tenant: it never waits and only
 //! counts what it spent.
 //!
 //! The `Tenants` set turns the limits into rates once a tick. What the
@@ -420,8 +422,9 @@ pub fn statsFor(kind: Kind, class: IoClass) *Stats {
     return &stats[@intFromEnum(kind)][@intFromEnum(class)];
 }
 
-/// The shared tenant, id 0: the default on every Ctx, and what the
-/// WAL, the manifest, raft and anything no session resolved runs as.
+/// The system's account, meter id 0, not a customer tenant: the default
+/// on every Ctx, and what the WAL, the manifest, raft, logins and the
+/// reserved namespaces run as. `Tenants.get(0)` returns it.
 /// Its buckets are never short: the rate is as large as a balance
 /// allows, and it is not in the `Tenants` map. Its totals are what
 /// the tick takes off the box before the tenants split it.
@@ -523,7 +526,10 @@ pub const Tenants = struct {
     }
 
     /// The tenant for `id`, made with the default limit on first sight.
+    /// Id 0 is `shared`, which lives outside the map, so no second,
+    /// throttled tenant 0 can be made by mistake.
     pub fn get(self: *Tenants, id: u64, now_ms: i64) !*Tenant {
+        if (id == shared.id) return &shared;
         self.lock.lockShared(@src());
         const known = self.map.get(id);
         self.lock.unlockShared();

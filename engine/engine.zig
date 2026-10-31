@@ -292,7 +292,14 @@ pub const StorageImpl = struct {
                 }
             },
             .tree_split => try self.forest.applySplit(index, mcs.*),
-            .create_ns, .drop_ns, .create_tree, .drop_tree => {
+            // create_tenant carries no trees; applyTrees hands it to
+            // the manifest alone.
+            .create_ns,
+            .drop_ns,
+            .create_tree,
+            .drop_tree,
+            .create_tenant,
+            => {
                 try self.forest.applyTrees(index, mcs.*);
             },
             .branch_ns => try self.forest.applyNsBranch(
@@ -968,7 +975,8 @@ pub const Engine = struct {
                     // snapshot is gone after a restart, so a name missing
                     // from the snapshot is lost and its database or table
                     // becomes unreachable even though its rows are there.
-                    try draft.apply(stored.index, mcs.*);
+                    // A change the live apply refused is refused here too.
+                    _ = try draft.apply(stored.index, mcs.*);
                 },
                 else => continue,
             }
@@ -1083,12 +1091,16 @@ pub const Engine = struct {
             };
             defer job.tree.release();
             defer job.tree.releaseJob(job.cand);
-            // The job is the tree's database's work, charged to its
-            // tenant, by the fibers the build spawns too. The class is
-            // the job's: foreground from L0, as the partitions run.
+            // The job is charged to the tenant that owns the tree's
+            // database, by the fibers the build spawns too; a reserved
+            // namespace, or one dropped while the job ran, to `shared`
+            // (meter id 0). The class is the job's: foreground from L0,
+            // as the partitions run.
             const ctx = fiber.ctx();
+            const tenant_id =
+                self.forest.manifest.tenantOf(job.key.namespace) orelse 0;
             ctx.tenant = fiber.meter.tenants.get(
-                job.key.namespace,
+                tenant_id,
                 utils.coarseMs(),
             ) catch &fiber.meter.shared;
             ctx.class = zdb.compaction.classFor(job.cand.level);

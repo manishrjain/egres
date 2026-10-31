@@ -85,35 +85,27 @@ pub const NsResult = struct {
     change: _manifest.ManifestChange,
 };
 
-/// buildNsCreate is Phase A of the Raft-replicated namespace create:
-/// returns a ManifestChange with one TreeChange per system table
-/// (manifest.namespace_system_table_ids) — the namespace's default
-/// (raw-KV) table (table_id 0, tree_id 0, carrying the namespace's `name`:
-/// a SQL database name; empty for unnamed namespaces) and its SQL
-/// catalogs — all with an infinite range (empty left+right). No state
-/// mutates, so a failed propose costs nothing. Caller owns the returned
-/// slice; `name` must outlive the change (it is marshalled at propose).
-///
-/// Errors with `NamespaceAlreadyExists` if a given id's default table
-/// already exists, `NameExists` if another namespace holds `name`.
-pub fn buildNsCreate(
-    self: *Forest,
-    alloc: std.mem.Allocator,
-    id: NsId,
-    name: String,
-) !NsResult {
-    const namespace_id = switch (id) {
-        .next => self.manifest.nextNamespace(),
-        .given => |n| n,
-    };
-    std.debug.assert(namespace_id > 0);
-    if (self.hasNamespace(namespace_id)) return error.NamespaceAlreadyExists;
-    if (self.manifest.lookupNamespace(name)) |_| return error.NameExists;
+/// A tenant create: the id it takes and the change to propose. Caller
+/// owns `change.tenants`.
+pub const TenantResult = struct {
+    tenant_id: u64,
+    change: _manifest.ManifestChange,
+};
 
-    // One tree per system table: the default (raw-KV) table plus the SQL
-    // catalogs, born with the namespace — catalog rows must never race
-    // tree creation, because buildFlush silently drops keys whose
-    // (ns, table_id) has no tree.
+/// The create_ns change for `namespace_id`: one tree per system table
+/// (manifest.namespace_system_table_ids), each with an infinite range.
+/// The tree-0 change (the raw-KV table) carries the namespace's `name`
+/// and, at or above `first_namespace`, its `tenant_id`. Reads no state,
+/// so genesis, which has no Forest, can call it. Caller owns
+/// `tree_changes`; `name` must outlive the change.
+pub fn nsCreateChange(
+    alloc: std.mem.Allocator,
+    namespace_id: u64,
+    tenant_id: u64,
+    name: String,
+) !_manifest.ManifestChange {
+    // Catalog rows must never race tree creation: buildFlush silently
+    // drops keys whose (ns, table_id) has no tree.
     const ids = _manifest.namespace_system_table_ids;
     const tree_changes = try alloc.alloc(_manifest.TreeChange, ids.len);
     // Bytes keys, and the raw-KV table takes roaring values from the
@@ -126,18 +118,112 @@ pub fn buildNsCreate(
             "",
             .posting_index,
         );
-    // table_id 0 carries the namespace's name.
     tree_changes[0].name = @constCast(name);
+    if (namespace_id >= _manifest.first_namespace)
+        tree_changes[0].tenant_id = tenant_id;
+    return .{
+        .tree_changes = tree_changes,
+        .sstable_changes = &.{},
+        .cmd = .create_ns,
+        .memtable_id = 0,
+    };
+}
 
+/// The create_ns change for namespace 1: the trees of the auth tables
+/// (roles, the server's secrets) and nothing else, no name, no tenant.
+/// Their keys are bytes, so a posting index, as every raw-KV table.
+/// Caller owns `tree_changes`.
+pub fn authNsCreateChange(
+    alloc: std.mem.Allocator,
+) !_manifest.ManifestChange {
+    const ids = _manifest.auth_table_ids;
+    const tree_changes = try alloc.alloc(_manifest.TreeChange, ids.len);
+    for (ids, tree_changes) |table_id, *tc|
+        tc.* = _manifest.createTreeChange(
+            makeTreeId(table_id, 0),
+            _manifest.auth_namespace,
+            "",
+            "",
+            .posting_index,
+        );
+    return .{
+        .tree_changes = tree_changes,
+        .sstable_changes = &.{},
+        .cmd = .create_ns,
+        .memtable_id = 0,
+    };
+}
+
+/// The create_tenant change for tenant `id` named `name`. Caller owns
+/// `tenants`; `name` must outlive the change.
+pub fn tenantCreateChange(
+    alloc: std.mem.Allocator,
+    id: u64,
+    name: String,
+) !_manifest.ManifestChange {
+    const tenants = try alloc.alloc(_manifest.TenantRecord, 1);
+    tenants[0] = .{ .id = id, .name = name };
+    return .{
+        .tenants = tenants,
+        .sstable_changes = &.{},
+        .cmd = .create_tenant,
+        .memtable_id = 0,
+    };
+}
+
+/// buildTenantCreate is Phase A of a tenant create: reserves the next
+/// tenant id and returns the change. Errors `TenantExists` if `name` is
+/// taken. Sound while the caller serializes creates.
+pub fn buildTenantCreate(
+    self: *Forest,
+    alloc: std.mem.Allocator,
+    name: String,
+) !TenantResult {
+    if (self.manifest.lookupTenant(name) != null) return error.TenantExists;
+    const id = self.manifest.nextTenant();
+    return .{
+        .tenant_id = id,
+        .change = try tenantCreateChange(alloc, id, name),
+    };
+}
+
+/// buildNsCreate is Phase A of the Raft-replicated namespace create:
+/// checks what the apply would refuse, then returns `nsCreateChange`. No
+/// state mutates, so a failed propose costs nothing. `name` (a SQL
+/// database name; empty for unnamed namespaces) must outlive the change.
+///
+/// Errors with `NamespaceAlreadyExists` if a given id's default table
+/// already exists, `TenantNotFound` if a namespace at or above
+/// `first_namespace` names no existing tenant, `NameExists` if the
+/// tenant already has a namespace called `name`.
+pub fn buildNsCreate(
+    self: *Forest,
+    alloc: std.mem.Allocator,
+    id: NsId,
+    tenant_id: u64,
+    name: String,
+) !NsResult {
+    const namespace_id = switch (id) {
+        .next => self.manifest.nextNamespace(),
+        .given => |n| n,
+    };
+    std.debug.assert(namespace_id > 0);
+    if (self.hasNamespace(namespace_id)) return error.NamespaceAlreadyExists;
+    try checkTenant(self, namespace_id, tenant_id);
+    if (name.len > 0 and self.manifest.lookupNamespace(tenant_id, name) != null)
+        return error.NameExists;
     return .{
         .namespace = namespace_id,
-        .change = .{
-            .tree_changes = tree_changes,
-            .sstable_changes = &.{},
-            .cmd = .create_ns,
-            .memtable_id = 0,
-        },
+        .change = try nsCreateChange(alloc, namespace_id, tenant_id, name),
     };
+}
+
+/// The leader-side twin of `Manifest.nsTenantValid`: a namespace at or
+/// above `first_namespace` needs a tenant that exists.
+fn checkTenant(self: *Forest, namespace_id: u64, tenant_id: u64) !void {
+    if (namespace_id < _manifest.first_namespace) return;
+    if (tenant_id == 0 or !self.manifest.hasTenant(tenant_id))
+        return error.TenantNotFound;
 }
 
 /// applyTrees is Phase B of create_ns, create_tree, drop_ns and
@@ -152,7 +238,8 @@ pub fn applyTrees(
     index: u64,
     mc: _manifest.ManifestChange,
 ) !void {
-    try self.manifest.apply(index, mc);
+    // A change the manifest refused gets no trees either.
+    if (!try self.manifest.apply(index, mc)) return;
     for (mc.tree_changes) |tc| switch (tc.op) {
         .create => {
             if (self.hasTree(tc.namespace_id, tc.tree_id)) continue;
@@ -196,10 +283,14 @@ pub fn buildNsBranch(
     self: *Forest,
     alloc: std.mem.Allocator,
     source: u64,
+    tenant_id: u64,
     name: String,
 ) !NsResult {
     if (!self.hasNamespace(source)) return error.NamespaceNotFound;
-    if (self.manifest.lookupNamespace(name)) |_| return error.NameExists;
+    if (tenant_id == 0 or !self.manifest.hasTenant(tenant_id))
+        return error.TenantNotFound;
+    if (self.manifest.lookupNamespace(tenant_id, name)) |_|
+        return error.NameExists;
 
     const namespace = self.manifest.nextNamespace();
     // A carrier for the target's id and name: the branch's trees take
@@ -213,6 +304,7 @@ pub fn buildNsBranch(
         .none,
     );
     tree_changes[0].name = @constCast(name);
+    tree_changes[0].tenant_id = tenant_id;
     return .{
         .namespace = namespace,
         .change = .{
@@ -239,7 +331,8 @@ pub fn applyNsBranch(
     ts: u64,
     mc: _manifest.ManifestChange,
 ) !void {
-    try self.manifest.apply(index, mc);
+    // A branch the manifest refused installs and forks nothing.
+    if (!try self.manifest.apply(index, mc)) return;
     const dst = mc.tree_changes[0].namespace_id;
     const keys = try self.manifest.treeKeys(self.allocator, dst);
     defer self.allocator.free(keys);
@@ -281,7 +374,7 @@ pub fn applyTableBranch(
     ts: u64,
     mc: _manifest.ManifestChange,
 ) !void {
-    try self.manifest.apply(index, mc);
+    _ = try self.manifest.apply(index, mc); // branch_table is never refused
     for (mc.tree_changes) |tc| {
         const ns = tc.namespace_id;
         const dst_tid = treeTableId(tc.tree_id);

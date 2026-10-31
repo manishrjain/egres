@@ -53,9 +53,11 @@ pub fn createDatabase(
 
     var arena = std.heap.ArenaAllocator.init(eng.allocator);
     defer arena.deinit();
+    // Every session acts in the default tenant until logins exist.
+    const tenant_id = zdb.manifest.default_tenant_id;
     var src: ?u64 = null;
     if (cd.source) |src_name| {
-        src = eng.forest.manifest.lookupNamespace(src_name) orelse
+        src = eng.forest.manifest.lookupNamespace(tenant_id, src_name) orelse
             return replyErrorCode(
                 state,
                 pgwire.sqlstate.invalid_catalog_name,
@@ -63,9 +65,9 @@ pub fn createDatabase(
             );
     }
     const built = if (src) |s|
-        eng.forest.buildNsBranch(arena.allocator(), s, name)
+        eng.forest.buildNsBranch(arena.allocator(), s, tenant_id, name)
     else
-        eng.forest.buildNsCreate(arena.allocator(), .next, name);
+        eng.forest.buildNsCreate(arena.allocator(), .next, tenant_id, name);
     const created = built catch |err| switch (err) {
         error.NameExists => return replyError(state, "database already exists"),
         else => |e| {
@@ -89,7 +91,10 @@ pub fn dropDatabase(self: *Handler, state: *pgwire.ConnState, name: String) !voi
 
     if (std.mem.eql(u8, name, default_database))
         return replyError(state, "cannot drop the default database");
-    const ns = eng.forest.manifest.lookupNamespace(name) orelse
+    const ns = eng.forest.manifest.lookupNamespace(
+        zdb.manifest.default_tenant_id,
+        name,
+    ) orelse
         return replyError(state, "database does not exist");
 
     // Set `dropped` first, then take and release every table lock

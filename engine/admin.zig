@@ -1714,9 +1714,11 @@ pub const AdminServer = struct {
         };
         var arena = std.heap.ArenaAllocator.init(self.engine.allocator);
         defer arena.deinit();
+        // In the default tenant until `ns create` takes one.
         const nr = self.engine.forest.buildNsCreate(
             arena.allocator(),
             .{ .given = req.ns },
+            zdb.manifest.default_tenant_id,
             "",
         ) catch |err| {
             log.err("ns create failed: {s}", .{@errorName(err)});

@@ -557,15 +557,18 @@ pub const Handler = struct {
     pub fn onStartup(self: *Handler, state: *pgwire.ConnState, params: pgwire.proto.StartupParams) !void {
         _ = state;
         const requested = params.database orelse "";
-        self.namespace = self.srv.engine.forest.manifest.lookupNamespace(
+        const manifest = &self.srv.engine.forest.manifest;
+        // Every session acts in the default tenant until logins exist.
+        self.namespace = manifest.lookupNamespace(
+            zdb.manifest.default_tenant_id,
             if (requested.len > 0) requested else default_database,
         ) orelse 0;
-        // The database is the tenant: every statement on this fiber is
-        // charged to it from here. A name that resolved to nothing
-        // stays on the system's, and is refused per statement anyway.
-        if (self.namespace != 0) {
+        // Every statement on this fiber is charged to the tenant that
+        // owns the session's database. A name that resolved to nothing
+        // stays on `shared`, and is refused per statement anyway.
+        if (manifest.tenantOf(self.namespace)) |tenant_id| {
             fiber.ctx().tenant = try fiber.meter.tenants.get(
-                self.namespace,
+                tenant_id,
                 utils.coarseMs(),
             );
         }

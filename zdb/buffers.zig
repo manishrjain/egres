@@ -86,6 +86,9 @@ pub const TreeChange = schema.Table(&.{
     .{ .id = 7, .name = "kind", .ty = TreeKind },
     // branch_table only: the table whose trees this table lists again.
     .{ .id = 8, .name = "from_table_id", .ty = schema.U32 },
+    // create_ns and branch_ns, on the tree-0 change: the tenant that
+    // owns the new namespace. 0 (no tenant) only below first_namespace.
+    .{ .id = 9, .name = "tenant_id", .ty = schema.U64 },
 });
 
 // SSTableChange records one SST file (`sst_id`) entering or leaving a tree at a
@@ -123,6 +126,14 @@ pub const Namespace = schema.Table(&.{
     .{ .id = 1, .name = "id", .ty = schema.U64 },
     .{ .id = 2, .name = "next_table_id", .ty = schema.U32 },
     .{ .id = 3, .name = "name", .ty = schema.Bytes },
+    .{ .id = 4, .name = "tenant_id", .ty = schema.U64 },
+});
+
+// A customer: it owns namespaces (databases) and, later, roles. Ids start
+// at 1 and are never reused; 0 means no tenant.
+pub const Tenant = schema.Table(&.{
+    .{ .id = 1, .name = "id", .ty = schema.U64 },
+    .{ .id = 2, .name = "name", .ty = schema.Bytes },
 });
 
 // Which kind of change a ManifestChange carries. `none` (0) is the zero value
@@ -155,6 +166,9 @@ pub const Command = schema.EnumDef(&.{
     // own id, the files shared, and takes the source's versions still
     // in memtables, as of the entry (Manifest.applyTableBranch).
     .{ .name = "branch_table", .tag = 11 },
+    // A new tenant: `tenants` holds its one record. It carries no tree
+    // changes; the tenant's database is an ordinary create_ns after it.
+    .{ .name = "create_tenant", .tag = 12 },
 });
 
 pub const ManifestChange = schema.Table(&.{
@@ -169,6 +183,10 @@ pub const ManifestChange = schema.Table(&.{
     .{ .id = 6, .name = "next_ns_id", .ty = schema.U64 },
     // branch_ns only: the namespace copied.
     .{ .id = 7, .name = "branch_from", .ty = schema.U64 },
+    // create_tenant: the one new tenant. Snapshot: every tenant.
+    .{ .id = 8, .name = "tenants", .ty = schema.Array(Tenant) },
+    // snapshot only: the next tenant id, which only grows.
+    .{ .id = 9, .name = "next_tenant_id", .ty = schema.U64 },
 });
 
 /// A single key-value write. `key` is a marshaled zdb key
@@ -256,6 +274,7 @@ pub const records: []const schema.Named = &.{
     .{ .name = "Mutations", .ty = Mutations, .id = tableId(8) },
     .{ .name = "Namespace", .ty = Namespace, .id = tableId(9) },
     .{ .name = "RoaringDelta", .ty = RoaringDelta, .id = tableId(10) },
+    .{ .name = "Tenant", .ty = Tenant, .id = tableId(11) },
 
     // Packed records: no message id.
     .{ .name = "BlockVersion", .ty = BlockVersion },
