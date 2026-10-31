@@ -688,9 +688,35 @@ pub const Handler = struct {
         // teardown destroys it.
         if (state.error_sent and !t.implicit and !t.failed) {
             t.failed = true;
-            t.releaseLocks();
+            t.doomed = unrecoverable(state.error_code);
+            // The locks go now unless a savepoint may revive the txn:
+            // a waiter behind them (a deadlock's other party among
+            // them) must not sit until the client's ROLLBACK.
+            if (t.doomed or t.savepoints.items.len == 0) t.releaseLocks();
             state.tx_status = .failed_tx;
         }
+    }
+
+    /// Whether an error's SQLSTATE class leaves the block beyond a
+    /// savepoint's reach (Txn.doomed): transaction rollback (40, a
+    /// lock error or a term change), snapshot too old (72), a resource
+    /// refusal (53, a statement stopped mid-way), an internal error
+    /// (XX). A client mistake — a constraint, a type, a name — is not.
+    fn unrecoverable(code: [5]u8) bool {
+        const class = code[0..2];
+        inline for (.{ "40", "72", "53", "XX" }) |bad| {
+            if (std.mem.eql(u8, class, bad)) return true;
+        }
+        return false;
+    }
+
+    /// Whether a statement is taken in a failed block: the ones that
+    /// end it, and ROLLBACK TO, which rewinds it.
+    fn allowedWhenFailed(stmt: _parse.Stmt) bool {
+        return switch (stmt) {
+            .commit_txn, .rollback_txn, .rollback_to => true,
+            else => false,
+        };
     }
 
     /// Whether `sql` is nothing but whitespace and semicolons — an
@@ -806,7 +832,8 @@ pub const Handler = struct {
         if (isEmptyQuery(ctx.sql)) return state.sendNoData();
         const stmt = (try self.cachedStatement(ctx.sql)) orelse
             return replySyntaxError(state);
-        if (self.txn) |t| if (t.failed) return replyFailedBlock(state);
+        if (self.txn) |t| if (t.failed and !allowedWhenFailed(stmt))
+            return replyFailedBlock(state);
         switch (stmt) {
             .select => |sel| try _dml.describeSelect(self, state, sel),
             .select_row => |sr| try _dml.describeSelectRow(state, sr),
@@ -825,8 +852,8 @@ pub const Handler = struct {
     ) !void {
         if (self.txn) |t| {
             // A failed block accepts only COMMIT/ROLLBACK (both roll
-            // back) until the client ends it.
-            if (t.failed and stmt != .commit_txn and stmt != .rollback_txn)
+            // back) and ROLLBACK TO until the client ends or rewinds it.
+            if (t.failed and !allowedWhenFailed(stmt))
                 return replyFailedBlock(state);
             // Leadership moved since BEGIN: nothing this txn read or
             // buffered can be trusted — abort eagerly (the defer above
@@ -860,6 +887,9 @@ pub const Handler = struct {
             .begin_txn => try self.beginTxn(state),
             .commit_txn => try self.endTxn(state, true),
             .rollback_txn => try self.endTxn(state, false),
+            .savepoint => |name| try self.savepointStmt(state, name),
+            .release_savepoint => |name| try self.releaseStmt(state, name),
+            .rollback_to => |name| try self.rollbackToStmt(state, name),
             .set_var => try state.sendCommandComplete("SET"),
             .reset_var => try state.sendCommandComplete("RESET"),
             .show_var => |show| try self.showVar(state, show),
@@ -1071,6 +1101,39 @@ pub const Handler = struct {
         try state.sendCommandComplete("BEGIN");
     }
 
+    /// SAVEPOINT: a point the block can come back to. Outside a block
+    /// it is an error (25P01), as in Postgres.
+    fn savepointStmt(self: *Handler, state: *pgwire.ConnState, name: String) !void {
+        const t = self.txn orelse return replyNoBlock(state, "SAVEPOINT");
+        try t.savepoint(name);
+        try state.sendCommandComplete("SAVEPOINT");
+    }
+
+    fn releaseStmt(self: *Handler, state: *pgwire.ConnState, name: String) !void {
+        const t = self.txn orelse
+            return replyNoBlock(state, "RELEASE SAVEPOINT");
+        if (!t.releaseSavepoint(name)) return replyNoSavepoint(state, name);
+        try state.sendCommandComplete("RELEASE");
+    }
+
+    /// ROLLBACK TO: the writes since the savepoint are gone and a failed
+    /// block is live again, unless the failure doomed it (Txn.doomed):
+    /// then 40001, the client retries the transaction.
+    fn rollbackToStmt(self: *Handler, state: *pgwire.ConnState, name: String) !void {
+        const t = self.txn orelse
+            return replyNoBlock(state, "ROLLBACK TO SAVEPOINT");
+        if (t.doomed) return replyErrorCode(
+            state,
+            pgwire.sqlstate.serialization_failure,
+            "the transaction was aborted by an earlier error and cannot " ++
+                "roll back to a savepoint, retry it",
+        );
+        if (!try t.rollbackToSavepoint(name))
+            return replyNoSavepoint(state, name);
+        state.tx_status = .in_tx;
+        try state.sendCommandComplete("ROLLBACK");
+    }
+
     /// COMMIT (commit=true) or ROLLBACK ends the block either way:
     /// COMMIT of a failed txn rolls back and says so (tag ROLLBACK,
     /// Postgres behavior); outside a block both warn and no-op.
@@ -1139,6 +1202,31 @@ pub const Handler = struct {
         return true;
     }
 };
+
+/// 25P01: a savepoint statement outside a transaction block.
+fn replyNoBlock(state: *pgwire.ConnState, comptime verb: String) !void {
+    return replyErrorCode(
+        state,
+        pgwire.sqlstate.no_active_sql_transaction,
+        verb ++ " can only be used in transaction blocks",
+    );
+}
+
+/// 3B001: no savepoint of that name is in effect.
+fn replyNoSavepoint(state: *pgwire.ConnState, name: String) !void {
+    var arena = fiber.ctx().newArena();
+    defer arena.deinit();
+    const msg = try std.fmt.allocPrint(
+        arena.allocator(),
+        "savepoint \"{s}\" does not exist",
+        .{name},
+    );
+    return replyErrorCode(
+        state,
+        pgwire.sqlstate.invalid_savepoint_specification,
+        msg,
+    );
+}
 
 /// 25P02: the block is aborted and only COMMIT/ROLLBACK is taken.
 fn replyFailedBlock(state: *pgwire.ConnState) !void {

@@ -62,7 +62,8 @@ The default SQL port is `3210`. The database `egres` exists from the first boot,
 | `DELETE FROM t [WHERE]` | Yes | Without `WHERE` it deletes every row. |
 | `DELETE ... USING`, `RETURNING`, `WITH` | Not&nbsp;yet | |
 | `BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK` | Yes | Transaction modes such as `ISOLATION LEVEL` are accepted and ignored; isolation is snapshot isolation. |
-| `SAVEPOINT`, `PREPARE TRANSACTION` | Not&nbsp;yet | |
+| `SAVEPOINT`, `RELEASE SAVEPOINT`, `ROLLBACK TO SAVEPOINT` | Yes | `ROLLBACK TO` discards the writes since the savepoint, releases the row locks taken since, and revives a block an error failed. After a serialization failure, a deadlock or a snapshot-too-old error the block cannot be rolled back to a savepoint: `ROLLBACK TO` is `40001`, retry the transaction. |
+| `PREPARE TRANSACTION` | Not&nbsp;yet | |
 | DDL inside a transaction block | Not&nbsp;yet | Returns `25001`. Each DDL statement runs as its own transaction. |
 | `SET`, `RESET` | Yes | Any parameter, accepted and ignored. |
 | `SHOW` | Partial | The connection's `ParameterStatus` settings, `transaction_isolation` and `default_transaction_isolation` (`repeatable read`), `transaction_read_only`, `search_path`, `max_identifier_length`. Any other parameter is `42704`; `SHOW ALL` too. |

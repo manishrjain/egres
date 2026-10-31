@@ -94,7 +94,9 @@ pub const sqlstate = struct {
     pub const serialization_failure: [5]u8 = .{ '4', '0', '0', '0', '1' };
     pub const deadlock_detected: [5]u8 = .{ '4', '0', 'P', '0', '1' };
     pub const active_sql_transaction: [5]u8 = .{ '2', '5', '0', '0', '1' };
+    pub const no_active_sql_transaction: [5]u8 = .{ '2', '5', 'P', '0', '1' };
     pub const in_failed_sql_transaction: [5]u8 = .{ '2', '5', 'P', '0', '2' };
+    pub const invalid_savepoint_specification: [5]u8 = .{ '3', 'B', '0', '0', '1' };
     pub const admin_shutdown: [5]u8 = .{ '5', '7', 'P', '0', '1' };
     pub const out_of_memory: [5]u8 = .{ '5', '3', '2', '0', '0' };
 };

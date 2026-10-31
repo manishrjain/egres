@@ -321,6 +321,11 @@ pub const Stmt = union(enum) {
     begin_txn,
     commit_txn,
     rollback_txn,
+    /// SAVEPOINT / RELEASE [SAVEPOINT] / ROLLBACK TO [SAVEPOINT], each
+    /// with its name (borrowed).
+    savepoint: String,
+    release_savepoint: String,
+    rollback_to: String,
     /// SET and RESET of any parameter, accepted and ignored: drivers
     /// send them on connect, and no setting changes anything here.
     /// SET TRANSACTION is ignored the way BEGIN's modes are.
@@ -371,7 +376,8 @@ pub fn statement(alloc: std.mem.Allocator, sql: String) parser.ParseError!Stmt {
     if (parser.cast(c.SelectStmt, node)) |s| return parseSelect(alloc, s);
     if (parser.cast(c.DeleteStmt, node)) |s| return parseDelete(alloc, s);
     if (parser.cast(c.UpdateStmt, node)) |s| return parseUpdate(alloc, s);
-    if (parser.cast(c.TransactionStmt, node)) |s| return parseTransaction(s);
+    if (parser.cast(c.TransactionStmt, node)) |s|
+        return parseTransaction(alloc, s);
     if (parser.cast(c.VariableSetStmt, node)) |s| return parseSet(s);
     if (parser.cast(c.VariableShowStmt, node)) |s|
         return .{ .show_var = .{ .name = try dup(alloc, s.name) } };
@@ -1322,14 +1328,26 @@ fn invalidFmt(
     return .{ .invalid = try std.fmt.allocPrint(alloc, fmt, args) };
 }
 
-/// BEGIN / START TRANSACTION / COMMIT / ROLLBACK. Transaction modes
-/// (ISOLATION LEVEL …) are ignored; savepoints and two-phase commit
-/// are rejected with a reason.
-fn parseTransaction(ts: *const c.TransactionStmt) Stmt {
+/// BEGIN / START TRANSACTION / COMMIT / ROLLBACK and the savepoint
+/// statements. Transaction modes (ISOLATION LEVEL …) are ignored;
+/// two-phase commit is rejected with a reason.
+fn parseTransaction(
+    alloc: std.mem.Allocator,
+    ts: *const c.TransactionStmt,
+) parser.ParseError!Stmt {
     return switch (ts.kind) {
         c.TRANS_STMT_BEGIN, c.TRANS_STMT_START => .begin_txn,
         c.TRANS_STMT_COMMIT => .commit_txn,
         c.TRANS_STMT_ROLLBACK => .rollback_txn,
+        c.TRANS_STMT_SAVEPOINT => .{
+            .savepoint = try dup(alloc, ts.savepoint_name),
+        },
+        c.TRANS_STMT_RELEASE => .{
+            .release_savepoint = try dup(alloc, ts.savepoint_name),
+        },
+        c.TRANS_STMT_ROLLBACK_TO => .{
+            .rollback_to = try dup(alloc, ts.savepoint_name),
+        },
         else => invalid("unsupported transaction statement"),
     };
 }

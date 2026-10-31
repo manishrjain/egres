@@ -216,6 +216,9 @@ pub const ConnState = struct {
     /// to drive failed-transaction state without threading a result
     /// through every reply site.
     error_sent: bool = false,
+    /// The SQLSTATE of the last error sent: what decides whether a
+    /// failed block can still roll back to a savepoint.
+    error_code: [5]u8 = .{ '0', '0', '0', '0', '0' },
 
     /// Registry of prepared statements by name. Empty string is the
     /// "unnamed" slot, overwritten on each Parse with name "".
@@ -884,6 +887,7 @@ pub const ConnState = struct {
 
     pub fn sendError(self: *ConnState, f: _proto.ErrorField) StateError!void {
         self.error_sent = true;
+        self.error_code = f.code;
         try self.writeError(f);
     }
 

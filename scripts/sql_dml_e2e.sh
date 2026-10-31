@@ -457,6 +457,65 @@ expect "unique index range: 1 < id AND id <= 2" "2" \
 expect "unique index range: none above" "0" v "SELECT count(*) FROM nn WHERE id > 5;"
 q "DROP TABLE nn;" >/dev/null
 
+# --- savepoints: ROLLBACK TO revives a failed block and drops its writes --
+q "CREATE TABLE sp (id int4 PRIMARY KEY, v text);" >/dev/null
+q "CREATE INDEX sp_v ON sp (v);" >/dev/null
+expect "savepoint: duplicate key inside, rolled back to, block commits" \
+    "COMMIT" tx "BEGIN;
+INSERT INTO sp VALUES (1, 'a');
+SAVEPOINT upsert;
+INSERT INTO sp VALUES (1, 'dup');
+ROLLBACK TO SAVEPOINT upsert;
+INSERT INTO sp VALUES (2, 'b');
+COMMIT;"
+expect "savepoint: both inserts around the failure landed" "2" \
+    v "SELECT count(*) FROM sp;"
+expect "savepoint: the failed insert did not" "a" \
+    v "SELECT v FROM sp WHERE id = 1;"
+expect "savepoint: nested, ROLLBACK TO the outer drops both" "COMMIT" \
+    tx "BEGIN;
+SAVEPOINT a;
+INSERT INTO sp VALUES (5, 'e');
+SAVEPOINT b;
+INSERT INTO sp VALUES (6, 'f');
+ROLLBACK TO a;
+COMMIT;"
+expect "savepoint: nothing from the rewound part" "2" \
+    v "SELECT count(*) FROM sp;"
+expect "savepoint: an UPDATE before it stays, one after it goes" "COMMIT" \
+    tx "BEGIN;
+UPDATE sp SET v = 'z' WHERE id = 1;
+SAVEPOINT s;
+UPDATE sp SET v = 'y' WHERE id = 1;
+ROLLBACK TO s;
+COMMIT;"
+expect "savepoint: the kept update, through the index" "1" \
+    v "SELECT id FROM sp WHERE v = 'z';"
+expect "savepoint: the dropped update's index entry is gone" "(0 rows)" \
+    q "SELECT id FROM sp WHERE v = 'y';"
+expect "savepoint: RELEASE keeps the writes" "COMMIT" tx "BEGIN;
+SAVEPOINT s;
+INSERT INTO sp VALUES (3, 'c');
+RELEASE SAVEPOINT s;
+COMMIT;"
+expect "savepoint: released savepoint's insert landed" "c" \
+    v "SELECT v FROM sp WHERE id = 3;"
+expect "savepoint: ROLLBACK TO an unknown name" 'savepoint "nope" does not exist' \
+    tx "BEGIN;
+INSERT INTO sp VALUES (4, 'd');
+ROLLBACK TO nope;
+COMMIT;"
+expect "savepoint: that error failed the block" "3" v "SELECT count(*) FROM sp;"
+expect "savepoint: outside a block" "can only be used in transaction blocks" \
+    q "SAVEPOINT s;"
+expect "savepoint: a failed block without one stays failed" \
+    "commands ignored until end" tx "BEGIN;
+INSERT INTO sp VALUES (1, 'dup');
+INSERT INTO sp VALUES (7, 'g');
+COMMIT;"
+expect "savepoint: plain failure rolled back" "3" v "SELECT count(*) FROM sp;"
+expect "DROP the savepoint table" "DROP TABLE" q "DROP TABLE sp;"
+
 # --- extended query protocol: psql 18's \bind, \parse, \bind_named --------
 # `\bind` sends Parse (unnamed) + Bind + Describe(portal) + Execute + Sync,
 # the shape pgbench -M extended uses; `\parse` + `\bind_named` is a named

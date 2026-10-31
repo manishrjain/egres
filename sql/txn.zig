@@ -72,6 +72,22 @@ const HeldTable = struct {
     mode: fiber.SemaphoreMap.Mode,
 };
 
+/// One SAVEPOINT: its name, the write set as it stood when it was set,
+/// and how many row locks were held then.
+pub const Savepoint = struct {
+    name: String, // owned by the txn allocator
+    writes: ?Writes,
+    held_rows_idx: usize,
+
+    /// A write set as items in one arena, the form the skiplist's
+    /// iterator yields and `putItem` takes back. A copy of the bytes
+    /// only; the skiplist is rebuilt if ROLLBACK TO reaches for it.
+    pub const Writes = struct {
+        arena: std.heap.ArenaAllocator,
+        items: []const Item,
+    };
+};
+
 pub const Txn = struct {
     allocator: std.mem.Allocator,
     /// Owner token for the lock table; Server-issued, process-local.
@@ -100,11 +116,25 @@ pub const Txn = struct {
     /// (the map handles re-entrant acquires); released in deinit — lock
     /// lifetime IS txn lifetime.
     held_rows: std.ArrayList(u64) = .empty,
-    /// A statement in this txn errored: locks are already released
-    /// (Postgres aborts and releases at error time), pending writes are
-    /// doomed, and only COMMIT/ROLLBACK — both of which roll back — are
-    /// accepted until the client ends the block.
+    /// A statement in this txn errored: only COMMIT/ROLLBACK — both of
+    /// which roll back — and ROLLBACK TO a savepoint are accepted until
+    /// the client ends the block or rewinds it. Without a savepoint to
+    /// rewind to the locks were released at the error (Postgres aborts
+    /// and releases at error time); with one they are held, since the
+    /// pending writes they guard may yet commit.
     failed: bool = false,
+    /// The failure left nothing a savepoint could return to: a lock
+    /// error (a deadlock victim must drop its locks; a conflict read
+    /// past the snapshot), a stale snapshot, a term change, an internal
+    /// failure. Locks are released at once and ROLLBACK TO is refused.
+    doomed: bool = false,
+    /// The savepoints in effect, oldest first. ROLLBACK TO swaps the
+    /// saved write set back in and releases the row locks taken since:
+    /// a lock is taken before the write it guards, so those guarded
+    /// only writes now discarded. Read tracking and allocated egids are
+    /// not rewound, which is safe and merely revalidates more than
+    /// Postgres would.
+    savepoints: std.ArrayList(Savepoint) = .empty,
     /// The snapshot every read in this txn sees. Starts at the initial
     /// read_ts and only moves FORWARD, via the bump in `lockRows`: locking
     /// a key another txn committed above our snapshot advances read_ts to
@@ -170,6 +200,110 @@ pub const Txn = struct {
         self.prev.deinit(self.allocator);
         self.cur.deinit(self.allocator);
         if (self.writes) |w| w.release();
+        self.dropSavepointsFrom(0);
+        self.savepoints.deinit(self.allocator);
+    }
+
+    /// SAVEPOINT `name`: remember the write set as it stands. A name
+    /// may repeat; RELEASE and ROLLBACK TO address the newest.
+    pub fn savepoint(self: *Txn, name: String) !void {
+        const copy = if (self.writes) |w|
+            try snapshotWrites(self.allocator, w)
+        else
+            null;
+        errdefer if (copy) |c| c.arena.deinit();
+
+        const owned = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned);
+
+        try self.savepoints.append(self.allocator, .{
+            .name = owned,
+            .writes = copy,
+            .held_rows_idx = self.held_rows.items.len,
+        });
+    }
+
+    /// RELEASE SAVEPOINT `name`: forget it and every savepoint set after
+    /// it; the writes since stay. false = no such savepoint.
+    pub fn releaseSavepoint(self: *Txn, name: String) bool {
+        const at = self.findSavepoint(name) orelse return false;
+        self.dropSavepointsFrom(at);
+        return true;
+    }
+
+    /// ROLLBACK TO SAVEPOINT `name`: the write set is again what it was
+    /// at the savepoint, the row locks taken since are released (they
+    /// are a suffix of `held_rows`, which is in acquisition order), the
+    /// savepoints set after it are gone, `name` itself stays (as in
+    /// Postgres), and a failed block is live again. false = no such
+    /// savepoint.
+    pub fn rollbackToSavepoint(self: *Txn, name: String) !bool {
+        const at = self.findSavepoint(name) orelse return false;
+        self.dropSavepointsFrom(at + 1);
+        const sp = self.savepoints.items[at];
+
+        const restored = if (sp.writes) |w|
+            try restoreWrites(self.allocator, w)
+        else
+            null;
+
+        if (self.writes) |w| w.release();
+        self.writes = restored;
+
+        const since = self.held_rows.items[sp.held_rows_idx..];
+        self.db.row_locks.releaseMany(since, self.id);
+        self.held_rows.shrinkRetainingCapacity(sp.held_rows_idx);
+        self.failed = false;
+        return true;
+    }
+
+    fn findSavepoint(self: *const Txn, name: String) ?usize {
+        var i = self.savepoints.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.savepoints.items[i].name, name)) return i;
+        }
+        return null;
+    }
+
+    fn dropSavepointsFrom(self: *Txn, at: usize) void {
+        for (self.savepoints.items[at..]) |sp| {
+            self.allocator.free(sp.name);
+            if (sp.writes) |w| w.arena.deinit();
+        }
+        self.savepoints.shrinkRetainingCapacity(at);
+    }
+
+    /// Every item of `w` copied into one arena: an iterator's item
+    /// borrows the skiplist's memory, which later writes replace.
+    fn snapshotWrites(
+        allocator: std.mem.Allocator,
+        w: *zdb.skl.SkipList,
+    ) !Savepoint.Writes {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const arloc = arena.allocator();
+
+        var items: std.ArrayList(Item) = .empty;
+        var it = try w.iterator(allocator);
+        defer it.deinit();
+
+        while (it.itemRef()) |item| : (try it.next())
+            try items.append(arloc, try item.dupe(arloc));
+        return .{ .arena = arena, .items = items.items };
+    }
+
+    /// A skiplist holding `writes` again; `putItem` copies each item
+    /// into it, so the savepoint keeps its own.
+    fn restoreWrites(
+        allocator: std.mem.Allocator,
+        writes: Savepoint.Writes,
+    ) !*zdb.skl.SkipList {
+        const list = try zdb.skl.SkipList.initCapacity(allocator, 0);
+        errdefer list.release();
+
+        for (writes.items) |item| try list.putItem(item);
+        return list;
     }
 
     /// A new statement begins: merge the finished statement's reads and

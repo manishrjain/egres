@@ -796,7 +796,7 @@ test "sql.parse: SET expressions keep the grammar's operator tree" {
     try testing.expectEqualStrings("b", inner.rhs.column);
 }
 
-test "sql.parse: transaction statements parse; savepoints are rejected" {
+test "sql.parse: transaction statements parse; two-phase commit is rejected" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -815,7 +815,7 @@ test "sql.parse: transaction statements parse; savepoints are rejected" {
     const r = try parse.statement(alloc, "ROLLBACK;");
     try testing.expect(r == .rollback_txn);
 
-    const sp = try parse.statement(alloc, "SAVEPOINT s1;");
+    const sp = try parse.statement(alloc, "PREPARE TRANSACTION 'gid';");
     try testing.expect(sp == .invalid);
 }
 
@@ -1161,4 +1161,25 @@ test "sql.parse: CONCAT and COALESCE in SET are calls over SET values" {
         try testing.expect(stmt == .invalid);
         try testing.expect(std.mem.indexOf(u8, stmt.invalid, case.needle) != null);
     }
+}
+
+test "sql.parse: savepoint statements carry their name" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const sp = try parse.statement(alloc, "SAVEPOINT upsert;");
+    try testing.expectEqualStrings("upsert", sp.savepoint);
+    const rel = try parse.statement(alloc, "RELEASE SAVEPOINT Upsert;");
+    try testing.expectEqualStrings("upsert", rel.release_savepoint);
+    const rel2 = try parse.statement(alloc, "release \"Upsert\"");
+    try testing.expectEqualStrings("Upsert", rel2.release_savepoint);
+    const rb = try parse.statement(alloc, "ROLLBACK TO SAVEPOINT upsert;");
+    try testing.expectEqualStrings("upsert", rb.rollback_to);
+    const rb2 = try parse.statement(alloc, "rollback to upsert");
+    try testing.expectEqualStrings("upsert", rb2.rollback_to);
+    try testing.expectEqual(@as(u16, 0), rb2.paramCount());
+    const prepared = try parse.statement(alloc, "PREPARE TRANSACTION 'x';");
+    try testing.expect(prepared == .invalid);
 }

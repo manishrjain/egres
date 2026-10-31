@@ -674,3 +674,86 @@ test "txn: wireKvs emits key order regardless of insert order" {
         try testing.expectEqualSlices(u8, p, k.primary);
     }
 }
+
+test "txn: ROLLBACK TO restores the write set at the savepoint, RELEASE keeps it" {
+    var fx = try Fixture.setup(&.{.{
+        .key = rowKey("k0"),
+        .versions = .{ .one = .{ .ts = 100, .meta = .{}, .value = "committed" } },
+    }});
+    defer fx.teardown();
+    var tx = fx.txn();
+    defer tx.deinit();
+
+    // Before any write a savepoint remembers an empty set: ROLLBACK TO
+    // it drops the pending tombstone and the committed row is back.
+    try tx.savepoint("empty");
+    try tx.put(tid, "k0", "", .{ .kind = .deleted });
+    try testing.expectEqual(null, try lookupOne(&tx, "k0"));
+    try testing.expect(try tx.rollbackToSavepoint("empty"));
+    const k0 = (try lookupOne(&tx, "k0")) orelse return error.TestExpectedRow;
+    defer k0.free(testing.allocator);
+    try testing.expectEqualSlices(u8, "committed", k0.newest().value);
+
+    try tx.put(tid, "k1", "a", .{});
+    try tx.savepoint("s1");
+    try tx.put(tid, "k1", "b", .{});
+    try tx.put(tid, "k2", "c", .{});
+    try tx.savepoint("s2");
+    try tx.put(tid, "k3", "d", .{});
+    tx.failed = true;
+
+    // Back to s1: k1 is "a" again, k2 and k3 are gone, s2 with them,
+    // s1 itself stays, and the block is live.
+    try testing.expect(try tx.rollbackToSavepoint("s1"));
+    try testing.expect(!tx.failed);
+    try testing.expectEqual(@as(usize, 2), tx.savepoints.items.len);
+    const k1 = (try lookupOne(&tx, "k1")) orelse return error.TestExpectedRow;
+    defer k1.free(testing.allocator);
+    try testing.expectEqualSlices(u8, "a", k1.newest().value);
+    try testing.expectEqual(null, try lookupOne(&tx, "k2"));
+    try testing.expectEqual(null, try lookupOne(&tx, "k3"));
+    try testing.expect(!try tx.rollbackToSavepoint("s2"));
+
+    // Writes after the rewind land on the restored set; RELEASE keeps
+    // them and forgets the savepoint and the ones above it.
+    try tx.put(tid, "k2", "e", .{});
+    try testing.expect(try tx.rollbackToSavepoint("s1"));
+    try testing.expectEqual(null, try lookupOne(&tx, "k2"));
+    try tx.put(tid, "k2", "f", .{});
+    try testing.expect(tx.releaseSavepoint("empty"));
+    try testing.expectEqual(@as(usize, 0), tx.savepoints.items.len);
+    try testing.expect(!tx.releaseSavepoint("s1"));
+    const k2 = (try lookupOne(&tx, "k2")) orelse return error.TestExpectedRow;
+    defer k2.free(testing.allocator);
+    try testing.expectEqualSlices(u8, "f", k2.newest().value);
+    // The commit payload is the restored set plus the later write.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const kvs = try tx.wireKvs(arena.allocator());
+    try testing.expectEqual(@as(usize, 2), kvs.len);
+}
+
+test "txn: ROLLBACK TO releases the row locks taken since the savepoint" {
+    var fx = try Fixture.setup(&.{});
+    defer fx.teardown();
+    var tx = fx.txn();
+    defer tx.deinit();
+
+    try lockOne(&tx, "r1");
+    try tx.savepoint("s");
+    try lockOne(&tx, "r2");
+    try lockOne(&tx, "r1"); // re-entrant: held since before, stays
+    try lockOne(&tx, "r3");
+    try testing.expectEqual(3, tx.held_rows.items.len);
+
+    try testing.expect(try tx.rollbackToSavepoint("s"));
+    try testing.expectEqual(1, tx.held_rows.items.len);
+    try testing.expectEqual(1, fx.db.row_locks.entries.count());
+    try testing.expect(fx.db.row_locks.entries.contains(tx.rowHash(tid, "r1")));
+    try testing.expect(!fx.db.row_locks.entries.contains(tx.rowHash(tid, "r2")));
+    // r2 is free for another txn right away.
+    var other = fx.txnAs(2);
+    defer other.deinit();
+    try lockOne(&other, "r2");
+    try testing.expectEqual(2, fx.db.row_locks.entries.count());
+}
