@@ -250,6 +250,37 @@ expect "COALESCE of a parameter" "UPDATE 1" \
 expect "COALESCE arithmetic visible" "31" v "SELECT m FROM ex WHERE n = 4;"
 expect "COALESCE mixes kinds refused" "operator does not exist" \
     q "UPDATE ex SET s = COALESCE(s, n);"
+expect "upper" "UPDATE 1" q "UPDATE ex SET s = upper(s) WHERE n = 3;"
+expect "upper visible" "XB,35" v "SELECT s FROM ex WHERE n = 3;"
+expect "substring, lower and length" "UPDATE 1" \
+    q "UPDATE ex SET s = CONCAT(lower(substring(s, 2, 2)), length(s))
+       WHERE n = 3;"
+expect "function chain visible" "b,5" v "SELECT s FROM ex WHERE n = 3;"
+expect "replace, left, right, concat_ws and btrim" "UPDATE 1" \
+    q "UPDATE ex SET s = btrim(concat_ws('-', left(s, 1),
+       right(replace(s, ',', 'x'), 2)), 'b') WHERE n = 3;"
+expect "string functions visible" "-x5" v "SELECT s FROM ex WHERE n = 3;"
+expect "round to places" "UPDATE 1" \
+    q "UPDATE ex SET f = round(f / 7, 2) WHERE n = 4;"
+expect "round visible" "4.29" v "SELECT f FROM ex WHERE n = 4;"
+expect "greatest and nullif" "UPDATE 1" \
+    q "UPDATE ex SET m = nullif(greatest(m, 40, 35), 40) WHERE n = 4;"
+expect "nullif made NULL" "1" \
+    v "SELECT count(*) FROM ex WHERE n = 4 AND m IS NULL;"
+expect "least, mod and abs" "UPDATE 1" \
+    q "UPDATE ex SET m = abs(mod(least(-17, 5), 5)) WHERE n = 4;"
+expect "numeric functions visible" "2" v "SELECT m FROM ex WHERE n = 4;"
+expect "power and sqrt" "UPDATE 1" \
+    q "UPDATE ex SET f = sqrt(power(2, 10)) WHERE n = 4;"
+expect "power visible" "32" v "SELECT f FROM ex WHERE n = 4;"
+expect "sqrt of a negative refused" "power function" \
+    q "UPDATE ex SET f = sqrt(-1);"
+expect "negative substring length refused" "negative substring length" \
+    q "UPDATE ex SET s = substring(s, 1, -1);"
+expect "wrong argument kind refused" "operator does not exist" \
+    q "UPDATE ex SET s = lower(n);"
+expect "wrong arity refused" "takes 1 argument" \
+    q "UPDATE ex SET s = upper(s, s);"
 q "UPDATE ex SET s = 'b' WHERE n = 3;" >/dev/null # the legs below find it by name
 expect "division by zero" "division by zero" \
     q "UPDATE ex SET n = n / 0 WHERE s = 'b';"

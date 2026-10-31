@@ -58,7 +58,7 @@ The default SQL port is `3210`. The database `egres` exists from the first boot,
 | `INSERT ... ON CONFLICT (column) DO NOTHING \| DO UPDATE SET ... [WHERE ...]` | Yes | The column must carry a `PRIMARY KEY` or `UNIQUE` constraint. `DO NOTHING` without a target takes any unique constraint. The `SET` values may name the existing row's columns (through the table name or its `AS` alias) and `EXCLUDED.column`, the proposed row's; the `WHERE` reads the existing row and skips it when false. The tag counts updated rows with inserted ones. Not yet: `ON CONSTRAINT`, a partial-index `WHERE` on the target, `EXCLUDED` in the `WHERE`. |
 | `INSERT ... SELECT`, `DEFAULT VALUES`, `DEFAULT` as a value, `RETURNING` | Not&nbsp;yet | |
 | `SELECT` | Partial | See [Queries](#queries). |
-| `UPDATE ... SET ... [WHERE]` | Yes | `SET` takes a literal, a parameter, a column, `CONCAT(...)`, `COALESCE(...)`, or `+ - * / % \|\|` over them. `CONCAT` skips NULL arguments and renders numbers as text. |
+| `UPDATE ... SET ... [WHERE]` | Yes | `SET` takes a literal, a parameter, a column, a call of a [supported function](#functions-and-operators), or `+ - * / % \|\|` over them. |
 | `UPDATE ... FROM`, `RETURNING`, `WITH` | Not&nbsp;yet | |
 | `DELETE FROM t [WHERE]` | Yes | Without `WHERE` it deletes every row. |
 | `DELETE ... USING`, `RETURNING`, `WITH` | Not&nbsp;yet | |
@@ -189,7 +189,8 @@ Assignments in `SET` follow Postgres: any integer into any numeric column with a
 | `+`, `-`, `*`, `/`, `%` on numeric types, unary minus | Yes | In `UPDATE ... SET`, over literals, parameters and columns of the same row. |
 | `\|\|` on strings | Yes | In `UPDATE ... SET`. |
 | A cast of a constant: `'6'::int8`, `CAST('x' AS text)` | Partial | In `VALUES`, `WHERE`, `SET` and a `SELECT` without `FROM`. The constant is typed by the column it meets, as a bare literal is; the named type is not checked. pgjdbc in simple query mode inlines every bind parameter this way. |
-| `now()`, casts of columns and expressions, string and date functions, `COALESCE`, `CASE`, every other function and operator | Not&nbsp;yet | |
+| `COALESCE`, `NULLIF`, `GREATEST`, `LEAST`, `CONCAT`, `CONCAT_WS`, `LOWER`, `UPPER`, `LENGTH`, `SUBSTRING`, `REPLACE`, `TRIM`, `LTRIM`, `RTRIM`, `LEFT`, `RIGHT`, `ABS`, `SIGN`, `FLOOR`, `CEIL`, `ROUND`, `TRUNC`, `MOD`, `POWER`, `SQRT` | Yes | In `UPDATE ... SET`, over literals, parameters and columns of the row; strings and numbers. `LOWER` and `UPPER` fold ASCII letters only, where Postgres folds by collation. `CONCAT` skips NULL arguments and renders numbers as text. |
+| `now()`, casts of columns and expressions, date functions, `CASE`, functions in `SELECT` or `WHERE`, every other function and operator | Not&nbsp;yet | |
 | User-defined functions, in SQL or any other language | Not&nbsp;yet | |
 
 ## Extensions

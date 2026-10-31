@@ -1183,10 +1183,22 @@ fn parseExpr(
     }
     if (parser.cast(c.CoalesceExpr, p)) |ce|
         return parseCall(arloc, params, &_funcs.coalesce, ce.args);
+    if (parser.cast(c.MinMaxExpr, p)) |mm| {
+        const func = if (mm.op == c.IS_GREATEST)
+            &_funcs.greatest
+        else
+            &_funcs.least;
+        return parseCall(arloc, params, func, mm.args);
+    }
     const ae = parser.cast(c.A_Expr, p) orelse return ParsedExpr.reject(
-        "SET value must be a literal, a column, CONCAT or COALESCE, " ++
+        "SET value must be a literal, a column, a function call, " ++
             "or an operator expression over them",
     );
+    if (ae.kind == c.AEXPR_NULLIF) {
+        return parseArgs(arloc, params, &_funcs.nullif, &.{
+            parser.asNode(ae.lexpr), parser.asNode(ae.rexpr),
+        });
+    }
     const bad_op = "only + - * / % || are supported in SET";
     const op = opFrom(operatorOf(ae) orelse "") orelse
         return ParsedExpr.reject(bad_op);
@@ -1213,8 +1225,7 @@ fn parseExpr(
     return .{ .expr = .{ .binop = .{ .op = op, .lhs = lhs, .rhs = rhs } } };
 }
 
-/// A call of `func` on `list`, each argument a SET value, as many as
-/// the function takes.
+/// A call of `func` on the grammar's argument list.
 fn parseCall(
     arloc: std.mem.Allocator,
     params: *ParamTally,
@@ -1222,27 +1233,52 @@ fn parseCall(
     list: [*c]c.List,
 ) parser.ParseError!ParsedExpr {
     const cells = parser.items(list);
-    if (!func.takes(cells.len)) return .{
-        .invalid = try std.fmt.allocPrint(
-            arloc,
-            "function {s}() takes {s}{d} argument{s}",
-            .{
-                func.name,
-                if (func.max_args == null) "at least " else "",
-                func.min_args,
-                if (func.min_args == 1) "" else "s",
-            },
-        ),
-    };
-    const args = try arloc.alloc(Expr, cells.len);
-    for (cells, args) |cell, *arg| {
-        const node = parser.asNode(cell.ptr_value);
+    const nodes = try arloc.alloc(?*c.Node, cells.len);
+    for (cells, nodes) |cell, *node| node.* = parser.asNode(cell.ptr_value);
+    return parseArgs(arloc, params, func, nodes);
+}
+
+/// A call of `func` on `nodes`, each a SET value, as many as the
+/// function takes.
+fn parseArgs(
+    arloc: std.mem.Allocator,
+    params: *ParamTally,
+    func: *const _funcs.Func,
+    nodes: []const ?*c.Node,
+) parser.ParseError!ParsedExpr {
+    if (!func.takes(nodes.len)) {
+        return .{ .invalid = try arityMsg(arloc, func) };
+    }
+    const args = try arloc.alloc(Expr, nodes.len);
+    for (nodes, args) |node, *arg| {
         arg.* = switch (try parseExpr(arloc, params, node)) {
             .expr => |e| e,
             .invalid => |msg| return .{ .invalid = msg },
         };
     }
     return .{ .expr = .{ .call = .{ .func = func, .args = args } } };
+}
+
+/// "function f() takes 2 arguments", "at least 1 argument",
+/// "1 to 2 arguments".
+fn arityMsg(arloc: std.mem.Allocator, func: *const _funcs.Func) ![]u8 {
+    const min = func.min_args;
+    const plural: String = if (min == 1) "" else "s";
+    const max = func.max_args orelse return std.fmt.allocPrint(
+        arloc,
+        "function {s}() takes at least {d} argument{s}",
+        .{ func.name, min, plural },
+    );
+    if (max == min) return std.fmt.allocPrint(
+        arloc,
+        "function {s}() takes {d} argument{s}",
+        .{ func.name, min, plural },
+    );
+    return std.fmt.allocPrint(
+        arloc,
+        "function {s}() takes {d} to {d} arguments",
+        .{ func.name, min, max },
+    );
 }
 
 /// The unqualified name of a function call, lowercased by the grammar

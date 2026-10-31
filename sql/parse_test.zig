@@ -1148,10 +1148,24 @@ test "sql.parse: CONCAT and COALESCE in SET are calls over SET values" {
     try testing.expectEqual(@as(i64, 0), coalesce.args[1].literal.int);
     try testing.expectEqual(@as(u16, 2), up.update.param_count);
 
+    // The keyword forms are calls too, through their own grammar nodes.
+    const kw = try parse.statement(
+        alloc,
+        "UPDATE t SET a = GREATEST(a, 1), b = NULLIF(b, 0), c = LEAST(c);",
+    );
+    const sets = kw.update.sets;
+    try testing.expectEqualStrings("greatest", sets[0].value.call.func.name);
+    try testing.expectEqualStrings("nullif", sets[1].value.call.func.name);
+    try testing.expectEqual(@as(usize, 2), sets[1].value.call.args.len);
+    try testing.expectEqualStrings("least", sets[2].value.call.func.name);
+
     // Any other function, and the aggregate forms, carry a reason.
     const cases = [_]struct { sql: String, needle: String }{
         .{ .sql = "UPDATE t SET a = now();", .needle = "now() is not supported" },
         .{ .sql = "UPDATE t SET a = concat();", .needle = "at least 1 argument" },
+        .{ .sql = "UPDATE t SET a = lower();", .needle = "takes 1 argument" },
+        .{ .sql = "UPDATE t SET a = substr(a);", .needle = "2 to 3 arguments" },
+        .{ .sql = "UPDATE t SET a = left(a,1,2);", .needle = "2 arguments" },
         .{ .sql = "UPDATE t SET a = concat(DISTINCT a);", .needle = "aggregate" },
         .{ .sql = "UPDATE t SET a = concat(a) OVER ();", .needle = "aggregate" },
         .{ .sql = "UPDATE t SET a = concat((SELECT 1));", .needle = "SET value" },

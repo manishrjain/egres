@@ -1207,6 +1207,16 @@ fn replyEvalErr(
             pgwire.sqlstate.division_by_zero,
             "division by zero",
         ),
+        error.SubstringLength => replyErrorCode(
+            state,
+            pgwire.sqlstate.substring_error,
+            "negative substring length not allowed",
+        ),
+        error.PowerArgument => replyErrorCode(
+            state,
+            pgwire.sqlstate.invalid_argument_for_power_function,
+            "invalid argument for power function",
+        ),
     };
 }
 

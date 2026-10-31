@@ -379,6 +379,8 @@ pub const EvalError = error{
     IntOutOfRange,
     FloatOutOfRange,
     DivisionByZero,
+    SubstringLength,
+    PowerArgument,
     StringTooLong,
     InvalidUtf8,
     OutOfMemory,
