@@ -168,6 +168,7 @@ pub fn bindNode(
     expr: _parse.Expr,
     target: ?*const Column,
     params: _parse.Params,
+    excluded: ?[]const Value,
 ) BindError!*const SetNode {
     const node = try arloc.create(SetNode);
     switch (expr) {
@@ -177,9 +178,17 @@ pub fn bindNode(
         .column => |name| node.* = .{
             .column = tbl.column(name) orelse return error.UndefinedColumn,
         },
+        // EXCLUDED.col in ON CONFLICT DO UPDATE SET: the proposed
+        // row's cell, already of its column's type, bound as a
+        // constant. A SET with no proposed row (UPDATE) has no EXCLUDED.
+        .excluded => |name| {
+            const cells = excluded orelse return error.UndefinedColumn;
+            const col = tbl.column(name) orelse return error.UndefinedColumn;
+            node.* = .{ .value = cells[col.pos] };
+        },
         .binop => |b| {
-            const lhs = try bindNode(arloc, tbl, b.lhs.*, null, params);
-            const rhs = try bindNode(arloc, tbl, b.rhs.*, null, params);
+            const lhs = try bindNode(arloc, tbl, b.lhs.*, null, params, excluded);
+            const rhs = try bindNode(arloc, tbl, b.rhs.*, null, params, excluded);
             node.* = .{ .binop = .{
                 .op = b.op,
                 .lhs = lhs,
@@ -190,7 +199,7 @@ pub fn bindNode(
         .call => |call| {
             const args = try arloc.alloc(*const SetNode, call.args.len);
             for (call.args, args) |arg, *slot|
-                slot.* = try bindNode(arloc, tbl, arg, null, params);
+                slot.* = try bindNode(arloc, tbl, arg, null, params, excluded);
             const tys = try arloc.alloc(?Type, args.len);
             for (args, tys) |arg, *t| t.* = arg.ty();
             node.* = .{ .call = .{
@@ -302,9 +311,10 @@ pub fn bind(
     target: *const Column,
     expr: _parse.Expr,
     params: _parse.Params,
+    excluded: ?[]const Value,
 ) !?*const SetNode {
     const code = pgwire.sqlstate;
-    return bindNode(arloc, tbl, expr, target, params) catch |err| {
+    return bindNode(arloc, tbl, expr, target, params, excluded) catch |err| {
         switch (err) {
             error.OutOfMemory => return err,
             error.UndefinedColumn => try replyErrorCode(

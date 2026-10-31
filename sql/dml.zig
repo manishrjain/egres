@@ -66,16 +66,13 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
         log.err("insert into '{s}': load schema: {s}", .{ ins.table, @errorName(err) });
         return replyError(state, "failed to load table schema");
     };
-    if (!try bumpToIndexes(state, tx, tbl)) return;
+    if (!try bumpToIndexes(state, arloc, tx, tbl)) return;
     fiber.ctx().record("txn begun, table open", .{});
 
-    // The column each VALUES position writes (its cell is Column.pos).
-    // Positional insert is the live columns themselves; an explicit
-    // list resolves names. Inserting an explicit `egid` isn't
-    // supported yet.
-    // TODO: allow user-provided egids once unique-index enforcement exists
-    // — a below-counter egid needs a data-tree existence check, and
-    // concurrent inserts of the same egid need apply-time validation.
+    // INSERT INTO t (a, b): the column each VALUES position writes
+    // (its cell is Column.pos). INSERT INTO t without a list is the
+    // live columns in order. The egid is never a target: the server
+    // allocates it (write), by design.
     const target_cols: []const _table.Column = blk: {
         const cols = ins.columns orelse break :blk tbl.columns;
 
@@ -112,13 +109,21 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
                 self.params,
             )) orelse return;
         }
+        // NOT NULL is checked on the proposed row, before ON CONFLICT
+        // may drop it: INSERT INTO t VALUES (1, NULL) ON CONFLICT DO
+        // NOTHING is 23502 even when id 1 exists, as in Postgres.
+        for (tbl.columns) |*col| {
+            if (cells[col.pos] == .null_value and col.not_null)
+                return replyNullViolation(state, arloc, ins.table, col);
+        }
         change.* = .{ .post = cells };
     }
     fiber.ctx().record("{d} rows parsed", .{changes.len});
 
-    // The whole VALUES list commits atomically as one .data entry; an
-    // implicit txn waits for apply so an immediate SELECT on this
-    // session sees the rows.
+    // INSERT INTO t VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET n = 7:
+    // the stored row with id 1 is gathered and locked here, before any
+    // index key — the writer lock order (rows, then keys) — and the
+    // action rewrites the change that proposed id 1.
     var ctx = ExecCtx{
         .arloc = arloc,
         .tx = tx,
@@ -126,14 +131,41 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
         .table_id = table_id,
         .lock = true,
     };
-    if (!try write(self, state, &ctx, table_key, ins.table, changes))
-        return;
+    var uniques: []Unique = &.{};
+    if (ins.on_conflict) |oc| {
+        uniques = (try uniqueIndexes(state, arloc, tbl, oc)) orelse return;
+        const ok = try resolveConflicts(
+            self,
+            state,
+            &ctx,
+            ins.table,
+            oc,
+            uniques,
+            changes,
+        );
+        if (!ok) return;
+    }
+
+    // The whole VALUES list commits atomically as one .data entry; an
+    // implicit txn waits for apply so an immediate SELECT on this
+    // session sees the rows.
+    const affected = (try write(
+        self,
+        state,
+        &ctx,
+        table_key,
+        ins.table,
+        changes,
+        uniques,
+    )) orelse return;
 
     if (tx.implicit) {
         if (!try self.commitOrReply(state, arloc, tx, "insert", ins.table)) return;
     }
 
-    try state.sendCommandComplete(try std.fmt.allocPrint(arloc, "INSERT 0 {d}", .{ins.rows.len}));
+    // Postgres counts the updated rows in the tag too.
+    const tag = try std.fmt.allocPrint(arloc, "INSERT 0 {d}", .{affected});
+    try state.sendCommandComplete(tag);
 }
 
 pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !void {
@@ -263,7 +295,7 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
         logDeleteErr(del.table, "load schema", err);
         return replyError(state, "failed to load table schema");
     };
-    if (!try bumpToIndexes(state, tx, tbl)) return;
+    if (!try bumpToIndexes(state, arloc, tx, tbl)) return;
 
     // Plan the WHERE: an egid or indexed term drives point reads,
     // anything else scans; no WHERE → tombstone every live row.
@@ -296,9 +328,15 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
     // newest versions, frozen by our locks, so no re-read.
     const changes = try arloc.alloc(Change, rows.len);
     for (rows, changes) |item, *change| change.* = .{ .pre = item };
-    if (!try write(self, state, &ctx, table_key, del.table, changes))
-        return;
-    const n = rows.len;
+    const n = (try write(
+        self,
+        state,
+        &ctx,
+        table_key,
+        del.table,
+        changes,
+        &.{},
+    )) orelse return;
     if (n > 0 and tx.implicit) {
         if (!try self.commitOrReply(state, arloc, tx, "delete", del.table)) return;
     }
@@ -331,9 +369,10 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
         log.err("update '{s}': load schema: {s}", .{ up.table, @errorName(err) });
         return replyError(state, "failed to load table schema");
     };
-    if (!try bumpToIndexes(state, tx, tbl)) return;
+    if (!try bumpToIndexes(state, arloc, tx, tbl)) return;
 
-    const sets = (try bindSets(self, state, arloc, tbl, up.sets)) orelse
+    // UPDATE t SET a = expr, ...: bound once, before any lock.
+    const sets = (try bindSets(self, state, arloc, tbl, up.sets, null)) orelse
         return;
 
     // Plan the WHERE: an egid or indexed term drives point reads,
@@ -357,20 +396,36 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
     const rows = mat.gatherAndLockRows(&ctx, batch) catch |err|
         return replyRunErr(state, "update", up.table, err);
 
-    // Past gatherAndLockRows' locks no candidate committed above read_ts —
-    // the gathered pre-images are the newest versions, frozen by our
-    // locks. Each is a Change with its post evaluated from it; an eval
-    // error ends the statement before any key is locked.
+    // SET, per gathered row. Past gatherAndLockRows' locks no candidate
+    // committed above read_ts — the pre-images are the newest versions,
+    // frozen by our locks. Each is a Change with its post evaluated
+    // from it; an eval error ends the statement before any key is
+    // locked.
     const changes = try arloc.alloc(Change, rows.len);
     var row: _value.Row = .{};
     for (rows, changes, 0..) |item, *change, ri| {
         if (ri % _exec.row_cap == 0) try fiber.ctx().maybeYield();
 
-        const post = try evalSets(state, arloc, tbl, item, sets, &row);
-        change.* = .{ .pre = item, .post = post orelse return };
+        const post = (try evalSets(
+            state,
+            arloc,
+            tbl,
+            up.table,
+            item,
+            sets,
+            &row,
+        )) orelse return;
+        change.* = .{ .pre = item, .post = post };
     }
-    if (!try write(self, state, &ctx, table_key, up.table, changes)) return;
-    const n = rows.len;
+    const n = (try write(
+        self,
+        state,
+        &ctx,
+        table_key,
+        up.table,
+        changes,
+        &.{},
+    )) orelse return;
 
     if (tx.implicit) {
         if (!try self.commitOrReply(state, arloc, tx, "update", up.table)) return;
@@ -381,7 +436,8 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
 /// One row a DML statement changes: `pre`, the stored row it
 /// replaces, locked by the gather that found it; `post`, the cells it
 /// leaves, by Column.pos. INSERT has a post, DELETE a pre, UPDATE
-/// both. `egid` is the row's id, set by `write`.
+/// both; neither is a proposed row ON CONFLICT dropped, which `write`
+/// skips. `egid` is the row's id, set by `write`.
 const Change = struct {
     pre: ?zdb.kv.Item = null,
     post: ?[]const _value.Value = null,
@@ -389,38 +445,34 @@ const Change = struct {
 };
 
 /// Write a decided list of changes, every pre locked already — the
-/// writer lock order is rows, then keys. A post with NULL in a NOT
-/// NULL column is 23502. The index entries are each change's pre keys
-/// diffed against its post keys, per index: a key only in the pre is
-/// removed, only in the post added, in both left alone — so an insert
-/// adds every key, a delete removes every key, and an update moves
-/// the keys its SET changed. Then the unique keys are locked, each
-/// row gets its egid (a fresh one without a pre) and is put — the
-/// post marshalled, or a tombstone — and the index entries are
-/// written. Nothing is buffered before the last lock: a Restart
-/// re-runs the statement. false = replied.
+/// writer lock order is rows, then keys. The index entries are each
+/// change's pre keys diffed against its post keys, per index: a key
+/// only in the pre is removed, only in the post added, in both left
+/// alone — so an insert adds every key, a delete removes every key,
+/// and an update moves the keys its SET changed. Then the unique keys
+/// are locked, each row gets its egid (a fresh one without a pre) and
+/// is put — the post marshalled, or a tombstone — and the index
+/// entries are written. Nothing is buffered before the last lock: a
+/// Restart re-runs the statement. `uniques` are the indexes an ON
+/// CONFLICT resolved against, for the probe; empty otherwise. Returns
+/// the rows written; null = replied.
 fn write(
     self: *Handler,
     state: *pgwire.ConnState,
-    ectx: *const ExecCtx,
+    ctx: *const ExecCtx,
     table_key: zdb.kv.TableKey,
     table_name: String,
     changes: []Change,
-) !bool {
-    const arloc = ectx.arloc;
-    const tbl = ectx.tbl;
-    const tx = ectx.tx;
+    uniques: []const Unique,
+) !?usize {
+    const arloc = ctx.arloc;
+    const tbl = ctx.tbl;
+    const tx = ctx.tx;
 
     var keys: std.ArrayList(IndexKey) = .empty;
     for (changes, 0..) |change, ri| {
         if (ri % _exec.row_cap == 0) try fiber.ctx().maybeYield();
 
-        if (change.post) |cells| for (tbl.columns) |*col| {
-            if (cells[col.pos] == .null_value and col.not_null) {
-                try replyNullViolation(state, arloc, table_name, col);
-                return false;
-            }
-        };
         for (tbl.indexes) |*idx| {
             // A building index gets no entries from DML: nothing reads
             // it yet, and its build merges in every row written
@@ -450,12 +502,15 @@ fn write(
                 });
         }
     }
-    if (!try sortAndLockIndexKeys(state, tx, keys.items)) return false;
+    if (!try sortAndLockIndexKeys(state, tx, keys.items)) return null;
     fiber.ctx().record("{d} index keys locked", .{keys.items.len});
 
     // Every lock is held: no Restart past here (puts don't bump).
     var buf: std.ArrayList(u8) = .empty; // marshalRow resets it
+    var count: usize = 0;
     for (changes) |*change| {
+        if (change.pre == null and change.post == null) continue;
+        count += 1;
         if (change.pre) |item| {
             change.egid = _key.decodeEgid(item.key.primary).?;
         } else {
@@ -464,7 +519,7 @@ fn write(
                     table_name, @errorName(err),
                 });
                 try replyError(state, "row id allocation failed");
-                return false;
+                return null;
             };
         }
         const ekey = _key.encodeEgid(change.egid);
@@ -476,8 +531,205 @@ fn write(
             try tx.put(table_key.table_id, &ekey, "", meta);
         }
     }
-    fiber.ctx().record("{d} rows buffered", .{changes.len});
-    return applyIndexKeys(state, tx, keys.items, changes);
+    fiber.ctx().record("{d} rows buffered", .{count});
+    if (!try applyIndexKeys(state, tx, keys.items, changes, uniques))
+        return null;
+    return count;
+}
+
+/// A unique index ON CONFLICT resolves against, with the change that
+/// proposes each of its keys. For
+///   INSERT INTO t VALUES (1, 5), (2, 6) ON CONFLICT (id) DO NOTHING
+/// the pkey index with {1 → change 0, 2 → change 1}: a stored row with
+/// id 1 finds its proposer in one lookup, and a key proposed twice is
+/// noticed.
+const Unique = struct {
+    idx: *const _table.Index,
+    change_by_key: std.StringHashMapUnmanaged(usize) = .empty,
+};
+
+/// The indexes an ON CONFLICT collides on. ON CONFLICT (id) is the
+/// unique indexes on id; a bare ON CONFLICT DO NOTHING every unique
+/// index. null = replied: ON CONFLICT (nosuch) is 42703, ON CONFLICT
+/// (n) with no unique index on n is 42P10 (Postgres's wording).
+fn uniqueIndexes(
+    state: *pgwire.ConnState,
+    arloc: std.mem.Allocator,
+    tbl: *const _table.Table,
+    oc: _parse.OnConflict,
+) !?[]Unique {
+    var col: ?*const _table.Column = null;
+    if (oc.column) |name| {
+        col = tbl.column(name) orelse {
+            try replyUndefinedColumn(state);
+            return null;
+        };
+    }
+    const idxs = try tbl.uniqueIndexes(arloc, col);
+    if (col != null and idxs.len == 0) {
+        try replyErrorCode(
+            state,
+            pgwire.sqlstate.invalid_column_reference,
+            "there is no unique or exclusion constraint matching the " ++
+                "ON CONFLICT specification",
+        );
+        return null;
+    }
+    const uniques = try arloc.alloc(Unique, idxs.len);
+    for (idxs, uniques) |idx, *unique| unique.* = .{ .idx = idx };
+    return uniques;
+}
+
+/// Rewrite the changes under ON CONFLICT. For
+///   INSERT INTO t VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET n = 7
+/// with (1, 10) stored: the stored row becomes the change's pre,
+/// gathered and locked like an UPDATE's match (the gather is
+/// pending-aware, so a row this transaction inserted earlier collides
+/// too), and the action sets its post to (1, 7). false = replied.
+fn resolveConflicts(
+    self: *Handler,
+    state: *pgwire.ConnState,
+    ctx: *ExecCtx,
+    table_name: String,
+    oc: _parse.OnConflict,
+    uniques: []Unique,
+    changes: []Change,
+) !bool {
+    const arloc = ctx.arloc;
+    const tbl = ctx.tbl;
+
+    // The keys the proposed rows would add: for VALUES (1, 5), (2, 6)
+    // ON CONFLICT (id) the predicate id = 1 OR id = 2, each key noted
+    // under its change.
+    const pred = collisionPred(arloc, uniques, changes, oc.action) catch |err|
+        switch (err) {
+            error.OutOfMemory => return err,
+            error.RowTwice => return replyRowTwice(state),
+        } orelse return true;
+
+    // DO UPDATE SET n = 7 WHERE t.n < 10: the WHERE, bound once, before
+    // any lock.
+    var where: ?*const Pred = null;
+    if (oc.action == .update) if (oc.action.update.where) |cond| {
+        where = (try _pred.bind(state, arloc, tbl, cond, self.params)) orelse
+            return false;
+    };
+
+    // The stored rows that hold one of those keys, read from the
+    // unique indexes and locked.
+    var plan = try _plan.plan(arloc, tbl, pred, .{ .read_ts = ctx.tx.read_ts });
+    defer plan.deinit();
+
+    const batch = try self.batch();
+    const gather = &plan.root.materialize;
+    const hits = gather.gatherAndLockRows(ctx, batch) catch |err| {
+        try replyRunErr(state, "insert", table_name, err);
+        return false;
+    };
+    fiber.ctx().record("{d} colliding rows locked", .{hits.len});
+
+    // Each stored row is the pre of the change that proposed its key:
+    // stored (1, 10) → the change proposing id 1. Under ON CONFLICT
+    // (id) a key has one stored row and one proposer (collisionPred),
+    // so a DO UPDATE change gets one pre; under a bare ON CONFLICT a
+    // change may collide on several indexes, and DO NOTHING drops it.
+    for (hits) |item| for (uniques) |unique| {
+        const cell = tbl.parseCol(item, unique.idx.column);
+        for (try unique.idx.keys(arloc, cell)) |key| {
+            const ci = unique.change_by_key.get(key) orelse continue;
+            changes[ci].pre = item;
+        }
+    };
+
+    // The action, per collided change. DO NOTHING drops it; DO UPDATE
+    // SET n = 7 WHERE t.n < 10 drops it when the stored row fails the
+    // WHERE. Else the change updates the stored row: SET bound per
+    // change, since EXCLUDED is that change's proposed row ((1, 5) for
+    // VALUES (1, 5)), and evaluated against the stored row.
+    var row: _value.Row = .{};
+    for (changes) |*change| {
+        const item = change.pre orelse continue;
+        const keep = switch (oc.action) {
+            .nothing => false,
+            .update => if (where) |cond| cond.matches(tbl, item) else true,
+        };
+        if (!keep) {
+            change.* = .{};
+            continue;
+        }
+        const up = oc.action.update;
+        const sets = (try bindSets(
+            self,
+            state,
+            arloc,
+            tbl,
+            up.sets,
+            change.post,
+        )) orelse return false;
+        change.post = (try evalSets(
+            state,
+            arloc,
+            tbl,
+            table_name,
+            item,
+            sets,
+            &row,
+        )) orelse return false;
+    }
+    return true;
+}
+
+/// One `col = cell` leaf per (change, unique index) with a non-NULL
+/// cell — NULL never collides (NULLS DISTINCT) — ORed into one
+/// predicate, and each key noted under its change in the index's map;
+/// null when no change has a key to collide on. For
+///   INSERT INTO t VALUES (1, 5), (1, 6) ON CONFLICT (id) ...
+/// id 1 is change 0's: DO NOTHING drops change 1 (Postgres skips the
+/// second of a pair), DO UPDATE is RowTwice (21000).
+fn collisionPred(
+    arloc: std.mem.Allocator,
+    uniques: []Unique,
+    changes: []Change,
+    action: _parse.OnConflict.Action,
+) error{ OutOfMemory, RowTwice }!?*const Pred {
+    var leaves: std.ArrayList(Pred) = .empty;
+    for (changes, 0..) |*change, ci| for (uniques) |*unique| {
+        const cells = change.post orelse continue;
+        const cell = cells[unique.idx.column.pos];
+        for (try unique.idx.keys(arloc, cell)) |key| {
+            const slot = try unique.change_by_key.getOrPut(arloc, key);
+            if (slot.found_existing) switch (action) {
+                .nothing => {
+                    change.* = .{};
+                    continue;
+                },
+                .update => return error.RowTwice,
+            };
+            slot.value_ptr.* = ci;
+            try leaves.append(arloc, .{
+                .cmp = .{ .col = unique.idx.column, .val = cell },
+            });
+        }
+    };
+    if (leaves.items.len == 0) return null;
+
+    const root = try arloc.create(Pred);
+    root.* = if (leaves.items.len == 1)
+        leaves.items[0]
+    else
+        .{ .or_ = leaves.items };
+    return root;
+}
+
+/// 21000: INSERT INTO t VALUES (1, 5), (1, 6) ON CONFLICT (id) DO
+/// UPDATE ... would update the row with id 1 twice.
+fn replyRowTwice(state: *pgwire.ConnState) !bool {
+    try replyErrorCode(
+        state,
+        pgwire.sqlstate.cardinality_violation,
+        "ON CONFLICT DO UPDATE command cannot affect row a second time",
+    );
+    return false;
 }
 
 /// One SET clause, bound: the expression and its target column. Parse
@@ -487,13 +739,19 @@ const Set = struct {
     col: *const _table.Column,
 };
 
-/// Bind a SET list against `tbl`. null = replied.
+/// Bind a SET list against `tbl`. `excluded` is the proposed row,
+/// every column in Column.pos order, that EXCLUDED.col reads in
+///   INSERT INTO t (id, n) VALUES (1, 5)
+///     ON CONFLICT (id) DO UPDATE SET n = t.n + EXCLUDED.n
+/// (EXCLUDED.n is 5, a constant once bound); null for an UPDATE,
+/// which has no proposed row. null = replied.
 fn bindSets(
     self: *Handler,
     state: *pgwire.ConnState,
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
     clauses: []const _parse.SetClause,
+    excluded: ?[]const _value.Value,
 ) !?[]Set {
     const sets = try arloc.alloc(Set, clauses.len);
     for (clauses, sets) |clause, *set| {
@@ -516,6 +774,7 @@ fn bindSets(
             col,
             clause.value,
             self.params,
+            excluded,
         )) orelse return null;
         set.* = .{ .node = node, .col = col };
     }
@@ -524,14 +783,15 @@ fn bindSets(
 
 /// The post of one row under `sets`: the pre-image `item` decoded,
 /// each SET evaluated against the pre-image (so `SET a = b, b = a`
-/// swaps) and laid over its cell. `row` is the decode scratch, reused
-/// across a statement's rows; the cells are copied out of it and
-/// borrow the item's value, which the arena keeps alive. null =
-/// replied (an eval error).
+/// swaps) and laid over its cell; NULL into a NOT NULL column is
+/// 23502. `row` is the decode scratch, reused across a statement's
+/// rows; the cells are copied out of it and borrow the item's value,
+/// which the arena keeps alive. null = replied.
 fn evalSets(
     state: *pgwire.ConnState,
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
+    table_name: String,
     item: zdb.kv.Item,
     sets: []const Set,
     row: *_value.Row,
@@ -543,21 +803,25 @@ fn evalSets(
             try replyEvalErr(state, arloc, err, col);
             return null;
         };
+        if (val == .null_value and col.not_null) {
+            try replyNullViolation(state, arloc, table_name, col);
+            return null;
+        }
         row.set(col.pos, val);
     }
     return try arloc.dupe(_value.Value, row.cells());
 }
 
-/// Describe's answer for a SELECT: the RowDescription `select` would
-/// send. The Table comes from the database's cache under the cache's
-/// shared lock: forgetTable destroys an entry only under the
-/// exclusive one, so the Table lives for as long as the hold, and no
-/// table lock or txn is needed — which matters, since every
-/// prepared SELECT sends a Describe. The names are copied out before
-/// the hold ends and the reply goes out after it: nothing may write
-/// to the socket under the cache lock. A miss (the first touch of
-/// the table in this process) loads the schema the way a statement
-/// does, under the table lock (describeSelectLoad).
+/// Describe of a prepared `SELECT id, n FROM t`, before any Execute:
+/// the RowDescription `select` would send. The Table comes from the
+/// database's cache under the cache's shared lock: forgetTable
+/// destroys an entry only under the exclusive one, so the Table lives
+/// for as long as the hold, and no table lock or txn is needed — which
+/// matters, since every prepared SELECT sends a Describe. The names
+/// are copied out before the hold ends and the reply goes out after
+/// it: nothing may write to the socket under the cache lock. A miss
+/// (the first touch of the table in this process) loads the schema the
+/// way a statement does, under the table lock (describeSelectLoad).
 pub fn describeSelect(
     self: *Handler,
     state: *pgwire.ConnState,
@@ -801,19 +1065,17 @@ pub const RowEmitter = struct {
 /// wrote. Called right after openTable, before any planning or row
 /// work, so a Restart discards nothing. A no-op for an implicit txn
 /// (its read_ts is the applied ts at newTxn) and for any txn that
-/// began after the build; an index still building is skipped — the
-/// writer neither maintains nor probes it, and its build merges the
-/// rows written meanwhile (index_ddl.zig). Readers never bump: the
-/// planner scans instead of using an index newer than the snapshot.
-/// Returns false when an error was replied (Conflict → 40001); a
-/// Restart propagates to the statement driver.
+/// began after the build. Readers never bump: the planner scans
+/// instead of using an index newer than the snapshot. Returns false
+/// when an error was replied (Conflict → 40001); a Restart propagates
+/// to the statement driver.
 fn bumpToIndexes(
     state: *pgwire.ConnState,
+    arloc: std.mem.Allocator,
     tx: *_txn.Txn,
     tbl: *const _table.Table,
 ) !bool {
-    for (tbl.indexes) |*idx| {
-        if (!idx.unique or idx.isBuilding()) continue;
+    for (try tbl.uniqueIndexes(arloc, null)) |idx| {
         tx.bumpTo(idx.valid_ts) catch |err| {
             try replyLockErr(state, err);
             return false;
@@ -1034,12 +1296,13 @@ fn sortAndLockIndexKeys(
 /// after the probe, which reads the pending skiplist and must not
 /// find this statement's own entry there; the probes go out in one
 /// batch per index table. `changes[ik.row].egid` is each entry's row
-/// id. false = replied.
+/// id; `uniques` goes to the probe. false = replied.
 fn applyIndexKeys(
     state: *pgwire.ConnState,
     tx: *_txn.Txn,
     keys: []const IndexKey,
     changes: []const Change,
+    uniques: []const Unique,
 ) !bool {
     for (keys) |ik| {
         if (ik.idx.unique) {
@@ -1074,7 +1337,8 @@ fn applyIndexKeys(
         try tx.put(table_id, first.key, &ekey, .{});
     }
 
-    if (!try probeUnique(state, tx, probes.items)) return false;
+    if (!try probeUnique(state, tx, probes.items, changes, uniques))
+        return false;
     fiber.ctx().record("{d} unique keys probed", .{probes.items.len});
     for (probes.items) |ik| {
         const ekey = _key.encodeEgid(changes[ik.row].egid);
@@ -1113,14 +1377,20 @@ fn groupOps(
 /// Whether every probed unique key is free: one batch read per index
 /// table over `probes`, entries in sorted order. Post-lock, read_ts
 /// covers each key's newest commit, so a live entry means the value
-/// exists. Only a unique index table may be read this way: a
-/// non-unique one's pending posting ops sit in `writes` keyed with
-/// timestamp = egid. false = replied (23505, or an internal read
-/// failure).
+/// exists: 23505 — unless the key is a new row's under an index ON
+/// CONFLICT resolved against (`uniques`): INSERT INTO t VALUES (1, 5)
+/// ON CONFLICT (id) DO NOTHING found no id 1 at the gather and another
+/// transaction committed one before the key lock; nothing is written
+/// yet, and the statement restarts to gather it. Only a unique index table may
+/// be read this way: a non-unique one's pending posting ops sit in
+/// `writes` keyed with timestamp = egid. false = replied (23505, or an
+/// internal read failure).
 fn probeUnique(
     state: *pgwire.ConnState,
     tx: *_txn.Txn,
     probes: []const IndexKey,
+    changes: []const Change,
+    uniques: []const Unique,
 ) !bool {
     var names: std.ArrayList(String) = .empty;
     defer names.deinit(tx.allocator);
@@ -1132,6 +1402,7 @@ fn probeUnique(
         const index_table_id = probes[i].idx.index_table_id;
         utils.clearRetainCap(&names);
 
+        const start = i;
         while (i < probes.len and
             probes[i].idx.index_table_id == index_table_id) : (i += 1)
         {
@@ -1146,11 +1417,21 @@ fn probeUnique(
             return false;
         };
         defer res.deinit();
-        for (names.items) |key| {
-            if (res.item(key) != null) return replyUniqueViolation(state);
+
+        for (probes[start..i], names.items) |ik, key| {
+            if (res.item(key) == null) continue;
+            if (changes[ik.row].pre == null and isUnique(uniques, ik.idx))
+                return error.Restart;
+            return replyUniqueViolation(state);
         }
     }
     return true;
+}
+
+/// Whether `idx` is one the ON CONFLICT resolved against.
+fn isUnique(uniques: []const Unique, idx: *const _table.Index) bool {
+    for (uniques) |unique| if (unique.idx == idx) return true;
+    return false;
 }
 
 /// Reply 23505; false, for the `!bool` helpers' "replied" convention.

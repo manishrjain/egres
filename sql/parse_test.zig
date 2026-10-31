@@ -402,7 +402,7 @@ test "sql.parse: INSERT rejections carry a reason" {
     defer arena.deinit();
     const alloc = arena.allocator();
     const cases = [_]struct { sql: String, needle: String }{
-        .{ .sql = "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING;", .needle = "ON CONFLICT" },
+        .{ .sql = "INSERT INTO t VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 1 RETURNING id;", .needle = "RETURNING" },
         .{ .sql = "INSERT INTO t VALUES (1) RETURNING id;", .needle = "RETURNING" },
         .{ .sql = "INSERT INTO t SELECT * FROM u;", .needle = "VALUES" },
     };
@@ -1182,4 +1182,83 @@ test "sql.parse: savepoint statements carry their name" {
     try testing.expectEqual(@as(u16, 0), rb2.paramCount());
     const prepared = try parse.statement(alloc, "PREPARE TRANSACTION 'x';");
     try testing.expect(prepared == .invalid);
+}
+
+test "sql.parse: INSERT ... ON CONFLICT names the column and the action" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const nothing = try parse.statement(
+        alloc,
+        "INSERT INTO t (id, v) VALUES (1, 'a') ON CONFLICT (id) DO NOTHING;",
+    );
+    const n = nothing.insert.on_conflict.?;
+    try testing.expectEqualStrings("id", n.column.?);
+    try testing.expect(n.action == .nothing);
+    const any = try parse.statement(
+        alloc,
+        "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING;",
+    );
+    try testing.expect(any.insert.on_conflict.?.column == null);
+
+    // The upstream Jepsen upsert: an alias, EXCLUDED, a WHERE on the
+    // existing row, parameters in every position.
+    const up = try parse.statement(
+        alloc,
+        "INSERT INTO t AS x (id, sk, val) VALUES ($1, $2, $3) " ++
+            "ON CONFLICT (id) DO UPDATE SET val = CONCAT(x.val, ',', " ++
+            "EXCLUDED.val), sk = EXCLUDED.sk WHERE x.sk = $4;",
+    );
+    const u = up.insert.on_conflict.?;
+    try testing.expectEqualStrings("id", u.column.?);
+    const sets = u.action.update.sets;
+    try testing.expectEqual(@as(usize, 2), sets.len);
+    try testing.expectEqualStrings("val", sets[0].column);
+    const call = sets[0].value.call;
+    try testing.expectEqualStrings("val", call.args[0].column);
+    try testing.expectEqualStrings("val", call.args[2].excluded);
+    try testing.expectEqualStrings("sk", sets[1].value.excluded);
+    const where = u.action.update.where.?.cmp;
+    try testing.expectEqualStrings("sk", where.column);
+    try testing.expectEqual(@as(u16, 4), where.literal.param);
+    try testing.expectEqual(@as(u16, 4), up.insert.param_count);
+
+    const cases = [_]struct { sql: String, needle: String }{
+        .{
+            .sql = "INSERT INTO t VALUES (1) ON CONFLICT ON CONSTRAINT t_pkey DO NOTHING;",
+            .needle = "ON CONSTRAINT",
+        },
+        .{
+            .sql = "INSERT INTO t VALUES (1) ON CONFLICT (a, b) DO NOTHING;",
+            .needle = "one column",
+        },
+        .{
+            .sql = "INSERT INTO t VALUES (1) ON CONFLICT (lower(a)) DO NOTHING;",
+            .needle = "not an expression",
+        },
+        .{
+            .sql = "INSERT INTO t VALUES (1) ON CONFLICT (a) WHERE a > 0 DO NOTHING;",
+            .needle = "WHERE on the ON CONFLICT target",
+        },
+        .{
+            .sql = "INSERT INTO t VALUES (1) ON CONFLICT DO UPDATE SET a = 1;",
+            .needle = "requires a conflict target",
+        },
+        .{
+            .sql = "INSERT INTO t VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 1 " ++
+                "WHERE EXCLUDED.a = 1;",
+            .needle = "EXCLUDED is not supported in a WHERE",
+        },
+        .{
+            .sql = "INSERT INTO t VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 1, a = 2;",
+            .needle = "duplicate",
+        },
+    };
+    for (cases) |case| {
+        const stmt = try parse.statement(alloc, case.sql);
+        try testing.expect(stmt == .invalid);
+        try testing.expect(std.mem.indexOf(u8, stmt.invalid, case.needle) != null);
+    }
 }

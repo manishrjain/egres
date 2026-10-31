@@ -55,7 +55,8 @@ The default SQL port is `3210`. The database `egres` exists from the first boot,
 | `ALTER TABLE`, `ALTER INDEX`, `ALTER DATABASE` | Not&nbsp;yet | |
 | `TRUNCATE` | Not&nbsp;yet | |
 | `INSERT ... VALUES` | Yes | Multi-row `VALUES` and an explicit column list. |
-| `INSERT ... SELECT`, `DEFAULT VALUES`, `DEFAULT` as a value, `ON CONFLICT`, `RETURNING` | Not&nbsp;yet | |
+| `INSERT ... ON CONFLICT (column) DO NOTHING \| DO UPDATE SET ... [WHERE ...]` | Yes | The column must carry a `PRIMARY KEY` or `UNIQUE` constraint. `DO NOTHING` without a target takes any unique constraint. The `SET` values may name the existing row's columns (through the table name or its `AS` alias) and `EXCLUDED.column`, the proposed row's; the `WHERE` reads the existing row and skips it when false. The tag counts updated rows with inserted ones. Not yet: `ON CONSTRAINT`, a partial-index `WHERE` on the target, `EXCLUDED` in the `WHERE`. |
+| `INSERT ... SELECT`, `DEFAULT VALUES`, `DEFAULT` as a value, `RETURNING` | Not&nbsp;yet | |
 | `SELECT` | Partial | See [Queries](#queries). |
 | `UPDATE ... SET ... [WHERE]` | Yes | `SET` takes a literal, a parameter, a column, `CONCAT(...)`, `COALESCE(...)`, or `+ - * / % \|\|` over them. `CONCAT` skips NULL arguments and renders numbers as text. |
 | `UPDATE ... FROM`, `RETURNING`, `WITH` | Not&nbsp;yet | |

@@ -135,8 +135,30 @@ pub const Insert = struct {
     table: String, // borrowed
     columns: ?[]String, // borrowed target columns; null = positional (all columns)
     rows: [][]Literal, // borrowed rows of literals
+    on_conflict: ?OnConflict = null,
     /// How many `$n` values Bind must supply: the highest index used.
     param_count: u16 = 0,
+};
+
+/// INSERT ... ON CONFLICT: the column whose unique index a row may
+/// collide on, and what it does then instead of inserting.
+pub const OnConflict = struct {
+    /// The conflict target's column; null when none was named, which
+    /// DO NOTHING takes as any unique constraint.
+    column: ?String, // borrowed
+    action: Action,
+
+    pub const Action = union(enum) {
+        nothing,
+        update: DoUpdate,
+    };
+    /// DO UPDATE SET ... [WHERE ...]: the SET values may name the
+    /// existing row's columns and `EXCLUDED.column`, the proposed
+    /// row's; the WHERE, on the existing row, decides update or skip.
+    pub const DoUpdate = struct {
+        sets: []SetClause, // borrowed
+        where: ?Where,
+    };
 };
 
 /// What a SELECT projects: `*` (all live columns), a named list (which
@@ -267,6 +289,9 @@ pub const Delete = struct {
 pub const Expr = union(enum) {
     literal: Literal,
     column: String, // borrowed
+    /// `EXCLUDED.column` in ON CONFLICT DO UPDATE: the row the INSERT
+    /// proposed (borrowed name).
+    excluded: String,
     binop: BinOp,
     call: Call,
 
@@ -704,7 +729,6 @@ fn parseInsert(
     alloc: std.mem.Allocator,
     is: *const c.InsertStmt,
 ) parser.ParseError!Stmt {
-    if (is.onConflictClause != null) return invalid("ON CONFLICT is not supported");
     if (parser.items(is.returningList).len > 0)
         return invalid("RETURNING is not supported");
     // VALUES rows nest under a SelectStmt with `valuesLists`; an
@@ -728,6 +752,17 @@ fn parseInsert(
     }
 
     var params = ParamTally{};
+    var on_conflict: ?OnConflict = null;
+    if (is.onConflictClause != null) {
+        on_conflict = switch (try parseOnConflict(
+            alloc,
+            &params,
+            is.onConflictClause,
+        )) {
+            .clause => |x| x,
+            .stmt => |rejected| return rejected,
+        };
+    }
     const rows = try alloc.alloc([]Literal, value_lists.len);
     for (value_lists, rows) |lcell, *row| {
         const list = parser.cast(c.List, lcell.ptr_value) orelse
@@ -749,7 +784,66 @@ fn parseInsert(
         .table = try relname(alloc, is.relation),
         .columns = columns,
         .rows = rows,
+        .on_conflict = on_conflict,
         .param_count = params.count,
+    } };
+}
+
+const ParsedOnConflict = union(enum) {
+    clause: OnConflict,
+    stmt: Stmt, // the rejection to return
+};
+
+/// ON CONFLICT [(column)] DO NOTHING | DO UPDATE SET ... [WHERE ...].
+/// A constraint by name, a partial-index WHERE on the target, more
+/// than one column or an expression carry a reason.
+fn parseOnConflict(
+    alloc: std.mem.Allocator,
+    params: *ParamTally,
+    oc: *const c.OnConflictClause,
+) parser.ParseError!ParsedOnConflict {
+    var column: ?String = null;
+    if (oc.infer != null) {
+        const infer: *const c.InferClause = oc.infer;
+        if (infer.conname != null)
+            return .{ .stmt = invalid("ON CONFLICT ON CONSTRAINT is not supported") };
+        if (infer.whereClause != null)
+            return .{ .stmt = invalid("a WHERE on the ON CONFLICT target is not supported") };
+        const elems = parser.items(infer.indexElems);
+        if (elems.len != 1)
+            return .{ .stmt = invalid("ON CONFLICT takes one column") };
+        const elem = parser.cast(c.IndexElem, elems[0].ptr_value) orelse
+            return .{ .stmt = .unsupported };
+        if (elem.name == null)
+            return .{ .stmt = invalid("ON CONFLICT takes a column, not an expression") };
+        column = try dup(alloc, elem.name);
+    }
+    switch (oc.action) {
+        c.ONCONFLICT_NOTHING => return .{ .clause = .{
+            .column = column,
+            .action = .nothing,
+        } },
+        c.ONCONFLICT_UPDATE => {},
+        else => return .{ .stmt = invalid("unsupported ON CONFLICT action") },
+    }
+    if (column == null)
+        return .{ .stmt = invalid("ON CONFLICT DO UPDATE requires a conflict target") };
+    const sets = switch (try parseSets(alloc, params, oc.targetList)) {
+        .sets => |s| s,
+        .stmt => |rejected| return .{ .stmt = rejected },
+    };
+    var where: ?Where = null;
+    if (oc.whereClause != null) switch (try parseWhere(
+        alloc,
+        params,
+        parser.asNode(oc.whereClause),
+    )) {
+        .where => |x| where = x,
+        .invalid => |msg| return .{ .stmt = .{ .invalid = msg } },
+    };
+    return .{ .clause = .{
+        .column = column,
+        .action = .{ .update = .{ .sets = sets, .where = where } },
     } };
 }
 
@@ -896,6 +990,17 @@ fn columnOf(alloc: std.mem.Allocator, p: anytype) parser.ParseError!?String {
     return lastName(alloc, cr.fields);
 }
 
+/// Whether `p` is `EXCLUDED.column`: a two-part column reference
+/// whose qualifier is that keyword (lowercased by the grammar). Any
+/// other qualifier, the table or its alias, is dropped by columnOf.
+fn isExcludedRef(p: anytype) bool {
+    const cr = parser.cast(c.ColumnRef, p) orelse return false;
+    if (parser.items(cr.fields).len != 2) return false;
+    const s = parser.cast(c.String, parser.nodeAt(cr.fields, 0)) orelse
+        return false;
+    return std.mem.eql(u8, parser.str(s.sval), "excluded");
+}
+
 /// The operator an A_Expr applies: the last part of its name, when it
 /// is a plain `AEXPR_OP` with one.
 fn operatorOf(ae: *const c.A_Expr) ?String {
@@ -959,6 +1064,9 @@ fn parseWhere(
 
     const ae = parser.cast(c.A_Expr, p) orelse
         return ParsedWhere.reject("unsupported WHERE clause");
+    // columnOf would read `excluded.x` as the row's own x.
+    if (isExcludedRef(ae.lexpr) or isExcludedRef(ae.rexpr))
+        return ParsedWhere.reject("EXCLUDED is not supported in a WHERE");
     var op = CmpOp.fromName(operatorOf(ae) orelse "") orelse
         return ParsedWhere.reject(
             "only = <> < <= > >= comparisons are supported in WHERE",
@@ -1045,7 +1153,12 @@ fn parseExpr(
             return .{ .invalid = try badParamMsg(arloc, pr.number) };
         return .{ .expr = .{ .literal = lit } };
     }
-    if (parser.cast(c.ColumnRef, p) != null) {
+    if (parser.cast(c.ColumnRef, p)) |cr| {
+        if (isExcludedRef(p)) {
+            const name = try lastName(arloc, cr.fields) orelse
+                return ParsedExpr.reject("unsupported column reference in SET");
+            return .{ .expr = .{ .excluded = name } };
+        }
         const column = try columnOf(arloc, p) orelse
             return ParsedExpr.reject("unsupported column reference in SET");
         return .{ .expr = .{ .column = column } };
@@ -1411,28 +1524,47 @@ fn parseUpdate(
         .invalid => |msg| return .{ .invalid = msg },
     };
 
-    var sets: std.ArrayList(SetClause) = .empty;
-    for (targets) |cell| {
-        const rt = parser.cast(c.ResTarget, cell.ptr_value) orelse
-            return .unsupported;
-        if (rt.name == null) return .unsupported;
-        const column = try dup(alloc, rt.name);
-        for (sets.items) |s| {
-            if (std.mem.eql(u8, s.column, column))
-                return invalid("duplicate column in SET");
-        }
-        const val = parser.asNode(rt.val);
-        const value = switch (try parseExpr(alloc, &params, val)) {
-            .expr => |e| e,
-            .invalid => |msg| return .{ .invalid = msg },
-        };
-        try sets.append(alloc, .{ .column = column, .value = value });
-    }
+    const sets = switch (try parseSets(alloc, &params, us.targetList)) {
+        .sets => |s| s,
+        .stmt => |rejected| return rejected,
+    };
 
     return .{ .update = .{
         .table = try relname(alloc, us.relation),
-        .sets = try sets.toOwnedSlice(alloc),
+        .sets = sets,
         .where = where,
         .param_count = params.count,
     } };
+}
+
+const ParsedSets = union(enum) {
+    sets: []SetClause,
+    stmt: Stmt, // the rejection to return
+};
+
+/// The SET list of an UPDATE or an ON CONFLICT DO UPDATE: `column =
+/// expr` each, no column twice.
+fn parseSets(
+    alloc: std.mem.Allocator,
+    params: *ParamTally,
+    list: [*c]c.List,
+) parser.ParseError!ParsedSets {
+    var sets: std.ArrayList(SetClause) = .empty;
+    for (parser.items(list)) |cell| {
+        const rt = parser.cast(c.ResTarget, cell.ptr_value) orelse
+            return .{ .stmt = .unsupported };
+        if (rt.name == null) return .{ .stmt = .unsupported };
+        const column = try dup(alloc, rt.name);
+        for (sets.items) |s| {
+            if (std.mem.eql(u8, s.column, column))
+                return .{ .stmt = invalid("duplicate column in SET") };
+        }
+        const val = parser.asNode(rt.val);
+        const value = switch (try parseExpr(alloc, params, val)) {
+            .expr => |e| e,
+            .invalid => |msg| return .{ .stmt = .{ .invalid = msg } },
+        };
+        try sets.append(alloc, .{ .column = column, .value = value });
+    }
+    return .{ .sets = try sets.toOwnedSlice(alloc) };
 }

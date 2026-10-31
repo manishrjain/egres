@@ -92,6 +92,25 @@ const Fixture = struct {
         assignment: String,
         params: sql.parse.Params,
     ) expr.BindError!Set {
+        return self.bindFull(assignment, params, null);
+    }
+
+    /// `bind` for an ON CONFLICT DO UPDATE: `excluded` is the proposed
+    /// row, one cell per column.
+    fn bindExcluded(
+        self: *const Fixture,
+        assignment: String,
+        excluded: []const Value,
+    ) expr.BindError!Set {
+        return self.bindFull(assignment, .{}, excluded);
+    }
+
+    fn bindFull(
+        self: *const Fixture,
+        assignment: String,
+        params: sql.parse.Params,
+        excluded: ?[]const Value,
+    ) expr.BindError!Set {
         const text = try std.fmt.allocPrint(
             self.arloc,
             "UPDATE t SET {s};",
@@ -109,6 +128,7 @@ const Fixture = struct {
             clause.value,
             target,
             params,
+            excluded,
         );
         return .{ .target = target, .root = root };
     }
@@ -351,4 +371,45 @@ test "sql.expr: CONCAT renders and skips NULL, COALESCE takes the first value" {
     try testing.expectError(error.NoSuchOperator, fx.bind("b = COALESCE(b, a)"));
     try testing.expectError(error.TypeMismatch, fx.bind("a = CONCAT(a, b)"));
     try testing.expectError(error.TypeMismatch, fx.bind("a = COALESCE(c, 1)"));
+}
+
+test "sql.expr: EXCLUDED.column is the proposed row's cell, absent in a plain UPDATE" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const arloc = arena.allocator();
+    var fx = try Fixture.init(arloc);
+    defer fx.tbl.deinit();
+    const row = try sampleRow(&fx);
+    // The proposed row: a = 9, b = "new", the rest NULL.
+    const proposed = [_]Value{
+        .{ .int4 = 9 }, .{ .text = "new" }, .null_value,
+        .null_value,    .null_value,        .null_value,
+    };
+
+    const concat = try fx.bindExcluded("b = CONCAT(b, ',', EXCLUDED.b)", &proposed);
+    try testing.expectEqualStrings(
+        "ab,new",
+        (try concat.root.eval(arloc, &fx.tbl, row, concat.target)).text,
+    );
+    const copy = try fx.bindExcluded("a = EXCLUDED.a", &proposed);
+    try testing.expectEqual(
+        Value{ .int4 = 9 },
+        try copy.root.eval(arloc, &fx.tbl, row, copy.target),
+    );
+    const sum = try fx.bindExcluded("a = a + EXCLUDED.a", &proposed);
+    try testing.expectEqual(
+        Value{ .int4 = 14 },
+        try sum.root.eval(arloc, &fx.tbl, row, sum.target),
+    );
+    // A NULL proposed cell is NULL; the type check still applies.
+    const nul = try fx.bindExcluded("c = EXCLUDED.c", &proposed);
+    try testing.expectEqual(
+        Value.null_value,
+        try nul.root.eval(arloc, &fx.tbl, row, nul.target),
+    );
+    try testing.expectError(error.TypeMismatch, fx.bindExcluded("a = EXCLUDED.b", &proposed));
+    try testing.expectError(error.UndefinedColumn, fx.bindExcluded("a = EXCLUDED.zz", &proposed));
+    // Without a proposed row there is no EXCLUDED.
+    try testing.expectError(error.UndefinedColumn, fx.bind("a = EXCLUDED.a"));
 }

@@ -211,6 +211,23 @@ pub const Table = struct {
         return null;
     }
 
+    /// The built unique indexes, on `col` when given: the ones a writer
+    /// probes and an ON CONFLICT can collide on. A building index is
+    /// left out — nothing reads it yet (index_ddl.zig).
+    pub fn uniqueIndexes(
+        self: *const Table,
+        arloc: std.mem.Allocator,
+        col: ?*const Column,
+    ) ![]const *const Index {
+        var list: std.ArrayList(*const Index) = .empty;
+        for (self.indexes) |*idx| {
+            if (!idx.unique or idx.isBuilding()) continue;
+            if (col) |want| if (idx.column != want) continue;
+            try list.append(arloc, idx);
+        }
+        return list.items;
+    }
+
     /// One column's value out of a stored row: the egid from the key,
     /// any other cell by a null-bit test plus one O(1) read
     /// (row.parseCol) — no full-row decode.

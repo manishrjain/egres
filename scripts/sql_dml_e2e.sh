@@ -457,6 +457,68 @@ expect "unique index range: 1 < id AND id <= 2" "2" \
 expect "unique index range: none above" "0" v "SELECT count(*) FROM nn WHERE id > 5;"
 q "DROP TABLE nn;" >/dev/null
 
+# --- ON CONFLICT: DO NOTHING, DO UPDATE with EXCLUDED and a WHERE -----------
+q "CREATE TABLE oc (id int4 PRIMARY KEY, sk int4, val text);" >/dev/null
+q "CREATE INDEX oc_sk ON oc (sk);" >/dev/null
+expect "ON CONFLICT: a new row inserts" "INSERT 0 1" \
+    q "INSERT INTO oc VALUES (1, 1, 'a') ON CONFLICT (id) DO NOTHING;"
+expect "ON CONFLICT DO NOTHING: the duplicate is skipped" "INSERT 0 0" \
+    q "INSERT INTO oc VALUES (1, 1, 'dup') ON CONFLICT (id) DO NOTHING;"
+expect "ON CONFLICT DO NOTHING: the row kept its value" "a" \
+    v "SELECT val FROM oc WHERE id = 1;"
+expect "ON CONFLICT DO UPDATE: the upstream append" "INSERT 0 1" \
+    q "INSERT INTO oc AS t (id, sk, val) VALUES (1, 1, 'x')
+       ON CONFLICT (id) DO UPDATE SET val = CONCAT(t.val, ',', EXCLUDED.val)
+       WHERE t.id = 1;"
+expect "ON CONFLICT DO UPDATE: appended" "a,x" v "SELECT val FROM oc WHERE id = 1;"
+expect "ON CONFLICT DO UPDATE: a false WHERE skips" "INSERT 0 0" \
+    q "INSERT INTO oc AS t VALUES (1, 1, 'no')
+       ON CONFLICT (id) DO UPDATE SET val = 'no' WHERE t.sk = 99;"
+expect "ON CONFLICT DO UPDATE: skipped row unchanged" "a,x" \
+    v "SELECT val FROM oc WHERE id = 1;"
+expect "ON CONFLICT: one statement, one update and one insert" "INSERT 0 2" \
+    q "INSERT INTO oc VALUES (1, 1, 'y'), (2, 2, 'b')
+       ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val;"
+expect "ON CONFLICT: the update took EXCLUDED" "y" v "SELECT val FROM oc WHERE id = 1;"
+expect "ON CONFLICT: the insert landed" "b" v "SELECT val FROM oc WHERE id = 2;"
+expect "ON CONFLICT DO UPDATE moves an index entry" "INSERT 0 1" \
+    q "INSERT INTO oc VALUES (1, 5, 'z') ON CONFLICT (id) DO UPDATE SET sk = EXCLUDED.sk;"
+expect "ON CONFLICT: new index key finds the row" "1" v "SELECT id FROM oc WHERE sk = 5;"
+expect "ON CONFLICT: old index key is gone" "(0 rows)" q "SELECT id FROM oc WHERE sk = 1;"
+expect "ON CONFLICT DO NOTHING without a target" "INSERT 0 0" \
+    q "INSERT INTO oc VALUES (2, 9, 'dup') ON CONFLICT DO NOTHING;"
+expect "ON CONFLICT: still two rows" "2" v "SELECT count(*) FROM oc;"
+expect "ON CONFLICT: inside a block, pending-aware" "COMMIT" tx "BEGIN;
+INSERT INTO oc VALUES (3, 3, 'c');
+INSERT INTO oc VALUES (3, 3, 'cc') ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val;
+COMMIT;"
+expect "ON CONFLICT: the block's own insert was updated" "cc" \
+    v "SELECT val FROM oc WHERE id = 3;"
+expect "ON CONFLICT: parameters in simple mode (cast literals)" "INSERT 0 1" \
+    q "INSERT INTO oc VALUES ('3'::int4, '7'::int4, 'p'::text)
+       ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val WHERE oc.id = '3'::int4;"
+expect "ON CONFLICT: no unique constraint on the target" \
+    "no unique or exclusion constraint" \
+    q "INSERT INTO oc VALUES (4, 4, 'd') ON CONFLICT (sk) DO NOTHING;"
+expect "ON CONFLICT: the same row twice in one statement" "a second time" \
+    q "INSERT INTO oc VALUES (3, 3, 'e'), (3, 3, 'f')
+       ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val;"
+expect "ON CONFLICT DO UPDATE: a new key twice in one statement" \
+    "a second time" \
+    q "INSERT INTO oc VALUES (7, 7, 'h'), (7, 7, 'i')
+       ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val;"
+expect "ON CONFLICT DO NOTHING: a new key twice inserts the first" \
+    "INSERT 0 1" \
+    q "INSERT INTO oc VALUES (7, 7, 'h'), (7, 7, 'i')
+       ON CONFLICT (id) DO NOTHING;"
+expect "ON CONFLICT DO NOTHING: the first of the pair is the row" "h" \
+    v "SELECT val FROM oc WHERE id = 7;"
+expect "ON CONFLICT: NOT NULL still holds on the update" "not-null" \
+    q "INSERT INTO oc VALUES (3, 3, 'g') ON CONFLICT (id) DO UPDATE SET id = NULL;"
+expect "ON CONFLICT: failed statements changed nothing" "p" \
+    v "SELECT val FROM oc WHERE id = 3;"
+expect "DROP the ON CONFLICT table" "DROP TABLE" q "DROP TABLE oc;"
+
 # --- savepoints: ROLLBACK TO revives a failed block and drops its writes --
 q "CREATE TABLE sp (id int4 PRIMARY KEY, v text);" >/dev/null
 q "CREATE INDEX sp_v ON sp (v);" >/dev/null
