@@ -147,9 +147,60 @@ pub const Projection = union(enum) {
     count_star,
 };
 
-/// A single `column = literal` comparison — the equality leaf of a WHERE.
-pub const Eq = struct {
+/// The comparison a WHERE leaf applies. `=` is the one an index
+/// answers; the rest are checked row by row.
+pub const CmpOp = enum {
+    eq,
+    ne,
+    lt,
+    le,
+    gt,
+    ge,
+
+    pub fn fromName(name: String) ?CmpOp {
+        const table = .{
+            .{ "=", .eq },  .{ "<>", .ne }, .{ "!=", .ne }, .{ "<", .lt },
+            .{ "<=", .le }, .{ ">", .gt },  .{ ">=", .ge },
+        };
+        inline for (table) |entry| {
+            if (std.mem.eql(u8, name, entry[0])) return entry[1];
+        }
+        return null;
+    }
+
+    /// The same comparison with its operands swapped: `5 < a` is
+    /// `a > 5`.
+    pub fn flipped(self: CmpOp) CmpOp {
+        return switch (self) {
+            .eq => .eq,
+            .ne => .ne,
+            .lt => .gt,
+            .le => .ge,
+            .gt => .lt,
+            .ge => .le,
+        };
+    }
+
+    /// Whether `order`, of the column's cell against the value, is
+    /// what the comparison asks for.
+    pub fn holds(self: CmpOp, order: std.math.Order) bool {
+        return switch (self) {
+            .eq => order == .eq,
+            .ne => order != .eq,
+            .lt => order == .lt,
+            .le => order != .gt,
+            .gt => order == .gt,
+            .ge => order != .lt,
+        };
+    }
+};
+
+/// A single `column op literal` comparison — the leaf of a WHERE. The
+/// column is always on the left: a literal written there turns the
+/// operator around.
+pub const Cmp = struct {
     column: String, // borrowed
+    op: CmpOp = .eq,
     literal: Literal,
 };
 
@@ -158,7 +209,7 @@ pub const Eq = struct {
 /// are never shared between parents); NOT is a pointer only because a
 /// union cannot contain itself by value. Everything borrows the arena.
 pub const Where = union(enum) {
-    eq: Eq,
+    cmp: Cmp,
     is_null: NullTest,
     and_: []const Where,
     or_: []const Where,
@@ -847,11 +898,11 @@ fn operatorOf(ae: *const c.A_Expr) ?String {
     return parser.str(s.sval);
 }
 
-/// Parse a WHERE tree, shared by SELECT, DELETE, and UPDATE: `column =
-/// literal` leaves, `column IS [NOT] NULL`, and AND / OR / NOT over
-/// them. Anything else (another operator, a subquery, column-vs-column,
-/// a bare boolean column) yields a clean `.invalid` reason; only OOM
-/// propagates. AND/OR children land in one arena slice, NOT's in one
+/// Parse a WHERE tree, shared by SELECT, DELETE, and UPDATE: `column
+/// op literal` leaves (`= <> < <= > >=`, the literal on either side),
+/// `column IS [NOT] NULL`, and AND / OR / NOT over them. Anything else
+/// (another operator, a subquery, column-vs-column, a bare boolean
+/// column) yields a clean `.invalid` reason; only OOM propagates. AND/OR children land in one arena slice, NOT's in one
 /// arena cell. Postgres flattens `a AND b AND c` into one node with
 /// three args; NOT always carries exactly one.
 fn parseWhere(
@@ -899,25 +950,45 @@ fn parseWhere(
 
     const ae = parser.cast(c.A_Expr, p) orelse
         return ParsedWhere.reject("unsupported WHERE clause");
-    const op = operatorOf(ae) orelse "";
-    if (!std.mem.eql(u8, op, "="))
+    var op = CmpOp.fromName(operatorOf(ae) orelse "") orelse
         return ParsedWhere.reject(
-            "only `column = value` comparisons are supported in WHERE",
+            "only = <> < <= > >= comparisons are supported in WHERE",
         );
 
-    const column = try columnOf(alloc, ae.lexpr) orelse
-        return ParsedWhere.reject("WHERE left side must be a column");
-    if (parser.cast(c.ParamRef, ae.rexpr)) |pr| {
+    // The column goes left; a literal written there turns the operator.
+    var column = try columnOf(alloc, ae.lexpr);
+    var value_side = ae.rexpr;
+    if (column == null) {
+        column = try columnOf(alloc, ae.rexpr) orelse
+            return ParsedWhere.reject(
+                "one side of a WHERE comparison must be a column",
+            );
+        value_side = ae.lexpr;
+        op = op.flipped();
+    } else if (try columnOf(alloc, ae.rexpr) != null) {
+        return ParsedWhere.reject(
+            "a column compared with a column is not supported in WHERE",
+        );
+    }
+    if (parser.cast(c.ParamRef, value_side)) |pr| {
         const lit = params.note(pr.number) orelse
             return .{ .invalid = try badParamMsg(alloc, pr.number) };
-        return .{ .where = .{ .eq = .{ .column = column, .literal = lit } } };
+        return .{ .where = .{ .cmp = .{
+            .column = column.?,
+            .op = op,
+            .literal = lit,
+        } } };
     }
-    const ac = constant(ae.rexpr) orelse
-        return ParsedWhere.reject("WHERE right side must be a literal");
+    const ac = constant(value_side) orelse
+        return ParsedWhere.reject("a WHERE comparison needs a literal");
     const lit = try literalFrom(alloc, ac);
     if (lit == .unsupported)
-        return ParsedWhere.reject("WHERE right side must be a literal");
-    return .{ .where = .{ .eq = .{ .column = column, .literal = lit } } };
+        return ParsedWhere.reject("a WHERE comparison needs a literal");
+    return .{ .where = .{ .cmp = .{
+        .column = column.?,
+        .op = op,
+        .literal = lit,
+    } } };
 }
 
 /// A parsed SET expression or a rejection reason (borrowed).

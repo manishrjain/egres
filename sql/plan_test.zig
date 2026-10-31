@@ -162,7 +162,7 @@ test "sql.plan: one equality — unique lookup, posting lookup, or scan" {
     try expectLookup(try bitmapOf(&on_a), pkey_index_id, true, k1);
     // The residual is the whole predicate, even when the index
     // decided it.
-    try testing.expect(source(&on_a).fetch.pred.?.* == .eq);
+    try testing.expect(source(&on_a).fetch.pred.?.* == .cmp);
 
     var on_b = try fx.planFor("b = 2", stream);
     defer on_b.deinit();
@@ -171,7 +171,7 @@ test "sql.plan: one equality — unique lookup, posting lookup, or scan" {
     var on_c = try fx.planFor("c = 'x'", stream);
     defer on_c.deinit();
     try expectScan(&on_c);
-    try testing.expect(source(&on_c).seq_scan.pred.?.* == .eq);
+    try testing.expect(source(&on_c).seq_scan.pred.?.* == .cmp);
 
     var all = try sql.plan.plan(a, &fx.tbl, null, stream);
     defer all.deinit();
@@ -364,7 +364,7 @@ test "sql.plan: never is the empty set, and a scan under NOT" {
     try expectEgids(try bitmapOf(&alone), &.{});
 
     // It empties an AND and drops out of an OR, like `= NULL`.
-    const a_eq_1 = Pred{ .eq = .{ .col = fx.tbl.column("a").?, .val = .{ .int4 = 1 } } };
+    const a_eq_1 = Pred{ .cmp = .{ .col = fx.tbl.column("a").?, .val = .{ .int4 = 1 } } };
     const and_kids = [_]Pred{ a_eq_1, never };
     const and_ = Pred{ .and_ = &and_kids };
     var both = try sql.plan.plan(a, &fx.tbl, &and_, stream);
@@ -382,4 +382,69 @@ test "sql.plan: never is the empty set, and a scan under NOT" {
     var negated = try sql.plan.plan(a, &fx.tbl, &not_, stream);
     defer negated.deinit();
     try expectScan(&negated);
+}
+
+fn expectRange(
+    node: *const BitmapNode,
+    index_table_id: u32,
+    unique: bool,
+    lo: String,
+    hi: String,
+) !void {
+    try testing.expect(node.* == .index_range);
+    const r = node.index_range;
+    try testing.expectEqual(index_table_id, r.index_table_id);
+    try testing.expectEqual(unique, r.unique);
+    try testing.expectEqualSlices(u8, lo, r.lo);
+    try testing.expectEqualSlices(u8, hi, r.hi);
+}
+
+test "sql.plan: an ordered comparison on an indexed column is an index range" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    const a = fx.arena.allocator();
+    const k1 = try int4Key(a, 1);
+    const after1 = try std.mem.concat(a, u8, &.{ k1, &.{0} });
+    const from = sql.key.values_from;
+    const end = sql.key.values_end;
+
+    var gt = try fx.planFor("a > 1", stream);
+    defer gt.deinit();
+    try expectRange(try bitmapOf(&gt), pkey_index_id, true, after1, end);
+    var ge = try fx.planFor("1 <= a", stream);
+    defer ge.deinit();
+    try expectRange(try bitmapOf(&ge), pkey_index_id, true, k1, end);
+    var lt = try fx.planFor("b < 1", stream);
+    defer lt.deinit();
+    try expectRange(try bitmapOf(&lt), b_index_id, false, from, k1);
+    var le = try fx.planFor("b <= 1", stream);
+    defer le.deinit();
+    try expectRange(try bitmapOf(&le), b_index_id, false, from, after1);
+    // The residual is still the whole predicate.
+    try testing.expect(source(&le).fetch.pred.?.* == .cmp);
+
+    // Two ranges intersect; a range beside an unindexed OR term scans.
+    var both = try fx.planFor("a > 1 AND b <= 1", stream);
+    defer both.deinit();
+    const kids = (try bitmapOf(&both)).and_;
+    try testing.expectEqual(@as(usize, 2), kids.len);
+    try expectRange(&kids[0], pkey_index_id, true, after1, end);
+    try expectRange(&kids[1], b_index_id, false, from, after1);
+    var mixed = try fx.planFor("a > 1 OR c = 'x'", stream);
+    defer mixed.deinit();
+    try expectScan(&mixed);
+
+    // No index reads `<>`, an unindexed column, an egid range, or NULL.
+    var ne = try fx.planFor("a <> 1", stream);
+    defer ne.deinit();
+    try expectScan(&ne);
+    var on_c = try fx.planFor("c > 'x'", stream);
+    defer on_c.deinit();
+    try expectScan(&on_c);
+    var egid = try fx.planFor("egid > 2", stream);
+    defer egid.deinit();
+    try expectScan(&egid);
+    var null_cmp = try fx.planFor("a > NULL", stream);
+    defer null_cmp.deinit();
+    try expectEgids(try bitmapOf(&null_cmp), &.{});
 }

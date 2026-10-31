@@ -13,9 +13,11 @@ const zdb = @import("zdb");
 
 const _exec = @import("exec.zig");
 const _key = @import("key.zig");
+const _parse = @import("parse.zig");
 const _pred = @import("pred.zig");
 const _table = @import("table.zig");
 const _value = @import("value.zig");
+const String = _value.String;
 
 const BitmapNode = _exec.BitmapNode;
 const Pred = _pred.Pred;
@@ -110,11 +112,17 @@ fn bitmapFor(
     p: *const Pred,
 ) Error!?BitmapNode {
     switch (p.*) {
-        .eq => |cmp| {
+        .cmp => |cmp| {
             if (cmp.val == .null_value) return try emptySet(arloc);
-            if (cmp.col.isEgid()) return try oneEgid(arloc, cmp.val.uint8);
+            // The egid is the row key: `egid = N` is the one-id set, and
+            // a range of them is the table itself, a scan.
+            if (cmp.col.isEgid()) return if (cmp.op == .eq)
+                try oneEgid(arloc, cmp.val.uint8)
+            else
+                null;
             const idx = validIndex(tbl, cmp.col, read_ts) orelse return null;
-            return try lookup(arloc, idx, cmp.val);
+            if (cmp.op == .eq) return try lookup(arloc, idx, cmp.val);
+            return try rangeLookup(arloc, idx, cmp.op, cmp.val);
         },
         .is_null => |nt| {
             if (nt.negate) return null;
@@ -164,6 +172,39 @@ fn lookup(
         .unique = idx.unique,
     } };
     return node;
+}
+
+/// `col op v` on an index, for `< <= > >=`: the entries between two
+/// memcomparable bounds, [lo, hi). Every value key starts with the
+/// value tag and NULL's lone tag byte sorts after them all, so an open
+/// side ends at those (key.values_from / values_end); the key followed
+/// by a zero byte is the smallest key above it, which makes a bound
+/// exclusive on the left or inclusive on the right. `<>` reads nothing
+/// from an index (null), nor does a value with no encoding.
+fn rangeLookup(
+    arloc: std.mem.Allocator,
+    idx: *const _table.Index,
+    op: _parse.CmpOp,
+    val: _value.Value,
+) Error!?BitmapNode {
+    const key = _key.encodeIndexKey(arloc, val, null) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return null;
+    };
+    const after = try std.mem.concat(arloc, u8, &.{ key, &.{0} });
+    const lo: String, const hi: String = switch (op) {
+        .lt => .{ _key.values_from, key },
+        .le => .{ _key.values_from, after },
+        .gt => .{ after, _key.values_end },
+        .ge => .{ key, _key.values_end },
+        .eq, .ne => return null,
+    };
+    return .{ .index_range = .{
+        .index_table_id = idx.index_table_id,
+        .lo = lo,
+        .hi = hi,
+        .unique = idx.unique,
+    } };
 }
 
 /// `egid = N`: the one-id set. Literal sets are built here and owned

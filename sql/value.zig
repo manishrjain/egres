@@ -394,6 +394,32 @@ fn fitInt(comptime T: type, n: i128) error{IntOutOfRange}!T {
 
 /// Equality of two cells (same type expected — the caller coerces the filter
 /// literal to the column's type first). NULL equals only NULL.
+/// The order of two non-null cells of one type, as a WHERE comparison
+/// sees it: numbers numerically, text and bytea bytewise, false before
+/// true, the time types by their instant, an interval by its length
+/// with a month as 30 days. Both sides must carry the same tag, which
+/// a bound comparison guarantees (the literal was coerced to the
+/// column).
+pub fn orderValues(x: Value, y: Value) std.math.Order {
+    std.debug.assert(std.meta.activeTag(x) == std.meta.activeTag(y));
+    return switch (x) {
+        .null_value => .eq,
+        .bool_ => |b| std.math.order(@intFromBool(b), @intFromBool(y.bool_)),
+        .text => std.mem.order(u8, x.text, y.text),
+        .bytea => std.mem.order(u8, x.bytea, y.bytea),
+        .uuid => std.mem.order(u8, &x.uuid, &y.uuid),
+        .interval => std.math.order(intervalMicros(x.interval), intervalMicros(y.interval)),
+        inline else => |v, tag| std.math.order(v, @field(y, @tagName(tag))),
+    };
+}
+
+/// An interval's length in microseconds for ordering: Postgres's
+/// interval_cmp, a month 30 days and a day 24 hours.
+fn intervalMicros(i: Interval) i128 {
+    const day: i128 = 86_400_000_000;
+    return @as(i128, i.micros) + day * i.days + day * 30 * i.months;
+}
+
 pub fn valuesEqual(x: Value, y: Value) bool {
     if (std.meta.activeTag(x) != std.meta.activeTag(y)) return false;
     return switch (x) {

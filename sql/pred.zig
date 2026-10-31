@@ -23,7 +23,7 @@ const replyErrorCode = _server.replyErrorCode;
 /// and children are never shared between parents. NOT is a pointer
 /// only because a union cannot contain itself by value.
 pub const Pred = union(enum) {
-    eq: Cmp,
+    cmp: Cmp,
     is_null: NullTest,
     and_: []const Pred,
     or_: []const Pred,
@@ -34,9 +34,13 @@ pub const Pred = union(enum) {
     /// NOT Pred, then it would always be true.
     never,
 
-    /// `col = val`, `val` already coerced to `col.ty` (for the egid
+    /// `col op val`, `val` already coerced to `col.ty` (for the egid
     /// pseudo-column: a positive uint8, or NULL).
-    pub const Cmp = struct { col: *const _table.Column, val: _value.Value };
+    pub const Cmp = struct {
+        col: *const _table.Column,
+        op: _parse.CmpOp = .eq,
+        val: _value.Value,
+    };
     /// `col IS NULL` (negate = false) / `col IS NOT NULL`.
     pub const NullTest = struct { col: *const _table.Column, negate: bool };
 
@@ -52,9 +56,9 @@ pub const Pred = union(enum) {
         };
     }
 
-    /// SQL three-valued logic: null = unknown. `eq` is unknown when
-    /// either side is NULL; IS [NOT] NULL is never unknown; AND / OR /
-    /// NOT follow Kleene. Reads only the cells the tree names
+    /// SQL three-valued logic: null = unknown. A comparison is unknown
+    /// when either side is NULL; IS [NOT] NULL is never unknown; AND /
+    /// OR / NOT follow Kleene. Reads only the cells the tree names
     /// (Table.read — a null-bit test plus one O(1) read each; no
     /// full-row decode).
     pub fn eval(
@@ -63,11 +67,11 @@ pub const Pred = union(enum) {
         item: zdb.kv.Item,
     ) ?bool {
         switch (self.*) {
-            .eq => |c| {
+            .cmp => |c| {
                 if (c.val == .null_value) return null;
                 const cell = tbl.parseCol(item, c.col);
                 if (cell == .null_value) return null;
-                return _value.valuesEqual(cell, c.val);
+                return c.op.holds(_value.orderValues(cell, c.val));
             },
             .is_null => |n| {
                 const is_null = tbl.parseCol(item, n.col) == .null_value;
@@ -134,26 +138,30 @@ pub fn bindNode(
     params: _parse.Params,
 ) BindError!Pred {
     switch (where) {
-        .eq => |f| {
+        .cmp => |f| {
             const col = tbl.column(f.column) orelse return error.UndefinedColumn;
             const val = _parse.litToValue(arloc, f.literal, col, //
                 params) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 // A literal longer than a `char(n)` / `varchar(n)` column
-                // is not an error in Postgres, it just never matches:
-                // every stored cell is at most n codepoints.
-                error.StringTooLong => return .never,
+                // is not an error in Postgres: every stored cell is at
+                // most n codepoints, so `=` never matches, and the
+                // other comparisons see the whole literal.
+                error.StringTooLong => if (f.op == .eq)
+                    return .never
+                else
+                    try longText(f.literal, params),
                 error.UnsupportedType => return error.UnsupportedValue,
                 error.TypeMismatch => return error.TypeMismatch,
                 else => return error.InvalidValue,
             };
             // The egid IS the row key. Its column is uint8, so a
             // negative literal already failed to coerce; zero (never a
-            // row) is rejected here, and `egid = NULL` is left to be
+            // row) is rejected for `=`, and `egid = NULL` is left to be
             // unknown like any other comparison.
-            if (col.isEgid() and val == .uint8 and val.uint8 == 0)
-                return error.EgidZero;
-            return .{ .eq = .{ .col = col, .val = val } };
+            if (col.isEgid() and f.op == .eq and val == .uint8 and
+                val.uint8 == 0) return error.EgidZero;
+            return .{ .cmp = .{ .col = col, .op = f.op, .val = val } };
         },
         .is_null => |nt| {
             const col = tbl.column(nt.column) orelse return error.UndefinedColumn;
@@ -171,6 +179,17 @@ pub fn bindNode(
             return .{ .not = out };
         },
     }
+}
+
+/// The text of a string literal that was too long for its column,
+/// uncut: what `<`, `>` and the rest compare against. Only a string
+/// or a text-format `$n` can be too long.
+fn longText(lit: _parse.Literal, params: _parse.Params) BindError!_value.Value {
+    return switch (lit) {
+        .str => |s| .{ .text = s },
+        .param => |n| params.untyped(n) catch return error.InvalidValue,
+        else => error.InvalidValue,
+    };
 }
 
 /// Bind a statement's WHERE to its table: bindNode plus the

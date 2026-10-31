@@ -113,11 +113,11 @@ Rows come back in `egid` order, which is insertion order, whether a scan or an i
 | `column IS NULL`, `column IS NOT NULL` | Yes | |
 | `AND`, `OR`, `NOT` | Yes | Nested to any depth. |
 | `egid = N` | Yes | A single-hop point read; `N` is a positive integer. See [Extensions](#extensions). |
-| `<`, `<=`, `>`, `>=`, `<>` | Not&nbsp;yet | |
+| `<`, `<=`, `>`, `>=`, `<>` (`!=`) | Yes | The literal may stand on either side. Text compares bytewise. On an indexed column `<`, `<=`, `>` and `>=` read the index between the bounds; `<>` scans. |
 | `BETWEEN`, `LIKE`, `ILIKE`, `IN (...)`, `IS DISTINCT FROM` | Not&nbsp;yet | |
 | A function or expression on either side, a bare boolean column, a column compared with a column | Not&nbsp;yet | |
 
-Any indexed column in the predicate drives the query through its bitmap index, and `AND`, `OR` and `NOT` over indexed columns become bitmap operations. A predicate on an unindexed column scans the table with the predicate applied to each row. A mixed predicate uses the indexed terms to pick a superset of the rows and re-checks the whole predicate on each. An index still being built is used once its backfill completes.
+Any indexed column in the predicate drives the query through its index, an equality as one entry and an ordered comparison as the entries between its bounds, and `AND`, `OR` and `NOT` over indexed columns become bitmap operations. A predicate on an unindexed column scans the table with the predicate applied to each row. A mixed predicate uses the indexed terms to pick a superset of the rows and re-checks the whole predicate on each. An index still being built is used once its backfill completes.
 
 ## Tables
 

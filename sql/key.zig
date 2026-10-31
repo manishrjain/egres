@@ -73,6 +73,12 @@ pub const U64 = packed struct(u64) {
 const tag_value: u8 = 0x00;
 const tag_null: u8 = 0x01;
 
+/// The index-key bounds of "every non-NULL value": every value key
+/// starts with tag_value, and NULL's key is the one byte that sorts
+/// after them all. A range with no bound on one side ends at these.
+pub const values_from: String = &.{tag_value};
+pub const values_end: String = &.{tag_null};
+
 /// The memcomparable index-key encoding of `v`: [tag_value] ++ value
 /// encoding, or the single [tag_null] byte for NULL. With `buf` the
 /// key is appended there and the return borrows from it; with null

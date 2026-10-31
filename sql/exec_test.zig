@@ -418,7 +418,7 @@ test "sql.exec: seq_scan: full ascending batches; pred skips without copying" {
     // values are borrows into storage the cursor pins, never copied.
     {
         const pred = Pred{
-            .eq = .{ .col = fx.col("b"), .val = .{ .text = "x" } },
+            .cmp = .{ .col = fx.col("b"), .val = .{ .text = "x" } },
         };
         var node = RowNode{ .seq_scan = .{ .pred = &pred } };
         defer node.deinit();
@@ -552,7 +552,7 @@ test "sql.exec: fetch: a bitmap wider than one chunk, with a residual" {
     for (1..2501) |egid| _ = try bm.set(egid);
     var leaf = BitmapNode{ .egids = bm };
     const pred = Pred{
-        .eq = .{ .col = fx.col("b"), .val = .{ .text = "y" } },
+        .cmp = .{ .col = fx.col("b"), .val = .{ .text = "y" } },
     };
     var node = RowNode{ .fetch = .{ .bnode = &leaf, .pred = &pred } };
     defer node.deinit();
@@ -584,7 +584,7 @@ test "sql.exec: filter clears bits and copies nothing" {
     defer b.deinit();
 
     const pred = Pred{
-        .eq = .{ .col = fx.col("b"), .val = .{ .text = "y" } },
+        .cmp = .{ .col = fx.col("b"), .val = .{ .text = "y" } },
     };
     var scan = RowNode{ .seq_scan = .{} };
     var node = RowNode{ .filter = .{ .child = &scan, .pred = &pred } };
@@ -613,7 +613,7 @@ test "sql.exec: materialize: ascending arena copies, locks held, streams back" {
     defer b.deinit();
 
     const pred = Pred{
-        .eq = .{ .col = fx.col("b"), .val = .{ .text = "x" } },
+        .cmp = .{ .col = fx.col("b"), .val = .{ .text = "x" } },
     };
     var scan = RowNode{ .seq_scan = .{ .pred = &pred } };
     var node = RowNode{ .materialize = .{ .child = &scan } };
@@ -671,7 +671,7 @@ test "sql.exec: materialize over a fetch locks the output rows only" {
     _ = try bm.set(9_999);
     var leaf = BitmapNode{ .egids = bm };
     const pred = Pred{
-        .eq = .{ .col = fx.col("b"), .val = .{ .text = "x" } },
+        .cmp = .{ .col = fx.col("b"), .val = .{ .text = "x" } },
     };
     var fetch = RowNode{ .fetch = .{ .bnode = &leaf, .pred = &pred } };
     var node = RowNode{ .materialize = .{ .child = &fetch } };
@@ -752,7 +752,7 @@ test "sql.exec: materialize with lock and a limit locks the limited rows" {
     // at 100, so 100 rows are locked — the first 100 even egids — and
     // next() streams exactly those back.
     const pred = Pred{
-        .eq = .{ .col = fx.col("b"), .val = .{ .text = "x" } },
+        .cmp = .{ .col = fx.col("b"), .val = .{ .text = "x" } },
     };
     var scan = RowNode{ .seq_scan = .{ .pred = &pred } };
     var node = RowNode{ .materialize = .{ .child = &scan, .remaining = 100 } };

@@ -189,7 +189,7 @@ test "sql.parse: a cast constant is the constant (pgjdbc simple mode)" {
         alloc,
         "SELECT val FROM t WHERE sk = '6'::int8;",
     );
-    const eq = sel.select.where.?.eq;
+    const eq = sel.select.where.?.cmp;
     try testing.expectEqualStrings("6", eq.literal.str);
     const ins = try parse.statement(
         alloc,
@@ -431,7 +431,7 @@ test "sql.parse: SELECT parses projection, table, and an equality filter" {
     try testing.expectEqual(@as(usize, 2), s2.select.projection.columns.len);
     try testing.expectEqualStrings("egid", s2.select.projection.columns[0]);
     try testing.expectEqualStrings("name", s2.select.projection.columns[1]);
-    const f = s2.select.where.?.eq;
+    const f = s2.select.where.?.cmp;
     try testing.expectEqualStrings("id", f.column);
     try testing.expectEqual(@as(i64, 5), f.literal.int);
 
@@ -445,7 +445,7 @@ test "sql.parse: SELECT parses projection, table, and an equality filter" {
         "select COUNT(*) from t where id = 5 limit 0;",
     );
     try testing.expect(c2.select.projection == .count_star);
-    try testing.expectEqualStrings("id", c2.select.where.?.eq.column);
+    try testing.expectEqualStrings("id", c2.select.where.?.cmp.column);
     try testing.expectEqual(@as(?usize, 0), c2.select.limit);
 }
 
@@ -460,28 +460,28 @@ test "sql.parse: WHERE parses AND / OR / NOT and IS [NOT] NULL" {
     const s1 = try parse.statement(alloc, "SELECT * FROM t WHERE a = 1 AND b = 2 AND c = 3;");
     const and3 = s1.select.where.?.and_;
     try testing.expectEqual(@as(usize, 3), and3.len);
-    try testing.expectEqualStrings("a", and3[0].eq.column);
-    try testing.expectEqualStrings("b", and3[1].eq.column);
-    try testing.expectEqualStrings("c", and3[2].eq.column);
-    try testing.expectEqual(@as(i64, 3), and3[2].eq.literal.int);
+    try testing.expectEqualStrings("a", and3[0].cmp.column);
+    try testing.expectEqualStrings("b", and3[1].cmp.column);
+    try testing.expectEqualStrings("c", and3[2].cmp.column);
+    try testing.expectEqual(@as(i64, 3), and3[2].cmp.literal.int);
 
     // Nesting, parentheses, NOT — shared by DELETE.
     const d = try parse.statement(alloc, "DELETE FROM t WHERE a = 1 OR (b = 2 AND NOT c = 'x');");
     const or2 = d.delete.where.?.or_;
     try testing.expectEqual(@as(usize, 2), or2.len);
-    try testing.expectEqualStrings("a", or2[0].eq.column);
+    try testing.expectEqualStrings("a", or2[0].cmp.column);
     const and2 = or2[1].and_;
     try testing.expectEqual(@as(usize, 2), and2.len);
-    try testing.expectEqualStrings("b", and2[0].eq.column);
+    try testing.expectEqualStrings("b", and2[0].cmp.column);
     const inner = and2[1].not.*;
-    try testing.expectEqualStrings("c", inner.eq.column);
-    try testing.expectEqualStrings("x", inner.eq.literal.str);
+    try testing.expectEqualStrings("c", inner.cmp.column);
+    try testing.expectEqualStrings("x", inner.cmp.literal.str);
 
     // SQL precedence: AND binds tighter than OR.
     const p = try parse.statement(alloc, "SELECT * FROM t WHERE a = 1 OR b = 2 AND c = 3;");
     const top = p.select.where.?.or_;
     try testing.expectEqual(@as(usize, 2), top.len);
-    try testing.expect(top[0] == .eq);
+    try testing.expect(top[0] == .cmp);
     try testing.expectEqual(@as(usize, 2), top[1].and_.len);
 
     // IS NULL / IS NOT NULL — shared by UPDATE.
@@ -491,16 +491,16 @@ test "sql.parse: WHERE parses AND / OR / NOT and IS [NOT] NULL" {
     const upd2 = try parse.statement(alloc, "UPDATE t SET a = 1 WHERE b IS NOT NULL AND c = 1;");
     const upd2_and = upd2.update.where.?.and_;
     try testing.expect(upd2_and[0].is_null.negate);
-    try testing.expectEqualStrings("c", upd2_and[1].eq.column);
+    try testing.expectEqualStrings("c", upd2_and[1].cmp.column);
 
     // Rejections anywhere in the tree surface the leaf's reason.
     const cases = [_]struct { sql: String, needle: String }{
-        .{ .sql = "SELECT * FROM t WHERE a = 1 AND b > 2;", .needle = "column = value" },
+        .{ .sql = "SELECT * FROM t WHERE a = 1 AND b ~ 'x';", .needle = "comparisons" },
         .{ .sql = "SELECT * FROM t WHERE a = 1 OR b;", .needle = "unsupported WHERE" },
         .{ .sql = "SELECT * FROM t WHERE NOT b;", .needle = "unsupported WHERE" },
-        .{ .sql = "SELECT * FROM t WHERE a IS DISTINCT FROM 1;", .needle = "column = value" },
+        .{ .sql = "SELECT * FROM t WHERE a IS DISTINCT FROM 1;", .needle = "comparisons" },
         .{ .sql = "SELECT * FROM t WHERE (a = 1) IS NULL;", .needle = "IS NULL operand" },
-        .{ .sql = "SELECT * FROM t WHERE a = 1 AND b = c;", .needle = "literal" },
+        .{ .sql = "SELECT * FROM t WHERE a = 1 AND b = c;", .needle = "column compared with a column" },
     };
     for (cases) |case| {
         const stmt = try parse.statement(alloc, case.sql);
@@ -562,7 +562,7 @@ test "sql.parse: SELECT rejections carry a reason" {
             .sql = "SELECT count(*) FROM t FOR UPDATE;",
             .needle = "FOR UPDATE",
         },
-        .{ .sql = "SELECT * FROM t WHERE a > 5;", .needle = "column = value" },
+        .{ .sql = "SELECT * FROM t WHERE a > b;", .needle = "column compared with a column" },
     };
     for (cases) |case| {
         const stmt = try parse.statement(alloc, case.sql);
@@ -653,20 +653,20 @@ test "sql.parse: DELETE parses table and the optional equality filter" {
 
     // WHERE on a payload column.
     const d2 = try parse.statement(alloc, "DELETE FROM t WHERE id = 5;");
-    const f2 = d2.delete.where.?.eq;
+    const f2 = d2.delete.where.?.cmp;
     try testing.expectEqualStrings("id", f2.column);
     try testing.expectEqual(@as(i64, 5), f2.literal.int);
 
     // WHERE on the egid pseudo-column parses as a plain column filter.
     const d3 = try parse.statement(alloc, "DELETE FROM t WHERE egid = 3;");
-    const f3 = d3.delete.where.?.eq;
+    const f3 = d3.delete.where.?.cmp;
     try testing.expectEqualStrings("egid", f3.column);
     try testing.expectEqual(@as(i64, 3), f3.literal.int);
 
     // Qualified name keeps the last part; string literal.
     const d4 = try parse.statement(alloc, "DELETE FROM public.t WHERE name = 'x';");
     try testing.expectEqualStrings("t", d4.delete.table);
-    const f4 = d4.delete.where.?.eq;
+    const f4 = d4.delete.where.?.cmp;
     try testing.expectEqualStrings("name", f4.column);
     try testing.expectEqualStrings("x", f4.literal.str);
 }
@@ -680,12 +680,12 @@ test "sql.parse: DELETE rejections carry a reason" {
         .{ .sql = "DELETE FROM t USING u WHERE t.a = u.a;", .needle = "USING" },
         .{ .sql = "DELETE FROM t RETURNING id;", .needle = "RETURNING" },
         .{ .sql = "WITH x AS (SELECT 1) DELETE FROM t;", .needle = "WITH" },
-        .{ .sql = "DELETE FROM t WHERE a > 5;", .needle = "column = value" },
+        .{ .sql = "DELETE FROM t WHERE 5 > 6;", .needle = "must be a column" },
         .{
             .sql = "DELETE FROM t WHERE id IN (SELECT id FROM u);",
             .needle = "WHERE",
         },
-        .{ .sql = "DELETE FROM t WHERE a = b;", .needle = "literal" },
+        .{ .sql = "DELETE FROM t WHERE a = b;", .needle = "column compared" },
     };
     for (cases) |case| {
         const stmt = try parse.statement(alloc, case.sql);
@@ -720,13 +720,13 @@ test "sql.parse: UPDATE parses table, SET list, and the optional filter" {
     // omitted-zero encoding ("ival":{} still means 0).
     const up2 = try parse.statement(alloc, "UPDATE t SET a = 0 WHERE id = 7;");
     try testing.expectEqual(@as(i64, 0), up2.update.sets[0].value.literal.int);
-    const f2 = up2.update.where.?.eq;
+    const f2 = up2.update.where.?.cmp;
     try testing.expectEqualStrings("id", f2.column);
     try testing.expectEqual(@as(i64, 7), f2.literal.int);
 
     // WHERE on the egid pseudo-column parses as a plain column filter.
     const up3 = try parse.statement(alloc, "UPDATE t SET a = 1 WHERE egid = 3;");
-    try testing.expectEqualStrings("egid", up3.update.where.?.eq.column);
+    try testing.expectEqualStrings("egid", up3.update.where.?.cmp.column);
 }
 
 /// The first SET value of an UPDATE that must parse.
@@ -835,7 +835,7 @@ test "sql.parse: UPDATE rejections carry a reason" {
         .{ .sql = "UPDATE t SET a = a AND b;", .needle = "SET value" },
         .{ .sql = "UPDATE t SET a = a ^ 2;", .needle = "supported" },
         .{ .sql = "UPDATE t SET a = a + 1, a = 2;", .needle = "duplicate" },
-        .{ .sql = "UPDATE t SET a = 1 WHERE b > 5;", .needle = "column = value" },
+        .{ .sql = "UPDATE t SET a = 1 WHERE b > (SELECT 1);", .needle = "needs a literal" },
     };
     for (cases) |case| {
         const stmt = try parse.statement(alloc, case.sql);
@@ -870,13 +870,13 @@ test "sql.parse: $n placeholders parse in every literal position" {
         "SELECT * FROM t WHERE a = $1 AND (b = $3 OR NOT c = $2);",
     );
     const top = sel.select.where.?.and_;
-    try testing.expectEqual(@as(u16, 1), top[0].eq.literal.param);
-    try testing.expectEqual(@as(u16, 3), top[1].or_[0].eq.literal.param);
-    try testing.expectEqual(@as(u16, 2), top[1].or_[1].not.eq.literal.param);
+    try testing.expectEqual(@as(u16, 1), top[0].cmp.literal.param);
+    try testing.expectEqual(@as(u16, 3), top[1].or_[0].cmp.literal.param);
+    try testing.expectEqual(@as(u16, 2), top[1].or_[1].not.cmp.literal.param);
     try testing.expectEqual(@as(u16, 3), sel.select.param_count);
 
     const del = try parse.statement(alloc, "DELETE FROM t WHERE a = $1;");
-    try testing.expectEqual(@as(u16, 1), del.delete.where.?.eq.literal.param);
+    try testing.expectEqual(@as(u16, 1), del.delete.where.?.cmp.literal.param);
     try testing.expectEqual(@as(u16, 1), del.delete.param_count);
 
     // SET: at the root, under an operator, and in the WHERE.
@@ -887,7 +887,7 @@ test "sql.parse: $n placeholders parse in every literal position" {
     const sets = up.update.sets;
     try testing.expectEqual(@as(u16, 1), sets[0].value.binop.rhs.literal.param);
     try testing.expectEqual(@as(u16, 2), sets[1].value.literal.param);
-    try testing.expectEqual(@as(u16, 3), up.update.where.?.eq.literal.param);
+    try testing.expectEqual(@as(u16, 3), up.update.where.?.cmp.literal.param);
     try testing.expectEqual(@as(u16, 3), up.update.param_count);
 
     // The count is the highest index, whether or not the lower ones
@@ -1078,4 +1078,48 @@ test "BENCH: parse point select" {
 test "BENCH: parse update" {
     const b = fiber.bench.current();
     try benchParse(b, "UPDATE big SET n = n + 1 WHERE id = 12345");
+}
+
+test "sql.parse: WHERE comparisons carry their operator, the column left" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const cases = [_]struct { sql: String, op: parse.CmpOp, int: i64 }{
+        .{ .sql = "SELECT * FROM t WHERE a < 5;", .op = .lt, .int = 5 },
+        .{ .sql = "SELECT * FROM t WHERE a <= 5;", .op = .le, .int = 5 },
+        .{ .sql = "SELECT * FROM t WHERE a > 5;", .op = .gt, .int = 5 },
+        .{ .sql = "SELECT * FROM t WHERE a >= 5;", .op = .ge, .int = 5 },
+        .{ .sql = "SELECT * FROM t WHERE a <> 5;", .op = .ne, .int = 5 },
+        .{ .sql = "SELECT * FROM t WHERE a != 5;", .op = .ne, .int = 5 },
+        .{ .sql = "SELECT * FROM t WHERE a = 5;", .op = .eq, .int = 5 },
+        // A literal on the left turns the operator around.
+        .{ .sql = "SELECT * FROM t WHERE 5 < a;", .op = .gt, .int = 5 },
+        .{ .sql = "SELECT * FROM t WHERE 5 >= a;", .op = .le, .int = 5 },
+        .{ .sql = "SELECT * FROM t WHERE 5 = a;", .op = .eq, .int = 5 },
+        .{ .sql = "DELETE FROM t WHERE a > 7;", .op = .gt, .int = 7 },
+        .{ .sql = "UPDATE t SET b = 1 WHERE 2 <> a;", .op = .ne, .int = 2 },
+    };
+    for (cases) |case| {
+        const stmt = try parse.statement(alloc, case.sql);
+        const where = switch (stmt) {
+            .select => |s| s.where.?,
+            .delete => |d| d.where.?,
+            .update => |u| u.where.?,
+            else => unreachable,
+        };
+        try testing.expectEqualStrings("a", where.cmp.column);
+        try testing.expectEqual(case.op, where.cmp.op);
+        try testing.expectEqual(case.int, where.cmp.literal.int);
+    }
+
+    // A parameter on either side, and a comparison under NOT / AND.
+    const p = try parse.statement(alloc, "SELECT * FROM t WHERE $1 <= a AND NOT b >= $2;");
+    const and2 = p.select.where.?.and_;
+    try testing.expectEqual(parse.CmpOp.ge, and2[0].cmp.op);
+    try testing.expectEqual(@as(u16, 1), and2[0].cmp.literal.param);
+    try testing.expectEqual(parse.CmpOp.ge, and2[1].not.cmp.op);
+    try testing.expectEqual(@as(u16, 2), and2[1].not.cmp.literal.param);
+    try testing.expectEqual(@as(u16, 2), p.select.param_count);
 }

@@ -375,35 +375,7 @@ pub const MultiGet = struct {
     ) !zroar.Bitmap {
         // Pending posting ops are the sql layer's to overlay.
         std.debug.assert(self.opts.pending == null);
-        const node = self.find(key);
-        const vers = node.versions.items;
-        var terminal: ?kv.Version = null;
-        var deltas = vers;
-        if (vers.len > 0) {
-            const oldest = vers[vers.len - 1];
-            // A tombstone's encoding is not looked at, as in compaction.
-            if (!oldest.meta.isDeleted() and !oldest.meta.isRoaring()) {
-                return error.NotRoaring;
-            }
-            // A state or a tombstone is the base the deltas fold onto.
-            // A delta at the end means the chain has no base here and
-            // folds from empty.
-            if (!oldest.meta.isDelta()) {
-                terminal = oldest;
-                deltas = vers[0 .. vers.len - 1];
-            }
-        }
-        var bm = try baseBitmap(alloc, terminal, null);
-        errdefer bm.deinit();
-
-        // The slice is newest first; a fold applies oldest first.
-        var i = deltas.len;
-        while (i > 0) {
-            i -= 1;
-            if (!deltas[i].meta.isRoaring()) return error.NotRoaring;
-            try applyDelta(&bm, deltas[i].value);
-        }
-        return bm;
+        return foldBitmap(alloc, self.find(key).versions.items);
     }
 
     /// Whether `key`'s chain has any version at all (rollupBitmap's
@@ -615,6 +587,38 @@ pub const MultiGet = struct {
 /// else empty. Reads (`MultiGet.bitmap`) and compaction
 /// (`VersionTracker.foldChain`) both fold through this
 /// and `applyDelta`, which is what keeps rollup read-invariant.
+/// A posting chain, newest first, folded into a bitmap owned by
+/// `alloc`: the oldest version is the base when it is a state or a
+/// tombstone, else the chain folds from empty; the deltas apply oldest
+/// first. NotRoaring when a version is not roaring (a tombstone's
+/// encoding is not looked at, as in compaction).
+pub fn foldBitmap(
+    alloc: std.mem.Allocator,
+    vers: []const kv.Version,
+) !zroar.Bitmap {
+    var terminal: ?kv.Version = null;
+    var deltas = vers;
+    if (vers.len > 0) {
+        const oldest = vers[vers.len - 1];
+        if (!oldest.meta.isDeleted() and !oldest.meta.isRoaring()) {
+            return error.NotRoaring;
+        }
+        if (!oldest.meta.isDelta()) {
+            terminal = oldest;
+            deltas = vers[0 .. vers.len - 1];
+        }
+    }
+    var bm = try baseBitmap(alloc, terminal, null);
+    errdefer bm.deinit();
+    var i = deltas.len;
+    while (i > 0) {
+        i -= 1;
+        if (!deltas[i].meta.isRoaring()) return error.NotRoaring;
+        try applyDelta(&bm, deltas[i].value);
+    }
+    return bm;
+}
+
 pub fn baseBitmap(
     alloc: std.mem.Allocator,
     terminal: ?kv.Version,
@@ -909,6 +913,21 @@ pub const Cursor = struct {
                 try self.pins.append(self.allocator, pin.acquire());
             }
         }
+    }
+
+    /// The item `next` just handed out, read as a posting: its chain
+    /// folded by `foldBitmap`. The cursor must carry the whole chain,
+    /// `num_versions` at its maximum, and no `pending`: a txn's pending
+    /// posting ops have their own encoding and are the sql layer's to
+    /// overlay.
+    pub fn bitmap(
+        self: *const Cursor,
+        alloc: std.mem.Allocator,
+        item: *const Item,
+    ) !zroar.Bitmap {
+        std.debug.assert(self.want_versions == std.math.maxInt(u32));
+        std.debug.assert(self.opts.pending == null);
+        return foldBitmap(alloc, item.versions.slice());
     }
 
     /// Look up the tree owning `key_range.left`, snapshot its range, and

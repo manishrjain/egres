@@ -213,11 +213,22 @@ pub const IndexLookup = struct {
     unique: bool,
 };
 
+/// A range read of an index tree: every entry whose key is in
+/// [lo, hi), the memcomparable bounds the planner built from `col op
+/// literal` (plan.rangeLookup).
+pub const IndexRange = struct {
+    index_table_id: u32,
+    lo: String,
+    hi: String,
+    unique: bool,
+};
+
 /// Bitmap nodes produce a WHOLE egid set — a bitmap already is the
 /// batch, and every variant evaluates to one (an egid list touches no
 /// index and and_/or_ combine bitmaps, hence not "IndexNode").
 pub const BitmapNode = union(enum) {
     index_lookup: IndexLookup,
+    index_range: IndexRange,
     /// Literal egids (`egid = N`; IN lists later), built by the planner
     /// and owned by the plan; eval hands out a clone.
     egids: zroar.Bitmap,
@@ -229,7 +240,7 @@ pub const BitmapNode = union(enum) {
         switch (self.*) {
             .egids => |*bm| bm.deinit(),
             .and_, .or_ => |kids| for (kids) |*kid| kid.deinit(),
-            .index_lookup => {},
+            .index_lookup, .index_range => {},
         }
     }
 
@@ -238,7 +249,7 @@ pub const BitmapNode = union(enum) {
     /// atomically), not an absent literal id.
     pub fn fromIndex(self: *const BitmapNode) bool {
         return switch (self.*) {
-            .index_lookup => true,
+            .index_lookup, .index_range => true,
             .egids => false,
             .and_, .or_ => |kids| for (kids) |*kid| {
                 if (kid.fromIndex()) break true;
@@ -266,6 +277,10 @@ pub const BitmapNode = union(enum) {
                 uniqueLookup(ctx, lu)
             else
                 postingLookup(ctx, lu),
+            .index_range => |r| return if (r.unique)
+                uniqueRange(ctx, r)
+            else
+                postingRange(ctx, r),
             .and_ => |kids| {
                 std.debug.assert(kids.len > 0);
                 var acc = try kids[0].eval(ctx);
@@ -341,6 +356,79 @@ pub const BitmapNode = union(enum) {
 
         try ctx.tx.overlayPostings(lu.index_table_id, lu.key, &bm);
         return bm;
+    }
+
+    /// `WHERE <unique col> op v`: every entry between the bounds, each
+    /// naming one row; the cursor merges this txn's pending entries in,
+    /// since a unique index's are row-shaped. A range is recorded as a
+    /// scan: a key committed into it later is a phantom no point read
+    /// would catch on a read_ts bump.
+    fn uniqueRange(ctx: *ExecCtx, ir: IndexRange) !zroar.Bitmap {
+        const alloc = ctx.tx.allocator;
+        var bm = try zroar.Bitmap.init(alloc);
+        errdefer bm.deinit();
+
+        ctx.tx.recordScan();
+        var cursor = try ctx.tx.forest.openCursor(
+            alloc,
+            .{ .namespace = ctx.tx.ns, .table_id = ir.index_table_id },
+            rangeOf(ctx, ir),
+            .{ .read_ts = ctx.tx.read_ts, .pending = ctx.tx.writes },
+        );
+        defer cursor.deinit();
+        while (try cursor.next()) |entry| {
+            const egid = _key.decodeEgid(entry.newest().value) orelse
+                return error.CorruptIndexEntry;
+            _ = try bm.set(egid);
+        }
+        return bm;
+    }
+
+    /// `WHERE <indexed col> op v` through posting bitmaps: one cursor
+    /// over the committed index between the bounds, each key's chain
+    /// folded and unioned, then this txn's pending ops on the range
+    /// overlaid in one pass. Cheaper than a table scan while the range
+    /// is selective, which is the planner's bet for now.
+    fn postingRange(ctx: *ExecCtx, r: IndexRange) !zroar.Bitmap {
+        const alloc = ctx.tx.allocator;
+        ctx.tx.recordScan();
+        var acc = try zroar.Bitmap.init(alloc);
+        errdefer acc.deinit();
+        var cursor = try ctx.tx.forest.openCursor(
+            alloc,
+            .{ .namespace = ctx.tx.ns, .table_id = r.index_table_id },
+            rangeOf(ctx, r),
+            .{
+                .read_ts = ctx.tx.read_ts,
+                .num_versions = std.math.maxInt(u32),
+            },
+        );
+        defer cursor.deinit();
+        var seen: usize = 0;
+        while (try cursor.next()) |entry| : (seen += 1) {
+            // One yield point per hundred keys: a key is one fold.
+            if (seen % 100 == 0) try fiber.ctx().maybeYield();
+            var part = try cursor.bitmap(alloc, &entry);
+            defer part.deinit();
+            try acc.orInPlace(&part);
+        }
+        try ctx.tx.overlayPostingsInRange(r.index_table_id, r.lo, r.hi, &acc);
+        return acc;
+    }
+
+    fn rangeOf(ctx: *ExecCtx, r: IndexRange) KeyRange {
+        return .{
+            .left = .{
+                .namespace = ctx.tx.ns,
+                .table_id = r.index_table_id,
+                .primary = r.lo,
+            },
+            .right = .{
+                .namespace = ctx.tx.ns,
+                .table_id = r.index_table_id,
+                .primary = r.hi,
+            },
+        };
     }
 };
 

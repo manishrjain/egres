@@ -32,6 +32,8 @@ expect() {
 
 q() { psql "$E" -X -c "$1"; }     # full output (row counts, headers)
 v() { psql "$E" -X -tA -c "$1"; } # tuples-only, unaligned (bare value)
+# A block, each statement its own message, from stdin.
+tx() { psql "$E" -X -tA -v ON_ERROR_STOP=0 -f - <<<"$1" 2>&1; }
 
 # Ready = listener up AND election won (see sql_ddl_e2e.sh).
 start_server() {
@@ -82,7 +84,13 @@ expect "AND binds tighter than OR" "(2 rows)" q "SELECT name FROM t WHERE id = 2
 expect "parentheses override" "(0 rows)" q "SELECT name FROM t WHERE (id = 2 OR id = 1) AND name = 'zz';"
 expect "egid conjunct drives a point read" "b" v "SELECT name FROM t WHERE egid = 2 AND id = 2;"
 expect "egid conjunct, false residual" "(0 rows)" q "SELECT name FROM t WHERE egid = 2 AND id = 1;"
-expect "unsupported operator rejected" "column = value" q "SELECT name FROM t WHERE id > 1;"
+expect ">" "b" v "SELECT name FROM t WHERE id > 1;"
+expect "<= and <>" "a" v "SELECT name FROM t WHERE id <= 2 AND name <> 'b';"
+expect ">= on text" "b" v "SELECT name FROM t WHERE name >= 'b';"
+expect "literal on the left turns the operator" "b" v "SELECT name FROM t WHERE 1 < id;"
+expect "< with an indexed = conjunct" "a" v "SELECT name FROM t WHERE egid = 1 AND id < 2;"
+expect "column vs column rejected" "column compared with a column" q "SELECT name FROM t WHERE id > id;"
+expect "unsupported operator rejected" "comparisons" q "SELECT name FROM t WHERE name ~ 'a';"
 
 # egid is a hidden system column: not in SELECT *.
 star_out=$(q "SELECT * FROM t;" 2>&1)
@@ -211,6 +219,23 @@ expect "NULL concat visible" "(1 row)" \
     q "SELECT * FROM ex WHERE n = -5 AND s IS NULL;"
 expect "SET column copy" "UPDATE 1" q "UPDATE ex SET n = m WHERE s = 'b';"
 expect "copy visible" "3" v "SELECT n FROM ex WHERE s = 'b';"
+# n is indexed: -5, 3, 4. Ranges go through the index, and see a
+# pending insert of a value the index has never held.
+expect "index range: n > 0" "2" v "SELECT count(*) FROM ex WHERE n > 0;"
+expect "index range: n >= 4" "1" v "SELECT count(*) FROM ex WHERE n >= 4;"
+expect "index range: n < 0" "1" v "SELECT count(*) FROM ex WHERE n < 0;"
+expect "index range: n <= 3" "2" v "SELECT count(*) FROM ex WHERE n <= 3;"
+expect "index range: two bounds" "2" \
+    v "SELECT count(*) FROM ex WHERE n > -10 AND n <= 3;"
+expect "index range: OR of ranges" "2" \
+    v "SELECT count(*) FROM ex WHERE n > 3 OR n < -1;"
+expect "index range: empty" "0" v "SELECT count(*) FROM ex WHERE n > 100;"
+expect "index range: pending value" "1" tx "BEGIN;
+INSERT INTO ex VALUES (100, 'r', 0, 0);
+SELECT count(*) FROM ex WHERE n > 50;
+ROLLBACK;"
+expect "index range: rolled back value gone" "0" \
+    v "SELECT count(*) FROM ex WHERE n > 50;"
 expect "division by zero" "division by zero" \
     q "UPDATE ex SET n = n / 0 WHERE s = 'b';"
 expect "integer overflow" "out of range" \
@@ -409,6 +434,12 @@ expect "NOT NULL: SET NULL rejected" 'violates not-null' q \
 expect "NOT NULL: SET NULL on nullable column" "UPDATE 1" q \
     "UPDATE nn SET v = NULL WHERE id = 1;"
 expect "NOT NULL: rejected rows never landed" "2" v "SELECT count(*) FROM nn;"
+# The primary key is a unique index: ranges over it read the index.
+expect "unique index range: id >= 2" "1" v "SELECT count(*) FROM nn WHERE id >= 2;"
+expect "unique index range: id < 2" "1" v "SELECT count(*) FROM nn WHERE id < 2;"
+expect "unique index range: 1 < id AND id <= 2" "2" \
+    v "SELECT id FROM nn WHERE 1 < id AND id <= 2;"
+expect "unique index range: none above" "0" v "SELECT count(*) FROM nn WHERE id > 5;"
 q "DROP TABLE nn;" >/dev/null
 
 # --- extended query protocol: psql 18's \bind, \parse, \bind_named --------

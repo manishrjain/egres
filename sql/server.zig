@@ -988,8 +988,10 @@ pub const Handler = struct {
         const db = try self.sessionDb(ns);
         const t = try eng.allocator.create(_txn.Txn);
         errdefer eng.allocator.destroy(t);
+        // Counted on the session's tenant, not a statement: a block's
+        // held rows, bitmaps and cursors outlive the statement's ctx.
         t.* = _txn.Txn.init(
-            eng.allocator,
+            fiber.allocator(.tenant),
             self.srv.next_txn_id.fetchAdd(1, .monotonic),
             eng.node.appliedTs(),
             term,

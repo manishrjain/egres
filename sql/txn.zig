@@ -467,6 +467,43 @@ pub const Txn = struct {
         }
     }
 
+    /// Read-your-own-writes for an index range: this txn's pending
+    /// posting ops on every key in [lo, hi) of `table_id`, applied to
+    /// `bm`, the union of the committed postings there. Removes before
+    /// adds: a row this txn moved between two keys of the range is
+    /// removed under its committed key and added under its new one,
+    /// and only that order leaves it present. The ops are the exact
+    /// diff against committed state (putPosting annihilates pairs), so
+    /// the range needs no per-key fold.
+    pub fn overlayPostingsInRange(
+        self: *Txn,
+        table_id: u32,
+        lo: String,
+        hi: String,
+        bm: *zdb.zroar.Bitmap,
+    ) !void {
+        const w = self.writes orelse return;
+        var it = try w.iterator(self.allocator);
+        defer it.deinit();
+        try it.seekRange(
+            .{ .namespace = self.ns, .table_id = table_id, .primary = lo },
+            .{ .namespace = self.ns, .table_id = table_id, .primary = hi },
+        );
+        var adds = try zdb.zroar.Bitmap.init(self.allocator);
+        defer adds.deinit();
+        while (it.itemRef()) |item| : (try it.next()) {
+            // A version's ts is the egid here.
+            for (item.versions.slice()) |ver| {
+                switch (@as(PostingOp, @enumFromInt(ver.value[0]))) {
+                    .add => _ = try adds.set(ver.ts),
+                    .remove => _ = bm.remove(ver.ts),
+                    .noop => {},
+                }
+            }
+        }
+        try bm.orInPlace(&adds);
+    }
+
     /// The rows `keys` name in `table_id` as this txn sees them, in one
     /// batch (Forest.multiGet): the txn's own pending writes first — a
     /// pending tombstone means absent with NO forest fallback (that
