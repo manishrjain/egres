@@ -699,6 +699,10 @@ test "forest: buildTables allocates and never reuses a dropped id" {
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
+    try addTenant(f, alloc);
+    const ns_create = try f.buildNsCreate(alloc, .{ .given = 102 }, 1, "");
+    defer alloc.free(ns_create.change.tree_changes);
+    try f.applyTrees(1, ns_create.change);
 
     const first = _manifest.first_table_id;
 
@@ -1281,6 +1285,10 @@ test "forest: table names — create registers, duplicate rejects, drop frees" {
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
+    try addTenant(f, alloc);
+    const ns_create = try f.buildNsCreate(alloc, .{ .given = 103 }, 1, "");
+    defer alloc.free(ns_create.change.tree_changes);
+    try f.applyTrees(1, ns_create.change);
 
     var ct_tc = [_]_manifest.TreeChange{
         _manifest.newTableChange("users", .posting_index),

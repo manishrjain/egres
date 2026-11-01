@@ -217,6 +217,8 @@ test "manifest serialize/restoreFrom round-trip" {
             .posting_index,
         ),
     });
+    try addTenant(&src, 1, "acme");
+    try src.registerNamespace(107, 1, "");
     try src.registerTableName(.{ .namespace = 107, .table_id = 16 }, "users");
     try src.commit(2, &.{
         createSSTableChange(10, 107, 1, 0, no_extent),
@@ -291,6 +293,7 @@ test "manifest restoreFrom replaces existing state" {
         createTreeChange(99, 0, &.{}, &.{}, .posting_index),
     });
     try dst.commit(4, &.{createSSTableChange(999, 0, 99, 0, no_extent)}, &.{});
+    try dst.registerNamespace(100, 1, "");
     try dst.registerTableName(.{ .namespace = 100, .table_id = 55 }, "stale");
     try std.testing.expect(dst.trees.contains(tk(0, 99)));
 
@@ -311,6 +314,7 @@ test "manifest table names: register/lookup/drop" {
     const alloc = std.testing.allocator;
     var manifest = _manifest.Manifest.init(alloc);
     defer manifest.deinit();
+    try manifest.registerNamespace(105, 1, "");
 
     try manifest.registerTableName(
         .{ .namespace = 105, .table_id = 16 },
@@ -409,6 +413,9 @@ test "manifest table_id counter allocate/advance/persist" {
     const first = _manifest.first_table_id;
     var manifest = _manifest.Manifest.init(alloc);
     defer manifest.deinit();
+    try addTenant(&manifest, 1, "acme");
+    try manifest.registerNamespace(16, 1, "");
+    try manifest.registerNamespace(17, 1, "");
 
     // First allocation in a namespace floors at first_table_id; then +1 each.
     try std.testing.expectEqual(first, try manifest.nextTableId(16));
@@ -822,6 +829,9 @@ test "manifest apply create_tree registers the name and advances the table id" {
     var manifest = _manifest.Manifest.init(alloc);
     defer manifest.deinit();
 
+    try addTenant(&manifest, 1, "acme");
+    var ns_tcs: [1]_manifest.TreeChange = undefined;
+    _ = try manifest.apply(5, nsCreateCmd(&ns_tcs, 100, 1, "shop"));
     var tcs: [1]_manifest.TreeChange = undefined;
     _ = try manifest.apply(6, createTreeCmd(
         &tcs,
@@ -868,6 +878,9 @@ test "manifest apply drop_tree removes the table name" {
     var manifest = _manifest.Manifest.init(alloc);
     defer manifest.deinit();
 
+    try addTenant(&manifest, 1, "acme");
+    var ns_tcs: [1]_manifest.TreeChange = undefined;
+    _ = try manifest.apply(5, nsCreateCmd(&ns_tcs, 100, 1, "shop"));
     var tcs: [1]_manifest.TreeChange = undefined;
     _ = try manifest.apply(6, createTreeCmd(
         &tcs,
@@ -881,7 +894,8 @@ test "manifest apply drop_tree removes the table name" {
     _ = try manifest.apply(7, .{ .tree_changes = &dtcs, .cmd = .drop_tree });
 
     try std.testing.expect(manifest.lookupTable(100, "users") == null);
-    try std.testing.expectEqual(@as(u32, 0), manifest.trees.count());
+    // Only the namespace's own default tree is left.
+    try std.testing.expectEqual(@as(u32, 1), manifest.trees.count());
     // The id is not rewound: ids are never reused.
     try std.testing.expectEqual(first + 1, try manifest.nextTableId(100));
 }
@@ -997,6 +1011,30 @@ test "manifest: an unnamed user namespace keeps its tenant" {
         try manifest.apply(5, nsCreateCmd(&tcs, 100, 1, "")),
     );
     try std.testing.expectEqual(@as(?u64, 1), manifest.tenantOf(100));
+}
+
+test "manifest: a table in a namespace never created gets no entry" {
+    const alloc = std.testing.allocator;
+    const first = _manifest.first_table_id;
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
+
+    // The leader cannot allocate a table id there...
+    try std.testing.expectError(
+        error.NamespaceNotFound,
+        manifest.nextTableId(100),
+    );
+    // ...and a committed create_tree for it is skipped at apply: its tree
+    // is listed, but no namespace entry (and so no tenant 0) appears.
+    var tcs: [1]_manifest.TreeChange = undefined;
+    _ = try manifest.apply(6, createTreeCmd(
+        &tcs,
+        .{ .namespace = 100, .table_id = first },
+        "users",
+    ));
+    try std.testing.expect(!manifest.namespaces.contains(100));
+    try std.testing.expect(manifest.tenantOf(100) == null);
+    try std.testing.expect(manifest.lookupTable(100, "users") == null);
 }
 
 test "manifest: branch_ns takes the change's tenant" {

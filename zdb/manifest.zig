@@ -175,9 +175,12 @@ pub const Manifest = struct {
         /// table_id allocation — bumped on apply of every create
         /// (advanceTableId), reserved by the leader (nextTableId).
         next_table_id: u32 = first_table_id,
-        /// The tenant that owns the namespace. Every namespace at or above
-        /// `first_namespace` has one; namespaces below it get no entry.
-        tenant_id: u64 = 0,
+        /// The tenant that owns the namespace. No default: an entry is
+        /// made only where the namespace is created (`registerNamespace`,
+        /// `applyNsBranch`, `restoreFrom`), which always knows its tenant,
+        /// so an entry can never hold 0 ("no tenant") by omission.
+        /// Namespaces below `first_namespace` get no entry.
+        tenant_id: u64,
         /// The `names` key: tenant id (8 bytes, big-endian) then the
         /// database name (SQL: CREATE DATABASE), owned here. Empty for
         /// unnamed namespaces (admin `ns create`), which never resolve by
@@ -327,19 +330,21 @@ pub const Manifest = struct {
         self.mu.lock(@src());
         defer self.mu.unlock();
 
-        const slot = try self.namespaces.getOrPut(namespace);
-        if (!slot.found_existing) slot.value_ptr.* = .{};
+        // Only a created namespace has a counter; never make one here.
+        const ns = self.namespaces.getPtr(namespace) orelse
+            return error.NamespaceNotFound;
 
         // Hand out the current counter (never below the floor), reserve next.
-        const id = @max(slot.value_ptr.next_table_id, first_table_id);
-        slot.value_ptr.next_table_id = id + 1;
+        const id = @max(ns.next_table_id, first_table_id);
+        ns.next_table_id = id + 1;
         return id;
     }
 
     /// Raise the table's namespace counter past its table_id (apply path,
     /// all nodes). Idempotent; never lowers it (so re-applying or applying
     /// a low system table leaves a higher user counter untouched). Floors
-    /// at first_table_id.
+    /// at first_table_id. A namespace that was never created is logged and
+    /// skipped, not given an entry: the apply loop retries an error forever.
     pub fn advanceTableId(
         self: *Manifest,
         table_key: TableKey,
@@ -348,21 +353,26 @@ pub const Manifest = struct {
         self.mu.lock(@src());
         defer self.mu.unlock();
 
-        const slot = try self.namespaces.getOrPut(table_key.namespace);
-        if (!slot.found_existing) slot.value_ptr.* = .{};
+        const ns = self.namespaces.getPtr(table_key.namespace) orelse {
+            log.err("table_id={d} in ns={d}: namespace not created, skipped", .{
+                table_key.table_id, table_key.namespace,
+            });
+            return;
+        };
 
         // Floor the current counter, then raise it past table_id; never lowers.
-        const floor = @max(slot.value_ptr.next_table_id, first_table_id);
-        slot.value_ptr.next_table_id = @max(floor, table_key.table_id +| 1);
+        const floor = @max(ns.next_table_id, first_table_id);
+        ns.next_table_id = @max(floor, table_key.table_id +| 1);
     }
 
-    /// Record `namespace`'s tenant and database name (create_ns and
-    /// branch_ns apply paths, all nodes). Below `first_namespace` it
-    /// records nothing: those namespaces get no entry. At or above, the
-    /// entry is made even for an empty name (admin `ns create`), so the
-    /// tenant is kept. Idempotent for re-applies. A name the tenant already
-    /// gave ANOTHER namespace is a build-side bug (uniqueness is checked
-    /// before propose) — logged and skipped, never clobbered.
+    /// Create `namespace`'s entry with its tenant and database name
+    /// (create_ns and branch_ns apply paths, all nodes). Below
+    /// `first_namespace` it records nothing: those namespaces get no
+    /// entry. At or above, the entry is made even for an empty name (admin
+    /// `ns create`), so the tenant is kept. Idempotent for re-applies. An
+    /// entry that already names a different tenant, or a name the tenant
+    /// already gave ANOTHER namespace, is a build-side bug — logged and
+    /// skipped, never clobbered.
     pub fn registerNamespace(
         self: *Manifest,
         namespace: u64,
@@ -375,8 +385,14 @@ pub const Manifest = struct {
         defer self.mu.unlock();
 
         const slot = try self.namespaces.getOrPut(namespace);
-        if (!slot.found_existing) slot.value_ptr.* = .{};
-        slot.value_ptr.tenant_id = tenant_id;
+        if (!slot.found_existing) {
+            slot.value_ptr.* = .{ .tenant_id = tenant_id };
+        } else if (slot.value_ptr.tenant_id != tenant_id) {
+            log.err("ns={d} belongs to tenant {d}, not re-owning it to {d}", .{
+                namespace, slot.value_ptr.tenant_id, tenant_id,
+            });
+            return;
+        }
         if (name.len == 0 or slot.value_ptr.name_key.len > 0) return;
 
         const key = try nameKey(self.allocator, tenant_id, name);
@@ -412,9 +428,9 @@ pub const Manifest = struct {
 
     /// Record a table's name (create_tree apply path, all nodes). Idempotent
     /// for re-applies (same name → same table_id). A name held by a DIFFERENT
-    /// table is a build-side bug (uniqueness is checked before propose) —
-    /// logged and skipped, never clobbered. Empty name records nothing
-    /// (system trees, splits).
+    /// table, or a namespace that was never created, is a build-side bug —
+    /// logged and skipped, never clobbered or given an entry. Empty name
+    /// records nothing (system trees, splits).
     pub fn registerTableName(
         self: *Manifest,
         table_key: TableKey,
@@ -425,10 +441,14 @@ pub const Manifest = struct {
         self.mu.lock(@src());
         defer self.mu.unlock();
 
-        const slot = try self.namespaces.getOrPut(table_key.namespace);
-        if (!slot.found_existing) slot.value_ptr.* = .{};
+        const ns = self.namespaces.getPtr(table_key.namespace) orelse {
+            log.err("table '{s}' in ns={d}: namespace not created, skipped", .{
+                name, table_key.namespace,
+            });
+            return;
+        };
 
-        if (slot.value_ptr.tables.get(name)) |owner| {
+        if (ns.tables.get(name)) |owner| {
             if (owner != table_key.table_id)
                 log.err(
                     "table name '{s}' in ns={d} already owned by " ++
@@ -444,11 +464,7 @@ pub const Manifest = struct {
         }
         const owned = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(owned);
-        try slot.value_ptr.tables.put(
-            self.allocator,
-            owned,
-            table_key.table_id,
-        );
+        try ns.tables.put(self.allocator, owned, table_key.table_id);
     }
 
     /// Resolve a table name to its table_id within a namespace (per-query
@@ -1035,8 +1051,8 @@ pub const Manifest = struct {
             // Names and the counter, under the same hold: the register
             // helpers take the lock themselves.
             const dst_slot = try self.namespaces.getOrPut(dst);
-            if (!dst_slot.found_existing) dst_slot.value_ptr.* = .{};
-            dst_slot.value_ptr.tenant_id = target.tenant_id;
+            if (!dst_slot.found_existing)
+                dst_slot.value_ptr.* = .{ .tenant_id = target.tenant_id };
 
             if (self.namespaces.getPtr(src)) |src_ns| {
                 dst_slot.value_ptr.next_table_id = src_ns.next_table_id;
@@ -1325,8 +1341,11 @@ pub const Manifest = struct {
             i = 0;
             while (i < ns_len) : (i += 1) {
                 const c = try reader.namespacesAt(i);
+                // A snapshot lists only namespaces that were created,
+                // each with its tenant (checked once tenants are back).
                 const slot = try self.namespaces.getOrPut(c.id());
-                if (!slot.found_existing) slot.value_ptr.* = .{};
+                if (!slot.found_existing)
+                    slot.value_ptr.* = .{ .tenant_id = c.tenantId() };
                 slot.value_ptr.next_table_id = c.nextTableId();
             }
 
@@ -1361,9 +1380,7 @@ pub const Manifest = struct {
         i = 0;
         while (i < ns_len) : (i += 1) {
             const c = try reader.namespacesAt(i);
-            // A namespace created with a tenant must find it; tenant 0 is
-            // only a table-id counter with no create behind it.
-            if (c.id() >= first_namespace and c.tenantId() != 0)
+            if (c.id() >= first_namespace)
                 std.debug.assert(self.hasTenant(c.tenantId()));
             try self.registerNamespace(c.id(), c.tenantId(), c.name());
         }
