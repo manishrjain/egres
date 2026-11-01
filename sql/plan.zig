@@ -95,12 +95,14 @@ pub fn plan(
 
 /// The egid set `p` can be answered from — a SUPERSET of its rows
 /// when the tree is only partly indexed — or null when it cannot be:
-/// then the rows are found by scanning. Leaves: `egid = N` is the
-/// one-id set; `col = v` on a valid index its entry (unique: the one
-/// row; non-unique: the posting bitmap); `col IS NULL` on a valid
-/// non-unique index the posting under the NULL tag key. A comparison
-/// against NULL can never be true (3VL), and `never` is false by
-/// construction, so both are the EMPTY set. An
+/// then the rows are found by scanning. Leaves are a bare column
+/// against a constant, the shape bind leaves them in; any other
+/// expression is the residual's. `egid = N` is the one-id set; `col =
+/// v` on a valid index its entry (unique: the one row; non-unique: the
+/// posting bitmap); `col IS NULL` on a valid non-unique index the
+/// posting under the NULL tag key. A comparison against NULL can never
+/// be true (3VL), and `never` is false by construction, so both are
+/// the EMPTY set. An
 /// AND intersects every indexable child and can drop the rest, so one
 /// indexable child is enough to route it (the dropped terms are the
 /// residual's job); an OR must union EVERY child, so all of them must
@@ -113,22 +115,34 @@ fn bitmapFor(
 ) Error!?BitmapNode {
     switch (p.*) {
         .cmp => |cmp| {
-            if (cmp.val == .null_value) return try emptySet(arloc);
+            const col = switch (cmp.lhs.*) {
+                .column => |col| col,
+                else => return null,
+            };
+            const val = switch (cmp.rhs.*) {
+                .value => |val| val,
+                else => return null,
+            };
+            if (val == .null_value) return try emptySet(arloc);
             // The egid is the row key: `egid = N` is the one-id set, and
             // a range of them is the table itself, a scan.
-            if (cmp.col.isEgid()) return if (cmp.op == .eq)
-                try oneEgid(arloc, cmp.val.uint8)
+            if (col.isEgid()) return if (cmp.op == .eq)
+                try oneEgid(arloc, val.uint8)
             else
                 null;
-            const idx = validIndex(tbl, cmp.col, read_ts) orelse return null;
-            if (cmp.op == .eq) return try lookup(arloc, idx, cmp.val);
-            return try rangeLookup(arloc, idx, cmp.op, cmp.val);
+            const idx = validIndex(tbl, col, read_ts) orelse return null;
+            if (cmp.op == .eq) return try lookup(arloc, idx, val);
+            return try rangeLookup(arloc, idx, cmp.op, val);
         },
         .is_null => |nt| {
             if (nt.negate) return null;
+            const col = switch (nt.expr.*) {
+                .column => |col| col,
+                else => return null,
+            };
             // A unique index holds no NULL entries; only a posting
             // bitmap can answer IS NULL.
-            const idx = validIndex(tbl, nt.col, read_ts) orelse return null;
+            const idx = validIndex(tbl, col, read_ts) orelse return null;
             if (idx.unique) return null;
             return try lookup(arloc, idx, .null_value);
         },

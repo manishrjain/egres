@@ -13,6 +13,7 @@ const fiber = @import("zfiber");
 const utils = @import("utils");
 const zdb = @import("zdb");
 
+const _expr = @import("expr.zig");
 const _key = @import("key.zig");
 const _pred = @import("pred.zig");
 const _table = @import("table.zig");
@@ -32,6 +33,10 @@ const zroar = zdb.zroar;
 pub const ExecCtx = struct {
     /// Statement arena: captured rows (Materialize), sorted key lists.
     arloc: std.mem.Allocator,
+    /// Per-row scratch for the expressions a predicate evaluates: a
+    /// source resets it before every fill, and count(*) before every
+    /// row, so it holds one batch's worth at most.
+    scratch: std.heap.ArenaAllocator,
     /// read_ts, pending writes, the forest, the locks; its allocator
     /// backs bitmaps and the scan cursor.
     tx: *Txn,
@@ -43,6 +48,19 @@ pub const ExecCtx = struct {
     /// Restart, so nothing reaches the wire before the last lock.
     /// Without this Materialize streams.
     lock: bool,
+
+    pub fn deinit(self: *ExecCtx) void {
+        self.scratch.deinit();
+    }
+
+    /// `item` as the row a predicate or target evaluates against.
+    pub fn row(self: *ExecCtx, item: Item) _expr.Row {
+        return .{
+            .scratch = self.scratch.allocator(),
+            .tbl = self.tbl,
+            .item = item,
+        };
+    }
 };
 
 pub const row_cap = 1024;
@@ -493,6 +511,7 @@ pub const SeqScan = struct {
     pub fn next(self: *SeqScan, ctx: *ExecCtx, b: *Batch) !bool {
         // The previous batch is consumed: let its values go.
         if (self.cursor) |*c| try c.releasePins();
+        _ = ctx.scratch.reset(.retain_capacity);
         b.reset();
         if (self.done) return false;
         // One yield point per batch: a scan is as long as the table.
@@ -517,7 +536,10 @@ pub const SeqScan = struct {
             // call, and the batch carries only the count.
             while (try cursor.next()) |item| {
                 if (self.pred) |pred| {
-                    if (!pred.matches(ctx.tbl, item)) continue;
+                    // The whole range in one fill: no batch bounds the
+                    // scratch, so each row starts it empty.
+                    _ = ctx.scratch.reset(.retain_capacity);
+                    if (!try pred.matches(ctx.row(item))) continue;
                 }
                 b.counted += 1;
             }
@@ -537,7 +559,7 @@ pub const SeqScan = struct {
                 break;
             };
             if (self.pred) |pred| {
-                if (!pred.matches(ctx.tbl, item)) continue;
+                if (!try pred.matches(ctx.row(item))) continue;
             }
 
             if (!try b.append(item, mode)) {
@@ -592,6 +614,7 @@ pub const Fetch = struct {
     done: bool = false,
 
     pub fn next(self: *Fetch, ctx: *ExecCtx, batch: *Batch) !bool {
+        _ = ctx.scratch.reset(.retain_capacity);
         batch.reset();
         if (self.done) return false;
         try fiber.ctx().maybeYield();
@@ -622,18 +645,20 @@ pub const Fetch = struct {
                 continue;
             }
             const key = self.keys[self.chunk_pos];
-            const row = self.res.?.item(key) orelse {
+            const item = self.res.?.item(key) orelse {
                 self.missing(ctx, key);
                 self.chunk_pos += 1;
                 continue;
             };
-            if (self.pred) |p| if (!p.matches(ctx.tbl, row)) {
-                self.chunk_pos += 1;
-                continue;
-            };
+            if (self.pred) |p| {
+                if (!try p.matches(ctx.row(item))) {
+                    self.chunk_pos += 1;
+                    continue;
+                }
+            }
             // A row that does not fit ends the fill and is offered
             // again by the next one (an empty batch admits any row).
-            if (!try batch.append(row, self.valueMode())) break;
+            if (!try batch.append(item, self.valueMode())) break;
             self.chunk_pos += 1;
         }
         return batch.numRows() > 0;
@@ -701,8 +726,10 @@ pub const Filter = struct {
             // copied the word it is handing bits out of.
             var it = batch.sel.iterator(.{});
             while (it.next()) |i| {
-                const row = batch.rows.items[i];
-                if (!self.pred.matches(ctx.tbl, row)) batch.sel.unset(i);
+                const item = batch.rows.items[i];
+                if (!try self.pred.matches(ctx.row(item))) {
+                    batch.sel.unset(i);
+                }
             }
             if (batch.sel.count() > 0) return true;
         }

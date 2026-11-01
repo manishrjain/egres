@@ -27,7 +27,7 @@ expect() {
     shift 2
     local out
     out=$("$@" 2>&1) || true
-    if grep -q "$needle" <<<"$out"; then ok "$desc"; else bad "$desc — got: $out"; fi
+    if grep -q -- "$needle" <<<"$out"; then ok "$desc"; else bad "$desc — got: $out"; fi
 }
 
 q() { psql "$E" -X -c "$1"; }     # full output (row counts, headers)
@@ -89,7 +89,23 @@ expect "<= and <>" "a" v "SELECT name FROM t WHERE id <= 2 AND name <> 'b';"
 expect ">= on text" "b" v "SELECT name FROM t WHERE name >= 'b';"
 expect "literal on the left turns the operator" "b" v "SELECT name FROM t WHERE 1 < id;"
 expect "< with an indexed = conjunct" "a" v "SELECT name FROM t WHERE egid = 1 AND id < 2;"
-expect "column vs column rejected" "column compared with a column" q "SELECT name FROM t WHERE id > id;"
+expect "column vs column" "(0 rows)" q "SELECT name FROM t WHERE id > id;"
+expect "function in WHERE" "b" v "SELECT name FROM t WHERE upper(name) = 'B';"
+expect "arithmetic in WHERE" "a" v "SELECT name FROM t WHERE id * 2 = 2;"
+expect "constants in WHERE" "0" v "SELECT count(*) FROM t WHERE 5 > 6;"
+expect "expression IS NOT NULL" "1" \
+    v "SELECT count(*) FROM t WHERE nullif(id, 1) IS NOT NULL;"
+expect "expression target with an alias" "3" \
+    v "SELECT id + 1 AS next FROM t WHERE id = 2;"
+expect "function target" "A" v "SELECT upper(name) FROM t WHERE id = 1;"
+expect "function target header" "upper" q "SELECT upper(name) FROM t WHERE id = 1;"
+expect "constant target header" "?column?" q "SELECT 7 FROM t WHERE id = 1;"
+expect "division by zero in WHERE" "division by zero" \
+    q "SELECT name FROM t WHERE id / 0 = 1;"
+expect "division by zero in a target" "division by zero" \
+    q "SELECT id / 0 FROM t;"
+expect "text vs number in WHERE refused" "operator does not exist" \
+    q "SELECT name FROM t WHERE name = id;"
 expect "unsupported operator rejected" "comparisons" q "SELECT name FROM t WHERE name ~ 'a';"
 
 # egid is a hidden system column: not in SELECT *.
@@ -647,7 +663,7 @@ expect "too few params is 08P01" \
 expect "too many params is 08P01" \
     "bind message supplies 2 parameters, but prepared statement requires 1" \
     x 'SELECT name FROM pt WHERE id = $1 \bind 1 2 \g'
-expect "a param that does not parse for its column" "invalid value in WHERE" \
+expect "a param that does not parse for its column" "invalid value" \
     x 'SELECT name FROM pt WHERE id = $1 \bind abc \g'
 expect "\$0 is rejected" "there is no parameter \$0" \
     x 'SELECT name FROM pt WHERE id = $0 \bind \g'

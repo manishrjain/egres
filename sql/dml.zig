@@ -35,7 +35,7 @@ const ExecCtx = _exec.ExecCtx;
 const Handler = _server.Handler;
 const PostingOp = _txn.Txn.PostingOp;
 const Pred = _pred.Pred;
-const SetNode = _expr.SetNode;
+const Node = _expr.Node;
 const String = _value.String;
 const litToValue = _parse.litToValue;
 const log = std.log.scoped(.sql);
@@ -126,11 +126,13 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
     // action rewrites the change that proposed id 1.
     var ctx = ExecCtx{
         .arloc = arloc,
+        .scratch = .init(tx.allocator),
         .tx = tx,
         .tbl = tbl,
         .table_id = table_id,
         .lock = true,
     };
+    defer ctx.deinit();
     var uniques: []Unique = &.{};
     if (ins.on_conflict) |oc| {
         uniques = (try uniqueIndexes(state, arloc, tbl, oc)) orelse return;
@@ -191,13 +193,16 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
     };
 
     const is_count = sel.projection == .count_star;
-    const proj = (try selectFields(state, arloc, tbl, sel)) orelse return;
+    const proj = (try selectFields(state, arloc, tbl, sel, self.params)) orelse
+        return;
     var emitter = RowEmitter{
         .state = state,
         .tbl = tbl,
-        .outs = proj.cols,
+        .outs = proj.outs,
+        .scratch = .init(tx.allocator),
         .limit = self.max_rows,
     };
+    defer emitter.scratch.deinit();
 
     // One loop for both kinds of plan. Plain SELECT streams each fill
     // to the wire; under FOR UPDATE the root's first `next` gathers
@@ -214,13 +219,16 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
         .count_only = is_count,
     })) orelse return;
     defer plan.deinit();
+
     var ctx = ExecCtx{
         .arloc = arloc,
+        .scratch = .init(tx.allocator),
         .tx = tx,
         .tbl = tbl,
         .table_id = table_id,
         .lock = sel.for_update,
     };
+    defer ctx.deinit();
     const batch = try self.batch();
     // The row description goes out after the first fill — after
     // whatever the root had to do to produce it. For a locking plan
@@ -260,7 +268,18 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
                 suspended = true;
                 break :outer;
             }
-            try emitter.emit(row);
+            // A target that fails to compute ends the result with the
+            // error, as in Postgres; a wire error goes to the serve loop.
+            emitter.emit(row) catch |err| switch (err) {
+                error.IntOutOfRange,
+                error.FloatOutOfRange,
+                error.DivisionByZero,
+                error.SubstringLength,
+                error.PowerArgument,
+                error.InvalidUtf8,
+                => return replyExprErr(state, @errorCast(err)),
+                else => return err,
+            };
         }
     }
     // count(*) is one row — which only LIMIT 0 drops.
@@ -312,11 +331,13 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
 
     var ctx = ExecCtx{
         .arloc = arloc,
+        .scratch = .init(tx.allocator),
         .tx = tx,
         .tbl = tbl,
         .table_id = table_id,
         .lock = true,
     };
+    defer ctx.deinit();
     const batch = try self.batch();
     const mat = &plan.root.materialize;
     const rows = mat.gatherAndLockRows(&ctx, batch) catch |err|
@@ -386,11 +407,13 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
 
     var ctx = ExecCtx{
         .arloc = arloc,
+        .scratch = .init(tx.allocator),
         .tx = tx,
         .tbl = tbl,
         .table_id = table_id,
         .lock = true,
     };
+    defer ctx.deinit();
     const batch = try self.batch();
     const mat = &plan.root.materialize;
     const rows = mat.gatherAndLockRows(&ctx, batch) catch |err|
@@ -611,8 +634,13 @@ fn resolveConflicts(
     // any lock.
     var where: ?*const Pred = null;
     if (oc.action == .update) if (oc.action.update.where) |cond| {
-        where = (try _pred.bind(state, arloc, tbl, cond, self.params)) orelse
-            return false;
+        where = (try _pred.bindOrReply(
+            state,
+            arloc,
+            tbl,
+            cond,
+            self.params,
+        )) orelse return false;
     };
 
     // The stored rows that hold one of those keys, read from the
@@ -651,7 +679,14 @@ fn resolveConflicts(
         const item = change.pre orelse continue;
         const keep = switch (oc.action) {
             .nothing => false,
-            .update => if (where) |cond| cond.matches(tbl, item) else true,
+            .update => if (where) |cond|
+                cond.matches(ctx.row(item)) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    try replyExprErr(state, err);
+                    return false;
+                }
+            else
+                true,
         };
         if (!keep) {
             change.* = .{};
@@ -706,9 +741,10 @@ fn collisionPred(
                 .update => return error.RowTwice,
             };
             slot.value_ptr.* = ci;
-            try leaves.append(arloc, .{
-                .cmp = .{ .col = unique.idx.column, .val = cell },
-            });
+            try leaves.append(
+                arloc,
+                try _pred.colCmp(arloc, unique.idx.column, .eq, cell),
+            );
         }
     };
     if (leaves.items.len == 0) return null;
@@ -735,7 +771,7 @@ fn replyRowTwice(state: *pgwire.ConnState) !bool {
 /// One SET clause, bound: the expression and its target column. Parse
 /// rejects duplicate SET columns.
 const Set = struct {
-    node: *const SetNode,
+    node: *const Node,
     col: *const _table.Column,
 };
 
@@ -767,7 +803,7 @@ fn bindSets(
             );
             return null;
         }
-        const node = (try _expr.bind(
+        const node = (try _expr.bindOrReply(
             state,
             arloc,
             tbl,
@@ -797,9 +833,11 @@ fn evalSets(
     row: *_value.Row,
 ) !?[]const _value.Value {
     try _row.unmarshalRow(arloc, &tbl.ps, item.newest().value, &.{}, row);
+    // The SET values outlive the row, so they compute into the arena.
+    const pre: _expr.Row = .{ .scratch = arloc, .tbl = tbl, .item = item };
     for (sets) |set| {
         const col = set.col;
-        const val = set.node.eval(arloc, tbl, item, col) catch |err| {
+        const val = set.node.eval(pre, col) catch |err| {
             try replyEvalErr(state, arloc, err, col);
             return null;
         };
@@ -851,16 +889,16 @@ pub fn describeSelect(
     const resolved = blk: {
         // state.send* can block below. Release the table hold here itself.
         defer hold.release();
-        const r = projectionOf(arloc, hold.tbl, sel);
+        const r = projectionOf(arloc, hold.tbl, sel, self.params);
         if (r) |proj| {
             for (proj.fields) |*fd| fd.name = try arloc.dupe(u8, fd.name);
         } else |_| {}
         break :blk r;
     };
 
-    const proj = resolved catch |err| switch (err) {
-        error.UndefinedColumn => return replyUndefinedColumn(state),
-        error.OutOfMemory => return err,
+    const proj = resolved catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return _expr.replyBindErr(state, arloc, err, null);
     };
     try state.sendRowDescription(proj.fields);
 }
@@ -884,7 +922,8 @@ fn describeSelectLoad(
         );
         return replyError(state, "failed to load table schema");
     };
-    const proj = (try selectFields(state, arloc, tbl, sel)) orelse return;
+    const proj = (try selectFields(state, arloc, tbl, sel, self.params)) orelse
+        return;
     try state.sendRowDescription(proj.fields);
 }
 
@@ -949,25 +988,36 @@ pub fn describeSelectRow(
 /// columns and their wire descriptions, one per column. count(*)
 /// projects no column — one int8 field.
 const SelectFields = struct {
-    cols: []const *const _table.Column,
+    /// The output expressions; egid is a column like any other.
+    outs: []const *const Node,
     fields: []pgwire.FieldDescription,
 };
 
-/// Resolve `sel`'s projection: `*` is the user columns; by name, egid
-/// resolves like any other column (Table.column). Pure:
-/// UndefinedColumn for a name the table lacks. The field names
-/// borrow the Table.
+/// Bind `sel`'s projection: `*` is the user columns; a target is an
+/// expression over the row (expr.bind), typed by what it computes.
+/// Pure: the expression binder's errors. The field names borrow the
+/// Table or the statement.
 fn projectionOf(
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
     sel: _parse.Select,
-) error{ UndefinedColumn, OutOfMemory }!SelectFields {
-    var cols: std.ArrayList(*const _table.Column) = .empty;
+    params: _parse.Params,
+) _expr.BindError!SelectFields {
+    var outs: std.ArrayList(*const Node) = .empty;
+    var names: std.ArrayList(String) = .empty;
     switch (sel.projection) {
-        .star => for (tbl.columns) |*c| try cols.append(arloc, c),
-        .columns => |names| for (names) |nm| {
-            const c = tbl.column(nm) orelse return error.UndefinedColumn;
-            try cols.append(arloc, c);
+        .star => for (tbl.columns) |*c| {
+            const node = try arloc.create(Node);
+            node.* = .{ .column = c };
+            try outs.append(arloc, node);
+            try names.append(arloc, c.name);
+        },
+        .targets => |targets| for (targets) |t| {
+            try outs.append(
+                arloc,
+                try _expr.bind(arloc, tbl, t.expr, null, params, null),
+            );
+            try names.append(arloc, t.name);
         },
         .count_star => {},
     }
@@ -975,33 +1025,42 @@ fn projectionOf(
     const is_count = sel.projection == .count_star;
     const fields = try arloc.alloc(
         pgwire.FieldDescription,
-        if (is_count) 1 else cols.items.len,
+        if (is_count) 1 else outs.items.len,
     );
     if (is_count) {
         fields[0] = .{ .name = "count", .type_oid = pgwire.oid.int8 };
-    } else for (cols.items, fields) |c, *fd| fd.* = .{
-        .name = c.name,
-        .type_oid = _value.pgTypeOid(c.ty),
-        .type_modifier = _value.pgTypeModifier(c.type_mod),
-        .format_code = 0,
-    };
-    return .{ .cols = cols.items, .fields = fields };
+    } else for (outs.items, names.items, fields) |node, name, *fd| {
+        // A NULL-only target has no type; text is what Postgres
+        // advertises for an unknown.
+        const col: ?*const _table.Column = switch (node.*) {
+            .column => |c| c,
+            else => null,
+        };
+        fd.* = .{
+            .name = name,
+            .type_oid = _value.pgTypeOid(node.ty() orelse .text),
+            .type_modifier = _value.pgTypeModifier(
+                if (col) |c| c.type_mod else null,
+            ),
+            .format_code = 0,
+        };
+    }
+    return .{ .outs = outs.items, .fields = fields };
 }
 
-/// projectionOf with the reply: null = 42703 was sent. `select`'s
-/// RowEmitter takes the columns.
+/// projectionOf with the reply: null = the bind error was sent.
+/// `select`'s RowEmitter takes the expressions.
 fn selectFields(
     state: *pgwire.ConnState,
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
     sel: _parse.Select,
+    params: _parse.Params,
 ) !?SelectFields {
-    return projectionOf(arloc, tbl, sel) catch |err| switch (err) {
-        error.UndefinedColumn => {
-            try replyUndefinedColumn(state);
-            return null;
-        },
-        error.OutOfMemory => return err,
+    return projectionOf(arloc, tbl, sel, params) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        try _expr.replyBindErr(state, arloc, err, null);
+        return null;
     };
 }
 
@@ -1022,7 +1081,9 @@ pub const RowEmitter = struct {
     state: *pgwire.ConnState,
     tbl: *const _table.Table,
     /// The projection — egid is a column too (table.egid_column).
-    outs: []const *const _table.Column,
+    outs: []const *const Node,
+    /// What a computed target needs for one row; reset per row.
+    scratch: std.heap.ArenaAllocator,
     count: u64 = 0,
     /// Execute's row limit; 0 = none.
     limit: u32 = 0,
@@ -1032,12 +1093,26 @@ pub const RowEmitter = struct {
         return self.limit != 0 and self.count >= self.limit;
     }
 
-    /// Project and send one row — each output cell decoded on its own
-    /// (O(1) each, Table.read), no full-row decode.
+    /// Project and send one row. A bare column is decoded on its own
+    /// (O(1), Table.read, no full-row decode) and printed with its
+    /// column's padding; any other target is computed into `scratch`.
     pub fn emit(self: *RowEmitter, item: zdb.kv.Item) !void {
+        _ = self.scratch.reset(.retain_capacity);
+        const row: _expr.Row = .{
+            .scratch = self.scratch.allocator(),
+            .tbl = self.tbl,
+            .item = item,
+        };
         var dw = try self.state.beginDataRow(@intCast(self.outs.len));
-        for (self.outs) |col| {
-            const v = self.tbl.parseCol(item, col);
+        for (self.outs) |node| {
+            const col: ?*const _table.Column = switch (node.*) {
+                .column => |c| c,
+                else => null,
+            };
+            const v = if (col) |c|
+                self.tbl.parseCol(item, c)
+            else
+                try node.cell(row);
             if (v == .null_value) {
                 try dw.writeNull();
             } else {
@@ -1085,7 +1160,7 @@ fn bumpToIndexes(
 }
 
 /// Bind the WHERE (null: every row) and plan it. null = bind already
-/// sent the error reply (the pred.bind convention).
+/// sent the error reply (the pred.bindOrReply convention).
 fn planFor(
     state: *pgwire.ConnState,
     arloc: std.mem.Allocator,
@@ -1096,7 +1171,7 @@ fn planFor(
 ) !?_plan.Plan {
     var pred: ?*const Pred = null;
     if (where) |tree| {
-        pred = (try _pred.bind(state, arloc, tbl, tree, params)) orelse
+        pred = (try _pred.bindOrReply(state, arloc, tbl, tree, params)) orelse
             return null;
     }
     return try _plan.plan(arloc, tbl, pred, opts);
@@ -1106,7 +1181,7 @@ fn planFor(
 /// non-constant literal: CURRENT_TIMESTAMP is the transaction's start
 /// (`now_us`, Unix µs), typed by the column it lands in — a timestamp
 /// column, else 42804. A `$n` is the bound value (`params`). null =
-/// the error reply was already sent (the pred.bind convention).
+/// the error reply was already sent (the pred.bindOrReply convention).
 fn coerceLiteral(
     state: *pgwire.ConnState,
     a: std.mem.Allocator,
@@ -1191,6 +1266,15 @@ fn replyEvalErr(
     return switch (err) {
         error.OutOfMemory => err,
         error.StringTooLong => replyStringTooLong(state, a, col),
+        else => replyExprErr(state, err),
+    };
+}
+
+/// An expression's own failure, no column involved: arithmetic, a
+/// function's argument, bytes that are not UTF-8.
+fn replyExprErr(state: *pgwire.ConnState, err: _expr.EvalError) !void {
+    return switch (err) {
+        error.OutOfMemory, error.StringTooLong => unreachable,
         error.InvalidUtf8 => replyInvalidUtf8(state),
         error.IntOutOfRange => replyErrorCode(
             state,
@@ -1503,6 +1587,14 @@ fn replyRunErr(
         error.Shutdown => err,
         error.MemLimit => _server.replyMemLimit(state),
         error.ReadBelowMinRead => _server.replySnapshotTooOld(state),
+        // The WHERE computed something it could not: PG's reply.
+        error.IntOutOfRange,
+        error.FloatOutOfRange,
+        error.DivisionByZero,
+        error.SubstringLength,
+        error.PowerArgument,
+        error.InvalidUtf8,
+        => replyExprErr(state, @errorCast(err)),
         else => {
             log.err(
                 verb ++ " '{s}': scan: {s}",

@@ -166,8 +166,16 @@ pub const OnConflict = struct {
 /// the number of rows the plan yields. Names are borrowed.
 pub const Projection = union(enum) {
     star,
-    columns: []String,
+    targets: []Target,
     count_star,
+};
+
+/// One SELECT target: an expression over the row and its output name,
+/// the alias or what Postgres prints without one: a column's name, a
+/// function's, else `?column?`.
+pub const Target = struct {
+    name: String, // borrowed
+    expr: Expr,
 };
 
 /// The comparison a WHERE leaf applies. `=` is the one an index
@@ -221,16 +229,20 @@ pub const CmpOp = enum {
 /// A single `column op literal` comparison — the leaf of a WHERE. The
 /// column is always on the left: a literal written there turns the
 /// operator around.
+/// `lhs op rhs`. When one side alone is a bare column it is the left
+/// one: the parser turns the operator to put it there, the shape the
+/// planner answers from an index.
 pub const Cmp = struct {
-    column: String, // borrowed
+    lhs: *const Expr,
     op: CmpOp = .eq,
-    literal: Literal,
+    rhs: *const Expr,
 };
 
-/// A parsed WHERE tree. Leaves name one column; AND/OR hold their
-/// children inline (a slice is already an indirection, and children
-/// are never shared between parents); NOT is a pointer only because a
-/// union cannot contain itself by value. Everything borrows the arena.
+/// A parsed WHERE tree. A leaf compares two expressions or tests one
+/// for NULL; AND/OR hold their children inline (a slice is already an
+/// indirection, and children are never shared between parents); NOT
+/// is a pointer only because a union cannot contain itself by value.
+/// Everything borrows the arena.
 pub const Where = union(enum) {
     cmp: Cmp,
     is_null: NullTest,
@@ -238,9 +250,9 @@ pub const Where = union(enum) {
     or_: []const Where,
     not: *const Where,
 
-    /// `column IS NULL` (negate = false) / `column IS NOT NULL`.
+    /// `expr IS NULL` (negate = false) / `expr IS NOT NULL`.
     pub const NullTest = struct {
-        column: String, // borrowed
+        expr: *const Expr,
         negate: bool,
     };
 };
@@ -1012,13 +1024,14 @@ fn operatorOf(ae: *const c.A_Expr) ?String {
     return parser.str(s.sval);
 }
 
-/// Parse a WHERE tree, shared by SELECT, DELETE, and UPDATE: `column
-/// op literal` leaves (`= <> < <= > >=`, the literal on either side),
-/// `column IS [NOT] NULL`, and AND / OR / NOT over them. Anything else
-/// (another operator, a subquery, column-vs-column, a bare boolean
-/// column) yields a clean `.invalid` reason; only OOM propagates. AND/OR children land in one arena slice, NOT's in one
-/// arena cell. Postgres flattens `a AND b AND c` into one node with
-/// three args; NOT always carries exactly one.
+/// Parse a WHERE tree, shared by SELECT, DELETE, and UPDATE: `expr op
+/// expr` leaves (`= <> < <= > >=`, each side a parseExpr expression),
+/// `expr IS [NOT] NULL`, and AND / OR / NOT over them. Anything else
+/// (another operator, a subquery, a bare boolean column) yields a
+/// clean `.invalid` reason; only OOM propagates. AND/OR children land
+/// in one arena slice, NOT's in one arena cell. Postgres flattens `a
+/// AND b AND c` into one node with three args; NOT always carries
+/// exactly one.
 fn parseWhere(
     alloc: std.mem.Allocator,
     params: *ParamTally,
@@ -1052,63 +1065,46 @@ fn parseWhere(
     }
 
     if (parser.cast(c.NullTest, p)) |nt| {
-        const column = try columnOf(alloc, nt.arg) orelse
-            return ParsedWhere.reject("IS NULL operand must be a column");
         const negate = switch (nt.nulltesttype) {
             c.IS_NULL => false,
             c.IS_NOT_NULL => true,
             else => return ParsedWhere.reject("unsupported WHERE clause"),
         };
-        return .{ .where = .{ .is_null = .{ .column = column, .negate = negate } } };
+        const operand = try alloc.create(Expr);
+        operand.* = switch (try parseExpr(alloc, params, parser.asNode(nt.arg))) {
+            .expr => |e| e,
+            .invalid => |msg| return .{ .invalid = msg },
+        };
+        return .{ .where = .{ .is_null = .{ .expr = operand, .negate = negate } } };
     }
 
     const ae = parser.cast(c.A_Expr, p) orelse
         return ParsedWhere.reject("unsupported WHERE clause");
-    // columnOf would read `excluded.x` as the row's own x.
     if (isExcludedRef(ae.lexpr) or isExcludedRef(ae.rexpr))
         return ParsedWhere.reject("EXCLUDED is not supported in a WHERE");
     var op = CmpOp.fromName(operatorOf(ae) orelse "") orelse
         return ParsedWhere.reject(
             "only = <> < <= > >= comparisons are supported in WHERE",
         );
-
-    // The column goes left; a literal written there turns the operator.
-    var column = try columnOf(alloc, ae.lexpr);
-    var value_side = ae.rexpr;
-    if (column == null) {
-        column = try columnOf(alloc, ae.rexpr) orelse
-            return ParsedWhere.reject(
-                "one side of a WHERE comparison must be a column",
-            );
-        value_side = ae.lexpr;
+    var lhs = try alloc.create(Expr);
+    lhs.* = switch (try parseExpr(alloc, params, parser.asNode(ae.lexpr))) {
+        .expr => |e| e,
+        .invalid => |msg| return .{ .invalid = msg },
+    };
+    var rhs = try alloc.create(Expr);
+    rhs.* = switch (try parseExpr(alloc, params, parser.asNode(ae.rexpr))) {
+        .expr => |e| e,
+        .invalid => |msg| return .{ .invalid = msg },
+    };
+    // A bare column goes left; the operator turns with it.
+    if (lhs.* != .column and rhs.* == .column) {
+        std.mem.swap(*Expr, &lhs, &rhs);
         op = op.flipped();
-    } else if (try columnOf(alloc, ae.rexpr) != null) {
-        return ParsedWhere.reject(
-            "a column compared with a column is not supported in WHERE",
-        );
     }
-    if (parser.cast(c.ParamRef, value_side)) |pr| {
-        const lit = params.note(pr.number) orelse
-            return .{ .invalid = try badParamMsg(alloc, pr.number) };
-        return .{ .where = .{ .cmp = .{
-            .column = column.?,
-            .op = op,
-            .literal = lit,
-        } } };
-    }
-    const ac = constant(value_side) orelse
-        return ParsedWhere.reject("a WHERE comparison needs a literal");
-    const lit = try literalFrom(alloc, ac);
-    if (lit == .unsupported)
-        return ParsedWhere.reject("a WHERE comparison needs a literal");
-    return .{ .where = .{ .cmp = .{
-        .column = column.?,
-        .op = op,
-        .literal = lit,
-    } } };
+    return .{ .where = .{ .cmp = .{ .lhs = lhs, .op = op, .rhs = rhs } } };
 }
 
-/// A parsed SET expression or a rejection reason (borrowed).
+/// A parsed expression or a rejection reason (borrowed).
 const ParsedExpr = union(enum) {
     expr: Expr,
     invalid: String,
@@ -1118,7 +1114,8 @@ const ParsedExpr = union(enum) {
     }
 };
 
-/// The operator an A_Expr names, or null for one SET does not do.
+/// The operator an A_Expr names, or null for one an expression does
+/// not do.
 fn opFrom(name: String) ?Expr.Op {
     if (std.mem.eql(u8, name, "||")) return .concat;
     if (name.len != 1) return null;
@@ -1132,11 +1129,12 @@ fn opFrom(name: String) ?Expr.Op {
     };
 }
 
-/// Parse a SET value: a literal, a `$n`, a column, CONCAT or COALESCE
-/// of SET values, or `+ - * / % ||` over them, recursively. Anything
-/// else (another function, a cast, a subquery, DEFAULT, another
-/// operator) yields a clean `.invalid` reason; only OOM propagates.
-/// Each child lands in one arena cell.
+/// Parse an expression, a SET value, a WHERE operand or a SELECT
+/// target: a literal, a `$n`, a column, a call of a funcs.zig function
+/// over expressions, or `+ - * / % ||` over them, recursively.
+/// Anything else (another function, a cast, a subquery, DEFAULT,
+/// another operator) yields a clean `.invalid` reason; only OOM
+/// propagates. Each child lands in one arena cell.
 fn parseExpr(
     arloc: std.mem.Allocator,
     params: *ParamTally,
@@ -1145,7 +1143,7 @@ fn parseExpr(
     if (constant(p)) |ac| {
         const lit = try literalFrom(arloc, ac);
         if (lit == .unsupported)
-            return ParsedExpr.reject("unsupported literal in SET");
+            return ParsedExpr.reject("unsupported literal");
         return .{ .expr = .{ .literal = lit } };
     }
     if (parser.cast(c.ParamRef, p)) |pr| {
@@ -1156,11 +1154,11 @@ fn parseExpr(
     if (parser.cast(c.ColumnRef, p)) |cr| {
         if (isExcludedRef(p)) {
             const name = try lastName(arloc, cr.fields) orelse
-                return ParsedExpr.reject("unsupported column reference in SET");
+                return ParsedExpr.reject("unsupported column reference");
             return .{ .expr = .{ .excluded = name } };
         }
         const column = try columnOf(arloc, p) orelse
-            return ParsedExpr.reject("unsupported column reference in SET");
+            return ParsedExpr.reject("unsupported column reference");
         return .{ .expr = .{ .column = column } };
     }
     if (parser.cast(c.FuncCall, p)) |fc| {
@@ -1168,7 +1166,7 @@ fn parseExpr(
         const func = _funcs.byName(name) orelse return .{
             .invalid = try std.fmt.allocPrint(
                 arloc,
-                "function {s}() is not supported in SET",
+                "function {s}() is not supported",
                 .{name},
             ),
         };
@@ -1176,7 +1174,7 @@ fn parseExpr(
             fc.over != null or fc.agg_order != null)
         {
             return ParsedExpr.reject(
-                "aggregate forms are not supported in SET",
+                "aggregate forms are not supported",
             );
         }
         return parseCall(arloc, params, func, fc.args);
@@ -1191,7 +1189,7 @@ fn parseExpr(
         return parseCall(arloc, params, func, mm.args);
     }
     const ae = parser.cast(c.A_Expr, p) orelse return ParsedExpr.reject(
-        "SET value must be a literal, a column, a function call, " ++
+        "an expression must be a literal, a column, a function call, " ++
             "or an operator expression over them",
     );
     if (ae.kind == c.AEXPR_NULLIF) {
@@ -1199,7 +1197,7 @@ fn parseExpr(
             parser.asNode(ae.lexpr), parser.asNode(ae.rexpr),
         });
     }
-    const bad_op = "only + - * / % || are supported in SET";
+    const bad_op = "only the + - * / % || operators are supported";
     const op = opFrom(operatorOf(ae) orelse "") orelse
         return ParsedExpr.reject(bad_op);
 
@@ -1238,7 +1236,7 @@ fn parseCall(
     return parseArgs(arloc, params, func, nodes);
 }
 
-/// A call of `func` on `nodes`, each a SET value, as many as the
+/// A call of `func` on `nodes`, each an expression, as many as the
 /// function takes.
 fn parseArgs(
     arloc: std.mem.Allocator,
@@ -1291,10 +1289,10 @@ fn funcName(fc: *const c.FuncCall) ?String {
     return parser.str(s.sval);
 }
 
-/// SELECT [cols|*|count(*)] FROM one_table [WHERE ...] [FOR UPDATE]
+/// SELECT [exprs|*|count(*)] FROM one_table [WHERE ...] [FOR UPDATE]
 /// [LIMIT n], or constants with no FROM (parseSelectRow). Joins,
-/// subqueries, ORDER BY / GROUP BY / OFFSET / DISTINCT and expression
-/// targets are rejected.
+/// subqueries and ORDER BY / GROUP BY / OFFSET / DISTINCT are
+/// rejected.
 fn parseSelect(
     alloc: std.mem.Allocator,
     ss: *const c.SelectStmt,
@@ -1332,25 +1330,38 @@ fn parseSelect(
     const rv = parser.cast(c.RangeVar, from[0].ptr_value) orelse
         return invalid("only table sources are supported");
 
-    // Every target must be a column reference, except the one aggregate,
-    // a lone `count(*)`; a `*` anywhere makes it a star projection.
+    // A `*` anywhere makes it a star projection; a lone `count(*)` is
+    // the one aggregate; every other target is an expression.
     const targets = parser.items(ss.targetList);
+    var params = ParamTally{};
     var star = false;
     var count_star = false;
+    var outs: std.ArrayList(Target) = .empty;
     for (targets) |cell| {
         const rt = parser.cast(c.ResTarget, cell.ptr_value) orelse
             return .unsupported;
         if (parser.cast(c.FuncCall, rt.val)) |fc| {
-            if (!isCountStar(fc))
-                return invalid("only count(*) is supported in SELECT");
-            count_star = true;
-            continue;
+            if (isCountStar(fc)) {
+                count_star = true;
+                continue;
+            }
+            if (isAggregate(fc))
+                return invalid("only count(*) is supported among aggregates");
         }
-        const cr = parser.cast(c.ColumnRef, rt.val) orelse
-            return invalid("only column references are supported in SELECT");
-        for (parser.items(cr.fields)) |f| {
-            if (parser.cast(c.A_Star, f.ptr_value) != null) star = true;
+        if (parser.cast(c.ColumnRef, rt.val)) |cr| {
+            for (parser.items(cr.fields)) |f| {
+                if (parser.cast(c.A_Star, f.ptr_value) != null) star = true;
+            }
+            if (star) continue;
         }
+        const expr = switch (try parseExpr(alloc, &params, parser.asNode(rt.val))) {
+            .expr => |e| e,
+            .invalid => |msg| return .{ .invalid = msg },
+        };
+        try outs.append(alloc, .{
+            .name = try targetName(alloc, rt, expr),
+            .expr = expr,
+        });
     }
     if (count_star and targets.len != 1)
         return invalid("count(*) cannot be combined with other targets");
@@ -1358,17 +1369,6 @@ fn parseSelect(
     if (count_star and locking.len > 0)
         return invalid("FOR UPDATE is not allowed with count(*)");
 
-    var cols: std.ArrayList(String) = .empty;
-    if (!star and !count_star) {
-        for (targets) |cell| {
-            const rt = parser.cast(c.ResTarget, cell.ptr_value).?;
-            const column = try columnOf(alloc, rt.val) orelse
-                return invalid("unsupported column reference");
-            try cols.append(alloc, column);
-        }
-    }
-
-    var params = ParamTally{};
     var where: ?Where = null;
     if (ss.whereClause != null) switch (try parseWhere(
         alloc,
@@ -1401,7 +1401,7 @@ fn parseSelect(
     else if (star)
         .star
     else
-        .{ .columns = try cols.toOwnedSlice(alloc) };
+        .{ .targets = try outs.toOwnedSlice(alloc) };
     return .{ .select = .{
         .table = try dup(alloc, rv.relname),
         .projection = projection,
@@ -1410,6 +1410,35 @@ fn parseSelect(
         .limit = limit,
         .param_count = params.count,
     } };
+}
+
+/// Whether a call is an aggregate: one of the standard five by name,
+/// or any call in an aggregate or window form.
+fn isAggregate(fc: *const c.FuncCall) bool {
+    if (fc.agg_star or fc.agg_distinct or fc.agg_filter != null or
+        fc.agg_order != null or fc.over != null) return true;
+    const name = funcName(fc) orelse return false;
+    const aggregates = [_]String{ "count", "sum", "avg", "min", "max" };
+    for (aggregates) |agg| {
+        if (std.mem.eql(u8, name, agg)) return true;
+    }
+    return false;
+}
+
+/// A target's output name: its alias, else what Postgres prints, the
+/// column's name for a column, the function's for a call, `?column?`
+/// for anything else.
+fn targetName(
+    alloc: std.mem.Allocator,
+    rt: *const c.ResTarget,
+    expr: Expr,
+) parser.ParseError!String {
+    if (rt.name != null) return dup(alloc, rt.name);
+    return switch (expr) {
+        .column, .excluded => |name| name,
+        .call => |call| call.func.name,
+        .literal, .binop => "?column?",
+    };
 }
 
 /// SELECT constant [AS name], ... with no FROM: one row, nothing

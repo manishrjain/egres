@@ -190,7 +190,7 @@ test "sql.parse: a cast constant is the constant (pgjdbc simple mode)" {
         "SELECT val FROM t WHERE sk = '6'::int8;",
     );
     const eq = sel.select.where.?.cmp;
-    try testing.expectEqualStrings("6", eq.literal.str);
+    try testing.expectEqualStrings("6", eq.rhs.literal.str);
     const ins = try parse.statement(
         alloc,
         "INSERT INTO t (id, val) VALUES (CAST('7' AS int8), 'x'::text);",
@@ -427,13 +427,15 @@ test "sql.parse: SELECT parses projection, table, and an equality filter" {
 
     // Named columns incl. the egid pseudo-column + a WHERE filter.
     const s2 = try parse.statement(alloc, "SELECT egid, name FROM t WHERE id = 5;");
-    try testing.expect(s2.select.projection == .columns);
-    try testing.expectEqual(@as(usize, 2), s2.select.projection.columns.len);
-    try testing.expectEqualStrings("egid", s2.select.projection.columns[0]);
-    try testing.expectEqualStrings("name", s2.select.projection.columns[1]);
+    try testing.expect(s2.select.projection == .targets);
+    const targets = s2.select.projection.targets;
+    try testing.expectEqual(@as(usize, 2), targets.len);
+    try testing.expectEqualStrings("egid", targets[0].expr.column);
+    try testing.expectEqualStrings("egid", targets[0].name);
+    try testing.expectEqualStrings("name", targets[1].expr.column);
     const f = s2.select.where.?.cmp;
-    try testing.expectEqualStrings("id", f.column);
-    try testing.expectEqual(@as(i64, 5), f.literal.int);
+    try testing.expectEqualStrings("id", f.lhs.column);
+    try testing.expectEqual(@as(i64, 5), f.rhs.literal.int);
 
     // count(*): its own projection kind; WHERE and LIMIT parse as usual.
     const c1 = try parse.statement(alloc, "SELECT count(*) FROM t;");
@@ -445,7 +447,7 @@ test "sql.parse: SELECT parses projection, table, and an equality filter" {
         "select COUNT(*) from t where id = 5 limit 0;",
     );
     try testing.expect(c2.select.projection == .count_star);
-    try testing.expectEqualStrings("id", c2.select.where.?.cmp.column);
+    try testing.expectEqualStrings("id", c2.select.where.?.cmp.lhs.column);
     try testing.expectEqual(@as(?usize, 0), c2.select.limit);
 }
 
@@ -460,22 +462,22 @@ test "sql.parse: WHERE parses AND / OR / NOT and IS [NOT] NULL" {
     const s1 = try parse.statement(alloc, "SELECT * FROM t WHERE a = 1 AND b = 2 AND c = 3;");
     const and3 = s1.select.where.?.and_;
     try testing.expectEqual(@as(usize, 3), and3.len);
-    try testing.expectEqualStrings("a", and3[0].cmp.column);
-    try testing.expectEqualStrings("b", and3[1].cmp.column);
-    try testing.expectEqualStrings("c", and3[2].cmp.column);
-    try testing.expectEqual(@as(i64, 3), and3[2].cmp.literal.int);
+    try testing.expectEqualStrings("a", and3[0].cmp.lhs.column);
+    try testing.expectEqualStrings("b", and3[1].cmp.lhs.column);
+    try testing.expectEqualStrings("c", and3[2].cmp.lhs.column);
+    try testing.expectEqual(@as(i64, 3), and3[2].cmp.rhs.literal.int);
 
     // Nesting, parentheses, NOT — shared by DELETE.
     const d = try parse.statement(alloc, "DELETE FROM t WHERE a = 1 OR (b = 2 AND NOT c = 'x');");
     const or2 = d.delete.where.?.or_;
     try testing.expectEqual(@as(usize, 2), or2.len);
-    try testing.expectEqualStrings("a", or2[0].cmp.column);
+    try testing.expectEqualStrings("a", or2[0].cmp.lhs.column);
     const and2 = or2[1].and_;
     try testing.expectEqual(@as(usize, 2), and2.len);
-    try testing.expectEqualStrings("b", and2[0].cmp.column);
+    try testing.expectEqualStrings("b", and2[0].cmp.lhs.column);
     const inner = and2[1].not.*;
-    try testing.expectEqualStrings("c", inner.cmp.column);
-    try testing.expectEqualStrings("x", inner.cmp.literal.str);
+    try testing.expectEqualStrings("c", inner.cmp.lhs.column);
+    try testing.expectEqualStrings("x", inner.cmp.rhs.literal.str);
 
     // SQL precedence: AND binds tighter than OR.
     const p = try parse.statement(alloc, "SELECT * FROM t WHERE a = 1 OR b = 2 AND c = 3;");
@@ -486,12 +488,12 @@ test "sql.parse: WHERE parses AND / OR / NOT and IS [NOT] NULL" {
 
     // IS NULL / IS NOT NULL — shared by UPDATE.
     const upd1 = try parse.statement(alloc, "UPDATE t SET a = 1 WHERE b IS NULL;");
-    try testing.expectEqualStrings("b", upd1.update.where.?.is_null.column);
+    try testing.expectEqualStrings("b", upd1.update.where.?.is_null.expr.column);
     try testing.expect(!upd1.update.where.?.is_null.negate);
     const upd2 = try parse.statement(alloc, "UPDATE t SET a = 1 WHERE b IS NOT NULL AND c = 1;");
     const upd2_and = upd2.update.where.?.and_;
     try testing.expect(upd2_and[0].is_null.negate);
-    try testing.expectEqualStrings("c", upd2_and[1].cmp.column);
+    try testing.expectEqualStrings("c", upd2_and[1].cmp.lhs.column);
 
     // Rejections anywhere in the tree surface the leaf's reason.
     const cases = [_]struct { sql: String, needle: String }{
@@ -499,8 +501,7 @@ test "sql.parse: WHERE parses AND / OR / NOT and IS [NOT] NULL" {
         .{ .sql = "SELECT * FROM t WHERE a = 1 OR b;", .needle = "unsupported WHERE" },
         .{ .sql = "SELECT * FROM t WHERE NOT b;", .needle = "unsupported WHERE" },
         .{ .sql = "SELECT * FROM t WHERE a IS DISTINCT FROM 1;", .needle = "comparisons" },
-        .{ .sql = "SELECT * FROM t WHERE (a = 1) IS NULL;", .needle = "IS NULL operand" },
-        .{ .sql = "SELECT * FROM t WHERE a = 1 AND b = c;", .needle = "column compared with a column" },
+        .{ .sql = "SELECT * FROM t WHERE (a = 1) IS NULL;", .needle = "operators" },
     };
     for (cases) |case| {
         const stmt = try parse.statement(alloc, case.sql);
@@ -562,7 +563,6 @@ test "sql.parse: SELECT rejections carry a reason" {
             .sql = "SELECT count(*) FROM t FOR UPDATE;",
             .needle = "FOR UPDATE",
         },
-        .{ .sql = "SELECT * FROM t WHERE a > b;", .needle = "column compared with a column" },
     };
     for (cases) |case| {
         const stmt = try parse.statement(alloc, case.sql);
@@ -654,21 +654,21 @@ test "sql.parse: DELETE parses table and the optional equality filter" {
     // WHERE on a payload column.
     const d2 = try parse.statement(alloc, "DELETE FROM t WHERE id = 5;");
     const f2 = d2.delete.where.?.cmp;
-    try testing.expectEqualStrings("id", f2.column);
-    try testing.expectEqual(@as(i64, 5), f2.literal.int);
+    try testing.expectEqualStrings("id", f2.lhs.column);
+    try testing.expectEqual(@as(i64, 5), f2.rhs.literal.int);
 
     // WHERE on the egid pseudo-column parses as a plain column filter.
     const d3 = try parse.statement(alloc, "DELETE FROM t WHERE egid = 3;");
     const f3 = d3.delete.where.?.cmp;
-    try testing.expectEqualStrings("egid", f3.column);
-    try testing.expectEqual(@as(i64, 3), f3.literal.int);
+    try testing.expectEqualStrings("egid", f3.lhs.column);
+    try testing.expectEqual(@as(i64, 3), f3.rhs.literal.int);
 
     // Qualified name keeps the last part; string literal.
     const d4 = try parse.statement(alloc, "DELETE FROM public.t WHERE name = 'x';");
     try testing.expectEqualStrings("t", d4.delete.table);
     const f4 = d4.delete.where.?.cmp;
-    try testing.expectEqualStrings("name", f4.column);
-    try testing.expectEqualStrings("x", f4.literal.str);
+    try testing.expectEqualStrings("name", f4.lhs.column);
+    try testing.expectEqualStrings("x", f4.rhs.literal.str);
 }
 
 test "sql.parse: DELETE rejections carry a reason" {
@@ -680,12 +680,10 @@ test "sql.parse: DELETE rejections carry a reason" {
         .{ .sql = "DELETE FROM t USING u WHERE t.a = u.a;", .needle = "USING" },
         .{ .sql = "DELETE FROM t RETURNING id;", .needle = "RETURNING" },
         .{ .sql = "WITH x AS (SELECT 1) DELETE FROM t;", .needle = "WITH" },
-        .{ .sql = "DELETE FROM t WHERE 5 > 6;", .needle = "must be a column" },
         .{
             .sql = "DELETE FROM t WHERE id IN (SELECT id FROM u);",
             .needle = "WHERE",
         },
-        .{ .sql = "DELETE FROM t WHERE a = b;", .needle = "column compared" },
     };
     for (cases) |case| {
         const stmt = try parse.statement(alloc, case.sql);
@@ -721,12 +719,12 @@ test "sql.parse: UPDATE parses table, SET list, and the optional filter" {
     const up2 = try parse.statement(alloc, "UPDATE t SET a = 0 WHERE id = 7;");
     try testing.expectEqual(@as(i64, 0), up2.update.sets[0].value.literal.int);
     const f2 = up2.update.where.?.cmp;
-    try testing.expectEqualStrings("id", f2.column);
-    try testing.expectEqual(@as(i64, 7), f2.literal.int);
+    try testing.expectEqualStrings("id", f2.lhs.column);
+    try testing.expectEqual(@as(i64, 7), f2.rhs.literal.int);
 
     // WHERE on the egid pseudo-column parses as a plain column filter.
     const up3 = try parse.statement(alloc, "UPDATE t SET a = 1 WHERE egid = 3;");
-    try testing.expectEqualStrings("egid", up3.update.where.?.cmp.column);
+    try testing.expectEqualStrings("egid", up3.update.where.?.cmp.lhs.column);
 }
 
 /// The first SET value of an UPDATE that must parse.
@@ -828,14 +826,14 @@ test "sql.parse: UPDATE rejections carry a reason" {
         .{ .sql = "UPDATE t SET a = 1 FROM u;", .needle = "FROM" },
         .{ .sql = "UPDATE t SET a = 1 RETURNING id;", .needle = "RETURNING" },
         .{ .sql = "WITH x AS (SELECT 1) UPDATE t SET a = 1;", .needle = "WITH" },
-        .{ .sql = "UPDATE t SET a = DEFAULT;", .needle = "SET value" },
+        .{ .sql = "UPDATE t SET a = DEFAULT;", .needle = "an expression" },
         .{ .sql = "UPDATE t SET a = now();", .needle = "not supported" },
-        .{ .sql = "UPDATE t SET a = (SELECT 1);", .needle = "SET value" },
-        .{ .sql = "UPDATE t SET (a, b) = (1, 2);", .needle = "SET value" },
-        .{ .sql = "UPDATE t SET a = a AND b;", .needle = "SET value" },
+        .{ .sql = "UPDATE t SET a = (SELECT 1);", .needle = "an expression" },
+        .{ .sql = "UPDATE t SET (a, b) = (1, 2);", .needle = "an expression" },
+        .{ .sql = "UPDATE t SET a = a AND b;", .needle = "an expression" },
         .{ .sql = "UPDATE t SET a = a ^ 2;", .needle = "supported" },
         .{ .sql = "UPDATE t SET a = a + 1, a = 2;", .needle = "duplicate" },
-        .{ .sql = "UPDATE t SET a = 1 WHERE b > (SELECT 1);", .needle = "needs a literal" },
+        .{ .sql = "UPDATE t SET a = 1 WHERE b > (SELECT 1);", .needle = "an expression" },
     };
     for (cases) |case| {
         const stmt = try parse.statement(alloc, case.sql);
@@ -870,13 +868,13 @@ test "sql.parse: $n placeholders parse in every literal position" {
         "SELECT * FROM t WHERE a = $1 AND (b = $3 OR NOT c = $2);",
     );
     const top = sel.select.where.?.and_;
-    try testing.expectEqual(@as(u16, 1), top[0].cmp.literal.param);
-    try testing.expectEqual(@as(u16, 3), top[1].or_[0].cmp.literal.param);
-    try testing.expectEqual(@as(u16, 2), top[1].or_[1].not.cmp.literal.param);
+    try testing.expectEqual(@as(u16, 1), top[0].cmp.rhs.literal.param);
+    try testing.expectEqual(@as(u16, 3), top[1].or_[0].cmp.rhs.literal.param);
+    try testing.expectEqual(@as(u16, 2), top[1].or_[1].not.cmp.rhs.literal.param);
     try testing.expectEqual(@as(u16, 3), sel.select.param_count);
 
     const del = try parse.statement(alloc, "DELETE FROM t WHERE a = $1;");
-    try testing.expectEqual(@as(u16, 1), del.delete.where.?.cmp.literal.param);
+    try testing.expectEqual(@as(u16, 1), del.delete.where.?.cmp.rhs.literal.param);
     try testing.expectEqual(@as(u16, 1), del.delete.param_count);
 
     // SET: at the root, under an operator, and in the WHERE.
@@ -887,7 +885,7 @@ test "sql.parse: $n placeholders parse in every literal position" {
     const sets = up.update.sets;
     try testing.expectEqual(@as(u16, 1), sets[0].value.binop.rhs.literal.param);
     try testing.expectEqual(@as(u16, 2), sets[1].value.literal.param);
-    try testing.expectEqual(@as(u16, 3), up.update.where.?.cmp.literal.param);
+    try testing.expectEqual(@as(u16, 3), up.update.where.?.cmp.rhs.literal.param);
     try testing.expectEqual(@as(u16, 3), up.update.param_count);
 
     // The count is the highest index, whether or not the lower ones
@@ -1109,18 +1107,18 @@ test "sql.parse: WHERE comparisons carry their operator, the column left" {
             .update => |u| u.where.?,
             else => unreachable,
         };
-        try testing.expectEqualStrings("a", where.cmp.column);
+        try testing.expectEqualStrings("a", where.cmp.lhs.column);
         try testing.expectEqual(case.op, where.cmp.op);
-        try testing.expectEqual(case.int, where.cmp.literal.int);
+        try testing.expectEqual(case.int, where.cmp.rhs.literal.int);
     }
 
     // A parameter on either side, and a comparison under NOT / AND.
     const p = try parse.statement(alloc, "SELECT * FROM t WHERE $1 <= a AND NOT b >= $2;");
     const and2 = p.select.where.?.and_;
     try testing.expectEqual(parse.CmpOp.ge, and2[0].cmp.op);
-    try testing.expectEqual(@as(u16, 1), and2[0].cmp.literal.param);
+    try testing.expectEqual(@as(u16, 1), and2[0].cmp.rhs.literal.param);
     try testing.expectEqual(parse.CmpOp.ge, and2[1].not.cmp.op);
-    try testing.expectEqual(@as(u16, 2), and2[1].not.cmp.literal.param);
+    try testing.expectEqual(@as(u16, 2), and2[1].not.cmp.rhs.literal.param);
     try testing.expectEqual(@as(u16, 2), p.select.param_count);
 }
 
@@ -1168,7 +1166,7 @@ test "sql.parse: CONCAT and COALESCE in SET are calls over SET values" {
         .{ .sql = "UPDATE t SET a = left(a,1,2);", .needle = "2 arguments" },
         .{ .sql = "UPDATE t SET a = concat(DISTINCT a);", .needle = "aggregate" },
         .{ .sql = "UPDATE t SET a = concat(a) OVER ();", .needle = "aggregate" },
-        .{ .sql = "UPDATE t SET a = concat((SELECT 1));", .needle = "SET value" },
+        .{ .sql = "UPDATE t SET a = concat((SELECT 1));", .needle = "an expression" },
     };
     for (cases) |case| {
         const stmt = try parse.statement(alloc, case.sql);
@@ -1235,8 +1233,8 @@ test "sql.parse: INSERT ... ON CONFLICT names the column and the action" {
     try testing.expectEqualStrings("val", call.args[2].excluded);
     try testing.expectEqualStrings("sk", sets[1].value.excluded);
     const where = u.action.update.where.?.cmp;
-    try testing.expectEqualStrings("sk", where.column);
-    try testing.expectEqual(@as(u16, 4), where.literal.param);
+    try testing.expectEqualStrings("sk", where.lhs.column);
+    try testing.expectEqual(@as(u16, 4), where.rhs.literal.param);
     try testing.expectEqual(@as(u16, 4), up.insert.param_count);
 
     const cases = [_]struct { sql: String, needle: String }{
@@ -1275,4 +1273,40 @@ test "sql.parse: INSERT ... ON CONFLICT names the column and the action" {
         try testing.expect(stmt == .invalid);
         try testing.expect(std.mem.indexOf(u8, stmt.invalid, case.needle) != null);
     }
+}
+
+test "sql.parse: expressions stand in SELECT targets and on both WHERE sides" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const stmt = try parse.statement(
+        alloc,
+        "SELECT upper(name) AS u, id + 1, lower(name), 7 FROM t " ++
+            "WHERE length(name) > id AND 5 > 6 AND a = b AND nullif(id, 0) IS NULL;",
+    );
+    const targets = stmt.select.projection.targets;
+    try testing.expectEqual(@as(usize, 4), targets.len);
+    try testing.expectEqualStrings("u", targets[0].name);
+    try testing.expectEqualStrings("upper", targets[0].expr.call.func.name);
+    try testing.expectEqualStrings("?column?", targets[1].name);
+    try testing.expect(targets[1].expr == .binop);
+    try testing.expectEqualStrings("lower", targets[2].name);
+    try testing.expectEqualStrings("?column?", targets[3].name);
+    try testing.expectEqual(@as(i64, 7), targets[3].expr.literal.int);
+
+    const terms = stmt.select.where.?.and_;
+    try testing.expectEqual(@as(usize, 4), terms.len);
+    // The bare column went left and the operator turned with it.
+    try testing.expectEqualStrings("id", terms[0].cmp.lhs.column);
+    try testing.expectEqual(parse.CmpOp.lt, terms[0].cmp.op);
+    try testing.expectEqualStrings("length", terms[0].cmp.rhs.call.func.name);
+    // Two constants, two columns: nothing to turn.
+    try testing.expectEqual(@as(i64, 5), terms[1].cmp.lhs.literal.int);
+    try testing.expectEqual(parse.CmpOp.gt, terms[1].cmp.op);
+    try testing.expectEqualStrings("a", terms[2].cmp.lhs.column);
+    try testing.expectEqualStrings("b", terms[2].cmp.rhs.column);
+    try testing.expectEqualStrings("nullif", terms[3].is_null.expr.call.func.name);
+    try testing.expect(!terms[3].is_null.negate);
 }

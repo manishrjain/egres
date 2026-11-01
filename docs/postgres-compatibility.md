@@ -82,7 +82,7 @@ The default SQL port is `3210`. The database `egres` exists from the first boot,
 The shape a `SELECT` takes today:
 
 ```sql
-SELECT column, ... | * | count(*)
+SELECT expression [AS name], ... | * | count(*)
 FROM one_table
 [WHERE predicate]
 [FOR UPDATE]
@@ -93,8 +93,9 @@ FROM one_table
 |---|---|---|
 | `SELECT 1`, constants with no `FROM` | Yes | One row; a pool's connection check. Aliases allowed. |
 | Column references and `*` in the target list | Yes | The `egid` column can be selected by name. |
+| Expressions in the target list, with `AS` | Yes | Arithmetic, `\|\|` and the [supported functions](#functions-and-operators) over the row's columns, literals and parameters. Without an alias the name is the column's, the function's, or `?column?`. |
 | `count(*)` | Yes | Alone in the target list. |
-| Other aggregates, expressions, casts, aliases, functions in the target list | Not&nbsp;yet | |
+| Other aggregates, casts, `CASE`, subqueries in the target list | Not&nbsp;yet | |
 | One table in `FROM`, named directly | Yes | |
 | `JOIN`, subqueries, `VALUES` in `FROM`, table aliases | Not&nbsp;yet | |
 | `WHERE` | Partial | See below. |
@@ -111,13 +112,15 @@ Rows come back in `egid` order, which is insertion order, whether a scan or an i
 | Form | Status | Notes |
 |---|---|---|
 | `column = literal` | Yes | A number, a string, a boolean or `NULL`. `column = NULL` matches nothing, as in Postgres. A literal that does not parse as the column's type returns `22P02`. |
+| `expression op expression` | Yes | Arithmetic, `\|\|` and the [supported functions](#functions-and-operators) on either side, a column compared with a column included. Two numbers or two strings compare; other pairings return `42883`. Checked row by row: only a bare column against a constant reads an index. |
+| `expression IS [NOT] NULL` | Yes | |
 | `column = $n` | Yes | |
 | `column IS NULL`, `column IS NOT NULL` | Yes | |
 | `AND`, `OR`, `NOT` | Yes | Nested to any depth. |
 | `egid = N` | Yes | A single-hop point read; `N` is a positive integer. See [Extensions](#extensions). |
 | `<`, `<=`, `>`, `>=`, `<>` (`!=`) | Yes | The literal may stand on either side. Text compares bytewise. On an indexed column `<`, `<=`, `>` and `>=` read the index between the bounds; `<>` scans. |
 | `BETWEEN`, `LIKE`, `ILIKE`, `IN (...)`, `IS DISTINCT FROM` | Not&nbsp;yet | |
-| A function or expression on either side, a bare boolean column, a column compared with a column | Not&nbsp;yet | |
+| A bare boolean column, `CASE`, subqueries | Not&nbsp;yet | |
 
 Any indexed column in the predicate drives the query through its index, an equality as one entry and an ordered comparison as the entries between its bounds, and `AND`, `OR` and `NOT` over indexed columns become bitmap operations. A predicate on an unindexed column scans the table with the predicate applied to each row. A mixed predicate uses the indexed terms to pick a superset of the rows and re-checks the whole predicate on each. An index still being built is used once its backfill completes.
 
@@ -186,11 +189,11 @@ Assignments in `SET` follow Postgres: any integer into any numeric column with a
 |---|---|---|
 | `count(*)` | Yes | Alone in the target list. |
 | `CURRENT_TIMESTAMP`, `LOCALTIMESTAMP` | Partial | In `INSERT ... VALUES`, into a `timestamp` or `timestamptz` column; the transaction's start time, as in Postgres. In `WHERE` or `SET`: not yet. |
-| `+`, `-`, `*`, `/`, `%` on numeric types, unary minus | Yes | In `UPDATE ... SET`, over literals, parameters and columns of the same row. |
-| `\|\|` on strings | Yes | In `UPDATE ... SET`. |
+| `+`, `-`, `*`, `/`, `%` on numeric types, unary minus | Yes | In `SELECT` targets, `WHERE` and `UPDATE ... SET`, over literals, parameters and columns of the same row. |
+| `\|\|` on strings | Yes | In `SELECT` targets, `WHERE` and `UPDATE ... SET`. |
 | A cast of a constant: `'6'::int8`, `CAST('x' AS text)` | Partial | In `VALUES`, `WHERE`, `SET` and a `SELECT` without `FROM`. The constant is typed by the column it meets, as a bare literal is; the named type is not checked. pgjdbc in simple query mode inlines every bind parameter this way. |
-| `COALESCE`, `NULLIF`, `GREATEST`, `LEAST`, `CONCAT`, `CONCAT_WS`, `LOWER`, `UPPER`, `LENGTH`, `SUBSTRING`, `REPLACE`, `TRIM`, `LTRIM`, `RTRIM`, `LEFT`, `RIGHT`, `ABS`, `SIGN`, `FLOOR`, `CEIL`, `ROUND`, `TRUNC`, `MOD`, `POWER`, `SQRT` | Yes | In `UPDATE ... SET`, over literals, parameters and columns of the row; strings and numbers. `LOWER` and `UPPER` fold ASCII letters only, where Postgres folds by collation. `CONCAT` skips NULL arguments and renders numbers as text. |
-| `now()`, casts of columns and expressions, date functions, `CASE`, functions in `SELECT` or `WHERE`, every other function and operator | Not&nbsp;yet | |
+| `COALESCE`, `NULLIF`, `GREATEST`, `LEAST`, `CONCAT`, `CONCAT_WS`, `LOWER`, `UPPER`, `LENGTH`, `SUBSTRING`, `REPLACE`, `TRIM`, `LTRIM`, `RTRIM`, `LEFT`, `RIGHT`, `ABS`, `SIGN`, `FLOOR`, `CEIL`, `ROUND`, `TRUNC`, `MOD`, `POWER`, `SQRT` | Yes | In `SELECT` targets, `WHERE` and `UPDATE ... SET`, over literals, parameters and columns of the row; strings and numbers. `LOWER` and `UPPER` fold ASCII letters only, where Postgres folds by collation. `CONCAT` skips NULL arguments and renders numbers as text. |
+| `now()`, casts of columns and expressions, date functions, `CASE`, every other function and operator | Not&nbsp;yet | |
 | User-defined functions, in SQL or any other language | Not&nbsp;yet | |
 
 ## Extensions

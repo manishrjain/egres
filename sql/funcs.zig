@@ -161,7 +161,7 @@ fn evalNullif(
 ) EvalError!?Scalar {
     const a = args[0] orelse return null;
     const b = args[1] orelse return a;
-    return if (order(a, b) == .eq) null else a;
+    return if (_expr.orderScalars(a, b) == .eq) null else a;
 }
 
 /// GREATEST and LEAST skip NULL arguments and are NULL only when every
@@ -206,17 +206,9 @@ fn extreme(args: []const ?Scalar, want: std.math.Order) ?Scalar {
             best = s;
             continue;
         };
-        if (order(s, cur) == want) best = s;
+        if (_expr.orderScalars(s, cur) == want) best = s;
     }
     return best;
-}
-
-/// Two scalars of one kind (bind's `one_kind`): text bytewise, numbers
-/// as floats unless both are integers.
-fn order(x: Scalar, y: Scalar) std.math.Order {
-    if (x == .text) return std.mem.order(u8, x.text, y.text);
-    if (x == .int and y == .int) return std.math.order(x.int, y.int);
-    return std.math.order(toFloat(x), toFloat(y));
 }
 
 // ---- strings --------------------------------------------------------

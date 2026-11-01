@@ -9,7 +9,7 @@ const String = sql.value.String;
 const zdb = @import("zdb");
 
 const expr = sql.expr;
-const SetNode = expr.SetNode;
+const Node = expr.Node;
 const Value = sql.value.Value;
 const Item = zdb.kv.Item;
 
@@ -78,7 +78,7 @@ const Fixture = struct {
     /// A SET assignment bound against its target column.
     const Set = struct {
         target: *const sql.table.Column,
-        root: *const SetNode,
+        root: *const Node,
     };
 
     /// Parse `UPDATE t SET <assignment>` and bind its one SET value.
@@ -122,7 +122,7 @@ const Fixture = struct {
         const target = self.tbl.column(clause.column) orelse
             return error.UndefinedColumn;
         const tbl = &self.tbl;
-        const root = try expr.bindNode(
+        const root = try expr.bind(
             self.arloc,
             tbl,
             clause.value,
@@ -133,10 +133,16 @@ const Fixture = struct {
         return .{ .target = target, .root = root };
     }
 
-    /// Bind then evaluate one assignment against `row`.
-    fn eval(self: *const Fixture, assignment: String, row: Item) !Value {
+    /// `item` as the row a SET evaluates against; the arena is the
+    /// scratch, as for a statement's SET.
+    fn row(self: *const Fixture, stored: Item) expr.Row {
+        return .{ .scratch = self.arloc, .tbl = &self.tbl, .item = stored };
+    }
+
+    /// Bind then evaluate one assignment against `stored`.
+    fn eval(self: *const Fixture, assignment: String, stored: Item) !Value {
         const set = try self.bind(assignment);
-        return set.root.eval(self.arloc, &self.tbl, row, set.target);
+        return set.root.eval(self.row(stored), set.target);
     }
 };
 
@@ -390,23 +396,23 @@ test "sql.expr: EXCLUDED.column is the proposed row's cell, absent in a plain UP
     const concat = try fx.bindExcluded("b = CONCAT(b, ',', EXCLUDED.b)", &proposed);
     try testing.expectEqualStrings(
         "ab,new",
-        (try concat.root.eval(arloc, &fx.tbl, row, concat.target)).text,
+        (try concat.root.eval(fx.row(row), concat.target)).text,
     );
     const copy = try fx.bindExcluded("a = EXCLUDED.a", &proposed);
     try testing.expectEqual(
         Value{ .int4 = 9 },
-        try copy.root.eval(arloc, &fx.tbl, row, copy.target),
+        try copy.root.eval(fx.row(row), copy.target),
     );
     const sum = try fx.bindExcluded("a = a + EXCLUDED.a", &proposed);
     try testing.expectEqual(
         Value{ .int4 = 14 },
-        try sum.root.eval(arloc, &fx.tbl, row, sum.target),
+        try sum.root.eval(fx.row(row), sum.target),
     );
     // A NULL proposed cell is NULL; the type check still applies.
     const nul = try fx.bindExcluded("c = EXCLUDED.c", &proposed);
     try testing.expectEqual(
         Value.null_value,
-        try nul.root.eval(arloc, &fx.tbl, row, nul.target),
+        try nul.root.eval(fx.row(row), nul.target),
     );
     try testing.expectError(error.TypeMismatch, fx.bindExcluded("a = EXCLUDED.b", &proposed));
     try testing.expectError(error.UndefinedColumn, fx.bindExcluded("a = EXCLUDED.zz", &proposed));

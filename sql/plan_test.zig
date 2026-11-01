@@ -107,7 +107,7 @@ const Fixture = struct {
         );
         const stmt = try sql.parse.statement(a, text);
         const pred = try a.create(Pred);
-        pred.* = try sql.pred.bindNode(a, &self.tbl, stmt.select.where.?, .{});
+        pred.* = try sql.pred.bind(a, &self.tbl, stmt.select.where.?, .{});
         return sql.plan.plan(a, &self.tbl, pred, opts);
     }
 };
@@ -364,7 +364,7 @@ test "sql.plan: never is the empty set, and a scan under NOT" {
     try expectEgids(try bitmapOf(&alone), &.{});
 
     // It empties an AND and drops out of an OR, like `= NULL`.
-    const a_eq_1 = Pred{ .cmp = .{ .col = fx.tbl.column("a").?, .val = .{ .int4 = 1 } } };
+    const a_eq_1 = try sql.pred.colCmp(a, fx.tbl.column("a").?, .eq, .{ .int4 = 1 });
     const and_kids = [_]Pred{ a_eq_1, never };
     const and_ = Pred{ .and_ = &and_kids };
     var both = try sql.plan.plan(a, &fx.tbl, &and_, stream);
@@ -447,4 +447,27 @@ test "sql.plan: an ordered comparison on an indexed column is an index range" {
     var null_cmp = try fx.planFor("a > NULL", stream);
     defer null_cmp.deinit();
     try expectEgids(try bitmapOf(&null_cmp), &.{});
+}
+
+test "sql.plan: an expression leaf scans; a bare-column leaf beside it indexes" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+
+    // No index answers a computed side: the whole predicate is residual.
+    var computed = try fx.planFor("a + 1 = 2", stream);
+    defer computed.deinit();
+    try expectScan(&computed);
+    var called = try fx.planFor("lower(c) = 'x'", stream);
+    defer called.deinit();
+    try expectScan(&called);
+    var nulled = try fx.planFor("nullif(a, 1) IS NULL", stream);
+    defer nulled.deinit();
+    try expectScan(&nulled);
+
+    // In an AND the indexable term drives the read; the expression is
+    // re-checked on the rows it yields.
+    var mixed = try fx.planFor("a = 1 AND length(c) > 2", stream);
+    defer mixed.deinit();
+    try expectLookup(try bitmapOf(&mixed), pkey_index_id, true, try int4Key(fx.arena.allocator(), 1));
+    try testing.expect(source(&mixed).fetch.pred.?.* == .and_);
 }

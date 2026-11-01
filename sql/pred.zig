@@ -2,22 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Boolean WHERE predicates over stored rows. `Pred` is the resolved
-//! tree — parse.Where with its columns bound to the table and its
-//! literals coerced to the columns' types — and `eval` is its SQL
-//! three-valued evaluation against one row. Choosing HOW rows are read
-//! (index vs. scan) is plan.zig's job; a Pred only says which rows
-//! match.
+//! tree — parse.Where with its expressions bound to the table
+//! (expr.Node) — and `eval` is its SQL three-valued evaluation against
+//! one row. Choosing HOW rows are read (index vs. scan) is plan.zig's
+//! job; a Pred only says which rows match.
 
 const std = @import("std");
 const pgwire = @import("pgwire");
 const zdb = @import("zdb");
 
+const _expr = @import("expr.zig");
 const _parse = @import("parse.zig");
 const _table = @import("table.zig");
 const _value = @import("value.zig");
 const _server = @import("server.zig");
 
 const replyErrorCode = _server.replyErrorCode;
+const Node = _expr.Node;
+const EvalError = _expr.EvalError;
 
 /// Children of AND/OR live inline: a slice is already an indirection
 /// and children are never shared between parents. NOT is a pointer
@@ -34,15 +36,16 @@ pub const Pred = union(enum) {
     /// NOT Pred, then it would always be true.
     never,
 
-    /// `col op val`, `val` already coerced to `col.ty` (for the egid
-    /// pseudo-column: a positive uint8, or NULL).
+    /// `lhs op rhs`. A bare column against a constant has the column
+    /// on the left (the parser turns the operator) and the constant
+    /// typed by it: the shape the planner answers from an index.
     pub const Cmp = struct {
-        col: *const _table.Column,
+        lhs: *const Node,
         op: _parse.CmpOp = .eq,
-        val: _value.Value,
+        rhs: *const Node,
     };
-    /// `col IS NULL` (negate = false) / `col IS NOT NULL`.
-    pub const NullTest = struct { col: *const _table.Column, negate: bool };
+    /// `expr IS NULL` (negate = false) / `expr IS NOT NULL`.
+    pub const NullTest = struct { expr: *const Node, negate: bool };
 
     /// The top-level AND terms: a root AND's children, else the root
     /// alone. Every one must hold for a row to match, which is what
@@ -58,31 +61,27 @@ pub const Pred = union(enum) {
 
     /// SQL three-valued logic: null = unknown. A comparison is unknown
     /// when either side is NULL; IS [NOT] NULL is never unknown; AND /
-    /// OR / NOT follow Kleene. Reads only the cells the tree names
-    /// (Table.read — a null-bit test plus one O(1) read each; no
-    /// full-row decode).
-    pub fn eval(
-        self: *const Pred,
-        tbl: *const _table.Table,
-        item: zdb.kv.Item,
-    ) ?bool {
+    /// OR / NOT follow Kleene. A leaf of two bare cells reads only
+    /// those (Table.read — a null-bit test plus one O(1) read each; no
+    /// full-row decode); an expression computes into `row.scratch`.
+    pub fn eval(self: *const Pred, row: _expr.Row) EvalError!?bool {
         switch (self.*) {
             .cmp => |c| {
-                if (c.val == .null_value) return null;
-                const cell = tbl.parseCol(item, c.col);
-                if (cell == .null_value) return null;
-                return c.op.holds(_value.orderValues(cell, c.val));
+                const lhs = try c.lhs.cell(row);
+                const rhs = try c.rhs.cell(row);
+                if (lhs == .null_value or rhs == .null_value) return null;
+                return c.op.holds(_expr.compare(lhs, rhs));
             },
             .is_null => |n| {
-                const is_null = tbl.parseCol(item, n.col) == .null_value;
-                return is_null != n.negate;
+                const v = try n.expr.cell(row);
+                return (v == .null_value) != n.negate;
             },
             .and_ => |kids| {
                 var unknown = false;
                 // TODO: We should have a mechanism to surface false evaluations
                 // quickly instead of going serially through every kid.eval.
                 for (kids) |*kid| {
-                    if (kid.eval(tbl, item)) |b| {
+                    if (try kid.eval(row)) |b| {
                         if (!b) return false;
                     } else unknown = true;
                 }
@@ -91,14 +90,14 @@ pub const Pred = union(enum) {
             .or_ => |kids| {
                 var unknown = false;
                 for (kids) |*kid| {
-                    if (kid.eval(tbl, item)) |b| {
+                    if (try kid.eval(row)) |b| {
                         if (b) return true;
                     } else unknown = true;
                 }
                 return if (unknown) null else false;
             },
             .not => |child| {
-                const b = child.eval(tbl, item) orelse return null;
+                const b = try child.eval(row) orelse return null;
                 return !b;
             },
             .never => return false,
@@ -107,31 +106,18 @@ pub const Pred = union(enum) {
 
     /// A row matches only when the predicate is TRUE — unknown rejects,
     /// so `WHERE col = NULL` matches nothing.
-    pub fn matches(
-        self: *const Pred,
-        tbl: *const _table.Table,
-        item: zdb.kv.Item,
-    ) bool {
-        return self.eval(tbl, item) orelse false;
+    pub fn matches(self: *const Pred, row: _expr.Row) EvalError!bool {
+        return try self.eval(row) orelse false;
     }
 };
 
-pub const BindError = error{
-    UndefinedColumn,
-    InvalidValue,
-    /// A binary-format `$n` of a declared type with no binary decoder.
-    UnsupportedValue,
-    /// A binary-format `$n` of a type the column cannot take.
-    TypeMismatch,
-    EgidZero,
-    OutOfMemory,
-};
+pub const BindError = _expr.BindError || error{EgidZero};
 
 /// Bind one WHERE node — and, recursively, its children — to `tbl`:
-/// names → columns, literals and `$n` values → typed cells
-/// (parse.litToValue). Pure; `bind` adds the client-facing error
-/// mapping. `arloc` (the statement arena) backs the tree.
-pub fn bindNode(
+/// its expressions through expr.bind. Pure; `bindOrReply` adds the
+/// client-facing error mapping. `arloc` (the statement arena) backs
+/// the tree.
+pub fn bind(
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
     where: _parse.Where,
@@ -139,94 +125,104 @@ pub fn bindNode(
 ) BindError!Pred {
     switch (where) {
         .cmp => |f| {
-            const col = tbl.column(f.column) orelse return error.UndefinedColumn;
-            const val = _parse.litToValue(arloc, f.literal, col, //
-                params) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                // A literal longer than a `char(n)` / `varchar(n)` column
-                // is not an error in Postgres: every stored cell is at
-                // most n codepoints, so `=` never matches, and the
-                // other comparisons see the whole literal.
+            // The trailing null: a WHERE has no proposed row, so
+            // EXCLUDED is unknown.
+            const lhs = try _expr.bind(arloc, tbl, f.lhs.*, null, params, null);
+            // A constant against a bare column takes the column's type,
+            // as a literal does from any column it meets: WHERE name =
+            // 'x' binds 'x' as name's type.
+            const target = if (lhs.* == .column and f.rhs.* == .literal)
+                lhs.column
+            else
+                null;
+            const rhs = _expr.bind(
+                arloc,
+                tbl,
+                f.rhs.*,
+                target,
+                params,
+                null,
+            ) catch |err| switch (err) {
+                // Too long for a char(n) / varchar(n) column is not
+                // an error in Postgres: every stored cell is at most
+                // n codepoints, so `=` never matches, and the other
+                // comparisons see the whole literal, as text.
                 error.StringTooLong => if (f.op == .eq)
                     return .never
                 else
-                    try longText(f.literal, params),
-                error.UnsupportedType => return error.UnsupportedValue,
-                error.TypeMismatch => return error.TypeMismatch,
-                else => return error.InvalidValue,
+                    try _expr.bind(arloc, tbl, f.rhs.*, null, params, null),
+                else => return err,
             };
+
+            if (!_expr.comparable(lhs.ty(), rhs.ty())) {
+                return error.NoSuchOperator;
+            }
             // The egid IS the row key. Its column is uint8, so a
             // negative literal already failed to coerce; zero (never a
             // row) is rejected for `=`, and `egid = NULL` is left to be
             // unknown like any other comparison.
-            if (col.isEgid() and f.op == .eq and val == .uint8 and
-                val.uint8 == 0) return error.EgidZero;
-            return .{ .cmp = .{ .col = col, .op = f.op, .val = val } };
+            if (lhs.* == .column and lhs.column.isEgid() and f.op == .eq and
+                rhs.* == .value and rhs.value == .uint8 and
+                rhs.value.uint8 == 0) return error.EgidZero;
+            return .{ .cmp = .{ .lhs = lhs, .op = f.op, .rhs = rhs } };
         },
-        .is_null => |nt| {
-            const col = tbl.column(nt.column) orelse return error.UndefinedColumn;
-            return .{ .is_null = .{ .col = col, .negate = nt.negate } };
-        },
+        .is_null => |nt| return .{ .is_null = .{
+            .expr = try _expr.bind(arloc, tbl, nt.expr.*, null, params, null),
+            .negate = nt.negate,
+        } },
         .and_, .or_ => |kids| {
             const out = try arloc.alloc(Pred, kids.len);
             for (kids, out) |kid, *slot|
-                slot.* = try bindNode(arloc, tbl, kid, params);
+                slot.* = try bind(arloc, tbl, kid, params);
             return if (where == .and_) .{ .and_ = out } else .{ .or_ = out };
         },
         .not => |child| {
             const out = try arloc.create(Pred);
-            out.* = try bindNode(arloc, tbl, child.*, params);
+            out.* = try bind(arloc, tbl, child.*, params);
             return .{ .not = out };
         },
     }
 }
 
-/// The text of a string literal that was too long for its column,
-/// uncut: what `<`, `>` and the rest compare against. Only a string
-/// or a text-format `$n` can be too long.
-fn longText(lit: _parse.Literal, params: _parse.Params) BindError!_value.Value {
-    return switch (lit) {
-        .str => |s| .{ .text = s },
-        .param => |n| params.untyped(n) catch return error.InvalidValue,
-        else => error.InvalidValue,
-    };
+/// `col op val` as a tree, for a predicate the server builds itself
+/// (INSERT's arbiter probe) and for the tests.
+pub fn colCmp(
+    arloc: std.mem.Allocator,
+    col: *const _table.Column,
+    op: _parse.CmpOp,
+    val: _value.Value,
+) std.mem.Allocator.Error!Pred {
+    const lhs = try arloc.create(Node);
+    lhs.* = .{ .column = col };
+    const rhs = try arloc.create(Node);
+    rhs.* = .{ .value = val };
+    return .{ .cmp = .{ .lhs = lhs, .op = op, .rhs = rhs } };
 }
 
-/// Bind a statement's WHERE to its table: bindNode plus the
+/// Bind a statement's WHERE to its table: bind plus the
 /// client-facing error mapping. null = the SQL error was already sent
 /// and the statement is over; only OOM propagates.
-pub fn bind(
+pub fn bindOrReply(
     state: *pgwire.ConnState,
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
     where: _parse.Where,
     params: _parse.Params,
 ) !?*const Pred {
-    const bad_value = pgwire.sqlstate.invalid_text_representation;
     const p = try arloc.create(Pred);
-    p.* = bindNode(arloc, tbl, where, params) catch |err| {
+    p.* = bind(arloc, tbl, where, params) catch |err| {
         switch (err) {
             error.OutOfMemory => return err,
-            error.UndefinedColumn => try replyErrorCode(
-                state,
-                pgwire.sqlstate.undefined_column,
-                "column does not exist",
-            ),
-            error.InvalidValue => try replyErrorCode(state, bad_value, "invalid value in WHERE"),
-            error.UnsupportedValue => try replyErrorCode(
-                state,
-                pgwire.sqlstate.feature_not_supported,
-                "unsupported value or column type",
-            ),
-            error.TypeMismatch => try replyErrorCode(
-                state,
-                pgwire.sqlstate.datatype_mismatch,
-                "parameter type does not match column type",
-            ),
             error.EgidZero => try replyErrorCode(
                 state,
-                bad_value,
+                pgwire.sqlstate.invalid_text_representation,
                 "egid must be a positive integer",
+            ),
+            else => |e| try _expr.replyBindErr(
+                state,
+                arloc,
+                @errorCast(e),
+                null,
             ),
         }
         return null;

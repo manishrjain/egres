@@ -178,6 +178,7 @@ const Fixture = struct {
     fn ctx(self: *Fixture, tx: *Txn, lock: bool) exec.ExecCtx {
         return .{
             .arloc = self.arena.allocator(),
+            .scratch = .init(self.arena.allocator()),
             .tx = tx,
             .tbl = &self.tbl,
             .table_id = tid,
@@ -417,9 +418,12 @@ test "sql.exec: seq_scan: full ascending batches; pred skips without copying" {
     // b = 'x': half the rows. The batch holds the KEYS of matches only;
     // values are borrows into storage the cursor pins, never copied.
     {
-        const pred = Pred{
-            .cmp = .{ .col = fx.col("b"), .val = .{ .text = "x" } },
-        };
+        const pred = try sql.pred.colCmp(
+            fx.arena.allocator(),
+            fx.col("b"),
+            .eq,
+            .{ .text = "x" },
+        );
         var node = RowNode{ .seq_scan = .{ .pred = &pred } };
         defer node.deinit();
         var total: usize = 0;
@@ -551,9 +555,12 @@ test "sql.exec: fetch: a bitmap wider than one chunk, with a residual" {
     var bm = try zroar.Bitmap.init(testing.allocator);
     for (1..2501) |egid| _ = try bm.set(egid);
     var leaf = BitmapNode{ .egids = bm };
-    const pred = Pred{
-        .cmp = .{ .col = fx.col("b"), .val = .{ .text = "y" } },
-    };
+    const pred = try sql.pred.colCmp(
+        fx.arena.allocator(),
+        fx.col("b"),
+        .eq,
+        .{ .text = "y" },
+    );
     var node = RowNode{ .fetch = .{ .bnode = &leaf, .pred = &pred } };
     defer node.deinit();
 
@@ -583,9 +590,12 @@ test "sql.exec: filter clears bits and copies nothing" {
     var b = try Batch.init(testing.allocator);
     defer b.deinit();
 
-    const pred = Pred{
-        .cmp = .{ .col = fx.col("b"), .val = .{ .text = "y" } },
-    };
+    const pred = try sql.pred.colCmp(
+        fx.arena.allocator(),
+        fx.col("b"),
+        .eq,
+        .{ .text = "y" },
+    );
     var scan = RowNode{ .seq_scan = .{} };
     var node = RowNode{ .filter = .{ .child = &scan, .pred = &pred } };
     defer node.deinit();
@@ -612,9 +622,12 @@ test "sql.exec: materialize: ascending arena copies, locks held, streams back" {
     var b = try Batch.init(testing.allocator);
     defer b.deinit();
 
-    const pred = Pred{
-        .cmp = .{ .col = fx.col("b"), .val = .{ .text = "x" } },
-    };
+    const pred = try sql.pred.colCmp(
+        fx.arena.allocator(),
+        fx.col("b"),
+        .eq,
+        .{ .text = "x" },
+    );
     var scan = RowNode{ .seq_scan = .{ .pred = &pred } };
     var node = RowNode{ .materialize = .{ .child = &scan } };
     defer node.deinit();
@@ -670,9 +683,12 @@ test "sql.exec: materialize over a fetch locks the output rows only" {
     for (1..301) |egid| _ = try bm.set(egid);
     _ = try bm.set(9_999);
     var leaf = BitmapNode{ .egids = bm };
-    const pred = Pred{
-        .cmp = .{ .col = fx.col("b"), .val = .{ .text = "x" } },
-    };
+    const pred = try sql.pred.colCmp(
+        fx.arena.allocator(),
+        fx.col("b"),
+        .eq,
+        .{ .text = "x" },
+    );
     var fetch = RowNode{ .fetch = .{ .bnode = &leaf, .pred = &pred } };
     var node = RowNode{ .materialize = .{ .child = &fetch } };
     defer node.deinit();
@@ -751,9 +767,12 @@ test "sql.exec: materialize with lock and a limit locks the limited rows" {
     // FOR UPDATE ... LIMIT 100 over the 1250 matches: the gather stops
     // at 100, so 100 rows are locked — the first 100 even egids — and
     // next() streams exactly those back.
-    const pred = Pred{
-        .cmp = .{ .col = fx.col("b"), .val = .{ .text = "x" } },
-    };
+    const pred = try sql.pred.colCmp(
+        fx.arena.allocator(),
+        fx.col("b"),
+        .eq,
+        .{ .text = "x" },
+    );
     var scan = RowNode{ .seq_scan = .{ .pred = &pred } };
     var node = RowNode{ .materialize = .{ .child = &scan, .remaining = 100 } };
     defer node.deinit();

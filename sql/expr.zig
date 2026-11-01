@@ -1,12 +1,12 @@
 // Copyright 2026 Manish R Jain
 // SPDX-License-Identifier: Apache-2.0
 
-//! SET value expressions over stored rows. `SetNode` is the resolved
-//! form of one `column = expr` assignment — parse.Expr with its
+//! Expressions over stored rows: a SET value, a WHERE operand, a
+//! SELECT target. `Node` is the resolved form — parse.Expr with its
 //! columns bound to the table, its literals typed, and its operators
-//! and calls type-checked — and `SetNode.eval` computes it against one
-//! row's pre-image. The pred.zig pattern: `bindNode` is pure and reports an
-//! error set, `bind` adds the client-facing error mapping.
+//! and calls type-checked — `Node.cell` computes it against one row,
+//! and `Node.eval` assigns the result to a column. `bind` is pure and
+//! reports an error set; `bindOrReply` adds the client-facing mapping.
 
 const std = @import("std");
 const pgwire = @import("pgwire");
@@ -27,18 +27,29 @@ const Type = _value.Type;
 const Op = _parse.Expr.Op;
 const Func = _funcs.Func;
 
-/// A SET value bound to its table: parse.Expr with its leaves
+/// An expression bound to its table: parse.Expr with its leaves
 /// resolved — a literal is a typed cell, a column is the table's —
-/// and every operator's result type fixed. The root literal is typed
-/// by the target column (parse.litToValue: `SET a = 1`, `SET name =
-/// 'x'`, `SET a = NULL`); a literal under an operator is the widest
-/// cell of its kind (int8 / float8 / text). At eval, leaves lift to a
-/// Scalar — integers compute in i128, floats in f64, text is bytes for
-/// `||` — and the result is coerced to the target column, unless the
-/// root is a leaf already of the target's type: then it IS the cell
-/// (any type; Scalar never sees a date or a uuid). Children are
+/// and every operator's result type fixed. A root literal is typed by
+/// the column it meets, when there is one (parse.litToValue: `SET a =
+/// 1`, `WHERE name = 'x'`); any other literal is the widest cell of
+/// its kind (int8 / float8 / text). At eval, leaves lift to a Scalar
+/// — integers compute in i128, floats in f64, text is bytes for `||`
+/// — and the result is coerced to the target column or widened to a
+/// cell of its own type, unless the root is a leaf: then it IS the
+/// cell (any type; Scalar never sees a date or a uuid). Children are
 /// pointers only because a union cannot hold itself by value.
-pub const SetNode = union(enum) {
+/// One stored row an expression is evaluated against: its table, the
+/// item, and where a computed value lives. The executor passes its
+/// per-row scratch, reset after the row; a SET passes the statement
+/// arena, since the value outlives the row. Text a leaf yields
+/// borrows `item.value` either way.
+pub const Row = struct {
+    scratch: std.mem.Allocator,
+    tbl: *const Table,
+    item: zdb.kv.Item,
+};
+
+pub const Node = union(enum) {
     value: Value,
     column: *const Column,
     binop: BinOp,
@@ -46,14 +57,14 @@ pub const SetNode = union(enum) {
 
     pub const BinOp = struct {
         op: Op,
-        lhs: *const SetNode,
-        rhs: *const SetNode,
+        lhs: *const Node,
+        rhs: *const Node,
         /// What the operator yields (resultType), fixed at bind.
         ty: ?Type,
     };
     pub const CallNode = struct {
         func: *const Func,
-        args: []const *const SetNode,
+        args: []const *const Node,
         /// What the call yields (Func.resultType), fixed at bind.
         ty: ?Type,
     };
@@ -61,7 +72,7 @@ pub const SetNode = union(enum) {
     /// The type this node evaluates to, or null for a NULL-only
     /// subtree (which takes the other operand's type, and fits any
     /// column).
-    pub fn ty(self: *const SetNode) ?Type {
+    pub fn ty(self: *const Node) ?Type {
         return switch (self.*) {
             .value => |v| v.ty(),
             .column => |col| col.ty,
@@ -71,20 +82,37 @@ pub const SetNode = union(enum) {
     }
 
     /// Whether this tree's result may be assigned to `target`.
-    pub fn fits(self: *const SetNode, target: *const Column) bool {
+    pub fn fits(self: *const Node, target: *const Column) bool {
         const result = self.ty() orelse return true;
         return result.assignableTo(target.ty);
     }
 
-    /// Evaluate against a row's pre-image, as a cell of `target` — the
+    /// This tree's value for one row as a cell of its own type: a leaf
+    /// is the cell itself, whatever its type; a computed result is the
+    /// widest cell of its kind (int8, float8, text). Text borrows
+    /// `row.item` or lives in `row.scratch`.
+    pub fn cell(self: *const Node, row: Row) EvalError!Value {
+        switch (self.*) {
+            .value => |v| return v,
+            .column => |col| return row.tbl.parseCol(row.item, col),
+            .binop, .call => {},
+        }
+        const s = try self.scalar(row) orelse return .null_value;
+        return switch (s) {
+            .int => .{ .int8 = try intCast(i64, s) },
+            .float => |f| .{ .float8 = f },
+            .text => |t| .{ .text = t },
+        };
+    }
+
+    /// Evaluate against a row's pre-image, as a cell of `col` — the
     /// column this tree was bound against. A text result borrows
-    /// `item.value` (a column, a text literal) or lives in `arloc` (a
-    /// `||` result); either outlives the row's rewrite.
+    /// `row.item` (a column, a text literal) or lives in `row.scratch`
+    /// (a `||` result), the statement arena for a SET; either outlives
+    /// the row's rewrite.
     pub fn eval(
-        self: *const SetNode,
-        arloc: std.mem.Allocator,
-        tbl: *const Table,
-        item: zdb.kv.Item,
+        self: *const Node,
+        row: Row,
         col: *const Column,
     ) EvalError!Value {
         std.debug.assert(self.fits(col));
@@ -94,48 +122,41 @@ pub const SetNode = union(enum) {
         switch (self.*) {
             .value => |v| if (v == .null_value or v.ty() == col.ty) return v,
             .column => |scol| if (scol.ty == col.ty and scol.type_mod == col.type_mod)
-                return tbl.parseCol(item, scol),
+                return row.tbl.parseCol(row.item, scol),
             .binop, .call => {},
         }
-        const result = try self.scalar(arloc, tbl, item) orelse
-            return .null_value;
+        const result = try self.scalar(row) orelse return .null_value;
         return coerceScalar(result, col);
     }
 
     /// This subtree's value for one row, before assignment; null = SQL
     /// NULL.
-    fn scalar(
-        self: *const SetNode,
-        arloc: std.mem.Allocator,
-        tbl: *const Table,
-        item: zdb.kv.Item,
-    ) EvalError!?Scalar {
+    fn scalar(self: *const Node, row: Row) EvalError!?Scalar {
         switch (self.*) {
             .value => |v| return scalarOf(v),
-            .column => |col| return scalarOf(tbl.parseCol(item, col)),
+            .column => |col| return scalarOf(row.tbl.parseCol(row.item, col)),
             .binop => |b| {
                 // Both sides first, then the NULL check: PG raises on
                 // `NULL + 1/0` too.
-                const lhs = try b.lhs.scalar(arloc, tbl, item);
-                const rhs = try b.rhs.scalar(arloc, tbl, item);
+                const lhs = try b.lhs.scalar(row);
+                const rhs = try b.rhs.scalar(row);
                 const l = lhs orelse return null;
                 const r = rhs orelse return null;
-                return try applyOp(arloc, b.op, l, r);
+                return try applyOp(row.scratch, b.op, l, r);
             },
             .call => |call| {
                 // Every argument first, as for an operator: PG raises
                 // on `COALESCE(NULL, 1/0)` too.
-                const vals = try arloc.alloc(?Scalar, call.args.len);
-                for (call.args, vals) |arg, *val|
-                    val.* = try arg.scalar(arloc, tbl, item);
+                const vals = try row.scratch.alloc(?Scalar, call.args.len);
+                for (call.args, vals) |arg, *val| val.* = try arg.scalar(row);
                 switch (call.func.eval) {
                     .strict => |f| {
-                        const plain = try arloc.alloc(Scalar, vals.len);
+                        const plain = try row.scratch.alloc(Scalar, vals.len);
                         for (vals, plain) |val, *slot|
                             slot.* = val orelse return null;
-                        return try f(arloc, plain);
+                        return try f(row.scratch, plain);
                     },
-                    .lax => |f| return try f(arloc, vals),
+                    .lax => |f| return try f(row.scratch, vals),
                 }
             },
         }
@@ -160,17 +181,17 @@ pub const BindError = error{
 /// takes its type (as PG resolves an "unknown" literal from where it
 /// stands: `'7'` into an int, `'t'` into a bool), and the root's
 /// result must fit it. `arloc` (the statement arena) backs the tree.
-/// `bind` adds the wire; pub for the unit tests, which have no
+/// `bindOrReply` adds the wire; pub for the unit tests, which have no
 /// connection to reply on.
-pub fn bindNode(
+pub fn bind(
     arloc: std.mem.Allocator,
     tbl: *const Table,
     expr: _parse.Expr,
     target: ?*const Column,
     params: _parse.Params,
     excluded: ?[]const Value,
-) BindError!*const SetNode {
-    const node = try arloc.create(SetNode);
+) BindError!*const Node {
+    const node = try arloc.create(Node);
     switch (expr) {
         .literal => |lit| node.* = .{
             .value = try literalValue(arloc, lit, target, params),
@@ -187,8 +208,8 @@ pub fn bindNode(
             node.* = .{ .value = cells[col.pos] };
         },
         .binop => |b| {
-            const lhs = try bindNode(arloc, tbl, b.lhs.*, null, params, excluded);
-            const rhs = try bindNode(arloc, tbl, b.rhs.*, null, params, excluded);
+            const lhs = try bind(arloc, tbl, b.lhs.*, null, params, excluded);
+            const rhs = try bind(arloc, tbl, b.rhs.*, null, params, excluded);
             node.* = .{ .binop = .{
                 .op = b.op,
                 .lhs = lhs,
@@ -197,9 +218,9 @@ pub fn bindNode(
             } };
         },
         .call => |call| {
-            const args = try arloc.alloc(*const SetNode, call.args.len);
+            const args = try arloc.alloc(*const Node, call.args.len);
             for (call.args, args) |arg, *slot|
-                slot.* = try bindNode(arloc, tbl, arg, null, params, excluded);
+                slot.* = try bind(arloc, tbl, arg, null, params, excluded);
             const tys = try arloc.alloc(?Type, args.len);
             for (args, tys) |arg, *t| t.* = arg.ty();
             node.* = .{ .call = .{
@@ -304,7 +325,7 @@ fn resultType(op: Op, lhs: ?Type, rhs: ?Type) BindError!?Type {
 /// Bind one SET assignment to its table and target column, replying
 /// the client-facing error. null = the SQL error was already sent and
 /// the statement is over; only OOM propagates.
-pub fn bind(
+pub fn bindOrReply(
     state: *pgwire.ConnState,
     arloc: std.mem.Allocator,
     tbl: *const Table,
@@ -312,41 +333,60 @@ pub fn bind(
     expr: _parse.Expr,
     params: _parse.Params,
     excluded: ?[]const Value,
-) !?*const SetNode {
-    const code = pgwire.sqlstate;
-    return bindNode(arloc, tbl, expr, target, params, excluded) catch |err| {
-        switch (err) {
-            error.OutOfMemory => return err,
-            error.UndefinedColumn => try replyErrorCode(
-                state,
-                code.undefined_column,
-                "column does not exist",
-            ),
-            error.InvalidValue => try replyErrorCode(
-                state,
-                code.invalid_text_representation,
-                "invalid value for column type",
-            ),
-            error.UnsupportedValue => try replyErrorCode(
-                state,
-                code.feature_not_supported,
-                "unsupported value or column type",
-            ),
-            error.TypeMismatch => try replyErrorCode(
-                state,
-                code.datatype_mismatch,
-                "expression type does not match column type",
-            ),
-            error.NoSuchOperator => try replyErrorCode(
-                state,
-                code.undefined_function,
-                "operator does not exist for these operand types",
-            ),
-            error.StringTooLong => try replyStringTooLong(state, arloc, target),
-            error.InvalidUtf8 => try replyInvalidUtf8(state),
-        }
+) !?*const Node {
+    return bind(arloc, tbl, expr, target, params, excluded) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        try replyBindErr(state, arloc, err, target);
         return null;
     };
+}
+
+/// A bind failure on the wire. `target` is the column the expression
+/// is assigned to, when there is one: a too-long string names it.
+pub fn replyBindErr(
+    state: *pgwire.ConnState,
+    arloc: std.mem.Allocator,
+    err: BindError,
+    target: ?*const Column,
+) !void {
+    const code = pgwire.sqlstate;
+    switch (err) {
+        error.OutOfMemory => return err,
+        error.UndefinedColumn => try replyErrorCode(
+            state,
+            code.undefined_column,
+            "column does not exist",
+        ),
+        error.InvalidValue => try replyErrorCode(
+            state,
+            code.invalid_text_representation,
+            "invalid value for column type",
+        ),
+        error.UnsupportedValue => try replyErrorCode(
+            state,
+            code.feature_not_supported,
+            "unsupported value or column type",
+        ),
+        error.TypeMismatch => try replyErrorCode(
+            state,
+            code.datatype_mismatch,
+            "expression type does not match column type",
+        ),
+        error.NoSuchOperator => try replyErrorCode(
+            state,
+            code.undefined_function,
+            "operator does not exist for these operand types",
+        ),
+        error.StringTooLong => if (target) |col|
+            try replyStringTooLong(state, arloc, col)
+        else
+            try replyErrorCode(
+                state,
+                code.string_data_right_truncation,
+                "value too long",
+            ),
+        error.InvalidUtf8 => try replyInvalidUtf8(state),
+    }
 }
 
 /// 22001 with Postgres's wording: `value too long for type
@@ -390,16 +430,42 @@ pub const EvalError = error{
 /// width compute as i128, floats as f64.
 pub const Scalar = union(enum) { int: i128, float: f64, text: String };
 
-/// A cell as an operand; null = SQL NULL. Only the types bind admits
-/// reach here.
+/// A cell as an operand; null for SQL NULL and for a cell of a kind
+/// no operator or function takes (a date, a uuid), which bind keeps
+/// away from them.
 fn scalarOf(v: Value) ?Scalar {
     return switch (v) {
-        .null_value => null,
         inline .int2, .int4, .int8, .uint2, .uint4, .uint8 => |n| .{ .int = n },
         inline .float4, .float8 => |f| .{ .float = f },
         .text => |s| .{ .text = s },
-        else => unreachable,
+        else => null,
     };
+}
+
+/// Whether `lhs op rhs` has a meaning: two numbers, two strings, or
+/// two cells of one type; a NULL-only side compares with anything.
+pub fn comparable(lhs: ?Type, rhs: ?Type) bool {
+    const l = lhs orelse return true;
+    const r = rhs orelse return true;
+    if (l.isNumeric() and r.isNumeric()) return true;
+    if (l.isString() and r.isString()) return true;
+    return l == r;
+}
+
+/// The order of two non-null cells a `comparable` pair yields: numbers
+/// numerically across widths and kinds, strings bytewise, any other
+/// type by value.orderValues.
+pub fn compare(x: Value, y: Value) std.math.Order {
+    if (scalarOf(x)) |l| if (scalarOf(y)) |r| return orderScalars(l, r);
+    return _value.orderValues(x, y);
+}
+
+/// Two scalars of one kind: text bytewise, numbers as floats unless
+/// both are integers.
+pub fn orderScalars(x: Scalar, y: Scalar) std.math.Order {
+    if (x == .text) return std.mem.order(u8, x.text, y.text);
+    if (x == .int and y == .int) return std.math.order(x.int, y.int);
+    return std.math.order(toFloat(x), toFloat(y));
 }
 
 fn applyOp(
