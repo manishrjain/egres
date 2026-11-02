@@ -5,7 +5,8 @@
             [clojure.string :as str]
             [jepsen.db :as db]
             [jepsen.egres.client :as client]
-            [jepsen.store :as store])
+            [jepsen.store :as store]
+            [next.jdbc :as j])
   (:import (java.lang ProcessBuilder ProcessBuilder$Redirect)
            (java.net ServerSocket)
            (java.util.concurrent TimeUnit)))
@@ -32,10 +33,8 @@
 (defn ready? [test log-file log-offset]
   (and (str/includes? (subs (slurp log-file) log-offset) "become-leader")
        (try
-         (with-open [conn (client/connect! test)
-                     stmt (.createStatement conn)
-                     rows (.executeQuery stmt "SELECT 1")]
-           (.next rows))
+         (with-open [conn (client/open test "127.0.0.1")]
+           (boolean (j/execute-one! conn ["SELECT 1"])))
          (catch java.sql.SQLException _ false))))
 
 (defn start! [state test]

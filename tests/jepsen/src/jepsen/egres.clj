@@ -6,27 +6,89 @@
 (ns jepsen.egres
   (:gen-class)
   (:require [clojure.java.io :as io]
+            [clojure.string :as str]
             [jepsen.checker :as checker]
             [jepsen.cli :as cli]
+            [jepsen.client :as jc]
             [jepsen.db :as db]
             [jepsen.egres.client :as client]
             [jepsen.egres.db :as local]
-            [jepsen.egres.internal :as internal]
             [jepsen.generator :as gen]
             [jepsen.nemesis :as nemesis]
+            [jepsen.sql :as sql]
+            [jepsen.sql.encoding :as encoding]
             [jepsen.tests :as tests]
-            [jepsen.tests.cycle.append :as append]
-            [jepsen.tests.cycle.wr :as wr]))
+            [next.jdbc :as j]))
 
-(defrecord FinalReads []
+(def workloads
+  "Upstream's SQL workloads over Egres connections. internal-sim is
+  left out: its generated schemas declare `TEXT COLLATE unicode`
+  columns and compare strings under that collation."
+  (dissoc (sql/workloads {:open client/open :error-fn client/error-fn})
+          :internal-sim))
+
+(defrecord IndexedClient [client node]
+  jc/Client
+  (open! [this test node]
+    (assoc this :client (jc/open! client test node) :node node))
+  (setup! [this test]
+    (jc/setup! client test)
+    ;; Upstream's sk is a bare column that a secondary lookup scans for.
+    ;; --secondary-index puts Egres's bitmap index under it, on each
+    ;; table the workload made: rw makes one per pair of encodings, up
+    ;; to --table-count. internal has no sk.
+    (when (and (:secondary-index? test) (not= :internal (:workload test)))
+      (with-open [conn (client/open test node)]
+        (doseq [{:keys [table]} (:tables client)]
+          (j/execute! conn [(str "CREATE INDEX IF NOT EXISTS " table
+                                 "_sk ON " table " (sk)")])))))
+  (invoke! [this test op] (jc/invoke! client test op))
+  (teardown! [this test] (jc/teardown! client test))
+  (close! [this test] (jc/close! client test)))
+
+(def final-read-attempts
+  "Reads of one batch of keys before the batch is given up and the run
+  fails. A worker idle across the last restart finds its socket dead on
+  its first statement, which completes the batch as :info; the next
+  attempt runs on a fresh connection."
+  4)
+
+(defn final-batches
+  "The keys written so far, eight per transaction, the highest and the
+  final partial batch included."
+  [ctx]
+  (mapv vec (partition-all 8 (range (inc (:max-key ctx 0))))))
+
+(defrecord FinalReads [pending issued tries]
+  ;; pending: batches not yet sent, nil before the first op; issued: the
+  ;; batches in flight; tries: batch -> attempts so far.
   gen/Generator
   (op [this test ctx]
-    ;; Include the highest key and the final partial batch. Final reads
-    ;; expose committed writes that no concurrent transaction observed.
-    (gen/op (for [ks (partition-all 8 (range (inc (:max-key ctx 0))))]
-              {:type :invoke :f :txn :final? true
-               :value (mapv #(vector :r % nil) ks)}) test ctx))
-  (update [this test ctx event] this))
+    (let [pending (or pending (final-batches ctx))]
+      (cond
+        (seq pending)
+        (let [batch (first pending)
+              op (gen/fill-in-op {:f :txn :final? true
+                                  :value (mapv #(vector :r % nil) batch)}
+                                 ctx)]
+          (if (= :pending op)
+            [:pending (assoc this :pending pending)]
+            [op (assoc this
+                       :pending (vec (rest pending))
+                       :issued (conj issued batch)
+                       :tries (update tries batch (fnil inc 0)))]))
+
+        (seq issued) [:pending (assoc this :pending pending)]
+        :else nil)))
+  (update [this test ctx event]
+    (if (and (:final? event) (not= :invoke (:type event)))
+      (let [batch (mapv second (:value event))
+            this (assoc this :issued (disj issued batch))]
+        (if (or (= :ok (:type event))
+                (<= final-read-attempts (get tries batch 0)))
+          this
+          (assoc this :pending (conj (or pending []) batch))))
+      this)))
 
 ;; The micro-ops that write, across the workloads.
 (def write-ops #{:append :w :insert :update})
@@ -37,9 +99,11 @@
       (let [ok (filter #(= :ok (:type %)) history)
             writes (count (filter #(some (fn [mop] (write-ops (first mop)))
                                          (:value %)) ok))
-            finals (filter #(and (:final? %) (not= :invoke (:type %)))
-                           history)
-            failed-finals (remove #(= :ok (:type %)) finals)
+            finals (filter :final? history)
+            batch (fn [op] (mapv second (:value op)))
+            wanted (set (map batch finals))
+            read (set (map batch (filter #(= :ok (:type %)) finals)))
+            unread (vec (sort (remove read wanted)))
             exceptions (filter :exception history)
             fault (:fault-mode test :none)
             faults (count (filter #(and (= :nemesis (:process %))
@@ -47,13 +111,13 @@
                                         (= fault (:value %))) history))]
         {:valid? (boolean
                    (and (pos? writes)
-                        (or (not (:final-reads? test true)) (seq finals))
-                        (empty? failed-finals)
+                        (or (not (:final-reads? test true)) (seq wanted))
+                        (empty? unread)
                         (empty? exceptions)
                         (or (= :none fault) (pos? faults))))
          :committed-write-transactions writes
-         :final-read-transactions (count finals)
-         :failed-final-reads (vec failed-finals)
+         :final-read-batches (count wanted)
+         :unread-final-batches unread
          :unhandled-exceptions (count exceptions)
          :process-faults faults}))))
 
@@ -71,36 +135,22 @@
       (assoc op :type :info :value (:f op)))
     (teardown! [this test])))
 
-(defn workload
-  "The generator, checker and generator wrapper for --workload. append
-  and rw are Jepsen's Elle workloads, checked for snapshot isolation;
-  internal is the own-writes check, with no final reads (its keys are
-  not Elle's)."
-  [opts]
-  (let [elle {:key-count (:key-count opts)
-              :min-txn-length 2
-              :max-txn-length (:max-txn-length opts)
-              :max-writes-per-key (:max-writes-per-key opts)
-              :cycle-search-timeout 10000
-              :consistency-models [:snapshot-isolation]}]
-    (case (:workload opts)
-      :append (assoc (append/test elle) :final-reads? true)
-      :rw (assoc (wr/test (assoc elle :min-txn-length 1)) :final-reads? true)
-      :internal {:generator (internal/generator)
-                 :checker (internal/checker)
-                 :wrap-generator identity
-                 :final-reads? false})))
-
 (defn egres-test [opts]
   (when-not (= ["127.0.0.1"] (:nodes opts))
     (throw (ex-info "This harness runs one local Egres node" {})))
   (when-not (pos? (:concurrency opts))
     (throw (ex-info "Concurrency must be positive" {})))
+  (when (:indirection? opts)
+    (throw (ex-info "Indirection reads through a JOIN, which Egres does not run"
+                    {})))
   (let [binary (.getCanonicalPath (io/file (:binary opts)))
         _ (when-not (.canExecute (io/file binary))
             (throw (ex-info "Build Egres in ReleaseSafe first"
                             {:binary binary})))
-        workload (workload opts)
+        workload ((workloads (:workload opts)) opts)
+        ;; Elle's workloads track the highest key for the final reads;
+        ;; internal has its own keys and no final reads.
+        final-reads? (not= :internal (:workload opts))
         database (local/->LocalDB (atom nil))
         fault (:nemesis opts)
         ;; The fault and its undo: a kill is followed by a start, a
@@ -113,29 +163,25 @@
                  (gen/cycle [(gen/sleep (:nemesis-interval opts))
                              {:type :info :f hurt}
                              (gen/sleep (:fault-duration opts))
-                             {:type :info :f heal}]))
-        checker (:checker workload)]
+                             {:type :info :f heal}]))]
     (merge tests/noop-test opts
            {:name (str "egres-" (name (:workload opts)) "-"
-                       (name (:access opts)) "-" (:query-mode opts) "-"
-                       (name fault))
+                       (str/join "+" (map name (:key-types opts))) "-"
+                       (:query-mode opts) "-" (name fault))
             :binary binary
             :fault-mode fault
-            :final-reads? (:final-reads? workload)
+            :final-reads? final-reads?
             :ssh {:dummy? true}
             :db database
-            :client (client/->Client nil)
+            :client (->IndexedClient (:client workload) nil)
             :nemesis (if hurt (process-nemesis database) nemesis/noop)
             :checker (checker/compose
-                       (cond-> {:stats (checker/stats)
-                                :exceptions (checker/unhandled-exceptions)
-                                :progress (progress-checker)}
-                         (= :internal (:workload opts))
-                         (assoc :internal checker)
-                         (not= :internal (:workload opts))
-                         (assoc :snapshot-isolation checker)))
+                       {:stats (checker/stats)
+                        :exceptions (checker/unhandled-exceptions)
+                        :progress (progress-checker)
+                        :workload (:checker workload)})
             :generator
-            ((:wrap-generator workload)
+            ((:wrap-generator workload identity)
              (gen/phases
                (->> (:generator workload)
                     (gen/stagger (/ (:rate opts)))
@@ -143,10 +189,16 @@
                     (gen/time-limit (:time-limit opts)))
                (when heal
                  (gen/nemesis (gen/once {:type :info :f heal})))
-               (when (:final-reads? workload)
-                 (gen/clients (->FinalReads)))))})))
+               (when final-reads?
+                 (gen/clients (->FinalReads nil #{} {})))))})))
 
-(def cli-opts
+(def encodings
+  "Upstream's value encodings, all six: decimal runs on `numeric(32,
+  16)`."
+  (mapv :name encoding/all-encodings))
+
+(def egres-opts
+  "Options added to, or given Egres's defaults over, jepsen.sql's."
   [[nil "--binary PATH" "ReleaseSafe Egres binary"
     :default "../../zig-out/bin/egres"]
    [nil "--port PORT" "SQL port; the next two ports are Raft and admin"
@@ -155,30 +207,37 @@
    [nil "--workload NAME" (str "append (Elle list-append), rw (Elle "
                               "registers) or internal (own writes)")
     :default :append :parse-fn keyword
-    :validate [#{:append :rw :internal} "append, rw, or internal"]]
+    :validate [workloads (cli/one-of workloads)]]
    [nil "--query-mode MODE" "PostgreSQL JDBC query mode"
     :default "simple" :validate [#{"simple" "extended"} "simple or extended"]]
-   [nil "--access PATH" "Read/write lookup path"
-    :default :primary :parse-fn keyword
-    :validate [#{:primary :secondary :scan} "primary, secondary, or scan"]]
+   [nil "--[no-]secondary-index"
+    "Index the secondary key sk, which upstream leaves a plain column"
+    :id :secondary-index? :default true]
    [nil "--table-count N" "Tables to distribute keys across"
     :default 4 :parse-fn parse-long :validate [pos? "Must be positive"]]
-   [nil "--key-count N" "Active keys; fewer keys increase contention"
-    :default 8 :parse-fn parse-long :validate [pos? "Must be positive"]]
-   [nil "--max-txn-length N" "Maximum micro-operations per transaction"
-    :default 8 :parse-fn parse-long :validate [#(<= 2 %) "Must be at least 2"]]
-   [nil "--max-writes-per-key N" "Writes before rotating a key"
-    :default 32 :parse-fn parse-long :validate [pos? "Must be positive"]]
-   [nil "--rate HZ" "Target transaction starts per second"
+   ["-i" "--isolation LEVEL"
+    "Isolation level asked of each transaction; Egres runs snapshot isolation"
+    :default :repeatable-read :parse-fn keyword
+    :validate [#{:read-uncommitted :read-committed :repeatable-read
+                 :serializable}
+               (str "read-uncommitted, read-committed, repeatable-read or "
+                    "serializable")]]
+   [nil "--expected-consistency-model MODEL" "The model Elle checks for"
+    :default :snapshot-isolation :parse-fn keyword]
+   [nil "--encodings ENCODING_NAMES" "Comma-separated value encodings for rw"
+    :default encodings :parse-fn sql/parse-comma-kws
+    :validate [(partial every? (set encodings)) (cli/one-of encodings)]]
+   ["-r" "--rate HZ" "Target transaction starts per second"
     :default 100 :parse-fn parse-long :validate [pos? "Must be positive"]]
    [nil "--nemesis MODE" (str "Fault injection: none, process kill/restart,"
                              " or pause (SIGSTOP/SIGCONT)")
     :default :none :parse-fn keyword
     :validate [#{:none :kill :pause} "none, kill, or pause"]]
-   [nil "--nemesis-interval SECONDS" "Healthy time between faults"
-    :default 5 :parse-fn parse-long :validate [pos? "Must be positive"]]
    [nil "--fault-duration SECONDS" "Time a process stays dead or paused"
     :default 1 :parse-fn parse-long :validate [pos? "Must be positive"]]])
+
+(def cli-opts
+  (cli/merge-opt-specs sql/cli-opts egres-opts))
 
 (defn -main [& args]
   (cli/run! (merge (cli/single-test-cmd {:test-fn egres-test

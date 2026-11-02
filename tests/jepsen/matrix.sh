@@ -33,24 +33,32 @@ run_case() {
     [[ "$status" == 0 ]] || failed=1
 }
 
+# Key lookups by primary key, by the indexed secondary key, or a mix
+# chosen per statement, as upstream runs it.
 for mode in simple extended; do
-    for access in primary secondary scan; do
-        run_case "$mode-$access-none" \
-            --query-mode "$mode" --access "$access"
+    for keys in primary secondary primary,secondary; do
+        run_case "$mode-${keys/,/+}-none" \
+            --query-mode "$mode" --key-types "$keys"
     done
 done
-for access in primary secondary scan; do
-    run_case "extended-$access-kill" \
-        --query-mode extended --access "$access" --nemesis kill
+run_case "extended-scan-none" \
+    --query-mode extended --key-types secondary --no-secondary-index
+for keys in primary secondary primary,secondary; do
+    run_case "extended-${keys/,/+}-kill" \
+        --query-mode extended --key-types "$keys" --nemesis kill
 done
 run_case "extended-primary-pause" \
-    --query-mode extended --access primary --nemesis pause --fault-duration 8
+    --query-mode extended --key-types primary --nemesis pause \
+    --fault-duration 8
+# rw mixes the six encodings per table; one run holds every key and
+# value in numeric(32, 16).
+run_case "rw-decimal-extended-none" \
+    --workload rw --query-mode extended --encodings decimal
 for workload in rw internal; do
-    run_case "$workload-extended-primary-none" \
-        --workload "$workload" --query-mode extended --access primary
-    run_case "$workload-extended-primary-kill" \
-        --workload "$workload" --query-mode extended --access primary \
-        --nemesis kill
+    run_case "$workload-extended-none" \
+        --workload "$workload" --query-mode extended
+    run_case "$workload-extended-kill" \
+        --workload "$workload" --query-mode extended --nemesis kill
 done
 echo "Matrix summary: $out/summary.tsv"
 exit "$failed"

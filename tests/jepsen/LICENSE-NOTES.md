@@ -9,11 +9,12 @@ The Egres server keeps its own Apache-2.0 license; these notes apply to
 These follow the structure of their upstream counterparts:
 
 - `src/jepsen/egres.clj`: test assembly and CLI, after the PostgreSQL
-  suite; the final-read generator, after Jepsen core.
-- `src/jepsen/egres/client.clj`: the SQL client, after the SQL suite's
-  append, register and internal workloads.
-- `src/jepsen/egres/internal.clj`: the internal generator and checker,
-  after the SQL suite.
+  suite's `cli.clj`; the final-read generator, after Jepsen core.
+- `src/jepsen/egres/client.clj`: connection and error mapping, after
+  the PostgreSQL suite's `client.clj`.
+
+The workloads themselves are the SQL suite's, used as a dependency
+and not copied.
 
 Upstream revisions:
 
@@ -36,6 +37,8 @@ secondary-license notice; the full license texts are in
 | Clojure 1.12.5 | EPL-1.0 |
 | Jepsen core 0.3.13 | EPL-1.0 |
 | Elle 0.2.7, through Jepsen | EPL-2.0 with conditional GPL secondary option |
+| `io.jepsen/sql` 0.1.0 | EPL-2.0 with conditional GPL secondary option |
+| next.jdbc 1.3.1093 | EPL-1.0 |
 | PostgreSQL JDBC 42.7.11 | BSD-2-Clause |
 
 `lein jar` produces a source JAR with these notes, the NOTICE and the

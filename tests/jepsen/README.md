@@ -1,10 +1,12 @@
 # Jepsen for Egres
 
-Jepsen's Elle workloads through PostgreSQL JDBC against a local Egres
-process, checked for snapshot isolation (`docs/design/transactions.md`).
-The client adapts the SQL of the
-[upstream PostgreSQL suite](https://github.com/jepsen-io/postgres) to
-the subset Egres implements; see
+The workloads of the
+[upstream PostgreSQL suite](https://github.com/jepsen-io/postgres), from
+its `io.jepsen/sql` library, through PostgreSQL JDBC against a local
+Egres process, checked for snapshot isolation
+(`docs/design/transactions.md`). The harness adds the connection, the
+error mapping, the local process and its faults, and a final read of
+every key; what differs from a run against PostgreSQL is in
 [SQL-COMPATIBILITY.md](SQL-COMPATIBILITY.md). Licensing is in
 [LICENSE-NOTES.md](LICENSE-NOTES.md).
 
@@ -22,7 +24,7 @@ From the repository root:
 
 ```sh
 tests/jepsen/run.sh --time-limit 60 --rate 200
-tests/jepsen/run.sh --query-mode extended --access secondary
+tests/jepsen/run.sh --query-mode extended --key-types secondary
 tests/jepsen/run.sh --nemesis kill --time-limit 120 --rate 200
 tests/jepsen/run.sh --workload rw --query-mode extended --nemesis pause
 tests/jepsen/run.sh --workload internal --query-mode extended
@@ -32,9 +34,10 @@ tests/jepsen/matrix.sh
 `run.sh` builds Egres in ReleaseSafe, runs the harness's unit tests
 (`lein test`), then one Jepsen test with 8 clients. `matrix.sh` runs
 these cases in sequence, each with 16 clients, rate 300 and `DURATION`
-seconds (60): append over both query modes and all three access paths,
-append with kills on each access path, append with 8-second pauses,
-and rw and internal with and without kills. It continues after a
+seconds (60): append over both query modes and the three key-type
+mixes, append on an unindexed secondary key, append with kills on each
+key-type mix, append with 8-second pauses, and rw and internal with and
+without kills. It continues after a
 failed case, writes logs and a TSV summary under `runs/`, and exits
 nonzero if any case fails. Set `LEIN` to use another Leiningen
 executable. `.github/workflows/jepsen.yml` runs the matrix nightly on
@@ -55,32 +58,51 @@ sudo are involved.
 
 ## Options
 
+`lein run test --help` lists them all; upstream's are described in the
+[jepsen-io/sql README](https://github.com/jepsen-io/sql). The ones that
+matter most:
+
 - `--workload append` (default): Elle's list-append. Each key is a
-  comma-separated list in a TEXT column; an append is `val = val || ?`,
-  or INSERT for a new key. `rw`: Elle's write-read registers, BIGINT
-  values written by UPDATE, or INSERT for a new key. `internal`:
-  upstream's internal-consistency check. A transaction inserts, updates
-  and reads recent keys, then reads every key it touched again and must
-  see its own latest write; it has no Elle check and no final reads.
+  comma-separated list in a TEXT column; an append is
+  `val = CONCAT(val, ',', ?)`, or INSERT for a new key. `rw`: Elle's
+  write-read registers; each table stores its keys and values in one
+  of `--encodings` (integer, decimal, double precision, char, varchar,
+  text).
+  `internal`: a transaction inserts, updates and reads recent keys,
+  then reads every key it touched again and must see its own latest
+  write; it has no Elle check and no final reads.
+- `--upsert-types update-insert-update,on-conflict`: how a write
+  reaches a key that may not exist, chosen per write. The first is
+  UPDATE, then INSERT under a savepoint, then UPDATE again; the second
+  is `INSERT ... ON CONFLICT (id) DO UPDATE`. `--no-savepoints` makes
+  a duplicate-key INSERT fail the whole transaction instead.
+- `--key-types primary,secondary`: look a key up by `id` or by `sk`,
+  chosen per statement. `--no-secondary-index` leaves `sk` a plain
+  column, as upstream has it, so a secondary lookup scans the table.
 - `--query-mode simple|extended`: pgjdbc's protocol. Every statement
   is a prepared statement with `?` parameters. Extended sends integers
   in binary with their types declared at Parse; simple inlines them as
   cast literals.
-- `--access primary|secondary|scan`: look keys up by primary key, by a
-  bitmap index on `sk`, or by `sk` without an index.
 - `--nemesis kill|pause`: every `--nemesis-interval` seconds (5),
   SIGKILL and restart the server on the same data directory, or
   SIGSTOP it, for `--fault-duration` seconds (1).
+- `--isolation repeatable-read`: the level asked of every transaction.
+  Egres runs snapshot isolation whatever is asked, so the model Elle
+  checks is `--expected-consistency-model snapshot-isolation`.
 - `--table-count`, `--key-count`, `--max-txn-length`,
-  `--max-writes-per-key`, `--rate`: workload shape.
+  `--max-writes-per-key`, `--mop-delay`, `--rate`: workload shape.
 
-The checker is Elle's snapshot-isolation check (the internal check for
-that workload) plus: some write transactions committed, the final reads
-of every key succeeded, no unhandled exceptions, and the requested
-faults happened. Serialization failures (40001), deadlocks (40P01),
-duplicate-key races (23505) and expired snapshots (72000) are failed
-transactions; transport errors, including a lost COMMIT reply, are
-indeterminate.
+Transactions are pgjdbc's: autocommit off, BEGIN sent with the first
+statement, `COMMIT` or `ROLLBACK` through the driver. A transaction of
+one micro-operation may run in autocommit instead, as upstream has it.
+
+The checker is the workload's (Elle's snapshot-isolation check, or the
+internal check) plus: some write transactions committed, every batch
+of final reads succeeded at least once, no unhandled exceptions, and
+the requested faults happened. Serialization failures (40001),
+deadlocks (40P01), duplicate-key races (23505) and expired snapshots
+(72000) are failed transactions; transport errors, including a lost
+COMMIT reply, are indeterminate.
 
 ## Results
 

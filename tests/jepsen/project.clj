@@ -7,6 +7,8 @@
             :comments "Provenance: LICENSE-NOTES.md"}
   :dependencies [[org.clojure/clojure "1.12.5"]
                  [jepsen "0.3.13"]
+                 [io.jepsen/sql "0.1.0"]
+                 [com.github.seancorfield/next.jdbc "1.3.1093"]
                  [org.postgresql/postgresql "42.7.11"]]
   :main ^:skip-aot jepsen.egres
   :filespecs [{:type :path :path "LICENSE-NOTES.md"}]

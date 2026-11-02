@@ -37,9 +37,9 @@ was received under EPL-1.0. For this adaptation we elect EPL-2.0 under the
 later-version provision in section 7 of EPL-1.0. The unmodified Jepsen
 dependency retains its own license.
 
-The adapted files are src/jepsen/egres.clj, src/jepsen/egres/client.clj,
-and src/jepsen/egres/internal.clj. LICENSE-NOTES.md identifies the
-modifications.
+The adapted files are src/jepsen/egres.clj and
+src/jepsen/egres/client.clj. The Jepsen SQL workloads are a dependency,
+used unmodified. LICENSE-NOTES.md identifies the modifications.
 
 The license texts are included in META-INF/licenses/. No upstream
 dependencies are bundled in the ordinary harness JAR. If dependencies
