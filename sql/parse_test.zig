@@ -497,9 +497,8 @@ test "sql.parse: WHERE parses AND / OR / NOT and IS [NOT] NULL" {
     // Rejections anywhere in the tree surface the leaf's reason.
     const cases = [_]struct { sql: String, needle: String }{
         .{ .sql = "SELECT * FROM t WHERE a = 1 AND b ~ 'x';", .needle = "comparisons" },
-        .{ .sql = "SELECT * FROM t WHERE a = 1 OR b;", .needle = "unsupported WHERE" },
-        .{ .sql = "SELECT * FROM t WHERE NOT b;", .needle = "unsupported WHERE" },
-        .{ .sql = "SELECT * FROM t WHERE a IS DISTINCT FROM 1;", .needle = "comparisons" },
+        .{ .sql = "SELECT * FROM t WHERE a = 1 OR b LIKE 'x';", .needle = "unsupported WHERE" },
+        .{ .sql = "SELECT * FROM t WHERE a BETWEEN SYMMETRIC 1 AND 2;", .needle = "unsupported WHERE" },
         .{ .sql = "SELECT * FROM t WHERE (a = 1) IS NULL;", .needle = "operators" },
     };
     for (cases) |case| {
@@ -507,6 +506,80 @@ test "sql.parse: WHERE parses AND / OR / NOT and IS [NOT] NULL" {
         try testing.expect(stmt == .invalid);
         try testing.expect(std.mem.indexOf(u8, stmt.invalid, case.needle) != null);
     }
+}
+
+test "sql.parse: IN and BETWEEN are ORs and ANDs of comparisons" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // a IN (1, 2) is a = 1 OR a = 2; NOT IN negates the OR.
+    const in = try parse.statement(alloc, "SELECT * FROM t WHERE a IN (1, 2);");
+    const in_or = in.select.where.?.or_;
+    try testing.expectEqual(@as(usize, 2), in_or.len);
+    try testing.expectEqualStrings("a", in_or[0].cmp.lhs.column);
+    try testing.expectEqual(parse.CmpOp.eq, in_or[0].cmp.op);
+    try testing.expectEqual(@as(i64, 1), in_or[0].cmp.rhs.literal.int);
+    try testing.expectEqual(@as(i64, 2), in_or[1].cmp.rhs.literal.int);
+    const not_in = try parse.statement(alloc, "DELETE FROM t WHERE a NOT IN ($1, $2);");
+    const not_in_or = not_in.delete.where.?.not.or_;
+    try testing.expectEqual(@as(u16, 2), not_in_or[1].cmp.rhs.literal.param);
+    try testing.expectEqual(@as(u16, 2), not_in.delete.param_count);
+    // A column in the list goes left in its own comparison.
+    const col_in = try parse.statement(alloc, "SELECT * FROM t WHERE 1 IN (a, 2);");
+    const col_or = col_in.select.where.?.or_;
+    try testing.expectEqualStrings("a", col_or[0].cmp.lhs.column);
+    try testing.expectEqual(@as(i64, 1), col_or[0].cmp.rhs.literal.int);
+    try testing.expectEqual(@as(i64, 1), col_or[1].cmp.lhs.literal.int);
+
+    // a BETWEEN 1 AND 5 is a >= 1 AND a <= 5; NOT BETWEEN, a < 1 OR a > 5.
+    const bt = try parse.statement(alloc, "SELECT * FROM t WHERE a BETWEEN 1 AND 5;");
+    const bt_and = bt.select.where.?.and_;
+    try testing.expectEqual(parse.CmpOp.ge, bt_and[0].cmp.op);
+    try testing.expectEqual(@as(i64, 1), bt_and[0].cmp.rhs.literal.int);
+    try testing.expectEqual(parse.CmpOp.le, bt_and[1].cmp.op);
+    try testing.expectEqual(@as(i64, 5), bt_and[1].cmp.rhs.literal.int);
+    const not_bt = try parse.statement(alloc, "SELECT * FROM t WHERE a NOT BETWEEN 1 AND 5;");
+    const not_bt_or = not_bt.select.where.?.or_;
+    try testing.expectEqual(parse.CmpOp.lt, not_bt_or[0].cmp.op);
+    try testing.expectEqual(parse.CmpOp.gt, not_bt_or[1].cmp.op);
+    try testing.expectEqualStrings("a", not_bt_or[1].cmp.lhs.column);
+}
+
+test "sql.parse: IS DISTINCT FROM, IS TRUE and a bare boolean column" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const d = try parse.statement(alloc, "SELECT * FROM t WHERE a IS DISTINCT FROM 1;");
+    try testing.expectEqual(parse.CmpOp.differs, d.select.where.?.cmp.op);
+    const nd = try parse.statement(alloc, "SELECT * FROM t WHERE NULL IS NOT DISTINCT FROM a;");
+    try testing.expectEqual(parse.CmpOp.same, nd.select.where.?.cmp.op);
+    try testing.expectEqualStrings("a", nd.select.where.?.cmp.lhs.column);
+    try testing.expect(nd.select.where.?.cmp.rhs.literal == .null_value);
+
+    const cases = [_]struct { sql: String, is: parse.Where.BoolIs, negate: bool }{
+        .{ .sql = "SELECT * FROM t WHERE b IS TRUE;", .is = .true_, .negate = false },
+        .{ .sql = "SELECT * FROM t WHERE b IS NOT TRUE;", .is = .true_, .negate = true },
+        .{ .sql = "SELECT * FROM t WHERE b IS FALSE;", .is = .false_, .negate = false },
+        .{ .sql = "SELECT * FROM t WHERE b IS NOT FALSE;", .is = .false_, .negate = true },
+        .{ .sql = "SELECT * FROM t WHERE b IS UNKNOWN;", .is = .unknown, .negate = false },
+        .{ .sql = "SELECT * FROM t WHERE b IS NOT UNKNOWN;", .is = .unknown, .negate = true },
+    };
+    for (cases) |case| {
+        const stmt = try parse.statement(alloc, case.sql);
+        const bt = stmt.select.where.?.bool_test;
+        try testing.expectEqualStrings("b", bt.expr.column);
+        try testing.expectEqual(case.is, bt.is);
+        try testing.expectEqual(case.negate, bt.negate);
+    }
+
+    // WHERE b is b = true; NOT b wraps it.
+    const bare = try parse.statement(alloc, "SELECT * FROM t WHERE b;");
+    try testing.expectEqualStrings("b", bare.select.where.?.cmp.lhs.column);
+    try testing.expect(bare.select.where.?.cmp.rhs.literal.bool_);
+    const not_bare = try parse.statement(alloc, "SELECT * FROM t WHERE a = 1 AND NOT b;");
+    try testing.expectEqualStrings("b", not_bare.select.where.?.and_[1].not.cmp.lhs.column);
 }
 
 test "sql.parse: LIMIT takes an integer literal; ALL and NULL mean none" {

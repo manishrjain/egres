@@ -27,6 +27,7 @@ const EvalError = _expr.EvalError;
 pub const Pred = union(enum) {
     cmp: Cmp,
     is_null: NullTest,
+    bool_test: BoolTest,
     and_: []const Pred,
     or_: []const Pred,
     not: *const Pred,
@@ -46,6 +47,12 @@ pub const Pred = union(enum) {
     };
     /// `expr IS NULL` (negate = false) / `expr IS NOT NULL`.
     pub const NullTest = struct { expr: *const Node, negate: bool };
+    /// `expr IS [NOT] TRUE | FALSE | UNKNOWN` over a boolean.
+    pub const BoolTest = struct {
+        node: *const Node,
+        is: _parse.Where.BoolIs,
+        negate: bool,
+    };
 
     /// The top-level AND terms: a root AND's children, else the root
     /// alone. Every one must hold for a row to match, which is what
@@ -60,21 +67,41 @@ pub const Pred = union(enum) {
     }
 
     /// SQL three-valued logic: null = unknown. A comparison is unknown
-    /// when either side is NULL; IS [NOT] NULL is never unknown; AND /
-    /// OR / NOT follow Kleene. A leaf of two bare cells reads only
-    /// those (Table.read — a null-bit test plus one O(1) read each; no
-    /// full-row decode); an expression computes into `row.scratch`.
+    /// when either side is NULL, except IS [NOT] DISTINCT FROM, which
+    /// a NULL decides; IS [NOT] NULL and IS [NOT] TRUE are never
+    /// unknown; AND / OR / NOT follow Kleene. A leaf of two bare cells
+    /// reads only those (Table.read — a null-bit test plus one O(1)
+    /// read each; no full-row decode); an expression computes into
+    /// `row.scratch`.
     pub fn eval(self: *const Pred, row: _expr.Row) EvalError!?bool {
         switch (self.*) {
             .cmp => |c| {
                 const lhs = try c.lhs.cell(row);
                 const rhs = try c.rhs.cell(row);
-                if (lhs == .null_value or rhs == .null_value) return null;
+                // WHERE a IS DISTINCT FROM NULL: true unless a is NULL.
+                if (lhs == .null_value or rhs == .null_value) {
+                    const both = (lhs == .null_value) == (rhs == .null_value);
+                    return switch (c.op) {
+                        .differs => !both,
+                        .same => both,
+                        else => null,
+                    };
+                }
                 return c.op.holds(_expr.compare(lhs, rhs));
             },
             .is_null => |n| {
                 const v = try n.expr.cell(row);
                 return (v == .null_value) != n.negate;
+            },
+            // WHERE active IS NOT TRUE: a NULL active is not true.
+            .bool_test => |t| {
+                const v = try t.node.cell(row);
+                const hit = switch (t.is) {
+                    .true_ => v == .bool_ and v.bool_,
+                    .false_ => v == .bool_ and !v.bool_,
+                    .unknown => v == .null_value,
+                };
+                return hit != t.negate;
             },
             .and_ => |kids| {
                 var unknown = false;
@@ -147,7 +174,7 @@ pub fn bind(
                 // an error in Postgres: every stored cell is at most
                 // n codepoints, so `=` never matches, and the other
                 // comparisons see the whole literal, as text.
-                error.StringTooLong => if (f.op == .eq)
+                error.StringTooLong => if (f.op == .eq or f.op == .same)
                     return .never
                 else
                     try _expr.bind(arloc, tbl, f.rhs.*, null, params, null),
@@ -170,6 +197,16 @@ pub fn bind(
             .expr = try _expr.bind(arloc, tbl, nt.expr.*, null, params, null),
             .negate = nt.negate,
         } },
+        // WHERE n IS TRUE on an int column is 42804, as in Postgres.
+        .bool_test => |bt| {
+            const node = try _expr.bind(arloc, tbl, bt.expr.*, null, params, null);
+            if (node.ty()) |ty| if (ty != .bool_) return error.TypeMismatch;
+            return .{ .bool_test = .{
+                .node = node,
+                .is = bt.is,
+                .negate = bt.negate,
+            } };
+        },
         .and_, .or_ => |kids| {
             const out = try arloc.alloc(Pred, kids.len);
             for (kids, out) |kid, *slot|

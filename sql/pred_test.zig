@@ -190,6 +190,58 @@ test "sql.pred: eval follows SQL three-valued logic" {
     try testing.expect(!try or_.matches(fx.row(r3)));
 }
 
+test "sql.pred: IS DISTINCT FROM and IS TRUE are never unknown" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try Fixture.init(a);
+    defer fx.tbl.deinit();
+
+    const r1 = try fx.item(1, &.{ .{ .int4 = 1 }, .{ .text = "x" } });
+    const r2 = try fx.item(2, &.{ .null_value, .{ .text = "x" } });
+    const T: ?bool = true;
+    const F: ?bool = false;
+
+    // a IS DISTINCT FROM 1 / FROM NULL, against a = 1 and a = NULL.
+    const dist_1 = try pred.colCmp(a, fx.col("a"), .differs, .{ .int4 = 1 });
+    const dist_null = try pred.colCmp(a, fx.col("a"), .differs, .null_value);
+    const same_1 = try pred.colCmp(a, fx.col("a"), .same, .{ .int4 = 1 });
+    const same_null = try pred.colCmp(a, fx.col("a"), .same, .null_value);
+    try testing.expectEqual(F, try dist_1.eval(fx.row(r1)));
+    try testing.expectEqual(T, try dist_1.eval(fx.row(r2)));
+    try testing.expectEqual(T, try dist_null.eval(fx.row(r1)));
+    try testing.expectEqual(F, try dist_null.eval(fx.row(r2)));
+    try testing.expectEqual(T, try same_1.eval(fx.row(r1)));
+    try testing.expectEqual(F, try same_1.eval(fx.row(r2)));
+    try testing.expectEqual(F, try same_null.eval(fx.row(r1)));
+    try testing.expectEqual(T, try same_null.eval(fx.row(r2)));
+
+    // IS [NOT] TRUE | FALSE | UNKNOWN over true, false and NULL.
+    const cells = [_]Value{ .{ .bool_ = true }, .{ .bool_ = false }, .null_value };
+    const truth = [_]struct { is: sql.parse.Where.BoolIs, want: [3]bool }{
+        .{ .is = .true_, .want = .{ true, false, false } },
+        .{ .is = .false_, .want = .{ false, true, false } },
+        .{ .is = .unknown, .want = .{ false, false, true } },
+    };
+    for (cells, 0..) |cell, i| {
+        const leaf = try a.create(sql.expr.Node);
+        leaf.* = .{ .value = cell };
+        for (truth) |t| {
+            const yes = Pred{ .bool_test = .{ .node = leaf, .is = t.is, .negate = false } };
+            const no = Pred{ .bool_test = .{ .node = leaf, .is = t.is, .negate = true } };
+            try testing.expectEqual(@as(?bool, t.want[i]), try yes.eval(fx.row(r1)));
+            try testing.expectEqual(@as(?bool, !t.want[i]), try no.eval(fx.row(r1)));
+        }
+    }
+
+    // Bound from SQL: an int under IS TRUE is a type mismatch.
+    const stmt = try sql.parse.statement(a, "SELECT * FROM t WHERE a IS TRUE");
+    try testing.expectError(
+        error.TypeMismatch,
+        pred.bind(a, &fx.tbl, stmt.select.where.?, .{}),
+    );
+}
+
 test "sql.pred: a literal longer than its char(n) column binds to never" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

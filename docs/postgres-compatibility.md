@@ -121,8 +121,11 @@ Rows come back in `egid` order, which is insertion order, whether a scan or an i
 | `AND`, `OR`, `NOT` | Yes | Nested to any depth. |
 | `egid = N` | Yes | A single-hop point read; `N` is a positive integer. See [Extensions](#extensions). |
 | `<`, `<=`, `>`, `>=`, `<>` (`!=`) | Yes | The literal may stand on either side. Text compares bytewise. On an indexed column `<`, `<=`, `>` and `>=` read the index between the bounds; `<>` scans. |
-| `BETWEEN`, `LIKE`, `ILIKE`, `IN (...)`, `IS DISTINCT FROM` | Not&nbsp;yet | |
-| A bare boolean column, `CASE`, subqueries | Not&nbsp;yet | |
+| `IN (...)`, `NOT IN (...)` | Yes | A list of literals, parameters or expressions; evaluated as the `OR` of equalities, so an indexed column reads one entry per value and `NOT IN` with a `NULL` in the list matches nothing, as in Postgres. |
+| `BETWEEN`, `NOT BETWEEN` | Yes | Evaluated as `>=` and `<=`, so an indexed column reads the range. `BETWEEN SYMMETRIC`: not yet. |
+| `IS [NOT] DISTINCT FROM` | Yes | Never unknown: two `NULL`s are not distinct. `IS NOT DISTINCT FROM` reads an index as `=` does. |
+| `IS [NOT] TRUE`, `IS [NOT] FALSE`, `IS [NOT] UNKNOWN`, a bare boolean column | Yes | Over a boolean column or expression; anything else returns `42804`. `IS TRUE`, `IS FALSE`, `IS UNKNOWN` and a bare column read an index; the `NOT` forms scan. |
+| `LIKE`, `ILIKE`, `CASE`, subqueries | Not&nbsp;yet | |
 
 Any indexed column in the predicate drives the query through its index, an equality as one entry and an ordered comparison as the entries between its bounds, and `AND`, `OR` and `NOT` over indexed columns become bitmap operations. A predicate on an unindexed column scans the table with the predicate applied to each row. A mixed predicate uses the indexed terms to pick a superset of the rows and re-checks the whole predicate on each. An index still being built is used once its backfill completes.
 

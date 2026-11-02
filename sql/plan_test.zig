@@ -3,8 +3,9 @@
 
 //! Planner tests: the tree a WHERE turns into, on a hand-built table
 //! — `a int4` the PK behind a unique index, `b int4` behind a
-//! non-unique one, `c text` unindexed. Each case is the SQL text of
-//! the WHERE, parsed and bound the way a statement's is.
+//! non-unique one, `c text` unindexed, `d bool` behind a non-unique
+//! one. Each case is the SQL text of the WHERE, parsed and bound the
+//! way a statement's is.
 
 const std = @import("std");
 const testing = std.testing;
@@ -19,6 +20,7 @@ const Table = sql.table.Table;
 
 const pkey_index_id: u32 = 17;
 const b_index_id: u32 = 18;
+const d_index_id: u32 = 19;
 /// The fixture's indexes are complete from ts 10; a snapshot at 50
 /// reads both.
 const read_ts: u64 = 50;
@@ -38,13 +40,14 @@ const Fixture = struct {
             .{ .column_id = 1, .name = "a", .ty = .int4 },
             .{ .column_id = 2, .name = "b", .ty = .int4 },
             .{ .column_id = 3, .name = "c", .ty = .text },
+            .{ .column_id = 4, .name = "d", .ty = .bool_ },
         };
         const ps = try sql.schema.compile(
             a,
             .{ .columns = &logical, .current_version = 1 },
             1,
         );
-        const columns = try a.alloc(sql.table.Column, 3);
+        const columns = try a.alloc(sql.table.Column, 4);
         columns[0] = .{
             .column_id = 1,
             .pos = 0,
@@ -66,7 +69,14 @@ const Fixture = struct {
             .ty = .text,
             .pkey_position = null,
         };
-        const indexes = try a.alloc(sql.table.Index, 2);
+        columns[3] = .{
+            .column_id = 4,
+            .pos = 3,
+            .name = "d",
+            .ty = .bool_,
+            .pkey_position = null,
+        };
+        const indexes = try a.alloc(sql.table.Index, 3);
         indexes[0] = .{
             .index_table_id = pkey_index_id,
             .unique = true,
@@ -78,6 +88,12 @@ const Fixture = struct {
             .unique = false,
             .valid_ts = built_ts,
             .column = &columns[1],
+        };
+        indexes[2] = .{
+            .index_table_id = d_index_id,
+            .unique = false,
+            .valid_ts = built_ts,
+            .column = &columns[3],
         };
         return .{ .arena = arena, .tbl = .{
             .columns = columns,
@@ -256,6 +272,75 @@ test "sql.plan: egid literals and NULL comparisons are egid sets" {
     var or_none = try fx.planFor("b = NULL OR c = NULL", stream);
     defer or_none.deinit();
     try expectEgids(try bitmapOf(&or_none), &.{});
+}
+
+test "sql.plan: IN, BETWEEN, IS NOT DISTINCT FROM and IS TRUE read an index" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    const a = fx.arena.allocator();
+    const k1 = try int4Key(a, 1);
+    const k2 = try int4Key(a, 2);
+    const null_key = try sql.key.encodeIndexKey(a, .null_value, null);
+
+    // b IN (1, 2) is the union of two entries; NOT IN scans.
+    var in = try fx.planFor("b IN (1, 2)", stream);
+    defer in.deinit();
+    const in_src = try bitmapOf(&in);
+    try testing.expect(in_src.* == .or_);
+    try expectLookup(&in_src.or_[0], b_index_id, false, k1);
+    try expectLookup(&in_src.or_[1], b_index_id, false, k2);
+    var not_in = try fx.planFor("b NOT IN (1, 2)", stream);
+    defer not_in.deinit();
+    try expectScan(&not_in);
+
+    // b BETWEEN 1 AND 2 is one range read, [1, 2]: the lower bound of
+    // `>= 1` and the upper of `<= 2` (the key followed by a zero byte).
+    var between = try fx.planFor("b BETWEEN 1 AND 2", stream);
+    defer between.deinit();
+    const bt_src = try bitmapOf(&between);
+    try testing.expect(bt_src.* == .index_range);
+    try testing.expectEqualSlices(u8, k1, bt_src.index_range.lo);
+    const k2_after = try std.mem.concat(a, u8, &.{ k2, &.{0} });
+    try testing.expectEqualSlices(u8, k2_after, bt_src.index_range.hi);
+    // The same two comparisons written out, and a third range on the
+    // same index, narrow to one node too; a lookup beside them stays.
+    var written = try fx.planFor("b >= 1 AND b <= 2 AND b < 2 AND a = 1", stream);
+    defer written.deinit();
+    const wr_src = try bitmapOf(&written);
+    try testing.expect(wr_src.* == .and_);
+    try testing.expectEqual(@as(usize, 2), wr_src.and_.len);
+    try testing.expect(wr_src.and_[0] == .index_range);
+    try testing.expectEqualSlices(u8, k1, wr_src.and_[0].index_range.lo);
+    try testing.expectEqualSlices(u8, k2, wr_src.and_[0].index_range.hi);
+    try expectLookup(&wr_src.and_[1], pkey_index_id, true, k1);
+
+    // IS NOT DISTINCT FROM 1 is the entry under 1; FROM NULL the NULL
+    // posting; IS DISTINCT FROM scans.
+    var same = try fx.planFor("b IS NOT DISTINCT FROM 1", stream);
+    defer same.deinit();
+    try expectLookup(try bitmapOf(&same), b_index_id, false, k1);
+    var same_null = try fx.planFor("b IS NOT DISTINCT FROM NULL", stream);
+    defer same_null.deinit();
+    try expectLookup(try bitmapOf(&same_null), b_index_id, false, null_key);
+    var dist = try fx.planFor("b IS DISTINCT FROM 1", stream);
+    defer dist.deinit();
+    try expectScan(&dist);
+
+    // d IS TRUE and a bare d are the entry under true; IS UNKNOWN the
+    // NULL posting; IS NOT TRUE scans.
+    const true_key = try sql.key.encodeIndexKey(a, .{ .bool_ = true }, null);
+    var is_true = try fx.planFor("d IS TRUE", stream);
+    defer is_true.deinit();
+    try expectLookup(try bitmapOf(&is_true), d_index_id, false, true_key);
+    var bare = try fx.planFor("d", stream);
+    defer bare.deinit();
+    try expectLookup(try bitmapOf(&bare), d_index_id, false, true_key);
+    var unknown = try fx.planFor("d IS UNKNOWN", stream);
+    defer unknown.deinit();
+    try expectLookup(try bitmapOf(&unknown), d_index_id, false, null_key);
+    var not_true = try fx.planFor("d IS NOT TRUE", stream);
+    defer not_true.deinit();
+    try expectScan(&not_true);
 }
 
 test "sql.plan: IS NULL reads a posting index, never a unique one" {

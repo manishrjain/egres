@@ -95,6 +95,32 @@ expect "arithmetic in WHERE" "a" v "SELECT name FROM t WHERE id * 2 = 2;"
 expect "constants in WHERE" "0" v "SELECT count(*) FROM t WHERE 5 > 6;"
 expect "expression IS NOT NULL" "1" \
     v "SELECT count(*) FROM t WHERE nullif(id, 1) IS NOT NULL;"
+expect "IN" "(2 rows)" q "SELECT name FROM t WHERE id IN (1, 2, 3);"
+expect "NOT IN" "b" v "SELECT name FROM t WHERE id NOT IN (1, 3);"
+expect "NOT IN with a NULL matches nothing" "0" \
+    v "SELECT count(*) FROM t WHERE id NOT IN (1, NULL);"
+expect "IN with an expression" "a" v "SELECT name FROM t WHERE id IN (0 + 1, 5);"
+expect "BETWEEN" "(2 rows)" q "SELECT name FROM t WHERE id BETWEEN 1 AND 2;"
+expect "NOT BETWEEN" "b" v "SELECT name FROM t WHERE id NOT BETWEEN 0 AND 1;"
+expect "IS DISTINCT FROM" "b" v "SELECT name FROM t WHERE id IS DISTINCT FROM 1;"
+expect "IS NOT DISTINCT FROM" "a" v "SELECT name FROM t WHERE 1 IS NOT DISTINCT FROM id;"
+expect "IS NOT DISTINCT FROM NULL matches nothing" "0" \
+    v "SELECT count(*) FROM t WHERE id IS NOT DISTINCT FROM NULL;"
+expect "IS TRUE on an int is a type mismatch" "does not match" \
+    q "SELECT name FROM t WHERE id IS TRUE;"
+expect "CREATE TABLE with a bool" "CREATE TABLE" \
+    q "CREATE TABLE flags (id int4, on_ bool);"
+expect "INSERT true, false, NULL" "INSERT 0 3" \
+    q "INSERT INTO flags VALUES (1, true), (2, false), (3, NULL);"
+expect "bare boolean column" "1" v "SELECT id FROM flags WHERE on_;"
+expect "NOT bare boolean column" "2" v "SELECT id FROM flags WHERE NOT on_;"
+expect "IS TRUE" "1" v "SELECT id FROM flags WHERE on_ IS TRUE;"
+expect "IS NOT TRUE takes the NULL row too" "(2 rows)" \
+    q "SELECT id FROM flags WHERE on_ IS NOT TRUE;"
+expect "IS FALSE" "2" v "SELECT id FROM flags WHERE on_ IS FALSE;"
+expect "IS UNKNOWN" "3" v "SELECT id FROM flags WHERE on_ IS UNKNOWN;"
+expect "IS NOT UNKNOWN" "(2 rows)" q "SELECT id FROM flags WHERE on_ IS NOT UNKNOWN;"
+expect "DROP the bool table" "DROP TABLE" q "DROP TABLE flags;"
 expect "expression target with an alias" "3" \
     v "SELECT id + 1 AS next FROM t WHERE id = 2;"
 expect "function target" "A" v "SELECT upper(name) FROM t WHERE id = 1;"

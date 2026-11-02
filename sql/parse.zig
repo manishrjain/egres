@@ -190,6 +190,11 @@ pub const CmpOp = enum {
     le,
     gt,
     ge,
+    /// `a IS DISTINCT FROM b` / `a IS NOT DISTINCT FROM b`: `<>` / `=`
+    /// with two NULLs the same and a NULL and a value different, so
+    /// never unknown (pred.eval).
+    differs,
+    same,
 
     pub fn fromName(name: String) ?CmpOp {
         const table = .{
@@ -212,6 +217,8 @@ pub const CmpOp = enum {
             .le => .ge,
             .gt => .lt,
             .ge => .le,
+            .differs => .differs,
+            .same => .same,
         };
     }
 
@@ -219,8 +226,8 @@ pub const CmpOp = enum {
     /// what the comparison asks for.
     pub fn holds(self: CmpOp, order: std.math.Order) bool {
         return switch (self) {
-            .eq => order == .eq,
-            .ne => order != .eq,
+            .eq, .same => order == .eq,
+            .ne, .differs => order != .eq,
             .lt => order == .lt,
             .le => order != .gt,
             .gt => order == .gt,
@@ -242,13 +249,16 @@ pub const Cmp = struct {
 };
 
 /// A parsed WHERE tree. A leaf compares two expressions or tests one
-/// for NULL; AND/OR hold their children inline (a slice is already an
-/// indirection, and children are never shared between parents); NOT
-/// is a pointer only because a union cannot contain itself by value.
+/// for NULL or a truth value; AND/OR hold their children inline (a
+/// slice is already an indirection, and children are never shared
+/// between parents); NOT is a pointer only because a union cannot
+/// contain itself by value. `IN (...)` and `BETWEEN` are not leaves:
+/// the parser spells them as the OR / AND of comparisons they mean.
 /// Everything borrows the arena.
 pub const Where = union(enum) {
     cmp: Cmp,
     is_null: NullTest,
+    bool_test: BoolTest,
     and_: []const Where,
     or_: []const Where,
     not: *const Where,
@@ -258,6 +268,13 @@ pub const Where = union(enum) {
         expr: *const Expr,
         negate: bool,
     };
+    /// `expr IS [NOT] TRUE | FALSE | UNKNOWN`, over a boolean.
+    pub const BoolTest = struct {
+        expr: *const Expr,
+        is: BoolIs,
+        negate: bool,
+    };
+    pub const BoolIs = enum { true_, false_, unknown };
 };
 
 pub const Select = struct {
@@ -1065,10 +1082,9 @@ fn isExcludedRef(p: anytype) bool {
     return std.mem.eql(u8, parser.str(s.sval), "excluded");
 }
 
-/// The operator an A_Expr applies: the last part of its name, when it
-/// is a plain `AEXPR_OP` with one.
+/// The operator an A_Expr names, the last part of it: `=` for an
+/// `AEXPR_OP`, and for `IN` too (`<>` for NOT IN).
 fn operatorOf(ae: *const c.A_Expr) ?String {
-    if (ae.kind != c.AEXPR_OP) return null;
     const n = parser.items(ae.name).len;
     if (n == 0) return null;
     const s = parser.cast(c.String, parser.nodeAt(ae.name, n - 1)) orelse
@@ -1077,13 +1093,16 @@ fn operatorOf(ae: *const c.A_Expr) ?String {
 }
 
 /// Parse a WHERE tree, shared by SELECT, DELETE, and UPDATE: `expr op
-/// expr` leaves (`= <> < <= > >=`, each side a parseExpr expression),
-/// `expr IS [NOT] NULL`, and AND / OR / NOT over them. Anything else
-/// (another operator, a subquery, a bare boolean column) yields a
-/// clean `.invalid` reason; only OOM propagates. AND/OR children land
-/// in one arena slice, NOT's in one arena cell. Postgres flattens `a
-/// AND b AND c` into one node with three args; NOT always carries
-/// exactly one.
+/// expr` leaves (`= <> < <= > >=`, `IS [NOT] DISTINCT FROM`, each
+/// side a parseExpr expression), `expr IS [NOT] NULL`, `expr IS [NOT]
+/// TRUE | FALSE | UNKNOWN`, a bare boolean column, and AND / OR / NOT
+/// over them. `IN (...)` and `BETWEEN` become those: `id IN (1, 2)`
+/// is `id = 1 OR id = 2` and `n BETWEEN 2 AND 5` is `n >= 2 AND n <=
+/// 5`, as Postgres rewrites BETWEEN itself. Anything else (another
+/// operator, a subquery, LIKE) yields a clean `.invalid` reason; only
+/// OOM propagates. AND/OR children land in one arena slice, NOT's in
+/// one arena cell. Postgres flattens `a AND b AND c` into one node
+/// with three args; NOT always carries exactly one.
 fn parseWhere(
     alloc: std.mem.Allocator,
     params: *ParamTally,
@@ -1122,38 +1141,140 @@ fn parseWhere(
             c.IS_NOT_NULL => true,
             else => return ParsedWhere.reject("unsupported WHERE clause"),
         };
-        const operand = try alloc.create(Expr);
-        operand.* = switch (try parseExpr(alloc, params, parser.asNode(nt.arg))) {
+        const operand = switch (try leafExpr(alloc, params, parser.asNode(nt.arg))) {
             .expr => |e| e,
             .invalid => |msg| return .{ .invalid = msg },
         };
         return .{ .where = .{ .is_null = .{ .expr = operand, .negate = negate } } };
     }
 
+    if (parser.cast(c.BooleanTest, p)) |bt| {
+        const is: Where.BoolIs, const negate = switch (bt.booltesttype) {
+            c.IS_TRUE => .{ .true_, false },
+            c.IS_NOT_TRUE => .{ .true_, true },
+            c.IS_FALSE => .{ .false_, false },
+            c.IS_NOT_FALSE => .{ .false_, true },
+            c.IS_UNKNOWN => .{ .unknown, false },
+            c.IS_NOT_UNKNOWN => .{ .unknown, true },
+            else => return ParsedWhere.reject("unsupported WHERE clause"),
+        };
+        const operand = switch (try leafExpr(alloc, params, parser.asNode(bt.arg))) {
+            .expr => |e| e,
+            .invalid => |msg| return .{ .invalid = msg },
+        };
+        return .{ .where = .{ .bool_test = .{
+            .expr = operand,
+            .is = is,
+            .negate = negate,
+        } } };
+    }
+
+    // `WHERE active`: the column against true, unknown when NULL.
+    if (parser.cast(c.ColumnRef, p) != null) {
+        const col = switch (try leafExpr(alloc, params, p)) {
+            .expr => |e| e,
+            .invalid => |msg| return .{ .invalid = msg },
+        };
+        const yes = try alloc.create(Expr);
+        yes.* = .{ .literal = .{ .bool_ = true } };
+        return .{ .where = cmpOf(col, .eq, yes) };
+    }
+
     const ae = parser.cast(c.A_Expr, p) orelse
         return ParsedWhere.reject("unsupported WHERE clause");
     if (isExcludedRef(ae.lexpr) or isExcludedRef(ae.rexpr))
         return ParsedWhere.reject("EXCLUDED is not supported in a WHERE");
-    var op = CmpOp.fromName(operatorOf(ae) orelse "") orelse
-        return ParsedWhere.reject(
-            "only = <> < <= > >= comparisons are supported in WHERE",
-        );
-    var lhs = try alloc.create(Expr);
-    lhs.* = switch (try parseExpr(alloc, params, parser.asNode(ae.lexpr))) {
+    const lhs = switch (try leafExpr(alloc, params, parser.asNode(ae.lexpr))) {
         .expr => |e| e,
         .invalid => |msg| return .{ .invalid = msg },
     };
-    var rhs = try alloc.create(Expr);
-    rhs.* = switch (try parseExpr(alloc, params, parser.asNode(ae.rexpr))) {
-        .expr => |e| e,
-        .invalid => |msg| return .{ .invalid = msg },
-    };
-    // A bare column goes left; the operator turns with it.
-    if (lhs.* != .column and rhs.* == .column) {
-        std.mem.swap(*Expr, &lhs, &rhs);
-        op = op.flipped();
+    switch (ae.kind) {
+        c.AEXPR_OP, c.AEXPR_DISTINCT, c.AEXPR_NOT_DISTINCT => {
+            const op: CmpOp = switch (ae.kind) {
+                c.AEXPR_DISTINCT => .differs,
+                c.AEXPR_NOT_DISTINCT => .same,
+                else => CmpOp.fromName(operatorOf(ae) orelse "") orelse
+                    return ParsedWhere.reject(
+                        "only = <> < <= > >= comparisons are supported in WHERE",
+                    ),
+            };
+            const rhs = switch (try leafExpr(alloc, params, parser.asNode(ae.rexpr))) {
+                .expr => |e| e,
+                .invalid => |msg| return .{ .invalid = msg },
+            };
+            return .{ .where = cmpOf(lhs, op, rhs) };
+        },
+        // `id IN (1, 2)` is `id = 1 OR id = 2`; NOT IN negates the OR.
+        c.AEXPR_IN => {
+            const list = parser.cast(c.List, ae.rexpr) orelse
+                return ParsedWhere.reject("IN takes a list of values");
+            const vals = parser.items(list);
+            if (vals.len == 0) return ParsedWhere.reject("IN takes a list of values");
+            const kids = try alloc.alloc(Where, vals.len);
+            for (vals, kids) |val, *kid| {
+                const rhs = switch (try leafExpr(alloc, params, parser.asNode(val.ptr_value))) {
+                    .expr => |e| e,
+                    .invalid => |msg| return .{ .invalid = msg },
+                };
+                kid.* = cmpOf(lhs, .eq, rhs);
+            }
+            const any = Where{ .or_ = kids };
+            if (std.mem.eql(u8, operatorOf(ae) orelse "", "=")) return .{ .where = any };
+            const not = try alloc.create(Where);
+            not.* = any;
+            return .{ .where = .{ .not = not } };
+        },
+        // `n BETWEEN 2 AND 5` is `n >= 2 AND n <= 5`; NOT BETWEEN is
+        // `n < 2 OR n > 5`, as Postgres rewrites both.
+        c.AEXPR_BETWEEN, c.AEXPR_NOT_BETWEEN => {
+            const list = parser.cast(c.List, ae.rexpr) orelse
+                return ParsedWhere.reject("BETWEEN takes two bounds");
+            const bounds = parser.items(list);
+            if (bounds.len != 2) return ParsedWhere.reject("BETWEEN takes two bounds");
+            const lo = switch (try leafExpr(alloc, params, parser.asNode(bounds[0].ptr_value))) {
+                .expr => |e| e,
+                .invalid => |msg| return .{ .invalid = msg },
+            };
+            const hi = switch (try leafExpr(alloc, params, parser.asNode(bounds[1].ptr_value))) {
+                .expr => |e| e,
+                .invalid => |msg| return .{ .invalid = msg },
+            };
+            const kids = try alloc.alloc(Where, 2);
+            if (ae.kind == c.AEXPR_BETWEEN) {
+                kids[0] = cmpOf(lhs, .ge, lo);
+                kids[1] = cmpOf(lhs, .le, hi);
+                return .{ .where = .{ .and_ = kids } };
+            }
+            kids[0] = cmpOf(lhs, .lt, lo);
+            kids[1] = cmpOf(lhs, .gt, hi);
+            return .{ .where = .{ .or_ = kids } };
+        },
+        else => return ParsedWhere.reject("unsupported WHERE clause"),
     }
-    return .{ .where = .{ .cmp = .{ .lhs = lhs, .op = op, .rhs = rhs } } };
+}
+
+/// `lhs op rhs` with a bare column on the left: a literal written
+/// there turns the operator around, `5 < a` is `a > 5`.
+fn cmpOf(lhs: *const Expr, op: CmpOp, rhs: *const Expr) Where {
+    if (lhs.* != .column and rhs.* == .column)
+        return .{ .cmp = .{ .lhs = rhs, .op = op.flipped(), .rhs = lhs } };
+    return .{ .cmp = .{ .lhs = lhs, .op = op, .rhs = rhs } };
+}
+
+/// One side of a WHERE leaf, parsed into its own arena cell.
+const ParsedLeaf = union(enum) { expr: *const Expr, invalid: String };
+
+fn leafExpr(
+    alloc: std.mem.Allocator,
+    params: *ParamTally,
+    p: ?*c.Node,
+) parser.ParseError!ParsedLeaf {
+    const out = try alloc.create(Expr);
+    out.* = switch (try parseExpr(alloc, params, p)) {
+        .expr => |e| e,
+        .invalid => |msg| return .{ .invalid = msg },
+    };
+    return .{ .expr = out };
 }
 
 /// A parsed expression or a rejection reason (borrowed).

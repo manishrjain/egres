@@ -239,6 +239,13 @@ pub const IndexRange = struct {
     lo: String,
     hi: String,
     unique: bool,
+
+    /// Tighten to the overlap with `other`, as KeyRange.intersect does:
+    /// the larger low bound and the smaller high bound, by byte order.
+    pub fn intersect(self: *IndexRange, other: IndexRange) void {
+        if (std.mem.order(u8, other.lo, self.lo) == .gt) self.lo = other.lo;
+        if (std.mem.order(u8, other.hi, self.hi) == .lt) self.hi = other.hi;
+    }
 };
 
 /// Bitmap nodes produce a WHOLE egid set — a bitmap already is the

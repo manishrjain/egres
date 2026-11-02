@@ -99,10 +99,10 @@ pub fn plan(
 /// against a constant, the shape bind leaves them in; any other
 /// expression is the residual's. `egid = N` is the one-id set; `col =
 /// v` on a valid index its entry (unique: the one row; non-unique: the
-/// posting bitmap); `col IS NULL` on a valid non-unique index the
-/// posting under the NULL tag key. A comparison against NULL can never
-/// be true (3VL), and `never` is false by construction, so both are
-/// the EMPTY set. An
+/// posting bitmap, as `IS NOT DISTINCT FROM v` and `IS TRUE`);
+/// `col IS NULL` on a valid non-unique index the posting under the
+/// NULL tag key. A comparison against NULL can never be true (3VL),
+/// and `never` is false by construction, so both are the EMPTY set. An
 /// AND intersects every indexable child and can drop the rest, so one
 /// indexable child is enough to route it (the dropped terms are the
 /// residual's job); an OR must union EVERY child, so all of them must
@@ -123,16 +123,25 @@ fn bitmapFor(
                 .value => |val| val,
                 else => return null,
             };
-            if (val == .null_value) return try emptySet(arloc);
+            // `col IS NOT DISTINCT FROM NULL` is `col IS NULL`; an egid
+            // is never NULL.
+            if (val == .null_value) {
+                if (cmp.op != .same or col.isEgid())
+                    return try emptySet(arloc);
+                return try nullLookup(arloc, tbl, col, read_ts);
+            }
             // The egid is the row key: `egid = N` is the one-id set, and
             // a range of them is the table itself, a scan.
-            if (col.isEgid()) return if (cmp.op == .eq)
-                try oneEgid(arloc, val.uint8)
-            else
-                null;
+            if (col.isEgid()) return switch (cmp.op) {
+                .eq, .same => try oneEgid(arloc, val.uint8),
+                else => null,
+            };
             const idx = validIndex(tbl, col, read_ts) orelse return null;
-            if (cmp.op == .eq) return try lookup(arloc, idx, val);
-            return try rangeLookup(arloc, idx, cmp.op, val);
+            return switch (cmp.op) {
+                .eq, .same => try lookup(arloc, idx, val),
+                .ne, .differs => null,
+                .lt, .le, .gt, .ge => try rangeLookup(arloc, idx, cmp.op, val),
+            };
         },
         .is_null => |nt| {
             if (nt.negate) return null;
@@ -140,17 +149,40 @@ fn bitmapFor(
                 .column => |col| col,
                 else => return null,
             };
-            // A unique index holds no NULL entries; only a posting
-            // bitmap can answer IS NULL.
+            return try nullLookup(arloc, tbl, col, read_ts);
+        },
+        // `col IS TRUE` is the entry under true; the negated forms
+        // would need the NULL entries too, so they scan.
+        .bool_test => |bt| {
+            if (bt.negate) return null;
+            const col = switch (bt.node.*) {
+                .column => |col| col,
+                else => return null,
+            };
+            if (bt.is == .unknown)
+                return try nullLookup(arloc, tbl, col, read_ts);
             const idx = validIndex(tbl, col, read_ts) orelse return null;
-            if (idx.unique) return null;
-            return try lookup(arloc, idx, .null_value);
+            return try lookup(arloc, idx, .{ .bool_ = bt.is == .true_ });
         },
         .and_ => |kids| return try andOf(arloc, tbl, read_ts, kids),
         .or_ => |kids| return try orOf(arloc, tbl, read_ts, kids),
         .not => return null, // We can't evaluate NOT via an index. So, make BitmapNode null.
         .never => return try emptySet(arloc),
     }
+}
+
+/// `col IS NULL` from an index: the posting under the NULL tag key. A
+/// unique index holds no NULL entries, so only a posting bitmap can
+/// answer it.
+fn nullLookup(
+    arloc: std.mem.Allocator,
+    tbl: *const _table.Table,
+    col: *const _table.Column,
+    read_ts: u64,
+) Error!?BitmapNode {
+    const idx = validIndex(tbl, col, read_ts) orelse return null;
+    if (idx.unique) return null;
+    return try lookup(arloc, idx, .null_value);
 }
 
 /// The index on `col` that is complete at `read_ts`, if any. An index
@@ -211,7 +243,7 @@ fn rangeLookup(
         .le => .{ _key.values_from, after },
         .gt => .{ after, _key.values_end },
         .ge => .{ key, _key.values_end },
-        .eq, .ne => return null,
+        .eq, .ne, .differs, .same => return null,
     };
     return .{ .index_range = .{
         .index_table_id = idx.index_table_id,
@@ -242,7 +274,8 @@ fn isEmptySet(node: BitmapNode) bool {
 
 /// AND: the intersection of every indexable child — a superset of the
 /// AND's rows when some child is not. One empty child empties it all
-/// and is then the whole answer: nothing is read for the others.
+/// and is then the whole answer: nothing is read for the others. Two
+/// ranges on one index become the one range between them (narrowRange).
 fn andOf(
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
@@ -259,10 +292,26 @@ fn andOf(
             deinitNodes(arloc, &nodes);
             return node;
         }
+        if (node == .index_range and narrowRange(nodes.items, node.index_range))
+            continue;
         try nodes.append(arloc, node);
     }
     if (nodes.items.len == 0) return null;
     return try collapse(arloc, &nodes, .and_);
+}
+
+/// `n BETWEEN 2 AND 5` reaches andOf as `n >= 2 AND n <= 5`, two
+/// ranges on one index, [2, end) and [start, 5]: one read of [2, 5]
+/// answers both. Narrows the range already in `nodes` on the same
+/// index to the overlap and reports whether `range` was taken up.
+fn narrowRange(nodes: []BitmapNode, range: _exec.IndexRange) bool {
+    for (nodes) |*node| {
+        if (node.* != .index_range) continue;
+        if (node.index_range.index_table_id != range.index_table_id) continue;
+        node.index_range.intersect(range);
+        return true;
+    }
+    return false;
 }
 
 /// OR: the union of every child — only when each one is indexable,
