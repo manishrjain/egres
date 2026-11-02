@@ -833,10 +833,14 @@ pub const Engine = struct {
     /// precise bound that makes (a) || (b) hold for every mutation:
     ///
     ///   - Mutations in still-in-memory memtables (no SST yet):
-    ///       Mutations into memtable `Mt` are at log indices > Mt.created_at.
-    ///       So if `Mt` is in-memory, `oldest_in_memory <= Mt.created_at`,
-    ///       and capping `I <= oldest_in_memory - 1` keeps every mutation
-    ///       index strictly above I → (a) holds.
+    ///       Mutations into memtable `Mt` are at log indices > Mt.created_at,
+    ///       except a branch's copies (Memtables.fork), rebuilt by
+    ///       replaying both the branch and the entries that wrote their
+    ///       sources, which may predate `Mt`. `Mt.replay_from` covers
+    ///       both: it is `Mt.created_at`, lowered by a fork to the oldest
+    ///       memtable the fork read. `oldest_in_memory` is the lowest
+    ///       `replay_from` in memory, and capping `I <= oldest_in_memory
+    ///       - 1` keeps every index replay needs above I → (a) holds.
     ///
     ///   - Mutations in already-flushed memtables (SST on disk):
     ///       The flush proposal at log index F either survives compaction
