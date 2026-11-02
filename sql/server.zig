@@ -555,20 +555,27 @@ pub const Handler = struct {
     }
 
     pub fn onStartup(self: *Handler, state: *pgwire.ConnState, params: pgwire.proto.StartupParams) !void {
-        _ = state;
         const requested = params.database orelse "";
         const eng = self.srv.engine;
         const name = if (requested.len > 0) requested else default_database;
-        // A failed read answers like a missing database: the session
-        // gets 3D000 on its first statement.
-        self.namespace = _names.namespaceId(
+        // A missing database stays namespace 0 and each statement gets
+        // 3D000. A failed read is storage failing, not a missing name:
+        // answering 3D000 would tell the client its database is gone,
+        // so the session ends with a FATAL XX000 instead.
+        const found = _names.namespaceId(
             eng.forest,
             eng.node.appliedTs(),
             name,
-        ) catch |err| blk: {
+        ) catch |err| {
             log.err("startup: database '{s}': {s}", .{ name, @errorName(err) });
-            break :blk null;
-        } orelse 0;
+            try state.sendError(.{
+                .severity = pgwire.severity_fatal,
+                .code = pgwire.sqlstate.internal_error,
+                .message = "database lookup failed",
+            });
+            return err;
+        };
+        self.namespace = found orelse 0;
         // The database is the tenant: every statement on this fiber is
         // charged to it from here. A name that resolved to nothing
         // stays on the system's, and is refused per statement anyway.
