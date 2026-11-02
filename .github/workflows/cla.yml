@@ -1,0 +1,47 @@
+# Copyright 2026 Manish R Jain
+# SPDX-License-Identifier: Apache-2.0
+#
+# Contributor License Agreement check. On a pull request from an account
+# that has not signed CLA.md, the bot comments asking the author to reply
+# with the signing sentence, and the check stays failed until they do.
+# Signatures are recorded in signatures/version1/cla.json on main, by
+# the bot, so no outside service holds them.
+#
+# pull_request_target runs with this repository's token on the base
+# branch's workflow, never on the pull request's code, which is what
+# lets it comment and commit without exposing write access to the PR.
+name: CLA
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, closed, synchronize]
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  cla:
+    runs-on: ubuntu-latest
+    steps:
+      - name: CLA Assistant
+        if: github.event_name == 'pull_request_target' || github.event.comment.body == 'recheck' || github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA'
+        uses: contributor-assistant/github-action@v2.6.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          path-to-signatures: signatures/version1/cla.json
+          path-to-document: https://github.com/manishrjain/egres/blob/main/CLA.md
+          branch: main
+          allowlist: manishrjain,dependabot[bot],github-actions[bot]
+          custom-notsigned-prcomment: >-
+            Thanks for the pull request. Egres asks every contributor to
+            sign its Contributor License Agreement once, before a first
+            change merges; see Contributing in README.md. Please read the agreement
+            linked below and, if you agree, reply with the sentence that
+            follows.
+          lock-pullrequest-aftermerge: false

@@ -70,6 +70,21 @@ struck the right balance between performance and readability.
 A pull request is expected to have had the same quality of human review
 before it is considered.
 
+## Contributing
+
+Open an issue first for anything large; Egres has strong opinions about
+its design, and a short discussion beats a week of rework. Run
+`scripts/prepush.sh` before opening a pull request. A bug fix comes with
+a test that fails without it. Commit messages name the subsystem and say
+what changed and why, as the history does.
+
+Before a first pull request merges, its author must sign the
+[Contributor License Agreement](CLA.md) once, from their GitHub account.
+The CLA bot comments on the pull request, and replying with the sentence
+it asks for is the signature. It is the Apache Software Foundation's
+individual agreement with the parties renamed. You keep the copyright to
+your work and grant the project a license to use and sublicense it.
+
 ## License
 
 Apache License 2.0, see [LICENSE](LICENSE). Every source file carries
