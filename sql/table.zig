@@ -112,8 +112,6 @@ pub const Index = struct {
     /// it; a writer bumps its read_ts to it before probing.
     valid_ts: u64,
     column: *const Column,
-    /// The index's name, as its catalog row records it.
-    name: String,
 
     /// Whether the backfill is still running: no statement reads the
     /// index, and no writer bumps to its `valid_ts`.
@@ -369,7 +367,6 @@ pub fn loadTableSchema(
             .unique = def.unique,
             .valid_ts = def.valid_ts,
             .column = col,
-            .name = def.name,
         };
     }
 
@@ -406,10 +403,7 @@ pub fn loadIndexes(
     while (try cur.next()) |item| {
         const value = item.newest().value;
         try _row.unmarshalRow(alloc, index_catalog_ps, value, &.{}, &scratch);
-        var def = try _catalog.decodeIndex(&scratch);
-        // The name borrows `scratch`, which the next row overwrites.
-        def.name = try alloc.dupe(u8, def.name);
-        try out.append(alloc, def);
+        try out.append(alloc, try _catalog.decodeIndex(&scratch));
     }
     return out.toOwnedSlice(alloc);
 }

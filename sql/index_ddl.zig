@@ -193,7 +193,6 @@ pub fn createIndex(
         .column_id = column_id,
         .unique = ci.unique,
         .valid_ts = _catalog.IndexDef.building,
-        .name = name,
     };
     var build = IndexBuild{
         .handler = self,

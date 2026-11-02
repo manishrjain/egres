@@ -202,12 +202,10 @@ pub const IndexField = enum(u32) {
     column_id = 3,
     unique = 4,
     valid_ts = 5,
-    name = 6,
 };
 
 /// The fixed schema of the index catalog, compiled into the binary. ids are
-/// uint4, `unique` a bool, `valid_ts` a uint8 HLC timestamp, `name` the
-/// index's name (its row in table 3 is keyed by it). Single-column
+/// uint4, `unique` a bool, `valid_ts` a uint8 HLC timestamp. Single-column
 /// today; a composite index will widen `column_id` into an ordered list
 /// cell.
 pub const index_logical_schema: LogicalSchema = .{
@@ -222,11 +220,6 @@ pub const index_logical_schema: LogicalSchema = .{
             .name = "valid_ts",
             .ty = .uint8,
         },
-        .{
-            .column_id = @intFromEnum(IndexField.name),
-            .name = "name",
-            .ty = .text,
-        },
     },
 };
 
@@ -237,16 +230,13 @@ pub const index_logical_schema: LogicalSchema = .{
 /// installed at ts = valid_ts, would be invisible), and a writer's
 /// read_ts is bumped to it before a unique probe. `building` while the
 /// backfill runs; the backfill's snapshot ts once built; 0 for an index
-/// made with its table, which no row precedes. `name` is the index's
-/// name, so DROP TABLE can remove each index's name row; decodeIndex
-/// borrows it from the row's buffer.
+/// made with its table, which no row precedes.
 pub const IndexDef = struct {
     base_table_id: u32,
     index_table_id: u32,
     column_id: u32,
     unique: bool,
     valid_ts: u64 = 0,
-    name: String,
 
     /// The `valid_ts` of an index whose backfill has not finished: no
     /// read_ts reaches it, so no statement reads the index, while every
@@ -256,24 +246,21 @@ pub const IndexDef = struct {
 
 /// Build the index catalog row cells (column_id order) for `def`. Pass
 /// `&result` to marshalRow with the index catalog's compiled PhysicalSchema.
-pub fn encodeIndex(def: IndexDef) [6]Value {
+pub fn encodeIndex(def: IndexDef) [5]Value {
     return .{
         .{ .uint4 = def.base_table_id },
         .{ .uint4 = def.index_table_id },
         .{ .uint4 = def.column_id },
         .{ .bool_ = def.unique },
         .{ .uint8 = def.valid_ts },
-        .{ .text = def.name },
     };
 }
 
-/// Decode a fully-read index catalog row (six cells, column_id order).
-/// `name` borrows `r`'s buffer — dupe it to outlive a reused Row.
+/// Decode a fully-read index catalog row (five cells, column_id order).
 pub fn decodeIndex(r: *const Row) Error!IndexDef {
-    if (r.len() != 6) return error.CorruptCatalogRow;
+    if (r.len() != 5) return error.CorruptCatalogRow;
     if (r.at(0) != .uint4 or r.at(1) != .uint4 or
-        r.at(2) != .uint4 or r.at(3) != .bool_ or r.at(4) != .uint8 or
-        r.at(5) != .text)
+        r.at(2) != .uint4 or r.at(3) != .bool_ or r.at(4) != .uint8)
         return error.CorruptCatalogRow;
     return .{
         .base_table_id = r.at(0).uint4,
@@ -281,7 +268,6 @@ pub fn decodeIndex(r: *const Row) Error!IndexDef {
         .column_id = r.at(2).uint4,
         .unique = r.at(3).bool_,
         .valid_ts = r.at(4).uint8,
-        .name = r.at(5).text,
     };
 }
 
@@ -295,8 +281,8 @@ pub fn encodeIndexKey(base_table_id: u32, index_tid: u32) [8]u8 {
 }
 
 /// The IndexDef an index catalog row KEY alone determines: base_table_id
-/// and index_table_id. The value-borne fields (column_id, unique, name)
-/// are zeroed — decodeIndex reads those. Null if `primary` isn't index-key
+/// and index_table_id. The value-borne fields (column_id, unique) are
+/// zeroed — decodeIndex reads those. Null if `primary` isn't index-key
 /// shaped (8 bytes).
 pub fn decodeIndexKey(primary: String) ?IndexDef {
     const k = decodeKey(primary) catch return null;
@@ -305,6 +291,5 @@ pub fn decodeIndexKey(primary: String) ?IndexDef {
         .index_table_id = k.column_id,
         .column_id = 0,
         .unique = false,
-        .name = "",
     };
 }

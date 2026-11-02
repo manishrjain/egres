@@ -116,6 +116,37 @@ pub fn tombstone(
     };
 }
 
+/// One tombstone per name in database `ns` whose row names one of
+/// `ids`: what DROP TABLE removes for a table and its indexes. It reads
+/// every name in the database, which is fine because DROP TABLE is rare
+/// and a database holds few names, and it keeps each index's name in
+/// this table alone.
+pub fn tombstonesFor(
+    arloc: std.mem.Allocator,
+    forest: *Forest,
+    read_ts: u64,
+    ns: u64,
+    ids: []const u32,
+) ![]zen.KeyValueStruct {
+    var cur = try forest.openCursor(
+        arloc,
+        .{ .namespace = ns, .table_id = table_id },
+        zdb.kv.KeyRange.all,
+        .{ .read_ts = read_ts },
+    );
+    defer cur.deinit();
+    var out: std.ArrayList(zen.KeyValueStruct) = .empty;
+    while (try cur.next()) |item| {
+        const value = item.newest().value;
+        // Every name in a database names a table_id.
+        if (value.len != 4) return error.CorruptNameRow;
+        const id = std.mem.readInt(u32, value[0..4], .big);
+        if (std.mem.indexOfScalar(u32, ids, id) == null) continue;
+        try out.append(arloc, try tombstone(arloc, ns, item.key.primary));
+    }
+    return out.toOwnedSlice(arloc);
+}
+
 fn wireKey(arloc: std.mem.Allocator, ns: u64, name: String) !String {
     return (Key{
         .namespace = ns,

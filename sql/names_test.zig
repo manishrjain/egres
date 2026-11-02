@@ -199,3 +199,29 @@ test "names: checkNew refuses a taken or repeated name" {
     // A generated name longer than 63 bytes is fine, as on main.
     try names.checkNew(fx.forest, 10, ns, &.{"x" ** 68});
 }
+
+test "names: tombstonesFor removes exactly the names of the given ids" {
+    var fx: Fixture = undefined;
+    try fx.setup();
+    defer fx.teardown();
+
+    try fx.put(try names.tableNameKv(fx.arloc(), ns, "users", 16), 10);
+    try fx.put(try names.tableNameKv(fx.arloc(), ns, "users_pkey", 17), 10);
+    try fx.put(try names.tableNameKv(fx.arloc(), ns, "orders", 18), 10);
+
+    const rows = try names.tombstonesFor(
+        fx.arloc(),
+        fx.forest,
+        10,
+        ns,
+        &.{ 16, 18 },
+    );
+    // Name order: the scan walks table 3 by key.
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    for (rows, [_]String{ "orders", "users" }) |row, want| {
+        const want_row = try names.tombstone(fx.arloc(), ns, want);
+        try testing.expectEqualStrings(want_row.key, row.key);
+        try testing.expect(Meta.fromByte(row.meta).isDeleted());
+        try testing.expectEqual(@as(usize, 0), row.value.len);
+    }
+}

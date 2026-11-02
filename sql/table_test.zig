@@ -103,7 +103,6 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
             .column_id = 1,
             .unique = true,
             .valid_ts = 7,
-            .name = "users_pkey",
         };
         const cells = catalog.encodeIndex(def);
         const bytes = try row.marshalRow(alloc, &index_ps, &cells, &buf);
@@ -137,7 +136,6 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
     try testing.expectEqual(pkey_index_id, t.indexes[0].index_table_id);
     try testing.expect(t.indexes[0].unique);
     try testing.expectEqual(@as(u64, 7), t.indexes[0].valid_ts);
-    try testing.expectEqualStrings("users_pkey", t.indexes[0].name);
     try testing.expect(!t.indexes[0].isBuilding());
 
     // scanIndexKeys classifies both directions: the index knows its
@@ -179,7 +177,6 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
         .unique = false,
         .valid_ts = 0,
         .column = &t.columns[1],
-        .name = "users_b_idx",
     };
     const tag = try posting.keys(alloc, .null_value);
     defer alloc.free(tag);

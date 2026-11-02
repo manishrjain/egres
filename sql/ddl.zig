@@ -264,18 +264,12 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
     // precedes it.
     const table_id = created.table_ids[0];
     const indexes = try a.alloc(_catalog.IndexDef, unique_cols.items.len);
-    for (
-        unique_cols.items,
-        created.table_ids[1..],
-        new_names.items[1..],
-        indexes,
-    ) |col, tid, index_name, *def| {
+    for (unique_cols.items, created.table_ids[1..], indexes) |col, tid, *def| {
         def.* = .{
             .base_table_id = table_id,
             .index_table_id = tid,
             .column_id = col,
             .unique = true,
-            .name = index_name,
         };
     }
     var mc = created.change;
@@ -435,19 +429,13 @@ pub fn createTableAs(
     // from the start.
     const table_id = created.table_ids[0];
     const indexes = try arloc.alloc(_catalog.IndexDef, src_indexes.items.len);
-    for (
-        src_indexes.items,
-        created.table_ids[1..],
-        new_names.items[1..],
-        indexes,
-    ) |idx, tid, index_name, *def| {
+    for (src_indexes.items, created.table_ids[1..], indexes) |idx, tid, *def| {
         def.* = .{
             .base_table_id = table_id,
             .index_table_id = tid,
             .column_id = idx.column.column_id,
             .unique = idx.unique,
             .valid_ts = if (cta.with_data) idx.valid_ts else 0,
-            .name = index_name,
         };
     }
     var mc = created.change;
@@ -590,23 +578,21 @@ pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: _parse.DropTable)
         log.err("drop table '{s}': {s}", .{ dt.name, @errorName(err) });
         return replyError(state, "drop table failed");
     };
-    // The index names, from the index catalog rows: a user-chosen name
-    // cannot be derived from its id.
-    const defs = _table.loadIndexes(
+    // The table's name and its indexes' names: every name row naming
+    // one of `ids`, which holds the indexes and, appended above, the
+    // table itself.
+    const name_rows = _names.tombstonesFor(
         a,
         eng.forest,
-        &self.srv.index_catalog_ps,
-        .{ .namespace = ns, .table_id = table_id },
+        eng.node.appliedTs(),
+        ns,
+        ids,
     ) catch |err| {
-        log.err("drop table '{s}': index rows: {s}", .{
+        log.err("drop table '{s}': name rows: {s}", .{
             dt.name, @errorName(err),
         });
         return replyError(state, "drop table failed");
     };
-    const name_rows = try a.alloc(zen.KeyValueStruct, defs.len + 1);
-    name_rows[0] = try _names.tombstone(a, ns, dt.name);
-    for (defs, name_rows[1..]) |def, *row|
-        row.* = try _names.tombstone(a, ns, def.name);
     mc.rows = .{ .namespace = ns, .kvs = name_rows };
     eng.proposeMC(mc, .apply) catch |err| {
         log.err("drop table '{s}': propose: {s}", .{ dt.name, @errorName(err) });

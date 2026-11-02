@@ -66,7 +66,6 @@ const Fixture = struct {
             .unique = unique,
             .valid_ts = sql.catalog.IndexDef.building,
             .column = &columns[0],
-            .name = "t_a_idx",
         };
 
         var tmp = std.testing.tmpDir(.{});
