@@ -566,6 +566,48 @@ expect "ON CONFLICT: failed statements changed nothing" "p" \
     v "SELECT val FROM oc WHERE id = 3;"
 expect "DROP the ON CONFLICT table" "DROP TABLE" q "DROP TABLE oc;"
 
+# --- RETURNING: the written rows, projected as a SELECT's ----------------
+q "CREATE TABLE rt (id int4 PRIMARY KEY, v text, n int8);" >/dev/null
+expect "INSERT RETURNING *" "1|a|10" \
+    v "INSERT INTO rt VALUES (1, 'a', 10) RETURNING *;"
+expect "INSERT RETURNING one row per VALUES row" "(2 rows)" \
+    q "INSERT INTO rt VALUES (2, 'b', 20), (3, 'c', 30) RETURNING id;"
+expect "INSERT RETURNING an expression with its alias" "next" \
+    q "INSERT INTO rt VALUES (4, 'd', 40) RETURNING id + 1 AS next;"
+expect "INSERT RETURNING the expression's value" "6" \
+    v "INSERT INTO rt VALUES (5, 'e', 50) RETURNING id + 1 AS next;"
+expect "INSERT RETURNING egid is the assigned id" "^[0-9][0-9]*$" \
+    v "INSERT INTO rt VALUES (6, 'f', 60) RETURNING egid;"
+expect "UPDATE RETURNING the row as rewritten" "1|A|11" \
+    v "UPDATE rt SET v = upper(v), n = n + 1 WHERE id = 1 RETURNING id, v, n;"
+expect "UPDATE RETURNING every matched row" "(3 rows)" \
+    q "UPDATE rt SET n = 0 WHERE id > 3 RETURNING id;"
+expect "DELETE RETURNING the row as it was" "2|b|20" \
+    v "DELETE FROM rt WHERE id = 2 RETURNING *;"
+expect "DELETE RETURNING removed it" "0" \
+    v "SELECT count(*) FROM rt WHERE id = 2;"
+expect "RETURNING an unknown column is 42703" "does not exist" \
+    q "INSERT INTO rt VALUES (9, 'z', 0) RETURNING nope;"
+expect "RETURNING 42703 wrote nothing" "0" \
+    v "SELECT count(*) FROM rt WHERE id = 9;"
+expect "ON CONFLICT DO UPDATE RETURNING the updated row" "1|A|99" \
+    v "INSERT INTO rt VALUES (1, 'x', 99) ON CONFLICT (id) DO UPDATE
+       SET n = EXCLUDED.n RETURNING *;"
+expect "ON CONFLICT DO NOTHING RETURNING skips the row" "(0 rows)" \
+    q "INSERT INTO rt VALUES (1, 'x', 0) ON CONFLICT (id) DO NOTHING
+       RETURNING id;"
+expect "ON CONFLICT DO NOTHING RETURNING keeps the new one" "7" \
+    v "INSERT INTO rt VALUES (1, 'x', 0), (7, 'g', 70)
+       ON CONFLICT (id) DO NOTHING RETURNING id;"
+expect "RETURNING inside a block" "8" tx "BEGIN;
+INSERT INTO rt VALUES (8, 'h', 80) RETURNING id;
+COMMIT;"
+expect "RETURNING in a block is visible after COMMIT" "h" \
+    v "SELECT v FROM rt WHERE id = 8;"
+expect "RETURNING an aggregate is refused" "RETURNING" \
+    q "DELETE FROM rt RETURNING count(*);"
+expect "DROP the RETURNING table" "DROP TABLE" q "DROP TABLE rt;"
+
 # --- savepoints: ROLLBACK TO revives a failed block and drops its writes --
 q "CREATE TABLE sp (id int4 PRIMARY KEY, v text);" >/dev/null
 q "CREATE INDEX sp_v ON sp (v);" >/dev/null
@@ -657,6 +699,12 @@ expect "highest index counts, lower ones unused" "z" \
 expect "extended DELETE with a param" "DELETE 1" \
     xq 'DELETE FROM pt WHERE id = $1 \bind 2 \g'
 expect "the DELETE landed" "1" x 'SELECT count(*) FROM pt \bind \g'
+expect "extended INSERT RETURNING header comes from Describe" "name" \
+    xq 'INSERT INTO pt VALUES ($1, $2, 0) RETURNING name \bind 3 c \g'
+expect "extended UPDATE RETURNING an expression" "c!" \
+    x 'UPDATE pt SET n = $1 WHERE id = $2 RETURNING name || $3 \bind 1 3 ! \g'
+expect "extended DELETE RETURNING with a param" "3" \
+    x 'DELETE FROM pt WHERE id = $1 RETURNING id \bind 3 \g'
 expect "too few params is 08P01" \
     "bind message supplies 0 parameters, but prepared statement requires 1" \
     x 'SELECT name FROM pt WHERE id = $1 \bind \g'

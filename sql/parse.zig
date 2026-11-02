@@ -136,6 +136,8 @@ pub const Insert = struct {
     columns: ?[]String, // borrowed target columns; null = positional (all columns)
     rows: [][]Literal, // borrowed rows of literals
     on_conflict: ?OnConflict = null,
+    /// RETURNING: the written rows, projected as a SELECT's are.
+    returning: ?Projection = null,
     /// How many `$n` values Bind must supply: the highest index used.
     param_count: u16 = 0,
 };
@@ -288,6 +290,8 @@ pub const SelectRow = struct {
 pub const Delete = struct {
     table: String, // borrowed
     where: ?Where, // null = delete every row
+    /// RETURNING: the deleted rows as they were, projected.
+    returning: ?Projection = null,
     /// How many `$n` values Bind must supply: the highest index used.
     param_count: u16 = 0,
 };
@@ -322,6 +326,8 @@ pub const Update = struct {
     table: String, // borrowed
     sets: []SetClause, // borrowed
     where: ?Where, // null = update every row
+    /// RETURNING: the rows as rewritten, projected.
+    returning: ?Projection = null,
     /// How many `$n` values Bind must supply: the highest index used.
     param_count: u16 = 0,
 };
@@ -734,15 +740,13 @@ fn parseCreateIndex(
     } };
 }
 
-/// INSERT ... VALUES. ON CONFLICT / RETURNING / INSERT…SELECT are rejected
-/// (before any allocation, so no cleanup); arity, unknown columns, and literal
-/// coercion are the executor's job.
+/// INSERT ... VALUES [ON CONFLICT ...] [RETURNING ...]. INSERT…SELECT
+/// is rejected; arity, unknown columns, and literal coercion are the
+/// executor's job.
 fn parseInsert(
     alloc: std.mem.Allocator,
     is: *const c.InsertStmt,
 ) parser.ParseError!Stmt {
-    if (parser.items(is.returningList).len > 0)
-        return invalid("RETURNING is not supported");
     // VALUES rows nest under a SelectStmt with `valuesLists`; an
     // INSERT ... SELECT has one without.
     const sel = parser.cast(c.SelectStmt, is.selectStmt) orelse
@@ -791,12 +795,18 @@ fn parseInsert(
         }
         row.* = lits;
     }
+    const ret = try parseReturning(alloc, &params, is.returningList);
+    const returning = switch (ret) {
+        .projection => |x| x,
+        .stmt => |rejected| return rejected,
+    };
 
     return .{ .insert = .{
         .table = try relname(alloc, is.relation),
         .columns = columns,
         .rows = rows,
         .on_conflict = on_conflict,
+        .returning = returning,
         .param_count = params.count,
     } };
 }
@@ -1330,41 +1340,13 @@ fn parseSelect(
     const rv = parser.cast(c.RangeVar, from[0].ptr_value) orelse
         return invalid("only table sources are supported");
 
-    // A `*` anywhere makes it a star projection; a lone `count(*)` is
-    // the one aggregate; every other target is an expression.
-    const targets = parser.items(ss.targetList);
     var params = ParamTally{};
-    var star = false;
-    var count_star = false;
-    var outs: std.ArrayList(Target) = .empty;
-    for (targets) |cell| {
-        const rt = parser.cast(c.ResTarget, cell.ptr_value) orelse
-            return .unsupported;
-        if (parser.cast(c.FuncCall, rt.val)) |fc| {
-            if (isCountStar(fc)) {
-                count_star = true;
-                continue;
-            }
-            if (isAggregate(fc))
-                return invalid("only count(*) is supported among aggregates");
-        }
-        if (parser.cast(c.ColumnRef, rt.val)) |cr| {
-            for (parser.items(cr.fields)) |f| {
-                if (parser.cast(c.A_Star, f.ptr_value) != null) star = true;
-            }
-            if (star) continue;
-        }
-        const expr = switch (try parseExpr(alloc, &params, parser.asNode(rt.val))) {
-            .expr => |e| e,
-            .invalid => |msg| return .{ .invalid = msg },
-        };
-        try outs.append(alloc, .{
-            .name = try targetName(alloc, rt, expr),
-            .expr = expr,
-        });
-    }
-    if (count_star and targets.len != 1)
-        return invalid("count(*) cannot be combined with other targets");
+    const parsed = try parseTargets(alloc, &params, ss.targetList, .select);
+    const projection = switch (parsed) {
+        .projection => |x| x,
+        .stmt => |rejected| return rejected,
+    };
+    const count_star = projection == .count_star;
     const locking = parser.items(ss.lockingClause);
     if (count_star and locking.len > 0)
         return invalid("FOR UPDATE is not allowed with count(*)");
@@ -1396,12 +1378,6 @@ fn parseSelect(
         for_update = true;
     }
 
-    const projection: Projection = if (count_star)
-        .count_star
-    else if (star)
-        .star
-    else
-        .{ .targets = try outs.toOwnedSlice(alloc) };
     return .{ .select = .{
         .table = try dup(alloc, rv.relname),
         .projection = projection,
@@ -1423,6 +1399,81 @@ fn isAggregate(fc: *const c.FuncCall) bool {
         if (std.mem.eql(u8, name, agg)) return true;
     }
     return false;
+}
+
+const ParsedTargets = union(enum) {
+    projection: Projection,
+    stmt: Stmt,
+};
+
+/// A target list, SELECT's or RETURNING's: a `*` anywhere makes it a
+/// star projection; every other target is an expression. count(*),
+/// the one aggregate, is SELECT's alone and stands by itself.
+fn parseTargets(
+    alloc: std.mem.Allocator,
+    params: *ParamTally,
+    list: [*c]const c.List,
+    clause: enum { select, returning },
+) parser.ParseError!ParsedTargets {
+    const targets = parser.items(list);
+    var star = false;
+    var count_star = false;
+    var outs: std.ArrayList(Target) = .empty;
+    for (targets) |cell| {
+        const rt = parser.cast(c.ResTarget, cell.ptr_value) orelse
+            return .{ .stmt = .unsupported };
+        if (parser.cast(c.FuncCall, rt.val)) |fc| {
+            if (isCountStar(fc) and clause == .select) {
+                count_star = true;
+                continue;
+            }
+            if (isAggregate(fc)) return .{ .stmt = invalid(switch (clause) {
+                .select => "only count(*) is supported among aggregates",
+                .returning => "aggregates are not allowed in RETURNING",
+            }) };
+        }
+        if (parser.cast(c.ColumnRef, rt.val)) |cr| {
+            for (parser.items(cr.fields)) |f| {
+                if (parser.cast(c.A_Star, f.ptr_value) != null) star = true;
+            }
+            if (star) continue;
+        }
+        const node = parser.asNode(rt.val);
+        const expr = switch (try parseExpr(alloc, params, node)) {
+            .expr => |e| e,
+            .invalid => |msg| return .{ .stmt = .{ .invalid = msg } },
+        };
+        try outs.append(alloc, .{
+            .name = try targetName(alloc, rt, expr),
+            .expr = expr,
+        });
+    }
+    if (count_star and targets.len != 1) return .{
+        .stmt = invalid("count(*) cannot be combined with other targets"),
+    };
+    if (count_star) return .{ .projection = .count_star };
+    if (star) return .{ .projection = .star };
+    return .{ .projection = .{ .targets = try outs.toOwnedSlice(alloc) } };
+}
+
+/// The outcome of a RETURNING list: null without one.
+const ParsedReturning = union(enum) {
+    projection: ?Projection,
+    stmt: Stmt,
+};
+
+/// INSERT, UPDATE or DELETE ... RETURNING id, name: a target list as
+/// a SELECT's, minus aggregates. Absent in the grammar = null.
+fn parseReturning(
+    alloc: std.mem.Allocator,
+    params: *ParamTally,
+    list: [*c]const c.List,
+) parser.ParseError!ParsedReturning {
+    if (parser.items(list).len == 0) return .{ .projection = null };
+    return switch (try parseTargets(alloc, params, list, .returning)) {
+        .projection => |x| .{ .projection = x },
+        .stmt => |rejected| .{ .stmt = rejected },
+    };
 }
 
 /// A target's output name: its alias, else what Postgres prints, the
@@ -1530,17 +1581,16 @@ fn parseTransaction(
     };
 }
 
-/// DELETE FROM one_table [WHERE ...]. USING, RETURNING, WITH, and any
-/// WHERE shape parseWhere rejects carry a reason. `WHERE egid = N` parses
-/// as an ordinary column comparison — egid resolution stays server-side.
+/// DELETE FROM one_table [WHERE ...] [RETURNING ...]. USING, WITH, and
+/// any WHERE shape parseWhere rejects carry a reason. `WHERE egid = N`
+/// parses as an ordinary column comparison — egid resolution stays
+/// server-side.
 fn parseDelete(
     alloc: std.mem.Allocator,
     ds: *const c.DeleteStmt,
 ) parser.ParseError!Stmt {
     if (ds.usingClause != null)
         return invalid("DELETE ... USING is not supported");
-    if (ds.returningList != null)
-        return invalid("RETURNING is not supported");
     if (ds.withClause != null)
         return invalid("WITH is not supported");
 
@@ -1555,24 +1605,29 @@ fn parseDelete(
         .invalid => |msg| return .{ .invalid = msg },
     };
 
+    const ret = try parseReturning(alloc, &params, ds.returningList);
+    const returning = switch (ret) {
+        .projection => |x| x,
+        .stmt => |rejected| return rejected,
+    };
+
     return .{ .delete = .{
         .table = try relname(alloc, ds.relation),
         .where = where,
+        .returning = returning,
         .param_count = params.count,
     } };
 }
 
-/// UPDATE one_table SET col = expr [, ...] [WHERE ...]. FROM,
-/// RETURNING, WITH, SET values parseExpr does not take, and duplicate
-/// SET columns are rejected with a reason.
+/// UPDATE one_table SET col = expr [, ...] [WHERE ...] [RETURNING ...].
+/// FROM, WITH, SET values parseExpr does not take, and duplicate SET
+/// columns are rejected with a reason.
 fn parseUpdate(
     alloc: std.mem.Allocator,
     us: *const c.UpdateStmt,
 ) parser.ParseError!Stmt {
     if (us.fromClause != null)
         return invalid("UPDATE ... FROM is not supported");
-    if (us.returningList != null)
-        return invalid("RETURNING is not supported");
     if (us.withClause != null)
         return invalid("WITH is not supported");
     const targets = parser.items(us.targetList);
@@ -1593,11 +1648,17 @@ fn parseUpdate(
         .sets => |s| s,
         .stmt => |rejected| return rejected,
     };
+    const ret = try parseReturning(alloc, &params, us.returningList);
+    const returning = switch (ret) {
+        .projection => |x| x,
+        .stmt => |rejected| return rejected,
+    };
 
     return .{ .update = .{
         .table = try relname(alloc, us.relation),
         .sets = sets,
         .where = where,
+        .returning = returning,
         .param_count = params.count,
     } };
 }

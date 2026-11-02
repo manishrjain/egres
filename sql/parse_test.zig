@@ -402,8 +402,7 @@ test "sql.parse: INSERT rejections carry a reason" {
     defer arena.deinit();
     const alloc = arena.allocator();
     const cases = [_]struct { sql: String, needle: String }{
-        .{ .sql = "INSERT INTO t VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 1 RETURNING id;", .needle = "RETURNING" },
-        .{ .sql = "INSERT INTO t VALUES (1) RETURNING id;", .needle = "RETURNING" },
+        .{ .sql = "INSERT INTO t VALUES (1) RETURNING count(*);", .needle = "RETURNING" },
         .{ .sql = "INSERT INTO t SELECT * FROM u;", .needle = "VALUES" },
     };
     for (cases) |case| {
@@ -678,7 +677,6 @@ test "sql.parse: DELETE rejections carry a reason" {
     const alloc = arena.allocator();
     const cases = [_]struct { sql: String, needle: String }{
         .{ .sql = "DELETE FROM t USING u WHERE t.a = u.a;", .needle = "USING" },
-        .{ .sql = "DELETE FROM t RETURNING id;", .needle = "RETURNING" },
         .{ .sql = "WITH x AS (SELECT 1) DELETE FROM t;", .needle = "WITH" },
         .{
             .sql = "DELETE FROM t WHERE id IN (SELECT id FROM u);",
@@ -824,7 +822,6 @@ test "sql.parse: UPDATE rejections carry a reason" {
     const alloc = arena.allocator();
     const cases = [_]struct { sql: String, needle: String }{
         .{ .sql = "UPDATE t SET a = 1 FROM u;", .needle = "FROM" },
-        .{ .sql = "UPDATE t SET a = 1 RETURNING id;", .needle = "RETURNING" },
         .{ .sql = "WITH x AS (SELECT 1) UPDATE t SET a = 1;", .needle = "WITH" },
         .{ .sql = "UPDATE t SET a = DEFAULT;", .needle = "an expression" },
         .{ .sql = "UPDATE t SET a = now();", .needle = "not supported" },
@@ -1194,6 +1191,47 @@ test "sql.parse: savepoint statements carry their name" {
     try testing.expectEqual(@as(u16, 0), rb2.paramCount());
     const prepared = try parse.statement(alloc, "PREPARE TRANSACTION 'x';");
     try testing.expect(prepared == .invalid);
+}
+
+test "sql.parse: RETURNING is a projection on INSERT, UPDATE and DELETE" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const ins = try parse.statement(
+        alloc,
+        "INSERT INTO t (id, v) VALUES ($1, 'a') RETURNING id, v || '!' AS loud;",
+    );
+    const targets = ins.insert.returning.?.targets;
+    try testing.expectEqual(@as(usize, 2), targets.len);
+    try testing.expectEqualStrings("id", targets[0].name);
+    try testing.expectEqualStrings("id", targets[0].expr.column);
+    try testing.expectEqualStrings("loud", targets[1].name);
+    try testing.expect(targets[1].expr == .binop);
+    try testing.expectEqual(@as(u16, 1), ins.insert.param_count);
+
+    const up = try parse.statement(
+        alloc,
+        "UPDATE t SET v = 'b' WHERE id = 1 RETURNING *;",
+    );
+    try testing.expect(up.update.returning.? == .star);
+    const del = try parse.statement(
+        alloc,
+        "DELETE FROM t WHERE id = $1 RETURNING egid;",
+    );
+    try testing.expectEqualStrings("egid", del.delete.returning.?.targets[0].name);
+    try testing.expectEqual(@as(u16, 1), del.delete.param_count);
+
+    // Without the clause there is nothing to project.
+    const plain = try parse.statement(alloc, "DELETE FROM t;");
+    try testing.expect(plain.delete.returning == null);
+    // Aggregates have no row to summarise.
+    const agg = try parse.statement(
+        alloc,
+        "UPDATE t SET v = 'b' RETURNING count(*);",
+    );
+    try testing.expect(agg == .invalid);
 }
 
 test "sql.parse: INSERT ... ON CONFLICT names the column and the action" {

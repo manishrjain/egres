@@ -56,12 +56,13 @@ The default SQL port is `3210`. The database `egres` exists from the first boot,
 | `TRUNCATE` | Not&nbsp;yet | |
 | `INSERT ... VALUES` | Yes | Multi-row `VALUES` and an explicit column list. |
 | `INSERT ... ON CONFLICT (column) DO NOTHING \| DO UPDATE SET ... [WHERE ...]` | Yes | The column must carry a `PRIMARY KEY` or `UNIQUE` constraint. `DO NOTHING` without a target takes any unique constraint. The `SET` values may name the existing row's columns (through the table name or its `AS` alias) and `EXCLUDED.column`, the proposed row's; the `WHERE` reads the existing row and skips it when false. The tag counts updated rows with inserted ones. Not yet: `ON CONSTRAINT`, a partial-index `WHERE` on the target, `EXCLUDED` in the `WHERE`. |
-| `INSERT ... SELECT`, `DEFAULT VALUES`, `DEFAULT` as a value, `RETURNING` | Not&nbsp;yet | |
+| `INSERT ... RETURNING`, `UPDATE ... RETURNING`, `DELETE ... RETURNING` | Yes | Any target a `SELECT` takes: columns, `*`, expressions with `AS`. `UPDATE` returns the rows as rewritten, `DELETE` the rows as they were, `ON CONFLICT DO UPDATE` the updated row and `DO NOTHING` nothing for a skipped row. Aggregates are refused. |
+| `INSERT ... SELECT`, `DEFAULT VALUES`, `DEFAULT` as a value | Not&nbsp;yet | |
 | `SELECT` | Partial | See [Queries](#queries). |
 | `UPDATE ... SET ... [WHERE]` | Yes | `SET` takes a literal, a parameter, a column, a call of a [supported function](#functions-and-operators), or `+ - * / % \|\|` over them. |
-| `UPDATE ... FROM`, `RETURNING`, `WITH` | Not&nbsp;yet | |
+| `UPDATE ... FROM`, `WITH` | Not&nbsp;yet | |
 | `DELETE FROM t [WHERE]` | Yes | Without `WHERE` it deletes every row. |
-| `DELETE ... USING`, `RETURNING`, `WITH` | Not&nbsp;yet | |
+| `DELETE ... USING`, `WITH` | Not&nbsp;yet | |
 | `BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK` | Yes | Transaction modes such as `ISOLATION LEVEL` are accepted and ignored; isolation is snapshot isolation. |
 | `SAVEPOINT`, `RELEASE SAVEPOINT`, `ROLLBACK TO SAVEPOINT` | Yes | `ROLLBACK TO` discards the writes since the savepoint, releases the row locks taken since, and revives a block an error failed. After a serialization failure, a deadlock or a snapshot-too-old error the block cannot be rolled back to a savepoint: `ROLLBACK TO` is `40001`, retry the transaction. |
 | `PREPARE TRANSACTION` | Not&nbsp;yet | |

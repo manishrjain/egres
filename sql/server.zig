@@ -823,6 +823,14 @@ pub const Handler = struct {
         state: *pgwire.ConnState,
         ctx: pgwire.DescribeCtx,
     ) !void {
+        // A portal's Describe carries its Bind values: a `$n` in a
+        // SELECT target or a RETURNING list binds as Execute will bind
+        // it. A statement's Describe has none yet.
+        self.params = .{
+            .values = ctx.params,
+            .formats = ctx.param_formats,
+        };
+        defer self.params = .{};
         state.error_sent = false;
         defer self.failBlockOnError(state);
         defer if (state.error_sent) {
@@ -835,7 +843,25 @@ pub const Handler = struct {
         if (self.txn) |t| if (t.failed and !allowedWhenFailed(stmt))
             return replyFailedBlock(state);
         switch (stmt) {
-            .select => |sel| try _dml.describeSelect(self, state, sel),
+            .select => |sel| try _dml.describeRows(
+                self,
+                state,
+                sel.table,
+                sel.projection,
+            ),
+            // DML sends rows only with RETURNING.
+            .insert => |ins| if (ins.returning) |p|
+                try _dml.describeRows(self, state, ins.table, p)
+            else
+                try state.sendNoData(),
+            .update => |up| if (up.returning) |p|
+                try _dml.describeRows(self, state, up.table, p)
+            else
+                try state.sendNoData(),
+            .delete => |del| if (del.returning) |p|
+                try _dml.describeRows(self, state, del.table, p)
+            else
+                try state.sendNoData(),
             .select_row => |sr| try _dml.describeSelectRow(state, sr),
             .show_var => |show| try describeShow(state, show),
             else => try state.sendNoData(),

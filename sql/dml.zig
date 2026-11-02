@@ -69,6 +69,19 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
     if (!try bumpToIndexes(state, arloc, tx, tbl)) return;
     fiber.ctx().record("txn begun, table open", .{});
 
+    // RETURNING id, name: bound before any row is parsed or locked, so
+    // an unknown column is 42703 with nothing written.
+    var ret: ?Outputs = null;
+    if (ins.returning) |projection| {
+        ret = (try projectionOrReply(
+            state,
+            arloc,
+            tbl,
+            projection,
+            self.params,
+        )) orelse return;
+    }
+
     // INSERT INTO t (a, b): the column each VALUES position writes
     // (its cell is Column.pos). INSERT INTO t without a list is the
     // live columns in order. The egid is never a target: the server
@@ -159,12 +172,25 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
         ins.table,
         changes,
         uniques,
+        ret != null,
     )) orelse return;
+    var suspended = false;
+    if (ret) |proj| {
+        suspended = (try sendReturning(
+            self,
+            state,
+            tbl,
+            tx,
+            proj,
+            changes,
+        )) orelse return;
+    }
 
     if (tx.implicit) {
         if (!try self.commitOrReply(state, arloc, tx, "insert", ins.table)) return;
     }
 
+    if (suspended) return state.sendPortalSuspended();
     // Postgres counts the updated rows in the tag too.
     const tag = try std.fmt.allocPrint(arloc, "INSERT 0 {d}", .{affected});
     try state.sendCommandComplete(tag);
@@ -193,8 +219,13 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
     };
 
     const is_count = sel.projection == .count_star;
-    const proj = (try selectFields(state, arloc, tbl, sel, self.params)) orelse
-        return;
+    const proj = (try projectionOrReply(
+        state,
+        arloc,
+        tbl,
+        sel.projection,
+        self.params,
+    )) orelse return;
     var emitter = RowEmitter{
         .state = state,
         .tbl = tbl,
@@ -235,7 +266,7 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
     // that is the whole gather and every lock, so nothing reaches the
     // wire before the last lock and a Restart re-runs a statement
     // that has sent nothing. An empty result still gets its description.
-    // On the extended path it is Describe's to send (describeSelect),
+    // On the extended path it is Describe's to send (describeRows),
     // never Execute's.
     // Execute's row limit: the rows that fit go out, and a row left
     // over suspends the portal instead of completing it, as Postgres
@@ -270,16 +301,7 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
             }
             // A target that fails to compute ends the result with the
             // error, as in Postgres; a wire error goes to the serve loop.
-            emitter.emit(row) catch |err| switch (err) {
-                error.IntOutOfRange,
-                error.FloatOutOfRange,
-                error.DivisionByZero,
-                error.SubstringLength,
-                error.PowerArgument,
-                error.InvalidUtf8,
-                => return replyExprErr(state, @errorCast(err)),
-                else => return err,
-            };
+            emitter.emit(row) catch |err| return replyEmitErr(state, err);
         }
     }
     // count(*) is one row — which only LIMIT 0 drops.
@@ -315,6 +337,18 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
         return replyError(state, "failed to load table schema");
     };
     if (!try bumpToIndexes(state, arloc, tx, tbl)) return;
+
+    // RETURNING *: the rows as they were, bound before any lock.
+    var ret: ?Outputs = null;
+    if (del.returning) |projection| {
+        ret = (try projectionOrReply(
+            state,
+            arloc,
+            tbl,
+            projection,
+            self.params,
+        )) orelse return;
+    }
 
     // Plan the WHERE: an egid or indexed term drives point reads,
     // anything else scans; no WHERE → tombstone every live row.
@@ -357,10 +391,23 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
         del.table,
         changes,
         &.{},
+        ret != null,
     )) orelse return;
+    var suspended = false;
+    if (ret) |proj| {
+        suspended = (try sendReturning(
+            self,
+            state,
+            tbl,
+            tx,
+            proj,
+            changes,
+        )) orelse return;
+    }
     if (n > 0 and tx.implicit) {
         if (!try self.commitOrReply(state, arloc, tx, "delete", del.table)) return;
     }
+    if (suspended) return state.sendPortalSuspended();
     const tag = try std.fmt.allocPrint(arloc, "DELETE {d}", .{n});
     try state.sendCommandComplete(tag);
 }
@@ -391,6 +438,18 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
         return replyError(state, "failed to load table schema");
     };
     if (!try bumpToIndexes(state, arloc, tx, tbl)) return;
+
+    // RETURNING id, n: the rows as rewritten, bound before any lock.
+    var ret: ?Outputs = null;
+    if (up.returning) |projection| {
+        ret = (try projectionOrReply(
+            state,
+            arloc,
+            tbl,
+            projection,
+            self.params,
+        )) orelse return;
+    }
 
     // UPDATE t SET a = expr, ...: bound once, before any lock.
     const sets = (try bindSets(self, state, arloc, tbl, up.sets, null)) orelse
@@ -448,11 +507,24 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
         up.table,
         changes,
         &.{},
+        ret != null,
     )) orelse return;
+    var suspended = false;
+    if (ret) |proj| {
+        suspended = (try sendReturning(
+            self,
+            state,
+            tbl,
+            tx,
+            proj,
+            changes,
+        )) orelse return;
+    }
 
     if (tx.implicit) {
         if (!try self.commitOrReply(state, arloc, tx, "update", up.table)) return;
     }
+    if (suspended) return state.sendPortalSuspended();
     try state.sendCommandComplete(try std.fmt.allocPrint(arloc, "UPDATE {d}", .{n}));
 }
 
@@ -460,11 +532,14 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
 /// replaces, locked by the gather that found it; `post`, the cells it
 /// leaves, by Column.pos. INSERT has a post, DELETE a pre, UPDATE
 /// both; neither is a proposed row ON CONFLICT dropped, which `write`
-/// skips. `egid` is the row's id, set by `write`.
+/// skips. `egid` is the row's id, set by `write`. `returned` is the row
+/// RETURNING projects, kept by `write` when asked: the row put, or a
+/// delete's pre.
 const Change = struct {
     pre: ?zdb.kv.Item = null,
     post: ?[]const _value.Value = null,
     egid: u64 = 0,
+    returned: ?zdb.kv.Item = null,
 };
 
 /// Write a decided list of changes, every pre locked already — the
@@ -477,7 +552,8 @@ const Change = struct {
 /// is put — the post marshalled, or a tombstone — and the index
 /// entries are written. Nothing is buffered before the last lock: a
 /// Restart re-runs the statement. `uniques` are the indexes an ON
-/// CONFLICT resolved against, for the probe; empty otherwise. Returns
+/// CONFLICT resolved against, for the probe; empty otherwise.
+/// `returning` keeps each written row in its change's `returned`. Returns
 /// the rows written; null = replied.
 fn write(
     self: *Handler,
@@ -487,6 +563,7 @@ fn write(
     table_name: String,
     changes: []Change,
     uniques: []const Unique,
+    returning: bool,
 ) !?usize {
     const arloc = ctx.arloc;
     const tbl = ctx.tbl;
@@ -549,9 +626,25 @@ fn write(
         if (change.post) |cells| {
             const bytes = try _row.marshalRow(arloc, &tbl.ps, cells, &buf);
             try tx.put(table_key.table_id, &ekey, bytes, .{});
+            // INSERT ... RETURNING reads the row as put: the bytes
+            // copied out of the reused buffer, under the put's key.
+            if (returning) change.returned = .{
+                .key = .{
+                    .namespace = table_key.namespace,
+                    .table_id = table_key.table_id,
+                    .primary = try arloc.dupe(u8, &ekey),
+                },
+                .versions = .{ .one = .{
+                    .ts = tx.read_ts,
+                    .meta = .{},
+                    .value = try arloc.dupe(u8, bytes),
+                } },
+            };
         } else {
             const meta: zdb.kv.Meta = .{ .kind = .deleted };
             try tx.put(table_key.table_id, &ekey, "", meta);
+            // DELETE ... RETURNING gives the row as it was.
+            if (returning) change.returned = change.pre;
         }
     }
     fiber.ctx().record("{d} rows buffered", .{count});
@@ -850,8 +943,9 @@ fn evalSets(
     return try arloc.dupe(_value.Value, row.cells());
 }
 
-/// Describe of a prepared `SELECT id, n FROM t`, before any Execute:
-/// the RowDescription `select` would send. The Table comes from the
+/// Describe of a prepared `SELECT id, n FROM t` or `INSERT ... RETURNING
+/// id`, before any Execute: the RowDescription its Execute would send.
+/// The Table comes from the
 /// database's cache under the cache's shared lock: forgetTable
 /// destroys an entry only under the exclusive one, so the Table lives
 /// for as long as the hold, and no table lock or txn is needed — which
@@ -859,15 +953,16 @@ fn evalSets(
 /// are copied out before the hold ends and the reply goes out after
 /// it: nothing may write to the socket under the cache lock. A miss
 /// (the first touch of the table in this process) loads the schema the
-/// way a statement does, under the table lock (describeSelectLoad).
-pub fn describeSelect(
+/// way a statement does, under the table lock (describeRowsLoad).
+pub fn describeRows(
     self: *Handler,
     state: *pgwire.ConnState,
-    sel: _parse.Select,
+    table: String,
+    projection: _parse.Projection,
 ) !void {
     const eng = self.srv.engine;
     const ns = try self.sessionNamespace(state) orelse return;
-    const table_id = eng.forest.manifest.lookupTable(ns, sel.table) orelse
+    const table_id = eng.forest.manifest.lookupTable(ns, table) orelse
         return replyErrorCode(
             state,
             pgwire.sqlstate.undefined_table,
@@ -884,12 +979,19 @@ pub fn describeSelect(
 
     const db = try self.sessionDb(ns);
     const hold = db.holdTable(table_id) orelse
-        return describeSelectLoad(self, state, arloc, table_key, sel);
+        return describeRowsLoad(
+            self,
+            state,
+            arloc,
+            table_key,
+            table,
+            projection,
+        );
 
     const resolved = blk: {
         // state.send* can block below. Release the table hold here itself.
         defer hold.release();
-        const r = projectionOf(arloc, hold.tbl, sel, self.params);
+        const r = projectionOf(arloc, hold.tbl, projection, self.params);
         if (r) |proj| {
             for (proj.fields) |*fd| fd.name = try arloc.dupe(u8, fd.name);
         } else |_| {}
@@ -903,27 +1005,33 @@ pub fn describeSelect(
     try state.sendRowDescription(proj.fields);
 }
 
-/// describeSelect for a table not in the cache: load it the way a
+/// describeRows for a table not in the cache: load it the way a
 /// statement does, under the table lock, in the block's txn or an
 /// implicit one that ends here.
-fn describeSelectLoad(
+fn describeRowsLoad(
     self: *Handler,
     state: *pgwire.ConnState,
     arloc: std.mem.Allocator,
     table_key: zdb.kv.TableKey,
-    sel: _parse.Select,
+    table: String,
+    projection: _parse.Projection,
 ) !void {
     defer self.endImplicit();
     _ = (try self.dmlTxn(state, table_key)) orelse return;
     const tbl = self.openTable(table_key) catch |err| {
         log.err(
-            "describe select from '{s}': load schema: {s}",
-            .{ sel.table, @errorName(err) },
+            "describe '{s}': load schema: {s}",
+            .{ table, @errorName(err) },
         );
         return replyError(state, "failed to load table schema");
     };
-    const proj = (try selectFields(state, arloc, tbl, sel, self.params)) orelse
-        return;
+    const proj = (try projectionOrReply(
+        state,
+        arloc,
+        tbl,
+        projection,
+        self.params,
+    )) orelse return;
     try state.sendRowDescription(proj.fields);
 }
 
@@ -984,28 +1092,29 @@ pub fn describeSelectRow(
     try state.sendRowDescription(fields);
 }
 
-/// A SELECT's output, resolved against its table: the projected
-/// columns and their wire descriptions, one per column. count(*)
-/// projects no column — one int8 field.
-const SelectFields = struct {
+/// What a statement that returns rows sends, SELECT's targets or a
+/// RETURNING list, resolved against its table: the expressions and
+/// their wire descriptions, one per target. count(*) has no
+/// expression — one int8 field.
+const Outputs = struct {
     /// The output expressions; egid is a column like any other.
     outs: []const *const Node,
     fields: []pgwire.FieldDescription,
 };
 
-/// Bind `sel`'s projection: `*` is the user columns; a target is an
-/// expression over the row (expr.bind), typed by what it computes.
-/// Pure: the expression binder's errors. The field names borrow the
-/// Table or the statement.
+/// Bind a projection, SELECT's or RETURNING's: `*` is the user
+/// columns; a target is an expression over the row (expr.bind), typed
+/// by what it computes. Pure: the expression binder's errors. The
+/// field names borrow the Table or the statement.
 fn projectionOf(
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
-    sel: _parse.Select,
+    projection: _parse.Projection,
     params: _parse.Params,
-) _expr.BindError!SelectFields {
+) _expr.BindError!Outputs {
     var outs: std.ArrayList(*const Node) = .empty;
     var names: std.ArrayList(String) = .empty;
-    switch (sel.projection) {
+    switch (projection) {
         .star => for (tbl.columns) |*c| {
             const node = try arloc.create(Node);
             node.* = .{ .column = c };
@@ -1022,7 +1131,7 @@ fn projectionOf(
         .count_star => {},
     }
 
-    const is_count = sel.projection == .count_star;
+    const is_count = projection == .count_star;
     const fields = try arloc.alloc(
         pgwire.FieldDescription,
         if (is_count) 1 else outs.items.len,
@@ -1050,14 +1159,14 @@ fn projectionOf(
 
 /// projectionOf with the reply: null = the bind error was sent.
 /// `select`'s RowEmitter takes the expressions.
-fn selectFields(
+fn projectionOrReply(
     state: *pgwire.ConnState,
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
-    sel: _parse.Select,
+    projection: _parse.Projection,
     params: _parse.Params,
-) !?SelectFields {
-    return projectionOf(arloc, tbl, sel, params) catch |err| {
+) !?Outputs {
+    return projectionOf(arloc, tbl, projection, params) catch |err| {
         if (err == error.OutOfMemory) return err;
         try _expr.replyBindErr(state, arloc, err, null);
         return null;
@@ -1070,6 +1179,56 @@ fn replyUndefinedColumn(state: *pgwire.ConnState) !void {
         pgwire.sqlstate.undefined_column,
         "column does not exist",
     );
+}
+
+/// INSERT INTO t VALUES (1, 'a') RETURNING id, name: the row
+/// description (Describe's on the extended path), then each written
+/// change's `returned` through the projection, as SELECT sends its rows.
+/// Returns whether Execute's row limit suspended the portal; null =
+/// replied.
+fn sendReturning(
+    self: *Handler,
+    state: *pgwire.ConnState,
+    tbl: *const _table.Table,
+    tx: *_txn.Txn,
+    proj: Outputs,
+    changes: []const Change,
+) !?bool {
+    if (self.mode == .simple) try state.sendRowDescription(proj.fields);
+    var emitter = RowEmitter{
+        .state = state,
+        .tbl = tbl,
+        .outs = proj.outs,
+        .scratch = .init(tx.allocator),
+        .limit = self.max_rows,
+    };
+    defer emitter.scratch.deinit();
+
+    for (changes) |change| {
+        const item = change.returned orelse continue;
+        if (emitter.full()) return true;
+        emitter.emit(item) catch |err| {
+            try replyEmitErr(state, err);
+            return null;
+        };
+    }
+    return false;
+}
+
+/// An emit failure: a target that could not compute is replied (the
+/// result ends with the error, as in Postgres); a wire error goes to
+/// the serve loop.
+fn replyEmitErr(state: *pgwire.ConnState, err: anyerror) !void {
+    return switch (err) {
+        error.IntOutOfRange,
+        error.FloatOutOfRange,
+        error.DivisionByZero,
+        error.SubstringLength,
+        error.PowerArgument,
+        error.InvalidUtf8,
+        => replyExprErr(state, @errorCast(err)),
+        else => err,
+    };
 }
 
 /// Turns each row into a projected DataRow on the wire — plain
