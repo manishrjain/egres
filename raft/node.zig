@@ -1629,24 +1629,28 @@ pub const Node = struct {
         .min_bytes = 1024,
         .min_saving = 1.0 / 8.0,
     };
+    /// Wait until the state machine can take rows, or error.NotReady.
+    /// Polls `StateMachine.isReady` for up to a second: long enough to
+    /// absorb startup (recovery + the leader's bootstrap `newMemtable`
+    /// round-trip), short enough that a client doesn't sit forever if
+    /// the SM is genuinely stuck. `propose` calls it for .data; a
+    /// proposer whose .manifest entry carries rows calls it too, since
+    /// the log does not look inside a payload.
+    pub fn waitReady(self: *Node) RaftError!void {
+        const sm = self.state_machine orelse return;
+        if (sm.isReady()) return;
+        const deadline = utils.coarseMs() + 1000; // 1s
+        while (!sm.isReady()) {
+            if (utils.coarseMs() >= deadline) return error.NotReady;
+            fiber.sleepMs(10);
+        }
+    }
+
     /// Queue a proposal for the main loop; `w` gets the outcome (see
     /// `ProposalWaiter`), or null when nobody wants it.
     pub fn propose(self: *Node, data: String, proposal_type: ProposalType, w: ?*ProposalWaiter) RaftError!void {
         if (self.isShuttingDown()) return error.QueueClosed;
-
-        // How long propose polls `StateMachine.isReady` before
-        // returning `error.NotReady`. Long enough to absorb startup (recovery +
-        // the leader's bootstrap `newMemtable` round-trip), short enough that a
-        // client doesn't sit forever if the SM is genuinely stuck.
-        if (self.state_machine) |sm| {
-            if (proposal_type == .data and !sm.isReady()) {
-                const deadline = utils.coarseMs() + 1000; // 1s
-                while (!sm.isReady()) {
-                    if (utils.coarseMs() >= deadline) return error.NotReady;
-                    fiber.sleepMs(10);
-                }
-            }
-        }
+        if (proposal_type == .data) try self.waitReady();
 
         // Compressed here, in the proposer's fiber, where every kind of
         // proposal passes: the log, the WAL and the followers only ever

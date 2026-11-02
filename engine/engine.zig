@@ -60,8 +60,9 @@ const log = std.log.scoped(.engine);
 const slow_manifest_apply_us: i64 = 100_000;
 
 /// A front-end's hook into the commit stream. `onData` fires on the apply
-/// fiber right after a committed Mutations entry is written to the forest,
-/// with the entry's namespace and the rows written — a Mutations entry is
+/// fiber right after a committed entry's rows are written to the forest
+/// (a .data entry's Mutations, or the rows a DDL manifest entry carries),
+/// with their namespace and the rows written — a Mutations is
 /// single-namespace (apply skips any key disagreeing with it), so `ns`
 /// names every item's home. Lets a front-end (SQL) maintain caches (e.g.
 /// a per-table max row id) from the commit stream on EVERY node, and a
@@ -94,11 +95,13 @@ pub const StorageImpl = struct {
     /// recovery routine calls — even on the no-snapshot fast path so the
     /// gate doesn't wedge the apply loop forever.
     recovery_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// Skip Mutations whose log index is strictly less than this during
-    /// recovery replay — the corresponding data is in SSTs that the replay
-    /// will install. Set from the recovery snapshot's
-    /// `oldest_memtable_index` field (0 if no snapshot, equivalent to "no
-    /// skipping"). Read-only after `recovery_done` flips, so no atomic.
+    /// Skip rows (a .data entry's, or a manifest entry's `rows`) whose
+    /// log index is strictly less than this during recovery replay — the
+    /// corresponding data is in SSTs that the replay will install; a
+    /// manifest entry's tree changes still apply. Set from the recovery
+    /// snapshot's `oldest_memtable_index` field (0 if no snapshot,
+    /// equivalent to "no skipping"). Read-only after `recovery_done`
+    /// flips, so no atomic.
     oldest_memtable_index: u64 = 0,
 
     pub fn asStateMachine(self: *StorageImpl) raft.Node.StateMachine {
@@ -164,84 +167,97 @@ pub const StorageImpl = struct {
             return;
         };
         switch (parsed) {
-            .Mutations => |ms| {
-                // Recovery shortcut: mutations below `oldest_memtable_index`
-                // are durable in SSTs that the replay will install via
-                // upcoming flush proposals. Putting them into the
-                // placeholder memtable here would just waste CPU — the
-                // placeholder is discarded by the first replayed
-                // `newMemtable` anyway.
-                if (entry.index < self.oldest_memtable_index) return;
-
-                const ns = ms.namespace();
-                const count = ms.kvsLen();
-
-                var items: std.ArrayList(Item) = .empty;
-                defer items.deinit(self.allocator);
-                try items.ensureTotalCapacity(self.allocator, count);
-
-                var total_bytes: u64 = 0;
-                for (0..count) |i| {
-                    const kv = try ms.kvsAt(@intCast(i));
-                    // Wire keys are marshaled keys (self-describing
-                    // ns/tid), with no timestamp: the commit timestamp is
-                    // the entry's HLC. Minimum: 12-byte prefix + 1
-                    // primary byte. A short key — or a key whose
-                    // namespace disagrees with the entry's — means an
-                    // encoder bug; skipping keeps apply deterministic
-                    // across nodes without wedging the loop on a poison
-                    // entry.
-                    if (kv.key().len < 13) {
-                        log.err("on_apply: short wire key at index={d} kv={d} len={d}", .{ entry.index, i, kv.key().len });
-                        continue;
-                    }
-                    const key = Key.init(kv.key());
-                    if (key.namespace != ns) {
-                        log.err("on_apply: key ns={d} != entry ns={d} at index={d} kv={d}", .{ key.namespace, ns, entry.index, i });
-                        continue;
-                    }
-                    items.appendAssumeCapacity(.{
-                        .key = key,
-                        .versions = .{ .one = .{
-                            .ts = entry.timestamp,
-                            .meta = Meta.fromByte(kv.meta()),
-                            .value = kv.value(),
-                        } },
-                    });
-                    total_bytes += kv.value().len;
-                }
-
-                // Write this to Forest.
-                try self.forest.put(items.items);
-
-                // Feed the committed rows to any front-end cache (SQL's
-                // per-table max row id) — on every node, so a new leader
-                // inherits it without a re-scan.
-                if (self.apply_observer) |obs|
-                    obs.onData(obs.ctx, ns, items.items);
-
-                try metrics.g().bytes_written.incrBy(.{
-                    .source = "user",
-                    .namespace_id = ns,
-                }, total_bytes);
-            },
-            .ManifestChange => |mc| {
-                try self.applyManifestChange(entry.index, entry.timestamp, mc);
-            },
+            .Mutations => |ms| try self.applyRows(entry, ms),
+            .ManifestChange => |mc| try self.applyManifestChange(entry, mc),
             else => {
                 log.err("on_apply: unhandled message type at index={d}", .{entry.index});
             },
         }
     }
 
-    /// `ts` is the entry's commit timestamp: what a branch takes as its
-    /// as-of point.
+    /// Write one entry's rows at the entry's commit timestamp: a .data
+    /// entry's Mutations, or the rows a DDL manifest entry carries.
+    fn applyRows(
+        self: *StorageImpl,
+        entry: raft.Entry,
+        ms: zdb_bufs.MutationsReader,
+    ) !void {
+        // Recovery shortcut: rows below `oldest_memtable_index` are
+        // durable in SSTs that the replay will install via upcoming
+        // flush proposals. Putting them into the placeholder memtable
+        // here would just waste CPU — the placeholder is discarded by
+        // the first replayed `newMemtable` anyway.
+        if (entry.index < self.oldest_memtable_index) return;
+
+        const ns = ms.namespace();
+        const count = ms.kvsLen();
+
+        var items: std.ArrayList(Item) = .empty;
+        defer items.deinit(self.allocator);
+        try items.ensureTotalCapacity(self.allocator, count);
+
+        var total_bytes: u64 = 0;
+        for (0..count) |i| {
+            const kv = try ms.kvsAt(@intCast(i));
+            // Wire keys are marshaled keys (self-describing ns/tid),
+            // with no timestamp: the commit timestamp is the entry's
+            // HLC. Minimum: 12-byte prefix + 1 primary byte. A short
+            // key — or a key whose namespace disagrees with the
+            // entry's — means an encoder bug; skipping keeps apply
+            // deterministic across nodes without wedging the loop on a
+            // poison entry.
+            if (kv.key().len < 13) {
+                log.err(
+                    "on_apply: short wire key at index={d} kv={d} len={d}",
+                    .{ entry.index, i, kv.key().len },
+                );
+                continue;
+            }
+            const key = Key.init(kv.key());
+            if (key.namespace != ns) {
+                log.err(
+                    "on_apply: key ns={d} != entry ns={d} at index={d} kv={d}",
+                    .{ key.namespace, ns, entry.index, i },
+                );
+                continue;
+            }
+            items.appendAssumeCapacity(.{
+                .key = key,
+                .versions = .{ .one = .{
+                    .ts = entry.timestamp,
+                    .meta = Meta.fromByte(kv.meta()),
+                    .value = kv.value(),
+                } },
+            });
+            total_bytes += kv.value().len;
+        }
+
+        try self.forest.put(items.items);
+
+        // Feed the committed rows to any front-end cache (SQL's
+        // per-table max row id) — on every node, so a new leader
+        // inherits it without a re-scan.
+        if (self.apply_observer) |obs|
+            obs.onData(obs.ctx, ns, items.items);
+
+        try metrics.g().bytes_written.incrBy(.{
+            .source = "user",
+            .namespace_id = ns,
+        }, total_bytes);
+    }
+
+    /// The entry's commit timestamp is what a branch takes as its
+    /// as-of point. Rows the change carries are written after the tree
+    /// changes for a create, so no row is visible before its tree, and
+    /// before them for a drop, so no row points at a removed tree.
     fn applyManifestChange(
         self: *StorageImpl,
-        index: u64,
-        ts: u64,
+        entry: raft.Entry,
         mc: zdb_bufs.ManifestChangeReader,
     ) !void {
+        const index = entry.index;
+        const ts = entry.timestamp;
+        const rows = mc.rows();
         const mcs = try mc.toStruct(self.allocator);
         defer {
             mcs.deinit(self.allocator);
@@ -270,6 +286,8 @@ pub const StorageImpl = struct {
             }
         }
 
+        const drops = mcs.cmd == .drop_ns or mcs.cmd == .drop_tree;
+        if (drops) if (rows) |r| try self.applyRows(entry, r);
         switch (mcs.cmd) {
             .new_memtable => try self.forest.newMemtable(index),
             .flush => try self.forest.applyFlush(index, mcs.sstable_changes, mcs.memtable_id),
@@ -307,6 +325,7 @@ pub const StorageImpl = struct {
             ),
             else => log.err("unknown ManifestChange cmd={d}", .{@intFromEnum(mcs.cmd)}),
         }
+        if (!drops) if (rows) |r| try self.applyRows(entry, r);
         // Whatever this change unlisted has no level pointing at it;
         // drop its blocks and its table cache entry now rather than
         // when the file goes.
@@ -1526,7 +1545,11 @@ pub const Engine = struct {
     /// it. Pairs with the forest `build*` constructors: the caller builds the
     /// change (leader side), this makes it real everywhere. Control plane uses
     /// `.apply` — the change must be locally visible when the caller returns.
+    /// A change carrying `rows` (DDL's catalog rows) waits for a real
+    /// memtable first, as a .data proposal does: rows applied into the
+    /// startup placeholder would be thrown away.
     pub fn proposeMC(self: *Engine, mc: _manifest.ManifestChange, wait_for: Wait) !void {
+        if (mc.rows) |rows| if (rows.kvs.len > 0) try self.node.waitReady();
         // The whole change: a branch names its source in `branch_from`.
         const payload = try zdb_bufs.marshalRoot(self.allocator, mc);
         defer self.allocator.free(payload);

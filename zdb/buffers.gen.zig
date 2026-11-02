@@ -1238,6 +1238,7 @@ pub const ManifestChangeStruct = struct {
     namespaces: []NamespaceStruct = &.{},
     next_ns_id: u64 = 0,
     branch_from: u64 = 0,
+    rows: ?MutationsStruct = null,
     pub fn deinit(self: *ManifestChangeStruct, alloc: std.mem.Allocator) void {
         for (self.tree_changes) |*_b| _b.deinit(alloc);
         alloc.free(self.tree_changes);
@@ -1248,6 +1249,8 @@ pub const ManifestChangeStruct = struct {
         for (self.namespaces) |*_b| _b.deinit(alloc);
         alloc.free(self.namespaces);
         self.namespaces = &.{};
+        if (self.rows) |*_bf| _bf.deinit(alloc);
+        self.rows = null;
     }
 
     pub fn destroy(self: *ManifestChangeStruct, alloc: std.mem.Allocator) void {
@@ -1283,6 +1286,9 @@ pub const ManifestChangeStruct = struct {
             for (self.namespaces, 0..) |_child, _i| {
                 s.namespaces[_i] = try _child.cloneValue(alloc);
             }
+        }
+        if (self.rows) |_child| {
+            s.rows = try _child.cloneValue(alloc);
         }
         return s;
     }
@@ -1324,6 +1330,10 @@ pub const ManifestChangeStruct = struct {
         }
         try writer.setNextNsId(self.next_ns_id);
         try writer.setBranchFrom(self.branch_from);
+        if (self.rows) |child| {
+            const child_off = try child.marshalTo(alloc, out);
+            try writer.setRows(child_off);
+        }
         const result = try writer.finish();
         return result.offset;
     }
@@ -1334,7 +1344,7 @@ pub const ManifestChangeReader = struct {
     t: zbuf.Table,
 
     pub const TABLE_ID: u16 = 46598;
-    pub const SIZE_BYTES: u16 = 51;
+    pub const SIZE_BYTES: u16 = 55;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
@@ -1384,6 +1394,11 @@ pub const ManifestChangeReader = struct {
         return self.t.scalar(u64, 43);
     }
 
+    pub fn rows(self: Self) ?MutationsReader {
+        const off = self.t.child(51) orelse return null;
+        return MutationsReader.init(self.t.buf, off) catch null;
+    }
+
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try ManifestChangeWriter.initWithBuf(alloc, out);
         const count_treeChanges: u32 = self.treeChangesLen();
@@ -1423,6 +1438,10 @@ pub const ManifestChangeReader = struct {
         }
         try writer.setNextNsId(self.nextNsId());
         try writer.setBranchFrom(self.branchFrom());
+        if (self.rows()) |child| {
+            const child_off = try child.cloneInto(alloc, out);
+            try writer.setRows(child_off);
+        }
         const result = try writer.finish();
         return result.offset;
     }
@@ -1441,6 +1460,7 @@ pub const ManifestChangeReader = struct {
         for (0..self.namespacesLen()) |i| {
             try (try self.namespacesAt(@intCast(i))).verify();
         }
+        if (self.rows()) |child_view| try child_view.verify();
     }
     pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!ManifestChangeStruct {
         var s = ManifestChangeStruct{
@@ -1477,6 +1497,9 @@ pub const ManifestChangeReader = struct {
                 s.namespaces[_i] = try _child.toStructValue(alloc);
             }
         }
+        if (self.rows()) |_child| {
+            s.rows = try _child.toStructValue(alloc);
+        }
         return s;
     }
     pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*ManifestChangeStruct {
@@ -1494,9 +1517,9 @@ pub const ManifestChangeWriter = struct {
     w: zbuf.TableWriter,
 
     pub const TABLE_ID: u16 = 46598;
-    pub const SIZE_BYTES: u16 = 51;
+    pub const SIZE_BYTES: u16 = 55;
     /// Slots of nested tables, null until set.
-    const child_slots = [_]u16{};
+    const child_slots = [_]u16{51};
 
     pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {
         return .{ .w = try zbuf.TableWriter.initWithBuf(alloc, buf, SIZE_BYTES, &child_slots) };
@@ -1534,6 +1557,10 @@ pub const ManifestChangeWriter = struct {
         return self.w.setScalar(u64, 43, v);
     }
 
+    pub fn setRows(self: *Self, child_off: u32) Error!void {
+        return self.w.setChild(51, child_off);
+    }
+
     pub fn set(self: *Self, values: anytype) Error!void {
         const Values = @TypeOf(values);
         if (@typeInfo(Values) != .@"struct") {
@@ -1546,6 +1573,7 @@ pub const ManifestChangeWriter = struct {
         if (@hasField(Values, "namespaces")) try self.setNamespaces(@field(values, "namespaces"));
         if (@hasField(Values, "next_ns_id")) try self.setNextNsId(@field(values, "next_ns_id"));
         if (@hasField(Values, "branch_from")) try self.setBranchFrom(@field(values, "branch_from"));
+        if (@hasField(Values, "rows")) try self.setRows(@field(values, "rows"));
     }
 
     pub fn finish(self: *Self) Error!ManifestChangeBuffer {

@@ -1,9 +1,9 @@
 // Copyright 2026 Manish R Jain
 // SPDX-License-Identifier: Apache-2.0
 
-//! DDL execution: CREATE/DROP DATABASE and TABLE. Each is a
-//! choreography over the forest's manifest (name reservation, tree
-//! creation, catalog rows) replicated through raft — the data plane
+//! DDL execution: CREATE/DROP DATABASE and TABLE. Each builds one
+//! manifest change (name reservation, tree creation) that carries its
+//! catalog rows, replicated through raft as one entry — the data plane
 //! proper lives in dml.zig, and CREATE/DROP INDEX with the online
 //! backfill in index_ddl.zig.
 //!
@@ -205,15 +205,10 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
             return replyError(state, "create table failed");
         },
     };
-    eng.proposeMC(created.change, .apply) catch |err| {
-        log.err("create table '{s}': propose: {s}", .{ ct.name, @errorName(err) });
-        return replyError(state, "create table proposal failed");
-    };
-    // Phase 2: the table's column rows (+ the index descriptor rows)
-    // into the namespace's catalogs — one proposal, atomic. A crash
-    // between the two proposals leaves a named, column-less table (DROP
-    // TABLE cleans it up) — acceptable pre-production. An index made
-    // with its table is valid from ts 0: no row precedes it.
+    // The trees and their catalog rows (columns, index descriptors)
+    // go in one entry, so a crash leaves all of the table or none of
+    // it. An index made with its table is valid from ts 0: no row
+    // precedes it.
     const table_id = created.table_ids[0];
     const indexes = try a.alloc(_catalog.IndexDef, unique_cols.items.len);
     for (unique_cols.items, created.table_ids[1..], indexes) |col, tid, *def| {
@@ -224,12 +219,19 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
             .unique = true,
         };
     }
-    writeCatalogRows(self, a, .{
+    var mc = created.change;
+    mc.rows = .{
         .namespace = ns,
-        .table_id = table_id,
-    }, columns, indexes) catch |err| {
-        log.err("create table '{s}': catalog rows: {s}", .{ ct.name, @errorName(err) });
-        return replyError(state, "create table failed writing catalog rows");
+        .kvs = try catalogRowKvs(self, a, .{
+            .namespace = ns,
+            .table_id = table_id,
+        }, columns, indexes),
+    };
+    eng.proposeMC(mc, .apply) catch |err| {
+        log.err("create table '{s}': propose: {s}", .{
+            ct.name, @errorName(err),
+        });
+        return replyError(state, "create table proposal failed");
     };
 
     log.info(
@@ -347,17 +349,11 @@ pub fn createTableAs(
             return replyError(state, "create table failed");
         },
     };
-    eng.proposeMC(created.change, .apply) catch |err| {
-        log.err("create table as '{s}': propose: {s}", .{
-            cta.name, @errorName(err),
-        });
-        return replyError(state, "create table proposal failed");
-    };
-
-    // Phase 2, as createTable: the catalog rows under the new ids. The
-    // column ids stay the source's, so the index descriptors and the
-    // shared rows keep naming the same columns. A branched index is
-    // valid from when its source was; an empty one from the start.
+    // The catalog rows under the new ids ride in the same entry, as in
+    // createTable. The column ids stay the source's, so the index
+    // descriptors and the shared rows keep naming the same columns. A
+    // branched index is valid from when its source was; an empty one
+    // from the start.
     const table_id = created.table_ids[0];
     const indexes = try arloc.alloc(_catalog.IndexDef, src_indexes.items.len);
     for (src_indexes.items, created.table_ids[1..], indexes) |idx, tid, *def| {
@@ -369,14 +365,19 @@ pub fn createTableAs(
             .valid_ts = if (cta.with_data) idx.valid_ts else 0,
         };
     }
-    writeCatalogRows(self, arloc, .{
+    var mc = created.change;
+    mc.rows = .{
         .namespace = ns,
-        .table_id = table_id,
-    }, columns, indexes) catch |err| {
-        log.err("create table as '{s}': catalog rows: {s}", .{
+        .kvs = try catalogRowKvs(self, arloc, .{
+            .namespace = ns,
+            .table_id = table_id,
+        }, columns, indexes),
+    };
+    eng.proposeMC(mc, .apply) catch |err| {
+        log.err("create table as '{s}': propose: {s}", .{
             cta.name, @errorName(err),
         });
-        return replyError(state, "create table failed writing catalog rows");
+        return replyError(state, "create table proposal failed");
     };
 
     log.info(
@@ -387,21 +388,19 @@ pub fn createTableAs(
     try state.sendCommandComplete("CREATE TABLE AS");
 }
 
-/// Marshal one catalog row per column plus one per index descriptor and
-/// replicate the batch into the namespace's catalog trees, waiting for
-/// local apply. Column rows land in table 1, index rows in table 2 —
-/// mixed table_ids in one atomic proposal. `columns` carry their minted
-/// ids (createTable assigns them); nothing is derived here.
-pub fn writeCatalogRows(
+/// Marshal one catalog row per column plus one per index descriptor,
+/// for the caller to propose: column rows land in table 1, index rows
+/// in table 2. `columns` carry their minted ids (createTable assigns
+/// them); nothing is derived here. The rows are allocated with `a`.
+pub fn catalogRowKvs(
     self: *Handler,
     a: std.mem.Allocator,
     table_key: zdb.kv.TableKey,
     columns: []const _schema.LogicalColumn,
     indexes: []const _catalog.IndexDef,
-) !void {
+) ![]zen.KeyValueStruct {
     const eng = self.srv.engine;
     const n = columns.len + indexes.len;
-    if (n == 0) return;
 
     const kvs = try a.alloc(zen.KeyValueStruct, n);
     var buf: std.ArrayList(u8) = .empty;
@@ -438,7 +437,7 @@ pub fn writeCatalogRows(
         };
         kvs[i] = .{ .key = try k.marshal(a), .value = try a.dupe(u8, bytes) };
     }
-    try eng.proposeWrites(table_key.namespace, kvs, .apply);
+    return kvs;
 }
 
 pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: _parse.DropTable) !void {

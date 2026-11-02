@@ -169,6 +169,14 @@ pub const ManifestChange = schema.Table(&.{
     .{ .id = 6, .name = "next_ns_id", .ty = schema.U64 },
     // branch_ns only: the namespace copied.
     .{ .id = 7, .name = "branch_from", .ty = schema.U64 },
+    // Rows a DDL entry writes with its tree change, so the two commit
+    // as one: catalog rows today. Only create_ns, drop_ns,
+    // create_tree, drop_tree, branch_ns and branch_table carry them.
+    // `rows.namespace` is the entry's trees' namespace or the system
+    // namespace; rows take the entry's commit timestamp, as a .data
+    // entry's do. Manifest.apply and the snapshot draft ignore them:
+    // rows reach a snapshot as SSTs.
+    .{ .id = 8, .name = "rows", .ty = Mutations },
 });
 
 /// A single key-value write. `key` is a marshaled zdb key
