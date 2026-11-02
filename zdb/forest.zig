@@ -264,6 +264,19 @@ pub const Memtables = struct {
             try self.putItem(copy);
             copied += 1;
         }
+        // The copies may come from any memtable the walk read, so the
+        // active memtable now needs every entry those replay from: until
+        // it flushes, no snapshot may drop them and recovery may not skip
+        // their rows. Without this a restart replays the branch with its
+        // sources gone, and the copies are lost.
+        if (copied > 0) {
+            self.mu.lock(@src());
+            defer self.mu.unlock();
+            var from = self.current.replay_from;
+            for (self.immutables.items) |imm|
+                from = @min(from, imm.replay_from);
+            self.current.replay_from = from;
+        }
         return copied;
     }
 
@@ -403,18 +416,23 @@ pub const Memtables = struct {
         }
         const new_mt = try SkipList.init(self.allocator);
         new_mt.raft_index = log_index;
+        new_mt.replay_from = log_index;
         self.current = new_mt;
     }
 
-    /// Log index of the oldest in-memory memtable. Returns 0 when the only
-    /// thing around is the initial placeholder (no real `newMemtable` entry
-    /// has been applied yet), which the caller treats as "no snapshot yet."
+    /// The lowest log index replay needs to rebuild every in-memory
+    /// memtable: the snapshot index stays below it, and recovery skips
+    /// rows only below it. Usually the oldest memtable's creation index;
+    /// lower while a memtable holds branch copies of older writes (see
+    /// SkipList.replay_from). Returns 0 when the only thing around is
+    /// the initial placeholder (no real `newMemtable` entry has been
+    /// applied yet), which the caller treats as "no snapshot yet."
     pub fn oldestInMemoryLogIndex(self: *Memtables) u64 {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
-        const imms = self.immutables.items;
-        if (imms.len > 0) return imms[imms.len - 1].raft_index;
-        return self.current.raft_index;
+        var from = self.current.replay_from;
+        for (self.immutables.items) |imm| from = @min(from, imm.replay_from);
+        return from;
     }
 
     /// Release every immutable whose id is strictly less than

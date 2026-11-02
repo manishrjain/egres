@@ -55,10 +55,16 @@ pub const SkipList = struct {
     /// Log index of the Raft `new_memtable` entry that created this
     /// memtable; also its identity (0 for the placeholder Forest.open
     /// creates before any replay). Flush proposals name the memtable by
-    /// it, and it bounds the safe snapshot index: replay must be able to
-    /// rebuild the oldest in-memory memtable from log entries above this
-    /// index, so `snapshot.index <= oldest.raft_index - 1`.
+    /// it.
     raft_index: u64,
+    /// The lowest log index whose replay rebuilds this memtable: its
+    /// `raft_index`, or lower once a branch copied versions written
+    /// before it was created (Memtables.fork). The copies have no log
+    /// entry of their own; replay remakes them only if the entries that
+    /// wrote their sources replay too. The snapshot horizon and the
+    /// recovery skip floor are the lowest over in-memory memtables
+    /// (Memtables.oldestInMemoryLogIndex).
+    replay_from: u64,
     allocator: Allocator,
     arena: std.heap.ArenaAllocator,
     head: *Node,
@@ -110,6 +116,7 @@ pub const SkipList = struct {
         const self = try allocator.create(Self);
         self.* = .{
             .raft_index = 0,
+            .replay_from = 0,
             .allocator = allocator,
             .arena = arena,
             .head = head,
