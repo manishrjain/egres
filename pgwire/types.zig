@@ -45,6 +45,8 @@ pub const oid = struct {
 /// before the byte swap and a decoder adds it after. Text format never
 /// sees it.
 pub const pg_epoch_unix_us: i64 = 946_684_800_000_000;
+/// The same epoch in days, for a `date`.
+pub const pg_epoch_unix_days: i32 = 10_957;
 
 /// One column descriptor for a result set. `format_code = 0` means text.
 /// `type_modifier = -1` means "no modifier" (e.g. for varchar(N), N is
@@ -90,6 +92,7 @@ pub const sqlstate = struct {
     pub const numeric_value_out_of_range: [5]u8 = .{ '2', '2', '0', '0', '3' };
     pub const division_by_zero: [5]u8 = .{ '2', '2', '0', '1', '2' };
     pub const substring_error: [5]u8 = .{ '2', '2', '0', '1', '1' };
+    pub const invalid_sql_statement_name: [5]u8 = .{ '2', '6', '0', '0', '0' };
     pub const invalid_argument_for_power_function: [5]u8 = .{ '2', '2', '0', '1', 'F' };
     pub const not_null_violation: [5]u8 = .{ '2', '3', '5', '0', '2' };
     pub const unique_violation: [5]u8 = .{ '2', '3', '5', '0', '5' };

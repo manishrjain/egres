@@ -616,6 +616,20 @@ test "sql.parse: SELECT without FROM is a row of constants" {
     }
 }
 
+test "sql.parse: DEALLOCATE names the statement, ALL is null" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const one = try parse.statement(alloc, "DEALLOCATE s1;");
+    try testing.expectEqualStrings("s1", one.deallocate.?);
+    const prep = try parse.statement(alloc, "DEALLOCATE PREPARE \"_pg3_0\";");
+    try testing.expectEqualStrings("_pg3_0", prep.deallocate.?);
+    const all = try parse.statement(alloc, "DEALLOCATE ALL;");
+    try testing.expect(all.deallocate == null);
+}
+
 test "sql.parse: SET and RESET are accepted and ignored" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);

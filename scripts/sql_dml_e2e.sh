@@ -739,6 +739,23 @@ if [ "$(printf '%s\n' "$named_out" | grep -c '^a$')" = 2 ] &&
 else
     bad "named statement — got: $named_out"
 fi
+# DEALLOCATE is the SQL spelling of Close: psycopg sends DEALLOCATE ALL
+# after every DROP.
+dealloc_out=$(x 'SELECT name FROM pt WHERE id = $1 \parse s2
+\bind_named s2 1 \g
+DEALLOCATE s2;
+\bind_named s2 1 \g
+SELECT name FROM pt WHERE id = $1 \parse s3
+DEALLOCATE ALL;
+\bind_named s3 1 \g
+DEALLOCATE s3;' 2>&1)
+if [ "$(printf '%s\n' "$dealloc_out" | grep -c '^a$')" = 1 ] &&
+    [ "$(grep -c 'unknown prepared statement' <<<"$dealloc_out")" = 2 ] &&
+    grep -q 'prepared statement does not exist' <<<"$dealloc_out"; then
+    ok "DEALLOCATE name and ALL drop prepared statements"
+else
+    bad "DEALLOCATE — got: $dealloc_out"
+fi
 
 # A transaction block over the extended path: an error aborts it, the
 # next statement is refused with 25P02 until ROLLBACK.

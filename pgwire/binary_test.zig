@@ -74,3 +74,46 @@ test "isBinarySupported covers expected OIDs" {
     try testing.expect(!binary.isBinarySupported(types.oid.text));
     try testing.expect(!binary.isBinarySupported(types.oid.numeric));
 }
+
+test "numeric: base-10000 digits, weight, sign and scale as numeric_send" {
+    const Case = struct { coef: i128, scale: u16, bytes: []const u8 };
+    const cases = [_]Case{
+        // 1234.5678: two digits at weight 0.
+        .{ .coef = 12345678, .scale = 4, .bytes = &.{
+            0, 2, 0, 0, 0, 0, 0, 4, 0x04, 0xD2, 0x16, 0x2E,
+        } },
+        // 0.321: the one digit is the first group after the point.
+        .{ .coef = 321, .scale = 3, .bytes = &.{
+            0, 1, 0xFF, 0xFF, 0, 0, 0, 3, 0x0C, 0x8A,
+        } },
+        // 0.0005: the group holds the whole fraction.
+        .{ .coef = 5, .scale = 4, .bytes = &.{
+            0, 1, 0xFF, 0xFF, 0, 0, 0, 4, 0, 5,
+        } },
+        // Zero at scale 2: no digits, the scale kept.
+        .{ .coef = 0, .scale = 2, .bytes = &.{ 0, 0, 0, 0, 0, 0, 0, 2 } },
+        // -1: the sign word.
+        .{ .coef = -1, .scale = 0, .bytes = &.{
+            0, 1, 0, 0, 0x40, 0, 0, 0, 0, 1,
+        } },
+        // 10000: a trailing zero group is dropped, the weight stays.
+        .{ .coef = 10000, .scale = 0, .bytes = &.{
+            0, 1, 0, 1, 0, 0, 0, 0, 0, 1,
+        } },
+        // 12000: [1, 2000] at weight 1.
+        .{ .coef = 12000, .scale = 0, .bytes = &.{
+            0, 2, 0, 1, 0, 0, 0, 0, 0, 1, 0x07, 0xD0,
+        } },
+        // The largest uint8, five groups.
+        .{ .coef = 18446744073709551615, .scale = 0, .bytes = &.{
+            0,    5,    0,    4,    0,    0,    0,    0,    0x07,
+            0x34, 0x1A, 0x58, 0x02, 0xE1, 0x03, 0xBB, 0x06, 0x4F,
+        } },
+    };
+    for (cases) |case| {
+        var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer aw.deinit();
+        try binary.encodeNumeric(&aw.writer, case.coef, case.scale);
+        try testing.expectEqualSlices(u8, case.bytes, aw.written());
+    }
+}

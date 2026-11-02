@@ -224,12 +224,13 @@ pub const Row = struct {
 // -----------------------------------------------------------------------------
 
 /// Parse a SQL literal into a typed cell of column type `ty`. The returned
-/// `text`/`bytea` Value BORROWS `text` (the caller keeps it alive until the row
-/// is marshaled). NULL is handled by the caller, not here. Numeric/bool/
-/// date/timestamp parse failures surface as errors (the executor maps them
-/// to 22P02); types this slice can't parse (time, interval, uuid) return
+/// `text` Value BORROWS `text` (the caller keeps it alive until the row
+/// is marshaled); a `bytea` in hex form is decoded into `alloc`. NULL is
+/// handled by the caller, not here. Numeric/bool/date/timestamp parse
+/// failures surface as errors (the executor maps them to 22P02); types
+/// this slice can't parse (time, interval, uuid) return
 /// `error.UnsupportedType` (→ 0A000).
-pub fn textToValue(ty: Type, text: String) !Value {
+pub fn textToValue(alloc: std.mem.Allocator, ty: Type, text: String) !Value {
     return switch (ty) {
         .bool_ => .{ .bool_ = try textToBool(text) },
         .int2 => .{ .int2 = try std.fmt.parseInt(i16, text, 10) },
@@ -241,12 +242,24 @@ pub fn textToValue(ty: Type, text: String) !Value {
         .float4 => .{ .float4 = try std.fmt.parseFloat(f32, text) },
         .float8 => .{ .float8 = try std.fmt.parseFloat(f64, text) },
         .text, .bpchar, .varchar => .{ .text = text },
-        .bytea => .{ .bytea = text },
+        .bytea => .{ .bytea = try byteaFromText(alloc, text) },
         .timestamp => .{ .timestamp = try date.parseTimestamp(text, false) },
         .timestamptz => .{ .timestamptz = try date.parseTimestamp(text, true) },
         .date => .{ .date = try date.parseDate(text) },
         .time, .interval, .uuid => error.UnsupportedType,
     };
+}
+
+/// A bytea literal: Postgres's hex form, `'\x0001'`, decoded into
+/// `alloc`; without the prefix the bytes as they are, the escape form
+/// without its escapes.
+fn byteaFromText(alloc: std.mem.Allocator, text: String) !String {
+    if (!std.mem.startsWith(u8, text, "\\x")) return text;
+    const hex = text[2..];
+    if (hex.len % 2 != 0) return error.InvalidBytea;
+    const out = try alloc.alloc(u8, hex.len / 2);
+    _ = std.fmt.hexToBytes(out, hex) catch return error.InvalidBytea;
+    return out;
 }
 
 fn textToBool(text: String) !bool {
@@ -311,7 +324,9 @@ pub fn valueToText(w: *std.Io.Writer, col: ?*const Column, v: Value) !void {
     switch (v) {
         .null_value => {}, // caller handles null out-of-band
         .bool_ => |b| try w.writeAll(if (b) "t" else "f"),
-        .text, .bytea => |s| try w.writeAll(s),
+        .text => |s| try w.writeAll(s),
+        // Postgres's hex form, as bytea_output = 'hex' sends it.
+        .bytea => |b| try w.print("\\x{x}", .{b}),
         // Every numeric payload renders via {d}; `inline` binds the capture
         // to each tag's concrete type. time/interval/uuid can't be inserted
         // this slice, so a live value never actually reaches those tags —
@@ -335,6 +350,39 @@ pub fn valueToText(w: *std.Io.Writer, col: ?*const Column, v: Value) !void {
     }
 }
 
+/// Render a non-null cell in the binary wire format of the type it is
+/// advertised as (pgTypeOid): the integers and floats big-endian, an
+/// unsigned widened like its OID, uint8 as a numeric, the time types
+/// counted from the 2000 epoch, strings and bytea as their bytes with
+/// a `char(n)` padded as in text. A type advertised as text (time,
+/// interval, uuid) sends its text: that is text's binary format.
+pub fn valueToBinary(w: *std.Io.Writer, col: ?*const Column, v: Value) !void {
+    switch (v) {
+        .null_value => {}, // caller handles null out-of-band
+        .bool_ => |b| try w.writeByte(@intFromBool(b)),
+        .int2 => |n| try w.writeInt(i16, n, .big),
+        .int4 => |n| try w.writeInt(i32, n, .big),
+        .int8 => |n| try w.writeInt(i64, n, .big),
+        .uint2 => |n| try w.writeInt(i32, n, .big),
+        .uint4 => |n| try w.writeInt(i64, n, .big),
+        .uint8 => |n| try pgwire.binary.encodeNumeric(w, n, 0),
+        .float4 => |f| try w.writeInt(u32, @bitCast(f), .big),
+        .float8 => |f| try w.writeInt(u64, @bitCast(f), .big),
+        .date => |days| try w.writeInt(
+            i32,
+            days - pgwire.types.pg_epoch_unix_days,
+            .big,
+        ),
+        .timestamp, .timestamptz => |us| try w.writeInt(
+            i64,
+            us - pgwire.types.pg_epoch_unix_us,
+            .big,
+        ),
+        .bytea => |b| try w.writeAll(b),
+        .text, .time, .interval, .uuid => try valueToText(w, col, v),
+    }
+}
+
 /// Assign a typed cell to `col`, as Bind does with a binary parameter
 /// whose declared type is not the column's: the same type passes (a
 /// string through the column's length rule); any integer goes into any
@@ -344,12 +392,16 @@ pub fn valueToText(w: *std.Io.Writer, col: ?*const Column, v: Value) !void {
 /// integer column, and every other pairing, is `error.TypeMismatch`,
 /// as Postgres refuses an assignment it would have to round or cannot
 /// make at all. NULL passes.
-pub fn valueToColumn(v: Value, col: *const Column) !Value {
+pub fn valueToColumn(
+    alloc: std.mem.Allocator,
+    v: Value,
+    col: *const Column,
+) !Value {
     const from = v.ty() orelse return v;
     if (v == .text) {
         if (col.ty.isString())
             return .{ .text = try fitString(v.text, col) };
-        return textToValue(col.ty, v.text);
+        return textToValue(alloc, col.ty, v.text);
     }
     if (from == col.ty) return v;
     if (from.isInteger()) {
@@ -450,7 +502,8 @@ pub fn pgTypeOid(ty: Type) pgwire.Oid {
         .date => pgwire.oid.date,
         .bpchar => pgwire.oid.bpchar,
         .varchar => pgwire.oid.varchar,
-        .text, .bytea, .time, .interval, .uuid => pgwire.oid.text,
+        .bytea => pgwire.oid.bytea,
+        .text, .time, .interval, .uuid => pgwire.oid.text,
     };
 }
 

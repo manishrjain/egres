@@ -374,6 +374,9 @@ pub const Stmt = union(enum) {
     /// SET TRANSACTION is ignored the way BEGIN's modes are.
     set_var,
     reset_var,
+    /// DEALLOCATE name, or DEALLOCATE ALL as null: the prepared
+    /// statement(s) the session drops, as a Close message would.
+    deallocate: ?String,
     /// SHOW of one parameter: the server answers from its fixed
     /// settings (server.showVar).
     show_var: Show,
@@ -424,6 +427,9 @@ pub fn statement(alloc: std.mem.Allocator, sql: String) parser.ParseError!Stmt {
     if (parser.cast(c.VariableSetStmt, node)) |s| return parseSet(s);
     if (parser.cast(c.VariableShowStmt, node)) |s|
         return .{ .show_var = .{ .name = try dup(alloc, s.name) } };
+    if (parser.cast(c.DeallocateStmt, node)) |s| return .{
+        .deallocate = if (s.isall) null else try dup(alloc, s.name),
+    };
     return .unsupported;
 }
 
@@ -907,17 +913,22 @@ pub const Params = struct {
     /// another width or kind takes it the way SET assigns a number.
     /// An index past what Bind supplied is `error.UnboundParam` (the
     /// runner checks the count first, so only a bug reaches it).
-    pub fn toValue(self: Params, index: u16, col: *const Column) !_value.Value {
+    pub fn toValue(
+        self: Params,
+        alloc: std.mem.Allocator,
+        index: u16,
+        col: *const Column,
+    ) !_value.Value {
         if (index == 0 or index > self.values.len) return error.UnboundParam;
 
         const bytes = self.values[index - 1] orelse return .null_value;
         if (self.isBinary(index)) {
             const typed = try self.binaryValue(index, bytes);
-            return _value.valueToColumn(typed, col);
+            return _value.valueToColumn(alloc, typed, col);
         }
         if (col.ty.isString())
             return .{ .text = try _value.fitString(bytes, col) };
-        return _value.textToValue(col.ty, bytes);
+        return _value.textToValue(alloc, col.ty, bytes);
     }
 
     /// `$index` with no column to type it (a placeholder under a SET
@@ -942,6 +953,7 @@ pub const Params = struct {
     /// declared, is `error.UnsupportedType`: the bytes cannot be read.
     fn binaryValue(self: Params, index: u16, bytes: String) !_value.Value {
         const binary = pgwire.binary;
+        const pg_epoch_us = pgwire.types.pg_epoch_unix_us;
         const oid: u32 = if (index <= self.oids.len)
             self.oids[index - 1]
         else
@@ -953,6 +965,18 @@ pub const Params = struct {
             pgwire.oid.int8 => .{ .int8 = try binary.decodeInt8(bytes) },
             pgwire.oid.float4 => .{ .float4 = try binary.decodeFloat4(bytes) },
             pgwire.oid.float8 => .{ .float8 = try binary.decodeFloat8(bytes) },
+            // The binary time types count from the 2000 epoch; storage
+            // from 1970 (value.zig).
+            pgwire.oid.date => .{
+                .date = try binary.decodeInt4(bytes) +
+                    pgwire.types.pg_epoch_unix_days,
+            },
+            pgwire.oid.timestamp => .{
+                .timestamp = try binary.decodeInt8(bytes) + pg_epoch_us,
+            },
+            pgwire.oid.timestamptz => .{
+                .timestamptz = try binary.decodeInt8(bytes) + pg_epoch_us,
+            },
             pgwire.oid.bytea => .{ .bytea = bytes },
             pgwire.oid.uuid => if (bytes.len == 16)
                 .{ .uuid = bytes[0..16].* }
@@ -985,14 +1009,14 @@ pub fn litToValue(
         // a position without a transaction time (SET, WHERE) never
         // produces it.
         .current_timestamp => return error.UnsupportedLiteral,
-        .param => |n| return params.toValue(n, col),
+        .param => |n| return params.toValue(a, n, col),
         .str, .float => |s| s,
         .int => |n| try std.fmt.allocPrint(a, "{d}", .{n}),
         .bool_ => |b| if (b) "t" else "f",
     };
     if (col.ty.isString())
         return .{ .text = try _value.fitString(text, col) };
-    return _value.textToValue(col.ty, text);
+    return _value.textToValue(a, col.ty, text);
 }
 
 /// A parsed WHERE tree or a rejection reason (borrowed).

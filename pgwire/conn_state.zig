@@ -110,6 +110,10 @@ pub const DescribeCtx = struct {
     /// Per-param format codes (text/binary). Empty for statement
     /// kind; same length as `params` for portal kind.
     param_formats: []const i16 = &.{},
+    /// The portal's result formats, as ExecuteCtx carries them: the
+    /// RowDescription reports the code each column will use. Empty
+    /// for statement kind.
+    result_formats: []const i16 = &.{},
 };
 
 pub const Event = union(enum) {
@@ -271,6 +275,19 @@ pub const ConnState = struct {
         self.alloc.free(p.params);
         self.alloc.free(p.param_formats);
         self.alloc.free(p.result_formats);
+    }
+
+    /// DEALLOCATE name / DEALLOCATE ALL: drop the prepared statement(s)
+    /// and their portals as a Close message would. A name the session
+    /// never prepared is nothing to do, as in Postgres's DEALLOCATE ALL;
+    /// the handler replies 26000 for a named miss.
+    pub fn deallocate(self: *ConnState, name: ?String) void {
+        if (name) |n| self.dropStatement(n) else self.dropAllStatements();
+    }
+
+    /// Whether `name` is a prepared statement of the session.
+    pub fn hasStatement(self: *const ConnState, name: String) bool {
+        return self.statements.contains(name);
     }
 
     fn dropAllStatements(self: *ConnState) void {
@@ -786,6 +803,7 @@ pub const ConnState = struct {
                     .sql = stmt.sql,
                     .params = @ptrCast(portal.params),
                     .param_formats = portal.param_formats,
+                    .result_formats = portal.result_formats,
                 } };
             },
         }

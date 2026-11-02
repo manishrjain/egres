@@ -107,6 +107,52 @@ pub fn decodeFloat8(bytes: String) DecodeError!f64 {
     return @bitCast(bits);
 }
 
+// ---------- numeric (OID 1700) ----------
+// Mirrors `numeric_send`: int16 ndigits, int16 weight, int16 sign,
+// int16 dscale, then ndigits base-10000 digits as int16, most
+// significant first. `weight` is the power of 10000 of the first
+// digit, so 1234.5678 is [1234, 5678] at weight 0 and 0.321 is
+// [3210] at weight -1. Leading and trailing zero digits are dropped
+// (zero is no digits at all); `dscale` keeps the scale regardless.
+
+pub const numeric_sign_neg: u16 = 0x4000;
+
+/// Encode `coef` × 10^-`scale`, a 38-digit coefficient at most. For
+/// coef -12345678 and scale 3, which is -12345.678, the frame is
+/// ndigits 3, weight 1, sign 0x4000, dscale 3, then the digits 1,
+/// 2345, 6780: 1 × 10000 + 2345, and 6780 / 10000.
+pub fn encodeNumeric(w: *std.Io.Writer, coef: i128, scale: u16) !void {
+    std.debug.assert(scale <= 39);
+    // The wire splits digits into groups of four either side of the
+    // point, so pad the scale to a whole group: 0.321 is sent as
+    // 0.3210, the magnitude 3210 one group below the point.
+    const frac_groups = (scale + 3) / 4;
+    var mag: u256 = @abs(coef);
+    for (scale..frac_groups * 4) |_| mag *= 10;
+
+    // Least significant first; the top group is never zero, so only
+    // the low zero groups need dropping.
+    var groups: [22]u16 = undefined;
+    var n: usize = 0;
+    while (mag != 0) : (mag /= 10_000) {
+        groups[n] = @intCast(mag % 10_000);
+        n += 1;
+    }
+    var ndigits = n;
+    while (ndigits > 0 and groups[n - ndigits] == 0) ndigits -= 1;
+    const weight: i16 = if (ndigits == 0)
+        0
+    else
+        @as(i16, @intCast(n)) - 1 - @as(i16, @intCast(frac_groups));
+    const sign: u16 = if (coef < 0 and ndigits != 0) numeric_sign_neg else 0;
+
+    try w.writeInt(u16, @intCast(ndigits), .big);
+    try w.writeInt(i16, weight, .big);
+    try w.writeInt(u16, sign, .big);
+    try w.writeInt(u16, scale, .big);
+    for (0..ndigits) |k| try w.writeInt(u16, groups[n - 1 - k], .big);
+}
+
 /// True if we have a binary encoder/decoder for this OID. Lets
 /// callers dispatch ahead of attempting a decode.
 pub fn isBinarySupported(oid: _types.Oid) bool {

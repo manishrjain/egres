@@ -23,10 +23,10 @@ A statement Egres recognises but does not run yet returns a Postgres error with 
 | Extended query protocol (`Parse`, `Bind`, `Describe`, `Execute`, `Close`, `Sync`, `Flush`) | Yes | Each session caches its parsed statements by SQL text. |
 | `$1`-style parameters | Yes | In `WHERE`, `SET` and `VALUES`, up to `$65535`. |
 | Parameters in text format | Yes | Any column type. |
-| Parameters in binary format | Partial | Decoded by the type declared at `Parse`: `bool`, `int2`, `int4`, `int8`, `float4`, `float8`, `bytea`, `uuid`, `text`, `varchar`, `char`. An integer assigns to any numeric column, range-checked; a float to a float column; a float into an integer column is `42804`. A binary value with no declared type is `0A000`. |
+| Parameters in binary format | Partial | Decoded by the type declared at `Parse`: `bool`, `int2`, `int4`, `int8`, `float4`, `float8`, `bytea`, `uuid`, `text`, `varchar`, `char`, `date`, `timestamp`, `timestamptz`. An integer assigns to any numeric column, range-checked; a float to a float column; a float into an integer column is `42804`. A binary value with no declared type is `0A000`. |
 | Parameter type inference at `Parse` | Not&nbsp;yet | The server echoes the OIDs the client sent. |
 | Result columns in text format | Yes | |
-| Result columns in binary format | Not&nbsp;yet | |
+| Result columns in binary format | Yes | Every type a column is advertised as: the integers, floats and `bool`, `bytea`, the string types, `date`, `timestamp`, `timestamptz`, and `numeric` for `uint8`. A column advertised as `text` (`time`, `interval`, `uuid` today) sends its text in either format. One code for every column or one per column, as the protocol allows. |
 | Portal row limits (`Execute` with a row count) | Partial | A result within the limit completes; a larger one returns `PortalSuspended` after the limit, and the next `Execute` on that portal is `0A000`. Covers JDBC's one-row `Execute` for statements it expects no rows from. |
 | Empty query | Yes | `EmptyQueryResponse`, as in Postgres. |
 | TLS | Not&nbsp;yet | `SSLRequest` is answered with `N`; clients with `sslmode=prefer` or `disable` continue over plain TCP. |
@@ -35,6 +35,7 @@ A statement Egres recognises but does not run yet returns a Postgres error with 
 | `pg_catalog`, `information_schema` | Not&nbsp;yet | `psql`'s backslash commands (`\d`, `\dt`, `\l`) depend on them. |
 | `COPY` | Not&nbsp;yet | |
 | `LISTEN` / `NOTIFY` | Not&nbsp;yet | |
+| `DEALLOCATE name`, `DEALLOCATE ALL` | Yes | Drops the session's prepared statements, as the protocol's `Close` does; psycopg sends `DEALLOCATE ALL` after every `DROP`. |
 | Cursors, `PREPARE` as a statement | Not&nbsp;yet | |
 | `NoticeResponse` | Not&nbsp;yet | |
 
@@ -173,7 +174,7 @@ CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (column);
 | `smallint`, `integer`, `bigint` | Yes | |
 | `real`, `double precision` | Yes | |
 | `text`, `varchar`, `varchar(n)`, `char(n)` | Yes | Values are valid UTF-8 (`22021` otherwise); a value longer than `n` returns `22001`. |
-| `bytea` | Yes | |
+| `bytea` | Yes | Hex form in text, `'\x00ff'`, as `bytea_output = 'hex'`. |
 | `date`, `timestamp`, `timestamptz` | Yes | |
 | `time`, `interval`, `uuid` | Partial | The column can be declared and holds `NULL`. Writing a value into it or comparing against it: not yet (`0A000`). |
 | `time with time zone` | Not&nbsp;yet | |

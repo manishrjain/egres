@@ -79,6 +79,7 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
             tbl,
             projection,
             self.params,
+            self.result_formats,
         )) orelse return;
     }
 
@@ -225,11 +226,12 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
         tbl,
         sel.projection,
         self.params,
+        self.result_formats,
     )) orelse return;
     var emitter = RowEmitter{
         .state = state,
         .tbl = tbl,
-        .outs = proj.outs,
+        .proj = proj,
         .scratch = .init(tx.allocator),
         .limit = self.max_rows,
     };
@@ -347,6 +349,7 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
             tbl,
             projection,
             self.params,
+            self.result_formats,
         )) orelse return;
     }
 
@@ -448,6 +451,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
             tbl,
             projection,
             self.params,
+            self.result_formats,
         )) orelse return;
     }
 
@@ -944,9 +948,9 @@ fn evalSets(
 }
 
 /// Describe of a prepared `SELECT id, n FROM t` or `INSERT ... RETURNING
-/// id`, before any Execute: the RowDescription its Execute would send.
-/// The Table comes from the
-/// database's cache under the cache's shared lock: forgetTable
+/// id`, before any Execute: the RowDescription its Execute would send,
+/// each field in the format the portal asked for. The Table comes from
+/// the database's cache under the cache's shared lock: forgetTable
 /// destroys an entry only under the exclusive one, so the Table lives
 /// for as long as the hold, and no table lock or txn is needed — which
 /// matters, since every prepared SELECT sends a Describe. The names
@@ -1002,6 +1006,7 @@ pub fn describeRows(
         if (err == error.OutOfMemory) return err;
         return _expr.replyBindErr(state, arloc, err, null);
     };
+    if (!try applyFormats(state, proj.fields, self.result_formats)) return;
     try state.sendRowDescription(proj.fields);
 }
 
@@ -1031,6 +1036,7 @@ fn describeRowsLoad(
         tbl,
         projection,
         self.params,
+        self.result_formats,
     )) orelse return;
     try state.sendRowDescription(proj.fields);
 }
@@ -1043,42 +1049,58 @@ pub fn selectRow(
     state: *pgwire.ConnState,
     sr: _parse.SelectRow,
 ) !void {
-    if (self.mode == .simple) try describeSelectRow(state, sr);
+    var arena = fiber.ctx().newArena();
+    defer arena.deinit();
+    const arloc = arena.allocator();
+    const fields = try selectRowFields(arloc, sr);
+    if (!try applyFormats(state, fields, self.result_formats)) return;
+    if (self.mode == .simple) try state.sendRowDescription(fields);
     const emit = (sr.limit orelse 1) > 0;
     if (emit) {
         var dw = try state.beginDataRow(@intCast(sr.cells.len));
-        for (sr.cells) |cell| {
-            if (cell.value == .null_value) {
-                try dw.writeNull();
-                continue;
-            }
-            const w = try dw.beginColumn();
-            switch (cell.value) {
-                .int => |n| try w.print("{d}", .{n}),
-                .float, .str => |s| try w.writeAll(s),
-                .bool_ => |b| try w.writeAll(if (b) "t" else "f"),
+        for (sr.cells, fields) |cell, fd| {
+            // A float keeps the literal's text in text format, as
+            // Postgres echoes `SELECT 1.50`; binary needs the number.
+            const v: _value.Value = switch (cell.value) {
+                .null_value => .null_value,
+                .int => |n| .{ .int8 = n },
+                .float => |text| if (fd.format_code == 1)
+                    .{ .float8 = std.fmt.parseFloat(f64, text) catch 0 }
+                else
+                    .{ .text = text },
+                .str => |text| .{ .text = text },
+                .bool_ => |b| .{ .bool_ = b },
                 else => unreachable, // the parser keeps only constants
-            }
-            dw.endColumn();
+            };
+            try writeCell(&dw, fd.format_code, null, v);
         }
         try dw.finish();
     }
     try state.sendCommandComplete(if (emit) "SELECT 1" else "SELECT 0");
 }
 
-/// The RowDescription of a SELECT without FROM: each field named by
-/// its target and typed by its constant, the widest of its kind. An
-/// untyped NULL is text, as Postgres resolves it.
+/// Describe of a SELECT without FROM: its fields, in the portal's
+/// formats.
 pub fn describeSelectRow(
+    self: *Handler,
     state: *pgwire.ConnState,
     sr: _parse.SelectRow,
 ) !void {
     var arena = fiber.ctx().newArena();
     defer arena.deinit();
-    const fields = try arena.allocator().alloc(
-        pgwire.FieldDescription,
-        sr.cells.len,
-    );
+    const fields = try selectRowFields(arena.allocator(), sr);
+    if (!try applyFormats(state, fields, self.result_formats)) return;
+    try state.sendRowDescription(fields);
+}
+
+/// The fields of a SELECT without FROM: each named by its target and
+/// typed by its constant, the widest of its kind; an untyped NULL is
+/// text, as Postgres resolves it.
+fn selectRowFields(
+    arloc: std.mem.Allocator,
+    sr: _parse.SelectRow,
+) ![]pgwire.FieldDescription {
+    const fields = try arloc.alloc(pgwire.FieldDescription, sr.cells.len);
     for (sr.cells, fields) |cell, *fd| fd.* = .{
         .name = cell.name,
         .type_oid = switch (cell.value) {
@@ -1089,7 +1111,7 @@ pub fn describeSelectRow(
             else => unreachable, // the parser keeps only constants
         },
     };
-    try state.sendRowDescription(fields);
+    return fields;
 }
 
 /// What a statement that returns rows sends, SELECT's targets or a
@@ -1157,20 +1179,54 @@ fn projectionOf(
     return .{ .outs = outs.items, .fields = fields };
 }
 
-/// projectionOf with the reply: null = the bind error was sent.
-/// `select`'s RowEmitter takes the expressions.
+/// projectionOf with the reply and the portal's result formats
+/// applied: null = the error was sent. `select`'s RowEmitter takes
+/// the expressions.
 fn projectionOrReply(
     state: *pgwire.ConnState,
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
     projection: _parse.Projection,
     params: _parse.Params,
+    formats: []const i16,
 ) !?Outputs {
-    return projectionOf(arloc, tbl, projection, params) catch |err| {
+    const proj = projectionOf(arloc, tbl, projection, params) catch |err| {
         if (err == error.OutOfMemory) return err;
         try _expr.replyBindErr(state, arloc, err, null);
         return null;
     };
+    if (!try applyFormats(state, proj.fields, formats)) return null;
+    return proj;
+}
+
+/// Bind's result formats onto the fields, as the protocol reads them:
+/// none is all text, one applies to every column, else one per
+/// column, and any other count is 08P01. false = replied.
+fn applyFormats(
+    state: *pgwire.ConnState,
+    fields: []pgwire.FieldDescription,
+    formats: []const i16,
+) !bool {
+    if (formats.len == 0) return true;
+    if (formats.len == 1) {
+        for (fields) |*fd| fd.format_code = formats[0];
+        return true;
+    }
+    if (formats.len != fields.len) {
+        var buf: [128]u8 = undefined;
+        try replyErrorCode(
+            state,
+            pgwire.sqlstate.protocol_violation,
+            std.fmt.bufPrint(
+                &buf,
+                "bind message has {d} result formats but query has {d} columns",
+                .{ formats.len, fields.len },
+            ) catch unreachable,
+        );
+        return false;
+    }
+    for (fields, formats) |*fd, format| fd.format_code = format;
+    return true;
 }
 
 fn replyUndefinedColumn(state: *pgwire.ConnState) !void {
@@ -1198,7 +1254,7 @@ fn sendReturning(
     var emitter = RowEmitter{
         .state = state,
         .tbl = tbl,
-        .outs = proj.outs,
+        .proj = proj,
         .scratch = .init(tx.allocator),
         .limit = self.max_rows,
     };
@@ -1239,8 +1295,9 @@ fn replyEmitErr(state: *pgwire.ConnState, err: anyerror) !void {
 pub const RowEmitter = struct {
     state: *pgwire.ConnState,
     tbl: *const _table.Table,
-    /// The projection — egid is a column too (table.egid_column).
-    outs: []const *const Node,
+    /// The projection, each output with the format it goes out in;
+    /// egid is a column too (table.egid_column).
+    proj: Outputs,
     /// What a computed target needs for one row; reset per row.
     scratch: std.heap.ArenaAllocator,
     count: u64 = 0,
@@ -1255,6 +1312,7 @@ pub const RowEmitter = struct {
     /// Project and send one row. A bare column is decoded on its own
     /// (O(1), Table.read, no full-row decode) and printed with its
     /// column's padding; any other target is computed into `scratch`.
+    /// Each cell goes out in its field's format, text or binary.
     pub fn emit(self: *RowEmitter, item: zdb.kv.Item) !void {
         _ = self.scratch.reset(.retain_capacity);
         const row: _expr.Row = .{
@@ -1262,8 +1320,8 @@ pub const RowEmitter = struct {
             .tbl = self.tbl,
             .item = item,
         };
-        var dw = try self.state.beginDataRow(@intCast(self.outs.len));
-        for (self.outs) |node| {
+        var dw = try self.state.beginDataRow(@intCast(self.proj.outs.len));
+        for (self.proj.outs, self.proj.fields) |node, fd| {
             const col: ?*const _table.Column = switch (node.*) {
                 .column => |c| c,
                 else => null,
@@ -1272,12 +1330,7 @@ pub const RowEmitter = struct {
                 self.tbl.parseCol(item, c)
             else
                 try node.cell(row);
-            if (v == .null_value) {
-                try dw.writeNull();
-            } else {
-                try _value.valueToText(try dw.beginColumn(), col, v);
-                dw.endColumn();
-            }
+            try writeCell(&dw, fd.format_code, col, v);
         }
         try dw.finish();
         self.count += 1;
@@ -1286,13 +1339,30 @@ pub const RowEmitter = struct {
     /// count(*)'s one output row: the int8 cell.
     pub fn emitCount(self: *RowEmitter, count: u64) !void {
         var dw = try self.state.beginDataRow(1);
-        const w = try dw.beginColumn();
-        try _value.valueToText(w, null, .{ .int8 = @intCast(count) });
-        dw.endColumn();
+        const v: _value.Value = .{ .int8 = @intCast(count) };
+        try writeCell(&dw, self.proj.fields[0].format_code, null, v);
         try dw.finish();
         self.count += 1;
     }
 };
+
+/// One DataRow column: NULL out of band, else the cell in the field's
+/// format, 0 text or 1 binary (applyFormats admits no other code).
+fn writeCell(
+    dw: *pgwire.proto.DataRowWriter,
+    format: i16,
+    col: ?*const _table.Column,
+    v: _value.Value,
+) !void {
+    if (v == .null_value) return dw.writeNull();
+    const w = try dw.beginColumn();
+    if (format == 1) {
+        try _value.valueToBinary(w, col, v);
+    } else {
+        try _value.valueToText(w, col, v);
+    }
+    dw.endColumn();
+}
 
 /// Advance a writer's read_ts to every built unique index's
 /// `valid_ts`, so its uniqueness probes see everything the build

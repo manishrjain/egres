@@ -64,21 +64,21 @@ test "sql.value: Type.fromName resolves DDL type names" {
 
 test "sql.value: textToValue reads literals and rejects unsupported types" {
     const toValue = value.textToValue;
-    try testing.expectEqual(@as(i32, -7), (try toValue(.int4, "-7")).int4);
-    try testing.expectEqual(@as(u64, 42), (try toValue(.uint8, "42")).uint8);
-    try testing.expectEqual(true, (try toValue(.bool_, "t")).bool_);
-    try testing.expectEqual(false, (try toValue(.bool_, "FALSE")).bool_);
+    try testing.expectEqual(@as(i32, -7), (try toValue(testing.allocator, .int4, "-7")).int4);
+    try testing.expectEqual(@as(u64, 42), (try toValue(testing.allocator, .uint8, "42")).uint8);
+    try testing.expectEqual(true, (try toValue(testing.allocator, .bool_, "t")).bool_);
+    try testing.expectEqual(false, (try toValue(testing.allocator, .bool_, "FALSE")).bool_);
     try testing.expectEqual(
         @as(f64, 1.5),
-        (try toValue(.float8, "1.5")).float8,
+        (try toValue(testing.allocator, .float8, "1.5")).float8,
     );
-    try testing.expectEqualStrings("hi", (try toValue(.text, "hi")).text);
+    try testing.expectEqualStrings("hi", (try toValue(testing.allocator, .text, "hi")).text);
     // Bad numeric / bool → error (executor maps to 22P02).
-    try testing.expectError(error.InvalidCharacter, toValue(.int4, "nope"));
-    try testing.expectError(error.InvalidBool, toValue(.bool_, "maybe"));
+    try testing.expectError(error.InvalidCharacter, toValue(testing.allocator, .int4, "nope"));
+    try testing.expectError(error.InvalidBool, toValue(testing.allocator, .bool_, "maybe"));
     // Types this slice can't parse.
-    try testing.expectError(error.UnsupportedType, toValue(.time, "10:00"));
-    try testing.expectError(error.UnsupportedType, toValue(.uuid, "x"));
+    try testing.expectError(error.UnsupportedType, toValue(testing.allocator, .time, "10:00"));
+    try testing.expectError(error.UnsupportedType, toValue(testing.allocator, .uuid, "x"));
 }
 
 test "sql.value: timestamps parse from and format to Postgres text" {
@@ -103,7 +103,7 @@ test "sql.value: timestamps parse from and format to Postgres text" {
     };
     for (cases) |c| {
         try testing.expectEqual(c.us, try date.parseTimestamp(c.text, false));
-        const cell = try value.textToValue(.timestamp, c.text);
+        const cell = try value.textToValue(testing.allocator, .timestamp, c.text);
         try testing.expectEqual(c.us, cell.timestamp);
     }
     // A zone offset shifts a timestamptz to UTC; a plain timestamp
@@ -123,7 +123,7 @@ test "sql.value: timestamps parse from and format to Postgres text" {
         sep12 + two_hours,
         try date.parseTimestamp(noon_plus2, false),
     );
-    const tz_cell = try value.textToValue(.timestamptz, noon_plus2);
+    const tz_cell = try value.textToValue(testing.allocator, .timestamptz, noon_plus2);
     try testing.expectEqual(sep12, tz_cell.timestamptz);
 
     const bad = [_]String{
@@ -288,7 +288,7 @@ test "sql.value: string types share cells, OIDs and modifiers differ" {
     try testing.expectEqual(Type.bpchar, Type.fromName("bpchar").?);
     try testing.expectEqual(Type.bpchar, Type.fromName("char").?);
     try testing.expectEqual(Type.text, Type.fromName("varchar").?);
-    const v = try value.textToValue(.bpchar, "abc");
+    const v = try value.textToValue(testing.allocator, .bpchar, "abc");
     try testing.expectEqualStrings("abc", v.text);
 }
 
@@ -309,7 +309,7 @@ test "sql.value: date parses and prints as YYYY-MM-DD" {
     try testing.expectError(error.InvalidTimestamp, date.parseDate("1996/03/13"));
     try testing.expectError(error.InvalidTimestamp, date.parseDate(""));
 
-    const v = try value.textToValue(.date, "1996-03-13");
+    const v = try value.textToValue(testing.allocator, .date, "1996-03-13");
     try testing.expectEqual(@as(i32, 9568), v.date);
     try testing.expectEqual(pgwire.oid.date, value.pgTypeOid(.date));
 
@@ -320,4 +320,71 @@ test "sql.value: date parses and prints as YYYY-MM-DD" {
         try value.valueToText(&w, null, .{ .date = try date.parseDate(text) });
         try testing.expectEqualStrings(text, w.buffered());
     }
+}
+
+test "sql.value: valueToBinary is the advertised type's wire format" {
+    const Case = struct { v: value.Value, bytes: []const u8 };
+    const cases = [_]Case{
+        .{ .v = .{ .bool_ = true }, .bytes = &.{1} },
+        .{ .v = .{ .int2 = -2 }, .bytes = &.{ 0xFF, 0xFE } },
+        .{ .v = .{ .int4 = 101 }, .bytes = &.{ 0, 0, 0, 0x65 } },
+        .{ .v = .{ .int8 = 1 }, .bytes = &.{ 0, 0, 0, 0, 0, 0, 0, 1 } },
+        // An unsigned widens to the type its OID promises.
+        .{ .v = .{ .uint2 = 65535 }, .bytes = &.{ 0, 0, 0xFF, 0xFF } },
+        .{ .v = .{ .uint4 = 1 }, .bytes = &.{ 0, 0, 0, 0, 0, 0, 0, 1 } },
+        // uint8 travels as a numeric: one digit at weight 0.
+        .{ .v = .{ .uint8 = 7 }, .bytes = &.{ 0, 1, 0, 0, 0, 0, 0, 0, 0, 7 } },
+        .{ .v = .{ .float4 = 1.5 }, .bytes = &.{ 0x3F, 0xC0, 0, 0 } },
+        .{ .v = .{ .float8 = -0.0 }, .bytes = &.{ 0x80, 0, 0, 0, 0, 0, 0, 0 } },
+        // The 2000 epoch: that day is 0, the Unix epoch 10957 days before.
+        .{ .v = .{ .date = 10957 }, .bytes = &.{ 0, 0, 0, 0 } },
+        .{ .v = .{ .date = 0 }, .bytes = &.{ 0xFF, 0xFF, 0xD5, 0x33 } },
+        .{
+            .v = .{ .timestamp = pgwire.types.pg_epoch_unix_us + 1 },
+            .bytes = &.{ 0, 0, 0, 0, 0, 0, 0, 1 },
+        },
+        .{ .v = .{ .text = "hé" }, .bytes = "hé" },
+        .{ .v = .{ .bytea = &.{ 0, 1 } }, .bytes = &.{ 0, 1 } },
+    };
+    for (cases) |case| {
+        var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer aw.deinit();
+        try value.valueToBinary(&aw.writer, null, case.v);
+        try testing.expectEqualSlices(u8, case.bytes, aw.written());
+    }
+
+    // A char(n) is padded in binary as in text.
+    var col = sql.table.Column{
+        .column_id = 1,
+        .pos = 0,
+        .name = "c",
+        .ty = .bpchar,
+        .pkey_position = null,
+        .type_mod = 3,
+    };
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try value.valueToBinary(&aw.writer, &col, .{ .text = "a" });
+    try testing.expectEqualStrings("a  ", aw.written());
+}
+
+test "sql.value: bytea is hex in text, raw in binary" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = try value.textToValue(a, .bytea, "\\x00ff");
+    try testing.expectEqualSlices(u8, &.{ 0, 0xFF }, v.bytea);
+    // The escape form without escapes: the bytes as they are.
+    const plain = try value.textToValue(a, .bytea, "ab");
+    try testing.expectEqualStrings("ab", plain.bytea);
+    try testing.expectError(error.InvalidBytea, value.textToValue(a, .bytea, "\\x0"));
+    try testing.expectError(error.InvalidBytea, value.textToValue(a, .bytea, "\\xzz"));
+
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try value.valueToText(&aw.writer, null, .{ .bytea = &.{ 0, 0xFF } });
+    try testing.expectEqualStrings("\\x00ff", aw.written());
+    aw.clearRetainingCapacity();
+    try value.valueToBinary(&aw.writer, null, .{ .bytea = &.{ 0, 0xFF } });
+    try testing.expectEqualSlices(u8, &.{ 0, 0xFF }, aw.written());
 }

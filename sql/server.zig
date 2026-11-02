@@ -374,6 +374,10 @@ pub const Handler = struct {
     /// Execute's row limit for the statement in flight; 0 = every
     /// row, always so for a simple query.
     max_rows: u32 = 0,
+    /// The portal's result formats for the Execute or Describe in
+    /// progress: empty = all text, one code = every column, else one
+    /// per column (dml.applyFormats).
+    result_formats: []const i16 = &.{},
     /// Parsed statements by SQL text, for the extended protocol: a
     /// prepared statement is parsed once per session, and the
     /// unnamed statement re-sent with the same text hits the same
@@ -519,6 +523,26 @@ pub const Handler = struct {
             },
             .sync, .flush, .terminate => {},
         }
+    }
+
+    /// DEALLOCATE ALL, which psycopg sends after any DROP to flush its
+    /// prepared statements, or DEALLOCATE name. Postgres's tag for both
+    /// is DEALLOCATE; an unknown name is 26000.
+    fn deallocate(
+        self: *Handler,
+        state: *pgwire.ConnState,
+        name: ?String,
+    ) !void {
+        _ = self;
+        if (name) |n| if (!state.hasStatement(n)) {
+            return replyErrorCode(
+                state,
+                pgwire.sqlstate.invalid_sql_statement_name,
+                "prepared statement does not exist",
+            );
+        };
+        state.deallocate(name);
+        try state.sendCommandComplete("DEALLOCATE");
     }
 
     /// The session's row batch, made on first use.
@@ -771,9 +795,11 @@ pub const Handler = struct {
             .oids = ctx.param_oids,
         };
         self.max_rows = ctx.max_rows;
+        self.result_formats = ctx.result_formats;
         defer {
             self.params = .{};
             self.max_rows = 0;
+            self.result_formats = &.{};
         }
 
         state.error_sent = false;
@@ -782,13 +808,6 @@ pub const Handler = struct {
             state.ext_failed = true;
         };
 
-        for (ctx.result_formats) |format| if (format != 0) {
-            return replyErrorCode(
-                state,
-                pgwire.sqlstate.feature_not_supported,
-                "binary result format is not supported",
-            );
-        };
         if (isEmptyQuery(ctx.sql)) return state.sendEmptyQueryResponse();
 
         const stmt = (try self.cachedStatement(ctx.sql)) orelse
@@ -796,14 +815,13 @@ pub const Handler = struct {
         fiber.ctx().record("bound {d} params", .{ctx.params.len});
         const needed = stmt.paramCount();
         if (needed != ctx.params.len) {
-            var arena = fiber.ctx().newArena();
-            defer arena.deinit();
-            const msg = try std.fmt.allocPrint(
-                arena.allocator(),
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &buf,
                 "bind message supplies {d} parameters, " ++
                     "but prepared statement requires {d}",
                 .{ ctx.params.len, needed },
-            );
+            ) catch unreachable;
             return replyErrorCode(
                 state,
                 pgwire.sqlstate.protocol_violation,
@@ -830,7 +848,11 @@ pub const Handler = struct {
             .values = ctx.params,
             .formats = ctx.param_formats,
         };
-        defer self.params = .{};
+        self.result_formats = ctx.result_formats;
+        defer {
+            self.params = .{};
+            self.result_formats = &.{};
+        }
         state.error_sent = false;
         defer self.failBlockOnError(state);
         defer if (state.error_sent) {
@@ -862,7 +884,7 @@ pub const Handler = struct {
                 try _dml.describeRows(self, state, del.table, p)
             else
                 try state.sendNoData(),
-            .select_row => |sr| try _dml.describeSelectRow(state, sr),
+            .select_row => |sr| try _dml.describeSelectRow(self, state, sr),
             .show_var => |show| try describeShow(state, show),
             else => try state.sendNoData(),
         }
@@ -918,6 +940,7 @@ pub const Handler = struct {
             .rollback_to => |name| try self.rollbackToStmt(state, name),
             .set_var => try state.sendCommandComplete("SET"),
             .reset_var => try state.sendCommandComplete("RESET"),
+            .deallocate => |name| try self.deallocate(state, name),
             .show_var => |show| try self.showVar(state, show),
             .invalid => |msg| try replyErrorCode(state, pgwire.sqlstate.feature_not_supported, msg),
             .unsupported => try replyError(state, "unsupported statement"),
