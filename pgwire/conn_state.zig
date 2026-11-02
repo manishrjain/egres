@@ -114,6 +114,9 @@ pub const DescribeCtx = struct {
     /// RowDescription reports the code each column will use. Empty
     /// for statement kind.
     result_formats: []const i16 = &.{},
+    /// The types Parse declared, by position, 0 for unspecified: a
+    /// statement's Describe has no values and types a `$n` by these.
+    param_oids: []const u32 = &.{},
 };
 
 pub const Event = union(enum) {
@@ -781,6 +784,7 @@ pub const ConnState = struct {
                     .kind = .statement,
                     .sql = stmt.sql,
                     .params = &.{},
+                    .param_oids = stmt.param_oids,
                 } };
             },
             .portal => {
@@ -804,6 +808,7 @@ pub const ConnState = struct {
                     .params = @ptrCast(portal.params),
                     .param_formats = portal.param_formats,
                     .result_formats = portal.result_formats,
+                    .param_oids = stmt.param_oids,
                 } };
             },
         }

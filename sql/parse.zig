@@ -947,6 +947,19 @@ pub const Params = struct {
         return .{ .text = bytes };
     }
 
+    /// Whether Bind supplied `$index`: false before Bind, when a
+    /// statement's Describe binds `SELECT n + $1 FROM t` by type alone.
+    pub fn bound(self: Params, index: u16) bool {
+        return index >= 1 and index <= self.values.len;
+    }
+
+    /// The type Parse declared for `$index`, null when it declared none
+    /// or one with no cell here (value.typeFromOid).
+    pub fn declared(self: Params, index: u16) ?_value.Type {
+        if (index == 0 or index > self.oids.len) return null;
+        return _value.typeFromOid(self.oids[index - 1]);
+    }
+
     fn isBinary(self: Params, index: u16) bool {
         return index <= self.formats.len and self.formats[index - 1] == 1;
     }

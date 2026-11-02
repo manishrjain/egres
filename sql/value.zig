@@ -567,6 +567,29 @@ pub fn pgTypeOid(ty: Type) pgwire.Oid {
     };
 }
 
+/// pgTypeOid's inverse, for the type a client declared in Parse: null
+/// for an OID with no cell here (json, an array), as for 0.
+pub fn typeFromOid(oid: pgwire.Oid) ?Type {
+    return switch (oid) {
+        pgwire.oid.bool_ => .bool_,
+        pgwire.oid.int2 => .int2,
+        pgwire.oid.int4 => .int4,
+        pgwire.oid.int8 => .int8,
+        pgwire.oid.float4 => .float4,
+        pgwire.oid.float8 => .float8,
+        pgwire.oid.numeric => .numeric,
+        pgwire.oid.timestamp => .timestamp,
+        pgwire.oid.timestamptz => .timestamptz,
+        pgwire.oid.date => .date,
+        pgwire.oid.bpchar => .bpchar,
+        pgwire.oid.varchar => .varchar,
+        pgwire.oid.bytea => .bytea,
+        pgwire.oid.uuid => .uuid,
+        pgwire.oid.text => .text,
+        else => null,
+    };
+}
+
 /// The RowDescription type modifier for a column: Postgres reports a
 /// `char(n)` / `varchar(n)` length as n plus its 4-byte varlena header
 /// (VARHDRSZ), and -1 for every type without a modifier.

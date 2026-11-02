@@ -130,6 +130,42 @@ def main(dsn):
     check("binary: numeric arithmetic", bin_.fetchone(), (Decimal("0.963"),))
     text.execute("DROP TABLE nb")
 
+    # --- a statement's Describe: Parse + Describe with no Bind ---------
+    # A $n in a target has no value yet, only the type Parse declared:
+    # psycopg's pgconn sends the two messages as libpq's PQprepare and
+    # PQdescribePrepared do, and the result carries the row's OIDs and
+    # the parameter OIDs. Those echo Parse: none declared is none
+    # listed, where Postgres would infer them.
+    def describe(sql, param_types=None):
+        name = b"d"
+        res = conn.pgconn.prepare(name, sql.encode(), param_types)
+        if res.status != psycopg.pq.ExecStatus.COMMAND_OK:
+            return res.error_message.decode()
+        res = conn.pgconn.describe_prepared(name)
+        if res.status != psycopg.pq.ExecStatus.COMMAND_OK:
+            return res.error_message.decode()
+        fields = [(res.fname(i).decode(), res.ftype(i))
+                  for i in range(res.nfields)]
+        params = [res.param_type(i) for i in range(res.nparams)]
+        text.execute("DEALLOCATE d")
+        return fields, params
+
+    TEXT, INT4, INT8, NUMERIC = 25, 23, 20, 1700
+    check("describe: an undeclared $1 under || is text",
+          describe("SELECT t || $1 AS c FROM bt"), ([("c", TEXT)], []))
+    check("describe: an undeclared $1 under + takes the column's type",
+          describe("SELECT i8 + $1 AS m FROM bt"), ([("m", INT8)], []))
+    check("describe: a bare undeclared $1 is text",
+          describe("SELECT $1 AS p FROM bt"), ([("p", TEXT)], []))
+    check("describe: a bare $1 declared int4 is int4, and echoed",
+          describe("SELECT $1 AS p FROM bt", [INT4]), ([("p", INT4)], [INT4]))
+    check("describe: i8 * $1 declared numeric is numeric",
+          describe("SELECT i8 * $1 AS m FROM bt", [NUMERIC]),
+          ([("m", NUMERIC)], [NUMERIC]))
+    check("describe: RETURNING with a $n",
+          describe("INSERT INTO bt (id) VALUES ($1) RETURNING id, t || $2"),
+          ([("id", INT4), ("?column?", TEXT)], []))
+
     text.execute("DROP TABLE bt")
     conn.close()
 

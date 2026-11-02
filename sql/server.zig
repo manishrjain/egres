@@ -843,10 +843,12 @@ pub const Handler = struct {
     ) !void {
         // A portal's Describe carries its Bind values: a `$n` in a
         // SELECT target or a RETURNING list binds as Execute will bind
-        // it. A statement's Describe has none yet.
+        // it. A statement's Describe has none yet, only the types
+        // Parse declared: `SELECT n + $1 FROM t` describes by those.
         self.params = .{
             .values = ctx.params,
             .formats = ctx.param_formats,
+            .oids = ctx.param_oids,
         };
         self.result_formats = ctx.result_formats;
         defer {

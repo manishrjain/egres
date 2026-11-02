@@ -53,6 +53,11 @@ pub const Row = struct {
 pub const Node = union(enum) {
     value: Value,
     column: *const Column,
+    /// A `$n` bound before Bind, `SELECT n + $1 FROM t` under a
+    /// statement's Describe: the type Parse declared, null when it
+    /// declared none (resolved by its context, as a NULL leaf is).
+    /// Describe reads only types; Execute binds anew with values.
+    param: ?Type,
     binop: BinOp,
     call: CallNode,
 
@@ -77,6 +82,7 @@ pub const Node = union(enum) {
         return switch (self.*) {
             .value => |v| v.ty(),
             .column => |col| col.ty,
+            .param => |t| t,
             .binop => |b| b.ty,
             .call => |call| call.ty,
         };
@@ -96,6 +102,7 @@ pub const Node = union(enum) {
         switch (self.*) {
             .value => |v| return v,
             .column => |col| return row.tbl.parseCol(row.item, col),
+            .param => unreachable, // Describe's tree is never evaluated
             .binop, .call => {},
         }
         const s = try self.scalar(row) orelse return .null_value;
@@ -125,6 +132,7 @@ pub const Node = union(enum) {
             .value => |v| if (v == .null_value or v.ty() == col.ty) return v,
             .column => |scol| if (scol.ty == col.ty and scol.type_mod == col.type_mod)
                 return row.tbl.parseCol(row.item, scol),
+            .param => unreachable, // Describe's tree is never evaluated
             .binop, .call => {},
         }
         const result = try self.scalar(row) orelse return .null_value;
@@ -137,6 +145,7 @@ pub const Node = union(enum) {
         switch (self.*) {
             .value => |v| return scalarOf(v),
             .column => |col| return scalarOf(row.tbl.parseCol(row.item, col)),
+            .param => unreachable, // Describe's tree is never evaluated
             .binop => |b| {
                 // Both sides first, then the NULL check: PG raises on
                 // `NULL + 1/0` too.
@@ -196,9 +205,13 @@ pub fn bind(
 ) BindError!*const Node {
     const node = try arloc.create(Node);
     switch (expr) {
-        .literal => |lit| node.* = .{
-            .value = try literalValue(arloc, lit, target, params),
-        },
+        // `SELECT n + $1 FROM t` under a statement's Describe: no
+        // value for $1 yet, so the leaf is the type Parse declared.
+        .literal => |lit| node.* = if (lit == .param and
+            !params.bound(lit.param))
+            .{ .param = params.declared(lit.param) }
+        else
+            .{ .value = try literalValue(arloc, lit, target, params) },
         .column => |name| node.* = .{
             .column = tbl.column(name) orelse return error.UndefinedColumn,
         },

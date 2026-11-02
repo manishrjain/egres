@@ -20,7 +20,7 @@ A statement Egres recognises but does not run yet returns a Postgres error with 
 | Feature | Status | Notes |
 |---|---|---|
 | Simple query protocol | Yes | One statement per message. A message with several statements separated by `;` runs the first one only. |
-| Extended query protocol (`Parse`, `Bind`, `Describe`, `Execute`, `Close`, `Sync`, `Flush`) | Yes | Each session caches its parsed statements by SQL text. |
+| Extended query protocol (`Parse`, `Bind`, `Describe`, `Execute`, `Close`, `Sync`, `Flush`) | Yes | Each session caches its parsed statements by SQL text. A statement's `Describe` types a `$n` in a target by what `Parse` declared; undeclared, it takes its operand's type, or text on its own. `ParameterDescription` echoes the declared types and infers none. |
 | `$1`-style parameters | Yes | In `WHERE`, `SET` and `VALUES`, up to `$65535`. |
 | Parameters in text format | Yes | Any column type. |
 | Parameters in binary format | Partial | Decoded by the type declared at `Parse`: `bool`, `int2`, `int4`, `int8`, `float4`, `float8`, `bytea`, `uuid`, `text`, `varchar`, `char`, `date`, `timestamp`, `timestamptz`. An integer assigns to any numeric column, range-checked; a float to a float column; a float into an integer column is `42804`. A binary value with no declared type is `0A000`. |

@@ -11,6 +11,7 @@ const zdb = @import("zdb");
 const expr = sql.expr;
 const Node = expr.Node;
 const Value = sql.value.Value;
+const Type = sql.value.Type;
 const Item = zdb.kv.Item;
 
 /// (a int4, b text, c float8, d int2, e int8, f float4) assembled by
@@ -335,6 +336,17 @@ test "sql.expr: bind — a $n is typed by its column, or by its text" {
         error.UnsupportedValue,
         fx.bindWith("a = a + $2", binary),
     );
+
+    // Before Bind, as a statement's Describe binds: the declared type
+    // with no value, and none declared is resolved by the operator,
+    // as a NULL is.
+    const declared = sql.parse.Params{ .oids = &.{pgwire.oid.int4} };
+    const desc = try fx.bindWith("a = a + $1", declared);
+    try testing.expectEqual(@as(?Type, .int4), desc.root.binop.rhs.param);
+    try testing.expectEqual(@as(?Type, .int8), desc.root.binop.ty);
+    const unknown = try fx.bindWith("b = b || $2", declared);
+    try testing.expectEqual(@as(?Type, null), unknown.root.binop.rhs.param);
+    try testing.expectEqual(@as(?Type, .text), unknown.root.binop.ty);
 }
 
 test "sql.expr: CONCAT renders and skips NULL, COALESCE takes the first value" {
