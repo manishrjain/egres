@@ -54,7 +54,6 @@ const Fixture = struct {
         const db = try self.forest.buildNsCreate(
             self.arena.allocator(),
             .{ .given = ns },
-            "",
         );
         try self.forest.applyTrees(1, db.change);
         const sys = zdb.manifest.system_namespace_trees;

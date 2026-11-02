@@ -140,7 +140,6 @@ const ApplyFixture = struct {
         const created = try self.forest.buildNsCreate(
             self.arena.allocator(),
             .{ .given = ns },
-            "",
         );
         try self.apply(2, 20, created.change);
     }
@@ -304,7 +303,7 @@ const ApplyFixture = struct {
             zdb.manifest.TreeChange,
             1,
         );
-        changes[0] = zdb.manifest.newTableChange("", .rows);
+        changes[0] = zdb.manifest.newTableChange(.rows);
         const created = try self.forest.buildTables(
             self.arena.allocator(),
             ns,
@@ -486,6 +485,38 @@ test "ddl rows: a snapshot of the manifest keeps the tree, not the rows" {
     try testing.expect(parsed.ManifestChange.rows() == null);
 }
 
+test "startup: a database without the system namespace is refused" {
+    var fx: ApplyFixture = undefined;
+    try fx.setup(0);
+    defer fx.teardown();
+    const check = engine.Engine.checkSystemNamespace;
+    const a = fx.arena.allocator();
+
+    // No database yet: a fresh node, or one still catching up.
+    try check(fx.forest);
+
+    // A database and no system namespace: an older build wrote it.
+    const db = try fx.forest.buildNsCreate(a, .next);
+    try fx.apply(3, 30, db.change);
+    try testing.expectError(error.OldDataDirectory, check(fx.forest));
+
+    // Genesis's namespace 1, with only its names tree.
+    var trees = [_]zdb.manifest.TreeChange{zdb.manifest.createTreeChange(
+        zdb.kv.makeTreeId(zdb.manifest.names_table_id, 0),
+        zdb.manifest.system_namespace,
+        "",
+        "",
+        .posting_index,
+    )};
+    try fx.apply(4, 40, .{
+        .cmd = .create_ns,
+        .tree_changes = &trees,
+        .sstable_changes = &.{},
+        .memtable_id = 0,
+    });
+    try check(fx.forest);
+}
+
 test "branch: a restart keeps the rows a namespace branch copied" {
     var fx: ApplyFixture = undefined;
     try fx.setup(0);
@@ -512,11 +543,7 @@ test "branch: a restart keeps the rows a namespace branch copied" {
 
     // 8: CREATE DATABASE ... TEMPLATE: the row is copied from frozen
     // memtable 4 into memtable 7, under the new namespace.
-    const branched = try fx.forest.buildNsBranch(
-        fx.arena.allocator(),
-        ns,
-        "",
-    );
+    const branched = try fx.forest.buildNsBranch(fx.arena.allocator(), ns);
     try fx.apply(8, 80, branched.change);
     const copy: zdb.kv.TableKey = .{
         .namespace = branched.namespace,

@@ -169,7 +169,6 @@ pub fn createIndex(
         );
 
     var changes = [_]zdb.manifest.TreeChange{zdb.manifest.newTableChange(
-        name,
         if (ci.unique) .unique_index else .posting_index,
     )};
     const created = eng.forest.buildTables(
@@ -177,16 +176,9 @@ pub fn createIndex(
         ns,
         &changes,
         .create_tree,
-    ) catch |err| switch (err) {
-        error.NameExists => return replyErrorCode(
-            state,
-            pgwire.sqlstate.duplicate_table,
-            "index already exists",
-        ),
-        else => {
-            logCreateIndexErr(name, "create tree", err);
-            return replyError(state, "create index failed");
-        },
+    ) catch |err| {
+        logCreateIndexErr(name, "create tree", err);
+        return replyError(state, "create index failed");
     };
     const index_tid = created.table_ids[0];
     const db = try self.srv.database(ns);

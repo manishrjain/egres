@@ -88,19 +88,18 @@ pub const NsResult = struct {
 /// buildNsCreate is Phase A of the Raft-replicated namespace create:
 /// returns a ManifestChange with one TreeChange per system table
 /// (manifest.namespace_system_table_ids) — the namespace's default
-/// (raw-KV) table (table_id 0, tree_id 0, carrying the namespace's `name`:
-/// a SQL database name; empty for unnamed namespaces) and its SQL
-/// catalogs — all with an infinite range (empty left+right). No state
-/// mutates, so a failed propose costs nothing. Caller owns the returned
-/// slice; `name` must outlive the change (it is marshalled at propose).
+/// (raw-KV) table, its SQL catalogs and its names table — all with an
+/// infinite range (empty left+right). No state mutates beyond the id
+/// reservation, so a failed propose costs nothing. Caller owns the
+/// returned slice. The database's name, if it has one, is a row the
+/// caller adds (the SQL layer's).
 ///
 /// Errors with `NamespaceAlreadyExists` if a given id's default table
-/// already exists, `NameExists` if another namespace holds `name`.
+/// already exists.
 pub fn buildNsCreate(
     self: *Forest,
     alloc: std.mem.Allocator,
     id: NsId,
-    name: String,
 ) !NsResult {
     const namespace_id = switch (id) {
         .next => self.manifest.nextNamespace(),
@@ -111,7 +110,6 @@ pub fn buildNsCreate(
     // misses it; genesis made it, and nothing creates it again.
     if (namespace_id == _manifest.system_namespace or
         self.hasNamespace(namespace_id)) return error.NamespaceAlreadyExists;
-    if (self.manifest.lookupNamespace(name)) |_| return error.NameExists;
 
     // One tree per system table: the default (raw-KV) table plus the SQL
     // catalogs, born with the namespace — catalog rows must never race
@@ -129,9 +127,6 @@ pub fn buildNsCreate(
             "",
             .posting_index,
         );
-    // table_id 0 carries the namespace's name.
-    tree_changes[0].name = @constCast(name);
-
     return .{
         .namespace = namespace_id,
         .change = .{
@@ -144,8 +139,8 @@ pub fn buildNsCreate(
 }
 
 /// applyTrees is Phase B of create_ns, create_tree, drop_ns and
-/// drop_tree. The manifest apply does what the command means (records
-/// names, advances or forgets counters, retires files whose last
+/// drop_tree. The manifest apply does what the command means (advances
+/// or forgets counters, retires files whose last
 /// listing a drop removes); then each created tree the forest lacks is
 /// installed and each deleted one torn down. Idempotent, per tree: a
 /// re-apply finds the creates present and the deletes gone. Called on
@@ -193,20 +188,17 @@ fn dropTree(self: *Forest, tc: _manifest.TreeChange) void {
 /// branch_ns change naming the source. The copy itself is derived at
 /// apply (Manifest.applyBranch), so nothing here goes stale between
 /// propose and apply. Errors `NamespaceNotFound` for a source that
-/// does not exist and `NameExists` for a taken name. Caller owns
-/// `change.tree_changes`; `name` must outlive the change.
+/// does not exist. Caller owns `change.tree_changes`.
 pub fn buildNsBranch(
     self: *Forest,
     alloc: std.mem.Allocator,
     source: u64,
-    name: String,
 ) !NsResult {
     if (!self.hasNamespace(source)) return error.NamespaceNotFound;
-    if (self.manifest.lookupNamespace(name)) |_| return error.NameExists;
 
     const namespace = self.manifest.nextNamespace();
-    // A carrier for the target's id and name: the branch's trees take
-    // the source's kinds (Manifest.applyBranch).
+    // A carrier for the target's id: the branch's trees take the
+    // source's kinds (Manifest.applyBranch).
     const tree_changes = try alloc.alloc(_manifest.TreeChange, 1);
     tree_changes[0] = _manifest.createTreeChange(
         makeTreeId(0, 0),
@@ -215,7 +207,6 @@ pub fn buildNsBranch(
         "",
         .none,
     );
-    tree_changes[0].name = @constCast(name);
     return .{
         .namespace = namespace,
         .change = .{
@@ -315,20 +306,15 @@ pub fn applyTableBranch(
 /// create_tree) and of CREATE TABLE AS TABLE (branch_table): N sibling
 /// tables in ONE change — a SQL table plus its index tables, so they
 /// commit atomically. `changes` are the caller's
-/// (`manifest.newTableChange`), `name` set, and `kind` for a create or
+/// (`manifest.newTableChange`), `kind` set for a create or
 /// `from_table_id` for a branch; each gets a freshly allocated table_id
 /// here. A create's apply installs one empty tree of its kind per
-/// table and registers every name → table_id on all nodes, advancing
-/// the id counter past each. A branch's apply lists its source's trees
-/// again, files shared (Manifest.applyTableBranch), so a branch change
-/// names no kind. A non-empty name already taken in the namespace
-/// errors `NameExists` (sound while the caller serializes DDL); an
-/// empty name registers nothing (system trees). Names must be pairwise
-/// distinct — an intra-batch duplicate is the caller's bug (the second
-/// would install unnamed). A branch of a table with no trees errors
-/// `TableNotFound`. Caller owns `table_ids` and `changes`, which the
-/// result's change lists; each name must outlive the change
-/// (marshalled at propose).
+/// table on all nodes, advancing the id counter past each. A branch's
+/// apply lists its source's trees again, files shared
+/// (Manifest.applyTableBranch), so a branch change names no kind. The
+/// tables' names are rows the caller adds. A branch of a table with no
+/// trees errors `TableNotFound`. Caller owns `table_ids` and `changes`,
+/// which the result's change lists.
 pub fn buildTables(
     self: *Forest,
     alloc: std.mem.Allocator,
@@ -338,9 +324,6 @@ pub fn buildTables(
 ) !TableResult {
     std.debug.assert(cmd == .create_tree or cmd == .branch_table);
     for (changes) |tc| {
-        if (tc.name.len > 0 and
-            self.manifest.lookupTable(namespace_id, tc.name) != null)
-            return error.NameExists;
         if (cmd == .branch_table and !self.hasTable(.{
             .namespace = namespace_id,
             .table_id = tc.from_table_id,

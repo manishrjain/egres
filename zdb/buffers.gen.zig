@@ -767,7 +767,6 @@ pub const TreeChangeStruct = struct {
     tree_id: u64 = 0,
     left_key: []const u8 = &.{},
     right_key: []const u8 = &.{},
-    name: []const u8 = &.{},
     kind: TreeKindEnum = @enumFromInt(0),
     from_table_id: u32 = 0,
     pub fn deinit(self: *TreeChangeStruct, alloc: std.mem.Allocator) void {
@@ -775,8 +774,6 @@ pub const TreeChangeStruct = struct {
         self.left_key = &.{};
         alloc.free(self.right_key);
         self.right_key = &.{};
-        alloc.free(self.name);
-        self.name = &.{};
     }
 
     pub fn destroy(self: *TreeChangeStruct, alloc: std.mem.Allocator) void {
@@ -795,7 +792,6 @@ pub const TreeChangeStruct = struct {
         errdefer s.deinit(alloc);
         s.left_key = try alloc.dupe(u8, self.left_key);
         s.right_key = try alloc.dupe(u8, self.right_key);
-        s.name = try alloc.dupe(u8, self.name);
         return s;
     }
 
@@ -813,7 +809,6 @@ pub const TreeChangeStruct = struct {
         try writer.setTreeId(self.tree_id);
         try writer.setLeftKey(self.left_key);
         try writer.setRightKey(self.right_key);
-        try writer.setName(self.name);
         try writer.setKind(self.kind);
         try writer.setFromTableId(self.from_table_id);
         const result = try writer.finish();
@@ -826,7 +821,7 @@ pub const TreeChangeReader = struct {
     t: zbuf.Table,
 
     pub const TABLE_ID: u16 = 46596;
-    pub const SIZE_BYTES: u16 = 48;
+    pub const SIZE_BYTES: u16 = 40;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
@@ -856,16 +851,12 @@ pub const TreeChangeReader = struct {
         return self.t.bytes(27);
     }
 
-    pub fn name(self: Self) []const u8 {
-        return self.t.bytes(35);
-    }
-
     pub fn kind(self: Self) TreeKindEnum {
-        return @enumFromInt(self.t.scalar(u8, 43));
+        return @enumFromInt(self.t.scalar(u8, 35));
     }
 
     pub fn fromTableId(self: Self) u32 {
-        return self.t.scalar(u32, 44);
+        return self.t.scalar(u32, 36);
     }
 
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
@@ -875,7 +866,6 @@ pub const TreeChangeReader = struct {
         try writer.setTreeId(self.treeId());
         try writer.setLeftKey(self.leftKey());
         try writer.setRightKey(self.rightKey());
-        try writer.setName(self.name());
         try writer.setKind(self.kind());
         try writer.setFromTableId(self.fromTableId());
         const result = try writer.finish();
@@ -886,7 +876,6 @@ pub const TreeChangeReader = struct {
         try self.t.verifyHeader();
         try self.t.verifyBytes(19);
         try self.t.verifyBytes(27);
-        try self.t.verifyBytes(35);
     }
     pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!TreeChangeStruct {
         var s = TreeChangeStruct{
@@ -899,7 +888,6 @@ pub const TreeChangeReader = struct {
         errdefer s.deinit(alloc);
         s.left_key = try alloc.dupe(u8, self.leftKey());
         s.right_key = try alloc.dupe(u8, self.rightKey());
-        s.name = try alloc.dupe(u8, self.name());
         return s;
     }
     pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*TreeChangeStruct {
@@ -917,7 +905,7 @@ pub const TreeChangeWriter = struct {
     w: zbuf.TableWriter,
 
     pub const TABLE_ID: u16 = 46596;
-    pub const SIZE_BYTES: u16 = 48;
+    pub const SIZE_BYTES: u16 = 40;
     /// Slots of nested tables, null until set.
     const child_slots = [_]u16{};
 
@@ -949,16 +937,12 @@ pub const TreeChangeWriter = struct {
         return self.w.setBytes(27, data);
     }
 
-    pub fn setName(self: *Self, data: []const u8) Error!void {
-        return self.w.setBytes(35, data);
-    }
-
     pub fn setKind(self: *Self, v: TreeKindEnum) Error!void {
-        return self.w.setScalar(u8, 43, @intFromEnum(v));
+        return self.w.setScalar(u8, 35, @intFromEnum(v));
     }
 
     pub fn setFromTableId(self: *Self, v: u32) Error!void {
-        return self.w.setScalar(u32, 44, v);
+        return self.w.setScalar(u32, 36, v);
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -971,7 +955,6 @@ pub const TreeChangeWriter = struct {
         if (@hasField(Values, "tree_id")) try self.setTreeId(@field(values, "tree_id"));
         if (@hasField(Values, "left_key")) try self.setLeftKey(@field(values, "left_key"));
         if (@hasField(Values, "right_key")) try self.setRightKey(@field(values, "right_key"));
-        if (@hasField(Values, "name")) try self.setName(@field(values, "name"));
         if (@hasField(Values, "kind")) try self.setKind(@field(values, "kind"));
         if (@hasField(Values, "from_table_id")) try self.setFromTableId(@field(values, "from_table_id"));
     }
@@ -1933,10 +1916,9 @@ pub const NamespaceStruct = struct {
     pub const TABLE_ID: u16 = 46601;
     id: u64 = 0,
     next_table_id: u32 = 0,
-    name: []const u8 = &.{},
     pub fn deinit(self: *NamespaceStruct, alloc: std.mem.Allocator) void {
-        alloc.free(self.name);
-        self.name = &.{};
+        _ = self;
+        _ = alloc;
     }
 
     pub fn destroy(self: *NamespaceStruct, alloc: std.mem.Allocator) void {
@@ -1950,7 +1932,6 @@ pub const NamespaceStruct = struct {
             .next_table_id = self.next_table_id,
         };
         errdefer s.deinit(alloc);
-        s.name = try alloc.dupe(u8, self.name);
         return s;
     }
 
@@ -1965,7 +1946,6 @@ pub const NamespaceStruct = struct {
         var writer = try NamespaceWriter.initWithBuf(alloc, out);
         try writer.setId(self.id);
         try writer.setNextTableId(self.next_table_id);
-        try writer.setName(self.name);
         const result = try writer.finish();
         return result.offset;
     }
@@ -1976,7 +1956,7 @@ pub const NamespaceReader = struct {
     t: zbuf.Table,
 
     pub const TABLE_ID: u16 = 46601;
-    pub const SIZE_BYTES: u16 = 22;
+    pub const SIZE_BYTES: u16 = 14;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
@@ -1994,22 +1974,16 @@ pub const NamespaceReader = struct {
         return self.t.scalar(u32, 10);
     }
 
-    pub fn name(self: Self) []const u8 {
-        return self.t.bytes(14);
-    }
-
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try NamespaceWriter.initWithBuf(alloc, out);
         try writer.setId(self.id());
         try writer.setNextTableId(self.nextTableId());
-        try writer.setName(self.name());
         const result = try writer.finish();
         return result.offset;
     }
 
     pub fn verify(self: Self) Error!void {
         try self.t.verifyHeader();
-        try self.t.verifyBytes(14);
     }
     pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!NamespaceStruct {
         var s = NamespaceStruct{
@@ -2017,7 +1991,6 @@ pub const NamespaceReader = struct {
             .next_table_id = self.nextTableId(),
         };
         errdefer s.deinit(alloc);
-        s.name = try alloc.dupe(u8, self.name());
         return s;
     }
     pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*NamespaceStruct {
@@ -2035,7 +2008,7 @@ pub const NamespaceWriter = struct {
     w: zbuf.TableWriter,
 
     pub const TABLE_ID: u16 = 46601;
-    pub const SIZE_BYTES: u16 = 22;
+    pub const SIZE_BYTES: u16 = 14;
     /// Slots of nested tables, null until set.
     const child_slots = [_]u16{};
 
@@ -2055,10 +2028,6 @@ pub const NamespaceWriter = struct {
         return self.w.setScalar(u32, 10, v);
     }
 
-    pub fn setName(self: *Self, data: []const u8) Error!void {
-        return self.w.setBytes(14, data);
-    }
-
     pub fn set(self: *Self, values: anytype) Error!void {
         const Values = @TypeOf(values);
         if (@typeInfo(Values) != .@"struct") {
@@ -2066,7 +2035,6 @@ pub const NamespaceWriter = struct {
         }
         if (@hasField(Values, "id")) try self.setId(@field(values, "id"));
         if (@hasField(Values, "next_table_id")) try self.setNextTableId(@field(values, "next_table_id"));
-        if (@hasField(Values, "name")) try self.setName(@field(values, "name"));
     }
 
     pub fn finish(self: *Self) Error!NamespaceBuffer {

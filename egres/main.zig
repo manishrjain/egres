@@ -205,8 +205,7 @@ fn seedGenesis(allocator: std.mem.Allocator, wal: *raft.DiskWAL) !void {
     const db_ns = zdb.manifest.first_namespace;
 
     // Same trees as forest.buildNsCreate — one per system table,
-    // posting indexes as there; tree 0 (the raw-KV default table)
-    // carries the database name.
+    // posting indexes as there. The database's name is a row.
     const sys = zdb.manifest.namespace_system_table_ids;
     var db_trees: [sys.len]zdb.manifest.TreeChange = undefined;
     for (sys, &db_trees) |table_id, *c|
@@ -217,7 +216,6 @@ fn seedGenesis(allocator: std.mem.Allocator, wal: *raft.DiskWAL) !void {
             "",
             .posting_index,
         );
-    db_trees[0].name = @constCast(default_database);
     var name_row = [_]zdb.buffers.KeyValueStruct{
         try sql.names.dbNameKv(arloc, default_database, db_ns),
     };

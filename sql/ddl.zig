@@ -85,15 +85,12 @@ pub fn createDatabase(
             );
     }
     const built = if (src) |s|
-        eng.forest.buildNsBranch(arena.allocator(), s, name)
+        eng.forest.buildNsBranch(arena.allocator(), s)
     else
-        eng.forest.buildNsCreate(arena.allocator(), .next, name);
-    const created = built catch |err| switch (err) {
-        error.NameExists => return replyError(state, "database already exists"),
-        else => |e| {
-            log.err("create database '{s}': {s}", .{ name, @errorName(e) });
-            return replyError(state, "create database failed");
-        },
+        eng.forest.buildNsCreate(arena.allocator(), .next);
+    const created = built catch |err| {
+        log.err("create database '{s}': {s}", .{ name, @errorName(err) });
+        return replyError(state, "create database failed");
     };
     // The database's name row, in the system namespace, commits with
     // its trees.
@@ -206,7 +203,7 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
     // The base table's rows tree, then a unique index tree per primary
     // key or UNIQUE column.
     var changes: std.ArrayList(zdb.manifest.TreeChange) = .empty;
-    try changes.append(a, zdb.manifest.newTableChange(ct.name, .rows));
+    try changes.append(a, zdb.manifest.newTableChange(.rows));
     // Every name the statement introduces, in `changes` order.
     var new_names: std.ArrayList(String) = .empty;
     try new_names.append(a, ct.name);
@@ -240,7 +237,7 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
         );
         try changes.append(
             a,
-            zdb.manifest.newTableChange(index_name, .unique_index),
+            zdb.manifest.newTableChange(.unique_index),
         );
         try new_names.append(a, index_name);
     }
@@ -257,12 +254,9 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
         ns,
         changes.items,
         .create_tree,
-    ) catch |err| switch (err) {
-        error.NameExists => return replyErrorCode(state, pgwire.sqlstate.duplicate_table, "table or index name already exists"),
-        else => |e| {
-            log.err("create table '{s}': {s}", .{ ct.name, @errorName(e) });
-            return replyError(state, "create table failed");
-        },
+    ) catch |err| {
+        log.err("create table '{s}': {s}", .{ ct.name, @errorName(err) });
+        return replyError(state, "create table failed");
     };
     // The trees and their catalog rows (columns, index descriptors)
     // go in one entry, so a crash leaves all of the table or none of
@@ -396,7 +390,7 @@ pub fn createTableAs(
     // Every name the statement introduces, in `changes` order.
     var new_names: std.ArrayList(String) = .empty;
 
-    var base = zdb.manifest.newTableChange(cta.name, .rows);
+    var base = zdb.manifest.newTableChange(.rows);
     base.from_table_id = src_tid;
     try changes.append(arloc, base);
     try new_names.append(arloc, cta.name);
@@ -410,7 +404,7 @@ pub fn createTableAs(
             );
 
         const index_name = try idx.nameFor(arloc, cta.name);
-        var tc = zdb.manifest.newTableChange(index_name, idx.treeKind());
+        var tc = zdb.manifest.newTableChange(idx.treeKind());
         try new_names.append(arloc, index_name);
         tc.from_table_id = idx.index_table_id;
         try changes.append(arloc, tc);
@@ -430,16 +424,9 @@ pub fn createTableAs(
         changes.items,
         if (cta.with_data) .branch_table else .create_tree,
     );
-    const created = built catch |err| switch (err) {
-        error.NameExists => return replyErrorCode(
-            state,
-            pgwire.sqlstate.duplicate_table,
-            "table or index name already exists",
-        ),
-        else => |e| {
-            log.err("create table as '{s}': {s}", .{ cta.name, @errorName(e) });
-            return replyError(state, "create table failed");
-        },
+    const created = built catch |err| {
+        log.err("create table as '{s}': {s}", .{ cta.name, @errorName(err) });
+        return replyError(state, "create table failed");
     };
     // The catalog rows under the new ids ride in the same entry, as in
     // createTable. The column ids stay the source's, so the index

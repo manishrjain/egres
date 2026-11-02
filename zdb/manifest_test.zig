@@ -217,7 +217,6 @@ test "manifest serialize/restoreFrom round-trip" {
             .posting_index,
         ),
     });
-    try src.registerTableName(.{ .namespace = 7, .table_id = 16 }, "users");
     try src.commit(2, &.{
         createSSTableChange(10, 7, 1, 0, no_extent),
         createSSTableChange(11, 7, 1, 0, no_extent),
@@ -263,9 +262,6 @@ test "manifest serialize/restoreFrom round-trip" {
     try std.testing.expect(t2.levels.items[3].tables.contains(50));
     try std.testing.expectEqual(_manifest.TreeKind.rows, t2.kind);
     try std.testing.expectEqual(_manifest.TreeKind.posting_index, t1.kind);
-
-    // The table name rode the snapshot (stamped on its tree's change).
-    try std.testing.expectEqual(@as(?u32, 16), dst.lookupTable(7, "users"));
 }
 
 // -------------------------------------------------------------------------
@@ -291,7 +287,7 @@ test "manifest restoreFrom replaces existing state" {
         createTreeChange(99, 0, &.{}, &.{}, .posting_index),
     });
     try dst.commit(4, &.{createSSTableChange(999, 0, 99, 0, no_extent)}, &.{});
-    try dst.registerTableName(.{ .namespace = 0, .table_id = 55 }, "stale");
+    try dst.advanceTableId(.{ .namespace = 0, .table_id = 55 });
     try std.testing.expect(dst.trees.contains(tk(0, 99)));
 
     try dst.restoreFrom(bytes);
@@ -299,70 +295,11 @@ test "manifest restoreFrom replaces existing state" {
     try std.testing.expect(!dst.trees.contains(tk(0, 99)));
     try std.testing.expect(dst.trees.contains(tk(0, 1)));
     try std.testing.expectEqual(@as(u32, 1), dst.tableCount());
-    // Pre-restore table names are gone too (freed, not leaked).
-    try std.testing.expect(dst.lookupTable(0, "stale") == null);
-}
-
-// -------------------------------------------------------------------------
-// Table names: register / lookup / drop
-// -------------------------------------------------------------------------
-
-test "manifest table names: register/lookup/drop" {
-    const alloc = std.testing.allocator;
-    var manifest = _manifest.Manifest.init(alloc);
-    defer manifest.deinit();
-
-    try manifest.registerTableName(
-        .{ .namespace = 5, .table_id = 16 },
-        "users",
-    );
+    // The pre-restore counter is gone too.
     try std.testing.expectEqual(
-        @as(?u32, 16),
-        manifest.lookupTable(5, "users"),
+        _manifest.first_table_id,
+        try dst.nextTableId(0),
     );
-
-    // Idempotent re-apply; a collision (build-side bug) is skipped, never
-    // clobbered.
-    try manifest.registerTableName(
-        .{ .namespace = 5, .table_id = 16 },
-        "users",
-    );
-    try manifest.registerTableName(
-        .{ .namespace = 5, .table_id = 17 },
-        "users",
-    );
-    try std.testing.expectEqual(
-        @as(?u32, 16),
-        manifest.lookupTable(5, "users"),
-    );
-
-    // Empty names record nothing; lookups are namespace-scoped.
-    try manifest.registerTableName(.{ .namespace = 5, .table_id = 18 }, "");
-    try std.testing.expect(manifest.lookupTable(5, "") == null);
-    try std.testing.expect(manifest.lookupTable(6, "users") == null);
-
-    // dropTable frees the name for a re-register at a fresh id; idempotent.
-    manifest.dropTable(.{ .namespace = 5, .table_id = 16 });
-    try std.testing.expect(manifest.lookupTable(5, "users") == null);
-    manifest.dropTable(.{ .namespace = 5, .table_id = 16 });
-    try manifest.registerTableName(
-        .{ .namespace = 5, .table_id = 19 },
-        "users",
-    );
-    try std.testing.expectEqual(
-        @as(?u32, 19),
-        manifest.lookupTable(5, "users"),
-    );
-
-    // dropNamespace forgets every table name (leak-checked by the test
-    // allocator).
-    try manifest.registerTableName(
-        .{ .namespace = 5, .table_id = 20 },
-        "orders",
-    );
-    manifest.dropNamespace(5);
-    try std.testing.expect(manifest.lookupTable(5, "users") == null);
-    try std.testing.expect(manifest.lookupTable(5, "orders") == null);
 }
 
 // -------------------------------------------------------------------------
@@ -736,15 +673,14 @@ test "manifest serialize round-trip preserves raft_index" {
 }
 
 // -------------------------------------------------------------------------
-// apply: structural changes plus the name and counter effects of `cmd`
+// apply: structural changes plus the counter effects of `cmd`
 // -------------------------------------------------------------------------
 
 /// The ns_create change a namespace create proposes: one tree for the
-/// namespace's default table, carrying the database name.
+/// namespace's default table.
 fn nsCreateChange(
     tcs: *[1]_manifest.TreeChange,
     namespace: u64,
-    name: []const u8,
 ) _manifest.ManifestChange {
     tcs[0] = createTreeChange(
         zdb.kv.makeTreeId(0, 0),
@@ -753,16 +689,14 @@ fn nsCreateChange(
         &.{},
         .posting_index,
     );
-    tcs[0].name = name;
     return .{ .tree_changes = tcs, .cmd = .create_ns };
 }
 
 /// The create_tree change a CREATE TABLE proposes: one tree at split 0 for
-/// `table_key`'s table, carrying the table name.
+/// `table_key`'s table.
 fn createTreeCmd(
     tcs: *[1]_manifest.TreeChange,
     table_key: zdb.kv.TableKey,
-    name: []const u8,
 ) _manifest.ManifestChange {
     tcs[0] = createTreeChange(
         zdb.kv.makeTreeId(table_key.table_id, 0),
@@ -771,29 +705,24 @@ fn createTreeCmd(
         &.{},
         .posting_index,
     );
-    tcs[0].name = name;
     return .{ .tree_changes = tcs, .cmd = .create_tree };
 }
 
-test "manifest apply create_ns registers the name and advances next_ns_id" {
+test "manifest apply create_ns advances next_ns_id" {
     const alloc = std.testing.allocator;
     var manifest = _manifest.Manifest.init(alloc);
     defer manifest.deinit();
 
     var tcs: [1]_manifest.TreeChange = undefined;
-    try manifest.apply(5, nsCreateChange(&tcs, 100, "shop"));
+    try manifest.apply(5, nsCreateChange(&tcs, 100));
 
     try std.testing.expect(manifest.trees.contains(tk(100, 0)));
-    try std.testing.expectEqual(
-        @as(?u64, 100),
-        manifest.lookupNamespace("shop"),
-    );
     // The counter moved past the created namespace, so the next allocation
     // cannot re-issue it.
     try std.testing.expectEqual(@as(u64, 101), manifest.nextNamespace());
 }
 
-test "manifest apply create_tree registers the name and advances the table id" {
+test "manifest apply create_tree advances the table id" {
     const alloc = std.testing.allocator;
     const first = _manifest.first_table_id;
     var manifest = _manifest.Manifest.init(alloc);
@@ -803,15 +732,10 @@ test "manifest apply create_tree registers the name and advances the table id" {
     try manifest.apply(6, createTreeCmd(
         &tcs,
         .{ .namespace = 7, .table_id = first },
-        "users",
     ));
 
     try std.testing.expect(
         manifest.trees.contains(tk(7, zdb.kv.makeTreeId(first, 0))),
-    );
-    try std.testing.expectEqual(
-        @as(?u32, first),
-        manifest.lookupTable(7, "users"),
     );
     try std.testing.expectEqual(first + 1, try manifest.nextTableId(7));
 }
@@ -825,18 +749,15 @@ test "manifest apply is idempotent for a re-applied create" {
     // second must leave one tree and leak nothing (std.testing.allocator
     // fails the test if the first tree's keys are dropped on the floor).
     var tcs: [1]_manifest.TreeChange = undefined;
-    const mc = nsCreateChange(&tcs, 100, "shop");
+    const mc = nsCreateChange(&tcs, 100);
     try manifest.apply(5, mc);
     try manifest.apply(5, mc);
 
     try std.testing.expectEqual(@as(u32, 1), manifest.trees.count());
-    try std.testing.expectEqual(
-        @as(?u64, 100),
-        manifest.lookupNamespace("shop"),
-    );
+    try std.testing.expectEqual(@as(u64, 101), manifest.nextNamespace());
 }
 
-test "manifest apply drop_tree removes the table name" {
+test "manifest apply drop_tree keeps the table id counter" {
     const alloc = std.testing.allocator;
     const first = _manifest.first_table_id;
     var manifest = _manifest.Manifest.init(alloc);
@@ -846,7 +767,6 @@ test "manifest apply drop_tree removes the table name" {
     try manifest.apply(6, createTreeCmd(
         &tcs,
         .{ .namespace = 7, .table_id = first },
-        "users",
     ));
 
     var dtcs = [_]_manifest.TreeChange{
@@ -854,25 +774,28 @@ test "manifest apply drop_tree removes the table name" {
     };
     try manifest.apply(7, .{ .tree_changes = &dtcs, .cmd = .drop_tree });
 
-    try std.testing.expect(manifest.lookupTable(7, "users") == null);
     try std.testing.expectEqual(@as(u32, 0), manifest.trees.count());
     // The id is not rewound: ids are never reused.
     try std.testing.expectEqual(first + 1, try manifest.nextTableId(7));
 }
 
-test "manifest apply drop_ns removes the namespace name" {
+test "manifest apply drop_ns forgets the namespace's counter" {
     const alloc = std.testing.allocator;
     var manifest = _manifest.Manifest.init(alloc);
     defer manifest.deinit();
 
     var tcs: [1]_manifest.TreeChange = undefined;
-    try manifest.apply(5, nsCreateChange(&tcs, 100, "shop"));
+    try manifest.apply(5, nsCreateChange(&tcs, 100));
+    try manifest.advanceTableId(.{ .namespace = 100, .table_id = 40 });
 
     var dtcs = [_]_manifest.TreeChange{deleteTreeChange(0, 100)};
     try manifest.apply(8, .{ .tree_changes = &dtcs, .cmd = .drop_ns });
 
-    try std.testing.expect(manifest.lookupNamespace("shop") == null);
     try std.testing.expectEqual(@as(u32, 0), manifest.trees.count());
+    try std.testing.expectEqual(
+        _manifest.first_table_id,
+        try manifest.nextTableId(100),
+    );
 }
 
 test "manifest takeToEvict hands over ids whose last listing went, once" {

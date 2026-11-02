@@ -1004,10 +1004,10 @@ pub const Engine = struct {
                         self.allocator.destroy(mcs);
                     }
                     // apply, not commit: the draft must also pick up the
-                    // change's name and counter effects. The WAL below the
-                    // snapshot is gone after a restart, so a name missing
-                    // from the snapshot is lost and its database or table
-                    // becomes unreachable even though its rows are there.
+                    // change's counter effects. The WAL below the
+                    // snapshot is gone after a restart, so a counter
+                    // missing from the snapshot would hand out an id
+                    // again. The change's rows reach the snapshot as SSTs.
                     try draft.apply(stored.index, mcs.*);
                 },
                 else => continue,
