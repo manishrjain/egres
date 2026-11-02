@@ -59,6 +59,9 @@ pub const ctx = _ctx.current;
 pub const writeTraces = _ctx.writeTraces;
 pub const tscNsPerCycleQ32 = _rt.tscNsPerCycleQ32;
 pub const ticksPerSecond = _rt.ticksPerSecond;
+pub const ticksTo = _rt.ticksTo;
+pub const TimeUnit = _rt.TimeUnit;
+pub const setTscFactorForTesting = _rt.setTscFactorForTesting;
 
 // Metering: the tenant a statement's cpu, io and memory are charged
 // to, with its resources and the policy (`Tenant.acquire`,

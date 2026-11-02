@@ -51,8 +51,9 @@ var tsc_ns_per_cycle_q32: std.atomic.Value(u64) = .init(0);
 
 /// Per-worker copy of `tsc_ns_per_cycle_q32`. Loaded once at the top
 /// of `Worker.run`; read non-atomically in the hot path. Stays 0 on
-/// non-Linux (calibration short-circuits) — `ticksTo` then yields
-/// 0 and `cpu_total_ns` stays at zero. Safe because the global is
+/// Windows and off x86_64/aarch64 (calibration short-circuits) —
+/// `ticksTo` then yields 0 and `cpu_total_ns` stays at zero. Safe
+/// because the global is
 /// set before any worker starts (Runtime.init → calibrateTsc →
 /// allocate workers → workers.run).
 threadlocal var tsc_factor_tls: u64 = 0;
@@ -1785,7 +1786,12 @@ pub const TimeUnit = enum { ns, ms };
 /// (`tsc_factor_tls`, populated once at `Worker.run` entry), in the
 /// caller's integer type with its sign: a debt in ticks is a debt in
 /// ms. 0 when the factor is not seeded: calibration short-circuited
-/// on a non-Linux build, or a call off a worker thread.
+/// (Windows, or an arch without a counter), or a call off a worker
+/// thread. Saturates at the type's range instead of trapping: the
+/// shared tenant's buckets hold a 2^62 sentinel, and at 41.7 ns a
+/// tick (Apple Silicon's 24 MHz counter) that is 1.9e20 ms, past
+/// i64. x86's sub-ns cycle shrinks it, which is why the trap only
+/// fired on macOS, at the first admin metrics scrape.
 pub inline fn ticksTo(ticks: anytype, comptime unit: TimeUnit) @TypeOf(ticks) {
     const T = @TypeOf(ticks);
     const ns: T = switch (comptime builtin.cpu.arch) {
@@ -1795,7 +1801,7 @@ pub inline fn ticksTo(ticks: anytype, comptime unit: TimeUnit) @TypeOf(ticks) {
             // i128 holds the product for multi-second deltas, and a
             // division, not a shift, truncates a negative toward zero.
             const wide = @as(i128, ticks) * @as(i128, factor);
-            break :blk @intCast(@divTrunc(wide, 1 << 32));
+            break :blk std.math.lossyCast(T, @divTrunc(wide, 1 << 32));
         },
         else => ticks,
     };
@@ -1815,11 +1821,21 @@ pub inline fn ticksTo(ticks: anytype, comptime unit: TimeUnit) @TypeOf(ticks) {
 /// only one wins the CAS; the others' computed value is discarded
 /// (in practice all 30-sample medians agree within ppm).
 /// Read the calibrated `ns_per_cycle * 2^32` factor. Returns 0 if
-/// calibration hasn't completed or short-circuited on non-Linux.
+/// calibration hasn't completed or short-circuited (Windows, or an
+/// arch without a counter).
 /// Mostly for diagnostic / test code that wants to inspect the
 /// hardware's TSC frequency (`tsc_hz ≈ 2^32 / factor * 1e9`).
 pub fn tscNsPerCycleQ32() u64 {
     return tsc_ns_per_cycle_q32.load(.acquire);
+}
+
+/// Sets this thread's `ticksTo` factor and returns the one it had, so
+/// a test can convert at another machine's tick rate; restore it
+/// after. Tests only: a worker seeds its own copy at run() entry.
+pub fn setTscFactorForTesting(factor: u64) u64 {
+    const old = tsc_factor_tls;
+    tsc_factor_tls = factor;
+    return old;
 }
 
 /// The tick counter's rate, ticks per second, from the calibration:

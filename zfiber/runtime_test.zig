@@ -154,6 +154,29 @@ test "Runtime: TSC accounting times a fibonacci workload" {
     );
 }
 
+test "Runtime: ticksTo saturates on a sentinel instead of trapping" {
+    // Apple Silicon's counter runs at 24 MHz: 41.67 ns a tick, as
+    // Q32.32. The shared tenant's buckets hold 2^62 ticks, which at
+    // that rate is 1.9e20 ms, past i64; x86's sub-ns cycle shrinks the
+    // same sentinel, so only macOS trapped, at the first metrics scrape.
+    const apple_q32: u64 = (@as(u64, std.time.ns_per_s) << 32) / 24_000_000;
+    const old = fiber.setTscFactorForTesting(apple_q32);
+    defer _ = fiber.setTscFactorForTesting(old);
+
+    const sentinel: i64 = 1 << 62;
+    const max_ms = @divTrunc(std.math.maxInt(i64), std.time.ns_per_ms);
+    const min_ms = @divTrunc(std.math.minInt(i64), std.time.ns_per_ms);
+    try std.testing.expectEqual(max_ms, fiber.ticksTo(sentinel, .ms));
+    try std.testing.expectEqual(min_ms, fiber.ticksTo(-sentinel, .ms));
+    try std.testing.expectEqual(std.math.maxInt(u64), fiber.ticksTo(@as(u64, 1 << 63), .ns));
+
+    // In range, the conversion holds: 24_000 ticks is one ms, within
+    // the Q32.32 factor's truncation of a nanosecond.
+    const one_ms = fiber.ticksTo(@as(u64, 24_000), .ns);
+    try std.testing.expect(one_ms + 1 >= std.time.ns_per_ms and one_ms <= std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(i64, -1), fiber.ticksTo(@as(i64, -48_000), .ms));
+}
+
 test "Runtime: high priority runs before normal in queue scan" {
     if (true) {
         return error.SkipZigTest;

@@ -476,10 +476,7 @@ pub const Node = struct {
     /// calls it too.
     pub fn abortPending(self: *Node) void {
         self.proposal_ch.close(.graceful);
-        while (self.proposal_ch.tryReceive()) |req| {
-            self.allocator.free(req.data);
-            self.reject(req, .shutdown);
-        } else |_| {}
+        self.rejectQueued(.shutdown);
         self.failAllPendingCallbacks(.shutdown);
     }
 
@@ -958,14 +955,22 @@ pub const Node = struct {
         // Wake mainLoop's blocked wait() so it observes shutdown and returns
         // (Notify has no close — a notify is the shutdown poke).
         self.event_notify.notify();
+        // Stop the apply queue before the apply loop: from here a
+        // waiter that misses the queue is failed inline with .shutdown
+        // (`send` fails on a closed channel), and the ones already
+        // queued stay drainable (graceful, not immediate) for
+        // `applyLoop` to fail on its way out. The order matters: the
+        // apply loop drains once, as it exits, so nothing may be
+        // queued after that drain. Before this, the queued waiters
+        // lived until deinit's failAllPendingCallbacks, which runs
+        // after Engine.wait has joined the loop group; a clock tick
+        // in flight at SIGTERM sat in that group waiting for its
+        // apply, so the join waited on deinit and deinit on the join.
+        self.apply_waiters.close(.graceful);
         // Wake applyLoop + any pending proposeAndWaitForApply / waitForApplied
         // callers with error.Closed.
         self.commit_index.close();
         self.applied_ts.close();
-        // Graceful, not immediate: buffered callbacks stay drainable for
-        // deinit's failAllPendingCallbacks to fail with .shutdown
-        // (immediate would clear them and wedge their waiters).
-        self.apply_waiters.close(.graceful);
     }
 
     pub fn isShuttingDown(self: *const Node) bool {
@@ -1836,10 +1841,7 @@ pub const Node = struct {
     // proposing them. This is only relevant to the leader node. Followers won't have this.
     pub fn processProposalRequests(self: *Node) RaftError!usize {
         if (self.isShuttingDown()) {
-            while (self.proposal_ch.tryReceive()) |req| {
-                self.allocator.free(req.data);
-                self.reject(req, .shutdown);
-            } else |_| {}
+            self.rejectQueued(.shutdown);
             return 0;
         }
 
@@ -1911,9 +1913,16 @@ pub const Node = struct {
                 if (err != error.Closed) {
                     raft_log.err("applyLoop: waitFor commit >= {d}: {s}", .{ target, @errorName(err) });
                 }
-                return;
+                break;
             };
         }
+        // Nothing applies any more, so every waiter still queued for
+        // an apply would park until deinit; fail them here, on the
+        // fiber that owns `applied_held`. `shutdownWatchLoop` closed
+        // the queue before waking this loop, so no waiter arrives
+        // after this drain. deinit's failAllPendingCallbacks stays as
+        // the backstop for a node whose loops never ran.
+        self.failApplyWaiters(.shutdown);
     }
 
     const max_apply_bytes: u64 = 16 * 1024 * 1024; // 16 MiB per batch
@@ -2116,7 +2125,7 @@ pub const Node = struct {
 
         while (!self.isShuttingDown()) {
             self.event_notify.wait();
-            if (self.isShuttingDown()) return;
+            if (self.isShuttingDown()) break;
 
             // Phase: inbound — drain inbound_ch (handle AE, AER, RV replies).
             // We observe even when the queue was empty: the histogram includes
@@ -2170,6 +2179,16 @@ pub const Node = struct {
             self.maybeBroadcast(heartbeat_due or ci_advanced or log_grew);
             _metrics.g().observePhase("broadcast", t);
         }
+        // Nothing commits any more: close the proposal queue (a late
+        // propose fails inline with QueueClosed), reject what it still
+        // holds and fail every waiter parked on a commit, here on the
+        // fiber that owns `commit_waiters`. Until now they waited for
+        // abortPending, which main runs after Engine.wait has joined
+        // this loop: a proposer in that group deadlocked the join, as
+        // the clock tick did on the apply side.
+        self.proposal_ch.close(.graceful);
+        self.rejectQueued(.shutdown);
+        self.failCommitWaiters(.shutdown);
     }
 
     pub fn isLeader(self: *const Node) bool {
@@ -2629,8 +2648,31 @@ pub const Node = struct {
     }
 
     fn failAllPendingCallbacks(self: *Node, status: CommitStatus) void {
+        self.failCommitWaiters(status);
+        self.failApplyWaiters(status);
+    }
+
+    /// Fail every waiter parked on a commit. Main loop only while it
+    /// runs (`commit_waiters` is its); abortPending once it is gone.
+    fn failCommitWaiters(self: *Node, status: CommitStatus) void {
         for (self.commit_waiters.items) |w| w.finish(status);
         utils.clearRetainCap(&self.commit_waiters);
+    }
+
+    /// Reject every proposal still in the queue: none will reach the
+    /// log. Main loop only while it runs; abortPending once it is gone.
+    fn rejectQueued(self: *Node, status: CommitStatus) void {
+        while (self.proposal_ch.tryReceive()) |req| {
+            self.allocator.free(req.data);
+            self.reject(req, status);
+        } else |_| {}
+    }
+
+    /// Fail the waiter held back for a later apply and every one still
+    /// queued. Apply fiber only while the loops run (`applied_held` is
+    /// its); the main loop's step-down and deinit call it once the
+    /// apply loop is gone or never ran.
+    fn failApplyWaiters(self: *Node, status: CommitStatus) void {
         if (self.applied_held) |w| {
             self.applied_held = null;
             w.finish(status);
