@@ -115,6 +115,7 @@ pub fn encodeIndexKey(
                 inline .float4, .float8 => |x| try appendFloat(a, x, out),
                 .uuid => |u| try out.appendSlice(a, &u),
                 .text, .bytea => |s| try out.appendSlice(a, s),
+                .numeric => |d| try d.encodeKey(a, out),
             }
         },
     }

@@ -178,7 +178,7 @@ CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (column);
 | `date`, `timestamp`, `timestamptz` | Yes | |
 | `time`, `interval`, `uuid` | Partial | The column can be declared and holds `NULL`. Writing a value into it or comparing against it: not yet (`0A000`). |
 | `time with time zone` | Not&nbsp;yet | |
-| `numeric`, `decimal` | Not&nbsp;yet | |
+| `numeric`, `decimal`, `numeric(p, s)` | Yes | Exact, up to 38 digits, where Postgres allows more: a longer value is `22003`, and an arithmetic result past 38 digits keeps as many fractional digits as fit, rounded half away from zero. A value is rounded to the column's scale, half away from zero, and must fit its precision. Printed with every digit of its scale (`12.50`). `NaN` and `Infinity` are not accepted. |
 | `serial`, `bigserial` | Not&nbsp;yet | `egid` gives an insertion-ordered id today. |
 | `json`, `jsonb` | Not&nbsp;yet | |
 | Arrays, `enum`, composite, range, `money`, `inet`, `bit`, `tsvector`, geometric types | Not&nbsp;yet | |
@@ -191,7 +191,7 @@ Assignments in `SET` follow Postgres: any integer into any numeric column with a
 |---|---|---|
 | `count(*)` | Yes | Alone in the target list. |
 | `CURRENT_TIMESTAMP`, `LOCALTIMESTAMP` | Partial | In `INSERT ... VALUES`, into a `timestamp` or `timestamptz` column; the transaction's start time, as in Postgres. In `WHERE` or `SET`: not yet. |
-| `+`, `-`, `*`, `/`, `%` on numeric types, unary minus | Yes | In `SELECT` targets, `WHERE` and `UPDATE ... SET`, over literals, parameters and columns of the same row. |
+| `+`, `-`, `*`, `/`, `%` on numeric types, unary minus | Yes | In `SELECT` targets, `WHERE` and `UPDATE ... SET`, over literals, parameters and columns of the same row. A `numeric` with an integer stays exact, with a float becomes `float8`; `numeric` division keeps 16 fractional digits or the dividend's scale, whichever is more. A literal with a decimal point or an exponent is `numeric`, as in Postgres, so `0.1 + 0.2` is exactly `0.3`. |
 | `\|\|` on strings | Yes | In `SELECT` targets, `WHERE` and `UPDATE ... SET`. |
 | A cast of a constant: `'6'::int8`, `CAST('x' AS text)` | Partial | In `VALUES`, `WHERE`, `SET` and a `SELECT` without `FROM`. The constant is typed by the column it meets, as a bare literal is; the named type is not checked. pgjdbc in simple query mode inlines every bind parameter this way. |
 | `COALESCE`, `NULLIF`, `GREATEST`, `LEAST`, `CONCAT`, `CONCAT_WS`, `LOWER`, `UPPER`, `LENGTH`, `SUBSTRING`, `REPLACE`, `TRIM`, `LTRIM`, `RTRIM`, `LEFT`, `RIGHT`, `ABS`, `SIGN`, `FLOOR`, `CEIL`, `ROUND`, `TRUNC`, `MOD`, `POWER`, `SQRT` | Yes | In `SELECT` targets, `WHERE` and `UPDATE ... SET`, over literals, parameters and columns of the row; strings and numbers. `LOWER` and `UPPER` fold ASCII letters only, where Postgres folds by collation. `CONCAT` skips NULL arguments and renders numbers as text. |

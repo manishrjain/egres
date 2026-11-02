@@ -1059,15 +1059,19 @@ pub fn selectRow(
     if (emit) {
         var dw = try state.beginDataRow(@intCast(sr.cells.len));
         for (sr.cells, fields) |cell, fd| {
-            // A float keeps the literal's text in text format, as
-            // Postgres echoes `SELECT 1.50`; binary needs the number.
+            // SELECT 1.50 is a numeric; text keeps the literal's text,
+            // as Postgres echoes it, binary needs the number.
             const v: _value.Value = switch (cell.value) {
                 .null_value => .null_value,
                 .int => |n| .{ .int8 = n },
-                .float => |text| if (fd.format_code == 1)
-                    .{ .float8 = std.fmt.parseFloat(f64, text) catch 0 }
-                else
-                    .{ .text = text },
+                .float => |text| if (fd.format_code == 1) .{
+                    .numeric = _value.Numeric.parse(text) catch
+                        return replyErrorCode(
+                            state,
+                            pgwire.sqlstate.numeric_value_out_of_range,
+                            "numeric field overflow",
+                        ),
+                } else .{ .text = text },
                 .str => |text| .{ .text = text },
                 .bool_ => |b| .{ .bool_ = b },
                 else => unreachable, // the parser keeps only constants
@@ -1105,7 +1109,7 @@ fn selectRowFields(
         .name = cell.name,
         .type_oid = switch (cell.value) {
             .int => pgwire.oid.int8,
-            .float => pgwire.oid.float8,
+            .float => pgwire.oid.numeric,
             .bool_ => pgwire.oid.bool_,
             .str, .null_value => pgwire.oid.text,
             else => unreachable, // the parser keeps only constants
@@ -1277,6 +1281,7 @@ fn sendReturning(
 fn replyEmitErr(state: *pgwire.ConnState, err: anyerror) !void {
     return switch (err) {
         error.IntOutOfRange,
+        error.NumericOutOfRange,
         error.FloatOutOfRange,
         error.DivisionByZero,
         error.SubstringLength,
@@ -1461,7 +1466,11 @@ fn coerceLiteral(
         },
         // A number the column cannot hold: parsed from text (Overflow)
         // or cast from a wider binary parameter.
-        error.Overflow, error.IntOutOfRange, error.FloatOutOfRange => {
+        error.Overflow,
+        error.IntOutOfRange,
+        error.FloatOutOfRange,
+        error.NumericOutOfRange,
+        => {
             try replyErrorCode(
                 state,
                 pgwire.sqlstate.numeric_value_out_of_range,
@@ -1509,6 +1518,11 @@ fn replyExprErr(state: *pgwire.ConnState, err: _expr.EvalError) !void {
             state,
             pgwire.sqlstate.numeric_value_out_of_range,
             "integer out of range",
+        ),
+        error.NumericOutOfRange => replyErrorCode(
+            state,
+            pgwire.sqlstate.numeric_value_out_of_range,
+            "numeric field overflow",
         ),
         error.FloatOutOfRange => replyErrorCode(
             state,
@@ -1818,6 +1832,7 @@ fn replyRunErr(
         error.ReadBelowMinRead => _server.replySnapshotTooOld(state),
         // The WHERE computed something it could not: PG's reply.
         error.IntOutOfRange,
+        error.NumericOutOfRange,
         error.FloatOutOfRange,
         error.DivisionByZero,
         error.SubstringLength,

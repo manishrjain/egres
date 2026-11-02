@@ -58,7 +58,8 @@ test "sql.value: Type.fromName resolves DDL type names" {
     try testing.expectEqual(@as(?Type, .uuid), Type.fromName("uuid"));
     // Unsupported names miss — the DDL layer turns these into errors.
     try testing.expect(Type.fromName("serial") == null);
-    try testing.expect(Type.fromName("numeric") == null);
+    try testing.expectEqual(@as(?Type, .numeric), Type.fromName("numeric"));
+    try testing.expectEqual(@as(?Type, .numeric), Type.fromName("decimal"));
     try testing.expect(Type.fromName("") == null);
 }
 

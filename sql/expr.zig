@@ -23,6 +23,7 @@ const replyErrorCode = _server.replyErrorCode;
 const Column = _table.Column;
 const Table = _table.Table;
 const Value = _value.Value;
+const Numeric = _value.Numeric;
 const Type = _value.Type;
 const Op = _parse.Expr.Op;
 const Func = _funcs.Func;
@@ -32,7 +33,7 @@ const Func = _funcs.Func;
 /// and every operator's result type fixed. A root literal is typed by
 /// the column it meets, when there is one (parse.litToValue: `SET a =
 /// 1`, `WHERE name = 'x'`); any other literal is the widest cell of
-/// its kind (int8 / float8 / text). At eval, leaves lift to a Scalar
+/// its kind (int8 / numeric / text). At eval, leaves lift to a Scalar
 /// — integers compute in i128, floats in f64, text is bytes for `||`
 /// — and the result is coerced to the target column or widened to a
 /// cell of its own type, unless the root is a leaf: then it IS the
@@ -101,6 +102,7 @@ pub const Node = union(enum) {
         return switch (s) {
             .int => .{ .int8 = try intCast(i64, s) },
             .float => |f| .{ .float8 = f },
+            .numeric => |d| .{ .numeric = d },
             .text => |t| .{ .text = t },
         };
     }
@@ -166,6 +168,7 @@ pub const Node = union(enum) {
 pub const BindError = error{
     UndefinedColumn,
     InvalidValue,
+    NumericOutOfRange,
     UnsupportedValue,
     TypeMismatch,
     NoSuchOperator,
@@ -238,10 +241,10 @@ pub fn bind(
 
 /// A literal as a cell: of `target`'s type when there is one
 /// (parse.litToValue), else the widest cell of its own kind — int8,
-/// float8, text. A `$n` under an operator is its declared type when
+/// numeric, text. A `$n` under an operator is its declared type when
 /// it came in binary; a text one has only its text to go by, and is
 /// read the way an unknown-typed literal would be: an integer, else a
-/// float, else text (`abalance + $1` computes in int8 and is
+/// numeric, else text (`abalance + $1` computes in int8 and is
 /// range-checked on assignment). (A non-literal item never parses —
 /// parseExpr rejects it.)
 fn literalValue(
@@ -285,14 +288,22 @@ fn literalValue(
     };
 }
 
-/// A numeric literal under an operator, from the text the scanner kept.
-/// An integer too wide for int4 arrives as float TEXT; it stays an
-/// integer when it parses as one (as textToValue does for a root
-/// literal).
+/// A numeric literal under an operator, from the text the scanner kept:
+/// an int8 when it parses as one, else a numeric, as Postgres types an
+/// unknown `1.5` (so `0.1 + 0.2` is exactly 0.3). An integer too wide
+/// for int8 is a numeric too; one past numeric's 38 digits, `1e308`,
+/// is a float8, the only cell that holds it.
 fn numberFromText(text: String) BindError!Value {
     if (std.fmt.parseInt(i64, text, 10)) |n| return .{ .int8 = n } else |_| {}
-    const f = std.fmt.parseFloat(f64, text) catch return error.InvalidValue;
-    return .{ .float8 = f };
+    const d = Numeric.parse(text) catch |err| switch (err) {
+        error.NumericOutOfRange => {
+            const f = std.fmt.parseFloat(f64, text) catch
+                return error.InvalidValue;
+            return .{ .float8 = f };
+        },
+        else => return error.InvalidValue,
+    };
+    return .{ .numeric = d };
 }
 
 /// A bound value with no type to read it by: a number when it is
@@ -304,9 +315,10 @@ fn untypedText(text: String) Value {
 /// The type `lhs op rhs` yields, or NoSuchOperator when the operator
 /// has no such operands: `||` takes two texts and yields text;
 /// arithmetic takes two numbers and yields float8 if either is a
-/// float, else int8 (the compute is i128 / f64 regardless, and the
-/// width is checked on assignment); `%` has no float form (as in
-/// PG). A NULL-only side takes the other's type.
+/// float, numeric if either is one, else int8 (the compute is i128 /
+/// f64 / exact regardless, and the width is checked on assignment);
+/// `%` has no float form (as in PG). A NULL-only side takes the
+/// other's type.
 fn resultType(op: Op, lhs: ?Type, rhs: ?Type) BindError!?Type {
     const l = lhs orelse rhs orelse return null;
     const r = rhs orelse l;
@@ -319,6 +331,7 @@ fn resultType(op: Op, lhs: ?Type, rhs: ?Type) BindError!?Type {
         if (op == .mod) return error.NoSuchOperator;
         return .float8;
     }
+    if (l == .numeric or r == .numeric) return .numeric;
     return .int8;
 }
 
@@ -356,6 +369,11 @@ pub fn replyBindErr(
             state,
             code.undefined_column,
             "column does not exist",
+        ),
+        error.NumericOutOfRange => try replyErrorCode(
+            state,
+            pgwire.sqlstate.numeric_value_out_of_range,
+            "numeric field overflow",
         ),
         error.InvalidValue => try replyErrorCode(
             state,
@@ -417,6 +435,7 @@ pub fn replyInvalidUtf8(state: *pgwire.ConnState) !void {
 
 pub const EvalError = error{
     IntOutOfRange,
+    NumericOutOfRange,
     FloatOutOfRange,
     DivisionByZero,
     SubstringLength,
@@ -427,8 +446,13 @@ pub const EvalError = error{
 };
 
 /// What a subtree evaluates to before assignment. Integers of every
-/// width compute as i128, floats as f64.
-pub const Scalar = union(enum) { int: i128, float: f64, text: String };
+/// width compute as i128, floats as f64, numerics exactly.
+pub const Scalar = union(enum) {
+    int: i128,
+    float: f64,
+    numeric: Numeric,
+    text: String,
+};
 
 /// A cell as an operand; null for SQL NULL and for a cell of a kind
 /// no operator or function takes (a date, a uuid), which bind keeps
@@ -437,6 +461,7 @@ fn scalarOf(v: Value) ?Scalar {
     return switch (v) {
         inline .int2, .int4, .int8, .uint2, .uint4, .uint8 => |n| .{ .int = n },
         inline .float4, .float8 => |f| .{ .float = f },
+        .numeric => |d| .{ .numeric = d },
         .text => |s| .{ .text = s },
         else => null,
     };
@@ -460,12 +485,14 @@ pub fn compare(x: Value, y: Value) std.math.Order {
     return _value.orderValues(x, y);
 }
 
-/// Two scalars of one kind: text bytewise, numbers as floats unless
-/// both are integers.
+/// Two scalars of one kind: text bytewise, numbers as floats when
+/// either is one, exactly otherwise.
 pub fn orderScalars(x: Scalar, y: Scalar) std.math.Order {
     if (x == .text) return std.mem.order(u8, x.text, y.text);
+    if (x == .float or y == .float)
+        return std.math.order(toFloat(x), toFloat(y));
     if (x == .int and y == .int) return std.math.order(x.int, y.int);
-    return std.math.order(toFloat(x), toFloat(y));
+    return Numeric.order(toNumeric(x), toNumeric(y));
 }
 
 fn applyOp(
@@ -480,14 +507,46 @@ fn applyOp(
     }
     if (lhs == .int and rhs == .int)
         return .{ .int = try intOp(op, lhs.int, rhs.int) };
-    return .{ .float = try floatOp(op, toFloat(lhs), toFloat(rhs)) };
+    if (lhs == .float or rhs == .float)
+        return .{ .float = try floatOp(op, toFloat(lhs), toFloat(rhs)) };
+    return .{ .numeric = try numericOp(op, toNumeric(lhs), toNumeric(rhs)) };
 }
 
 fn toFloat(s: Scalar) f64 {
     return switch (s) {
         .int => |n| @floatFromInt(n),
         .float => |f| f,
+        .numeric => |d| d.toFloat(),
         .text => unreachable,
+    };
+}
+
+/// An integer or numeric operand as a decimal: what the exact
+/// operations compute over.
+pub fn toNumeric(s: Scalar) Numeric {
+    return switch (s) {
+        .int => |n| Numeric.fromInt(n),
+        .numeric => |d| d,
+        .float, .text => unreachable,
+    };
+}
+
+/// Exact arithmetic (numeric.zig); a result past 38 digits is
+/// NumericOutOfRange, as a coefficient the type cannot hold.
+fn numericOp(op: Op, x: Numeric, y: Numeric) EvalError!Numeric {
+    const r = switch (op) {
+        .add => x.add(y),
+        .sub => x.sub(y),
+        .mul => x.mul(y),
+        .div => x.div(y),
+        .mod => x.mod(y),
+        .concat => unreachable,
+    };
+    return r catch |err| switch (err) {
+        error.DivisionByZero => error.DivisionByZero,
+        error.NumericOutOfRange,
+        error.InvalidNumeric,
+        => error.NumericOutOfRange,
     };
 }
 
@@ -562,6 +621,13 @@ fn coerceScalar(s: Scalar, target: *const Column) EvalError!Value {
         },
         .text, .bpchar, .varchar => return .{
             .text = try _value.fitString(s.text, target),
+        },
+        .numeric => {
+            const d = if (s == .float)
+                Numeric.fromFloat(s.float) catch return error.NumericOutOfRange
+            else
+                toNumeric(s);
+            return .{ .numeric = try _value.fitNumeric(d, target) };
         },
         else => unreachable,
     }

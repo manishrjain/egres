@@ -38,6 +38,7 @@
 const std = @import("std");
 
 pub const value = @import("sql/value.zig");
+pub const numeric = @import("sql/numeric.zig");
 pub const schema = @import("sql/schema.zig");
 pub const row = @import("sql/row.zig");
 pub const catalog = @import("sql/catalog.zig");
@@ -61,6 +62,7 @@ pub const Server = server.Server;
 pub const default_database = server.default_database;
 
 pub const Type = value.Type;
+pub const Numeric = numeric.Numeric;
 pub const Value = value.Value;
 pub const Interval = value.Interval;
 pub const Row = value.Row;

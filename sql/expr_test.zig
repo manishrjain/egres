@@ -205,8 +205,8 @@ test "sql.expr: bind — literals, columns, operators, and the type rules" {
     const arith = try fx.bind("a = a * 2 + 1");
     try testing.expectEqual(sql.parse.Expr.Op.add, arith.root.binop.op);
     try testing.expectEqual(sql.value.Type.int8, arith.root.ty().?);
-    const mixed = try fx.bind("c = a + 1.5"); // int with float → float8
-    try testing.expectEqual(sql.value.Type.float8, mixed.root.ty().?);
+    const mixed = try fx.bind("c = a + 1.5"); // int with a decimal → numeric
+    try testing.expectEqual(sql.value.Type.numeric, mixed.root.ty().?);
     _ = try fx.bind("c = a + 1"); // an integer result into a float column
     const nulls = try fx.bind("a = NULL + NULL"); // NULL-only fits anything
     try testing.expect(nulls.root.ty() == null);
@@ -306,7 +306,10 @@ test "sql.expr: bind — a $n is typed by its column, or by its text" {
     const nul = try fx.bindWith("a = a + $3", text);
     try testing.expect(nul.root.binop.rhs.value == .null_value);
     const mixed = try fx.bindWith("c = a * $4", text);
-    try testing.expectEqual(Value{ .float8 = 1.5 }, mixed.root.binop.rhs.value);
+    try testing.expectEqual(
+        sql.Numeric{ .coef = 15, .scale = 1 },
+        mixed.root.binop.rhs.value.numeric,
+    );
     try testing.expectError(
         error.NoSuchOperator,
         fx.bindWith("a = a + $2", text),

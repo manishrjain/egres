@@ -566,6 +566,50 @@ expect "ON CONFLICT: failed statements changed nothing" "p" \
     v "SELECT val FROM oc WHERE id = 3;"
 expect "DROP the ON CONFLICT table" "DROP TABLE" q "DROP TABLE oc;"
 
+# --- numeric: exact decimals, rounded to the column's scale ---------------
+q "CREATE TABLE nm (id int4 PRIMARY KEY, price numeric(10, 2), raw numeric);" \
+    >/dev/null
+expect "numeric: rounded to the column's scale, half away from zero" \
+    "1.01" v "INSERT INTO nm VALUES (1, 1.005, 0.321) RETURNING price;"
+expect "numeric: a bare numeric keeps the value's scale" "0.321" \
+    v "SELECT raw FROM nm WHERE id = 1;"
+expect "numeric: trailing zeros of the scale are printed" "12.50" \
+    v "INSERT INTO nm VALUES (2, '12.5', 1e3) RETURNING price;"
+expect "numeric: an exponent literal" "1000" v "SELECT raw FROM nm WHERE id = 2;"
+expect "numeric: past the precision is 22003" "out of range" \
+    q "INSERT INTO nm VALUES (3, 123456789.99, 0);"
+expect "numeric: NaN is not a value" "invalid" \
+    q "INSERT INTO nm VALUES (3, 'NaN', 0);"
+expect "numeric: an integer literal into numeric" "7.00" \
+    v "INSERT INTO nm VALUES (3, 7, 7) RETURNING price;"
+expect "numeric: WHERE compares exactly" "2" \
+    v "SELECT id FROM nm WHERE price = 12.5;"
+expect "numeric: ordered comparison" "2" \
+    v "SELECT count(*) FROM nm WHERE price > 1.01;"
+expect "numeric: column against column" "1" \
+    v "SELECT count(*) FROM nm WHERE price = raw;"
+expect "numeric: arithmetic in SET is exact" "13.60" \
+    v "UPDATE nm SET price = price + 1.1 WHERE id = 2 RETURNING price;"
+expect "numeric: a numeric plus an integer stays exact" "1.321" \
+    v "SELECT raw + 1 FROM nm WHERE id = 1;"
+expect "numeric: division keeps 16 fractional digits" "333.3333333333333333" \
+    v "SELECT raw / 3 FROM nm WHERE id = 2;"
+expect "numeric: ROUND to places pads the scale" "0.32" \
+    v "SELECT round(raw, 2) FROM nm WHERE id = 1;"
+expect "numeric: ROUND to a negative place" "1000" \
+    v "SELECT round(raw, -2) FROM nm WHERE id = 2;"
+expect "numeric: a decimal literal is numeric, the scales add" "0.6420" \
+    v "SELECT raw * 2.0 FROM nm WHERE id = 1;"
+expect "numeric: 0.1 + 0.2 is exactly 0.3" "0.3" \
+    v "SELECT 0.1 + 0.2 FROM nm WHERE id = 1;"
+expect "numeric: an index on a numeric column" "CREATE INDEX" \
+    q "CREATE INDEX nm_price ON nm (price);"
+expect "numeric: the index answers a range" "1" \
+    v "SELECT count(*) FROM nm WHERE price >= 10 AND price < 20;"
+expect "numeric: the index answers equality across scales" "2" \
+    v "SELECT id FROM nm WHERE price = 13.6;"
+expect "DROP the numeric table" "DROP TABLE" q "DROP TABLE nm;"
+
 # --- RETURNING: the written rows, projected as a SELECT's ----------------
 q "CREATE TABLE rt (id int4 PRIMARY KEY, v text, n int8);" >/dev/null
 expect "INSERT RETURNING *" "1|a|10" \

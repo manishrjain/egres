@@ -13,6 +13,7 @@ const _value = @import("value.zig");
 const String = _value.String;
 const Type = _value.Type;
 const Scalar = _expr.Scalar;
+const Numeric = _value.Numeric;
 const EvalError = _expr.EvalError;
 
 pub const StrictEval = *const fn (
@@ -85,19 +86,34 @@ pub const Func = struct {
                     }
                 },
             }
-            const wide: Type = if (t.isString()) .text else if (t.isFloat())
+            // The widest of the kind: text, or int8 < numeric < float8
+            // across the number arguments.
+            const wide: Type = if (t.isString())
+                .text
+            else if (t.isFloat())
                 .float8
+            else if (t == .numeric)
+                .numeric
             else
                 .int8;
             const prev = ty orelse {
                 ty = wide;
                 continue;
             };
-            if (prev.isNumeric() and wide == .float8) ty = .float8;
+            if (prev.isNumeric() and numberRank(wide) > numberRank(prev))
+                ty = wide;
         }
         return switch (self.result) {
             .fixed => |t| t,
             .widest => ty,
+        };
+    }
+
+    fn numberRank(t: Type) u8 {
+        return switch (t) {
+            .float8 => 2,
+            .numeric => 1,
+            else => 0,
         };
     }
 
@@ -485,6 +501,11 @@ pub fn scalarText(arloc: std.mem.Allocator, s: Scalar) EvalError!String {
                 return error.OutOfMemory;
             return aw.written();
         },
+        .numeric => |d| {
+            var aw: std.Io.Writer.Allocating = .init(arloc);
+            d.format(&aw.writer) catch return error.OutOfMemory;
+            return aw.written();
+        },
     }
 }
 
@@ -529,6 +550,10 @@ fn evalAbs(_: std.mem.Allocator, args: []const Scalar) EvalError!?Scalar {
     return switch (args[0]) {
         .int => |n| .{ .int = try negated(n, n < 0) },
         .float => |f| .{ .float = @abs(f) },
+        .numeric => |d| .{ .numeric = if (d.coef < 0)
+            d.negated() catch return error.NumericOutOfRange
+        else
+            d },
         .text => unreachable,
     };
 }
@@ -546,6 +571,7 @@ fn evalSign(_: std.mem.Allocator, args: []const Scalar) EvalError!?Scalar {
     return switch (args[0]) {
         .int => |n| .{ .int = std.math.sign(n) },
         .float => |f| .{ .float = std.math.sign(f) },
+        .numeric => |d| .{ .numeric = Numeric.fromInt(std.math.sign(d.coef)) },
         .text => unreachable,
     };
 }
@@ -587,7 +613,9 @@ pub const trunc: Func = .{
     .eval = .{ .strict = rounder(.trunc) },
 };
 
-const Rounding = enum { round, trunc, floor, ceil };
+/// The four whole-number forms, numeric.zig's enum so a numeric rounds
+/// through it.
+const Rounding = _value.numeric.Rounding;
 
 /// The strict eval that rounds in `mode`: FLOOR, CEIL, ROUND and
 /// TRUNC differ only in it.
@@ -629,6 +657,12 @@ fn rounded(args: []const Scalar, mode: Rounding) EvalError!Scalar {
             if (r[1] != 0) return error.IntOutOfRange;
             return .{ .int = r[0] };
         },
+        .numeric => |d| {
+            const p: i32 = std.math.cast(i32, places) orelse
+                return error.NumericOutOfRange;
+            const r = d.roundTo(p, mode) catch return error.NumericOutOfRange;
+            return .{ .numeric = r };
+        },
         .text => unreachable,
     }
 }
@@ -657,9 +691,17 @@ fn evalMod(_: std.mem.Allocator, args: []const Scalar) EvalError!?Scalar {
         if (args[1].int == 0) return error.DivisionByZero;
         return .{ .int = @rem(args[0].int, args[1].int) };
     }
-    const y = toFloat(args[1]);
-    if (y == 0) return error.DivisionByZero;
-    return .{ .float = @rem(toFloat(args[0]), y) };
+    if (args[0] == .float or args[1] == .float) {
+        const y = toFloat(args[1]);
+        if (y == 0) return error.DivisionByZero;
+        return .{ .float = @rem(toFloat(args[0]), y) };
+    }
+    const r = _expr.toNumeric(args[0]).mod(_expr.toNumeric(args[1])) catch |err|
+        return switch (err) {
+            error.DivisionByZero => error.DivisionByZero,
+            else => error.NumericOutOfRange,
+        };
+    return .{ .numeric = r };
 }
 
 /// POWER and SQRT compute in float8, as Postgres does for
@@ -703,6 +745,7 @@ fn toFloat(s: Scalar) f64 {
     return switch (s) {
         .int => |n| @floatFromInt(n),
         .float => |f| f,
+        .numeric => |d| d.toFloat(),
         .text => unreachable,
     };
 }
@@ -716,6 +759,8 @@ fn intArg(s: Scalar) EvalError!i128 {
             @intFromFloat(@trunc(f))
         else
             error.IntOutOfRange,
+        .numeric => |d| (d.rescale(0, .trunc) catch
+            return error.IntOutOfRange).coef,
         .text => unreachable,
     };
 }

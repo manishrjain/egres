@@ -616,6 +616,40 @@ test "sql.parse: SELECT without FROM is a row of constants" {
     }
 }
 
+test "sql.parse: numeric(p, s) packs the precision and scale" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const ct = try parse.statement(
+        alloc,
+        "CREATE TABLE t (a numeric(10, 2), b decimal(5), c numeric);",
+    );
+    const cols = ct.create_table.columns;
+    try testing.expectEqual(sql.Type.numeric, cols[0].ty);
+    try testing.expectEqual(@as(?u32, (10 << 16) | 2), cols[0].type_mod);
+    try testing.expectEqual(sql.Type.numeric, cols[1].ty);
+    try testing.expectEqual(@as(?u32, 5 << 16), cols[1].type_mod);
+    try testing.expectEqual(@as(?u32, null), cols[2].type_mod);
+
+    const cases = [_]struct { sql: String, needle: String }{
+        .{ .sql = "CREATE TABLE t (a numeric(0));", .needle = "precision 0" },
+        .{ .sql = "CREATE TABLE t (a numeric(39));", .needle = "precision 39" },
+        .{ .sql = "CREATE TABLE t (a numeric(5, 6));", .needle = "scale 6" },
+        .{
+            .sql = "CREATE TABLE t (a numeric(5, 1, 1));",
+            .needle = "modifier",
+        },
+    };
+    for (cases) |case| {
+        const stmt = try parse.statement(alloc, case.sql);
+        try testing.expect(stmt == .invalid);
+        const found = std.mem.indexOf(u8, stmt.invalid, case.needle);
+        try testing.expect(found != null);
+    }
+}
+
 test "sql.parse: DEALLOCATE names the statement, ALL is null" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);

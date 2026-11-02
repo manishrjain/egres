@@ -17,6 +17,8 @@ const date = utils.date;
 /// cycle). valueToText takes it because a char(n) cell is a plain text
 /// value and only the column knows to pad it.
 const Column = @import("table.zig").Column;
+pub const numeric = @import("numeric.zig");
+pub const Numeric = numeric.Numeric;
 
 /// A borrowed byte string (names, row bytes, encoded keys); see
 /// `utils.String`.
@@ -67,6 +69,12 @@ pub const Type = enum {
     /// `varchar(n)`: text with a length check on the way in. Bare
     /// `varchar` is `.text`.
     varchar,
+    /// `numeric` / `decimal`: an exact decimal (numeric.zig), the
+    /// coefficient and its scale. `numeric(p, s)` packs the precision
+    /// and scale into the column's `type_mod` as Postgres does,
+    /// `(p << 16) | s`; a bare `numeric` has none and keeps each
+    /// value's own scale.
+    numeric,
 
     /// Byte width of a fixed-width type, or null for a varlen type.
     pub inline fn fixedWidth(self: Type) ?u8 {
@@ -76,6 +84,7 @@ pub const Type = enum {
             .int4, .uint4, .float4, .date => 4,
             .int8, .uint8, .float8, .time, .timestamp, .timestamptz => 8,
             .interval, .uuid => 16,
+            .numeric => 17,
             .text, .bytea, .bpchar, .varchar => null,
         };
     }
@@ -102,19 +111,22 @@ pub const Type = enum {
         return self == .float4 or self == .float8;
     }
 
-    /// The types SET arithmetic computes over (expr.zig).
+    /// The types SET arithmetic computes over (expr.zig): the
+    /// integers, the floats and numeric.
     pub inline fn isNumeric(self: Type) bool {
-        return self.isInteger() or self.isFloat();
+        return self.isInteger() or self.isFloat() or self == .numeric;
     }
 
     /// Whether a value of this type may be assigned to a column of
     /// `to` by SET: the same type; any integer into any number (the
-    /// width is range-checked on assignment); a float into a float.
-    /// A float into an integer column is refused (PG would round).
+    /// width is range-checked on assignment); a float into a float
+    /// or a numeric, a numeric into a numeric or a float. A float or
+    /// numeric into an integer column is refused (PG would round).
     pub fn assignableTo(self: Type, to: Type) bool {
         if (self == to) return true;
         if (self.isInteger()) return to.isNumeric();
-        if (self.isFloat()) return to.isFloat();
+        if (self.isFloat() or self == .numeric)
+            return to.isFloat() or to == .numeric;
         if (self.isString()) return to.isString();
         return false;
     }
@@ -131,6 +143,7 @@ pub const Type = enum {
     pub fn fromName(name: String) ?Type {
         if (std.mem.eql(u8, name, "bool")) return .bool_;
         if (std.mem.eql(u8, name, "varchar")) return .text;
+        if (std.mem.eql(u8, name, "decimal")) return .numeric;
         if (std.mem.eql(u8, name, "char") or std.mem.eql(u8, name, "character")) return .bpchar;
         return std.meta.stringToEnum(Type, name);
     }
@@ -171,6 +184,7 @@ pub const Value = union(enum) {
     uuid: [16]u8,
     text: String,
     bytea: String,
+    numeric: Numeric,
 
     /// The cell's type, or null for SQL NULL. Every non-null tag is
     /// named exactly as its Type.
@@ -246,8 +260,39 @@ pub fn textToValue(alloc: std.mem.Allocator, ty: Type, text: String) !Value {
         .timestamp => .{ .timestamp = try date.parseTimestamp(text, false) },
         .timestamptz => .{ .timestamptz = try date.parseTimestamp(text, true) },
         .date => .{ .date = try date.parseDate(text) },
+        .numeric => .{ .numeric = try Numeric.parse(text) },
         .time, .interval, .uuid => error.UnsupportedType,
     };
+}
+
+/// A text literal or parameter as a cell of `col`: parsed as its type
+/// (textToValue) and fitted to its modifier, a string's length or a
+/// numeric's precision and scale.
+pub fn textToColumn(
+    alloc: std.mem.Allocator,
+    col: *const Column,
+    text: String,
+) !Value {
+    if (col.ty.isString()) return .{ .text = try fitString(text, col) };
+    const v = try textToValue(alloc, col.ty, text);
+    if (v == .numeric) return .{ .numeric = try fitNumeric(v.numeric, col) };
+    return v;
+}
+
+/// A numeric cell as column `col` stores it: rounded to the column's
+/// scale, half away from zero, and within its precision; past that is
+/// Postgres's "numeric field overflow" (22003). A column with no
+/// modifier keeps the value's own scale.
+pub fn fitNumeric(
+    d: Numeric,
+    col: *const Column,
+) error{NumericOutOfRange}!Numeric {
+    const mod = col.type_mod orelse return d;
+    const precision: u8 = @intCast(mod >> 16);
+    const scale: u8 = @intCast(mod & 0xFFFF);
+    const r = d.rescale(scale, .round) catch return error.NumericOutOfRange;
+    if (!r.fitsPrecision(precision)) return error.NumericOutOfRange;
+    return r;
 }
 
 /// A bytea literal: Postgres's hex form, `'\x0001'`, decoded into
@@ -347,6 +392,7 @@ pub fn valueToText(w: *std.Io.Writer, col: ?*const Column, v: Value) !void {
         .timestamptz => |us| try date.formatTimestamp(w, us, true),
         .interval => |iv| try w.print("{d}mon {d}d {d}us", .{ iv.months, iv.days, iv.micros }),
         .uuid => |u| try w.print("{x}", .{u}),
+        .numeric => |d| try d.format(w),
     }
 }
 
@@ -379,6 +425,7 @@ pub fn valueToBinary(w: *std.Io.Writer, col: ?*const Column, v: Value) !void {
             .big,
         ),
         .bytea => |b| try w.writeAll(b),
+        .numeric => |d| try pgwire.binary.encodeNumeric(w, d.coef, d.scale),
         .text, .time, .interval, .uuid => try valueToText(w, col, v),
     }
 }
@@ -398,11 +445,21 @@ pub fn valueToColumn(
     col: *const Column,
 ) !Value {
     const from = v.ty() orelse return v;
-    if (v == .text) {
-        if (col.ty.isString())
-            return .{ .text = try fitString(v.text, col) };
-        return textToValue(alloc, col.ty, v.text);
+    if (v == .text) return textToColumn(alloc, col, v.text);
+    if (col.ty == .numeric) {
+        const d: Numeric = switch (v) {
+            .numeric => |d| d,
+            inline .int2, .int4, .int8, .uint2, .uint4, .uint8 => |n| Numeric.fromInt(n),
+            inline .float4, .float8 => |f| try Numeric.fromFloat(f),
+            else => return error.TypeMismatch,
+        };
+        return .{ .numeric = try fitNumeric(d, col) };
     }
+    if (v == .numeric) return switch (col.ty) {
+        .float8 => .{ .float8 = v.numeric.toFloat() },
+        .float4 => .{ .float4 = @floatCast(v.numeric.toFloat()) },
+        else => error.TypeMismatch,
+    };
     if (from == col.ty) return v;
     if (from.isInteger()) {
         const n: i128 = switch (v) {
@@ -461,6 +518,7 @@ pub fn orderValues(x: Value, y: Value) std.math.Order {
         .bytea => std.mem.order(u8, x.bytea, y.bytea),
         .uuid => std.mem.order(u8, &x.uuid, &y.uuid),
         .interval => std.math.order(intervalMicros(x.interval), intervalMicros(y.interval)),
+        .numeric => |d| Numeric.order(d, y.numeric),
         inline else => |v, tag| std.math.order(v, @field(y, @tagName(tag))),
     };
 }
@@ -480,6 +538,7 @@ pub fn valuesEqual(x: Value, y: Value) bool {
         .bytea => std.mem.eql(u8, x.bytea, y.bytea),
         .uuid => std.mem.eql(u8, &x.uuid, &y.uuid),
         .interval => std.meta.eql(x.interval, y.interval),
+        .numeric => |d| d.eql(y.numeric),
         inline else => |v, tag| v == @field(y, @tagName(tag)),
     };
 }
@@ -503,6 +562,7 @@ pub fn pgTypeOid(ty: Type) pgwire.Oid {
         .bpchar => pgwire.oid.bpchar,
         .varchar => pgwire.oid.varchar,
         .bytea => pgwire.oid.bytea,
+        .numeric => pgwire.oid.numeric,
         .text, .time, .interval, .uuid => pgwire.oid.text,
     };
 }

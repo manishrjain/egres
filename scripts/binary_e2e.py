@@ -106,7 +106,8 @@ def main(dsn):
     bin_.execute("SELECT 1")
     check("binary: SELECT 1", bin_.fetchone(), (1,))
     bin_.execute("SELECT 2.5, 'x', true, NULL")
-    check("binary: SELECT constants", bin_.fetchone(), (2.5, "x", True, None))
+    check("binary: SELECT constants", bin_.fetchone(),
+          (Decimal("2.5"), "x", True, None))
     bin_.execute("INSERT INTO bt (id, i8) VALUES (%s, %s) RETURNING id, i8",
                  (4, 7))
     check("binary: RETURNING", bin_.fetchone(), (4, 7))
@@ -115,6 +116,19 @@ def main(dsn):
     bin_.execute("UPDATE bt SET i8 = i8 + %s WHERE id = %s RETURNING i8",
                  (1, 4))
     check("binary: UPDATE ... RETURNING", bin_.fetchone(), (8,))
+
+    # --- numeric: Decimal both ways, rounded to the column's scale -----
+    text.execute("CREATE TABLE nb (id int4 PRIMARY KEY, p numeric(10, 2), r numeric)")
+    bin_.execute("INSERT INTO nb VALUES (%s, %s, %s)",
+                 (1, Decimal("1.005"), Decimal("0.321")))
+    bin_.execute("SELECT p, r FROM nb WHERE id = %s", (1,))
+    check("binary: numeric params and results", bin_.fetchone(),
+          (Decimal("1.01"), Decimal("0.321")))
+    text.execute("SELECT p, r FROM nb WHERE id = 1")
+    check("text: numeric", text.fetchone(), (Decimal("1.01"), Decimal("0.321")))
+    bin_.execute("SELECT r * %s FROM nb WHERE id = %s", (Decimal("3"), 1))
+    check("binary: numeric arithmetic", bin_.fetchone(), (Decimal("0.963"),))
+    text.execute("DROP TABLE nb")
 
     text.execute("DROP TABLE bt")
     conn.close()

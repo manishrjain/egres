@@ -22,6 +22,7 @@ const pgwire = @import("pgwire");
 const parser = pgwire.parser;
 const _funcs = @import("funcs.zig");
 const _value = @import("value.zig");
+const _numeric = @import("numeric.zig");
 const Column = @import("table.zig").Column;
 
 const String = _value.String;
@@ -550,10 +551,16 @@ fn parseCreateTable(
 
         // A length modifier: only `char(n)` / `varchar(n)` take one, a
         // single integer in 1..max_type_mod. A lengthless `char` is
-        // `char(1)`; a lengthless `varchar` stays `.text`.
+        // `char(1)`; a lengthless `varchar` stays `.text`. `numeric(p,
+        // s)` packs both into the one modifier (value.Type.numeric).
         const typmods = parser.items(tn.typmods);
         var type_mod: ?u32 = null;
-        if (typmods.len > 0) {
+        if (typmods.len > 0 and ty == .numeric) {
+            type_mod = switch (try numericTypmod(alloc, typmods)) {
+                .mod => |m| m,
+                .stmt => |rejected| return rejected,
+            };
+        } else if (typmods.len > 0) {
             const is_varchar = std.mem.eql(u8, tyname, "varchar");
             if (ty != .bpchar and !is_varchar)
                 return invalidFmt(alloc, "type modifier is not allowed for type \"{s}\"", .{tyname});
@@ -926,9 +933,7 @@ pub const Params = struct {
             const typed = try self.binaryValue(index, bytes);
             return _value.valueToColumn(alloc, typed, col);
         }
-        if (col.ty.isString())
-            return .{ .text = try _value.fitString(bytes, col) };
-        return _value.textToValue(alloc, col.ty, bytes);
+        return _value.textToColumn(alloc, col, bytes);
     }
 
     /// `$index` with no column to type it (a placeholder under a SET
@@ -978,6 +983,9 @@ pub const Params = struct {
                 .timestamptz = try binary.decodeInt8(bytes) + pg_epoch_us,
             },
             pgwire.oid.bytea => .{ .bytea = bytes },
+            pgwire.oid.numeric => .{
+                .numeric = try _value.Numeric.decodeBinary(bytes),
+            },
             pgwire.oid.uuid => if (bytes.len == 16)
                 .{ .uuid = bytes[0..16].* }
             else
@@ -990,12 +998,11 @@ pub const Params = struct {
     }
 };
 
-/// Coerce a parsed literal to a cell of `col`, reusing value.textToValue
-/// by rendering non-string literals to text first (int/bool stringified
-/// into `a`, so a text-typed column can borrow it). A string column goes
-/// through value.fitString with its length. NULL passes through; a
-/// non-literal item is `error.UnsupportedLiteral`; a `$n` is the bound
-/// value (Params.toValue).
+/// Coerce a parsed literal to a cell of `col` (value.textToColumn) by
+/// rendering non-string literals to text first (int/bool stringified
+/// into `a`, so a text-typed column can borrow it). NULL passes
+/// through; a non-literal item is `error.UnsupportedLiteral`; a `$n`
+/// is the bound value (Params.toValue).
 pub fn litToValue(
     a: std.mem.Allocator,
     lit: Literal,
@@ -1014,9 +1021,7 @@ pub fn litToValue(
         .int => |n| try std.fmt.allocPrint(a, "{d}", .{n}),
         .bool_ => |b| if (b) "t" else "f",
     };
-    if (col.ty.isString())
-        return .{ .text = try _value.fitString(text, col) };
-    return _value.textToValue(a, col.ty, text);
+    return _value.textToColumn(a, col, text);
 }
 
 /// A parsed WHERE tree or a rejection reason (borrowed).
@@ -1498,6 +1503,48 @@ fn parseReturning(
         .projection => |x| .{ .projection = x },
         .stmt => |rejected| .{ .stmt = rejected },
     };
+}
+
+const ParsedTypmod = union(enum) { mod: u32, stmt: Stmt };
+
+/// NUMERIC(p) / NUMERIC(p, s): the precision in 1..38 (Postgres allows
+/// 1000; numeric.zig holds 38 digits) and the scale in 0..p, packed as
+/// Postgres packs them, `(p << 16) | s`, with its wording for a bad
+/// one.
+fn numericTypmod(
+    alloc: std.mem.Allocator,
+    typmods: []const c.ListCell,
+) parser.ParseError!ParsedTypmod {
+    if (typmods.len > 2) return .{
+        .stmt = invalid("invalid type modifier for type numeric"),
+    };
+    var nums: [2]i64 = .{ 0, 0 };
+    for (typmods, 0..) |cell, i| {
+        const ac = parser.cast(c.A_Const, cell.ptr_value);
+        if (ac == null or ac.?.val.node.type != c.T_Integer) return .{
+            .stmt = invalid("invalid type modifier for type numeric"),
+        };
+        nums[i] = ac.?.val.ival.ival;
+    }
+    const precision = nums[0];
+    const scale = if (typmods.len == 2) nums[1] else 0;
+    if (precision < 1 or precision > _numeric.max_digits) return .{
+        .stmt = try invalidFmt(
+            alloc,
+            "NUMERIC precision {d} must be between 1 and {d}",
+            .{ precision, _numeric.max_digits },
+        ),
+    };
+    if (scale < 0 or scale > precision) return .{
+        .stmt = try invalidFmt(
+            alloc,
+            "NUMERIC scale {d} must be between 0 and precision {d}",
+            .{ scale, precision },
+        ),
+    };
+    const p: u32 = @intCast(precision);
+    const s: u32 = @intCast(scale);
+    return .{ .mod = (p << 16) | s };
 }
 
 /// A target's output name: its alias, else what Postgres prints, the
