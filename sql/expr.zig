@@ -85,21 +85,21 @@ pub const SetNode = union(enum) {
         arloc: std.mem.Allocator,
         tbl: *const Table,
         item: zdb.kv.Item,
-        target: *const Column,
+        col: *const Column,
     ) EvalError!Value {
-        std.debug.assert(self.fits(target));
+        std.debug.assert(self.fits(col));
         // A leaf already of the target's type is the cell itself.
         // (A string column of another length is not a leaf of the
         // target's type: its cell must go through the length check.)
         switch (self.*) {
-            .value => |v| if (v == .null_value or v.ty() == target.ty) return v,
-            .column => |col| if (col.ty == target.ty and col.type_mod == target.type_mod)
-                return tbl.parseCol(item, col),
+            .value => |v| if (v == .null_value or v.ty() == col.ty) return v,
+            .column => |scol| if (scol.ty == col.ty and scol.type_mod == col.type_mod)
+                return tbl.parseCol(item, scol),
             .binop, .call => {},
         }
         const result = try self.scalar(arloc, tbl, item) orelse
             return .null_value;
-        return coerceScalar(result, target);
+        return coerceScalar(result, col);
     }
 
     /// This subtree's value for one row, before assignment; null = SQL
