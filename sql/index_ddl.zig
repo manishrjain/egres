@@ -36,6 +36,17 @@ const catalogRowKvs = _ddl.catalogRowKvs;
 const replyNameError = _ddl.replyNameError;
 const _names = @import("names.zig");
 
+/// 42P07 for a CREATE INDEX whose name is taken. The holder may be a
+/// `building` index left by a proposal that failed yet committed (see
+/// createIndex), which only DROP INDEX frees, so the hint says so.
+fn replyIndexExists(state: *pgwire.ConnState) !void {
+    try state.sendError(.{
+        .code = pgwire.sqlstate.duplicate_table,
+        .message = "index already exists",
+        .hint = "an index of this name exists; DROP INDEX it to retry",
+    });
+}
+
 /// CREATE [UNIQUE] INDEX — the online-backfill protocol. Blocks the
 /// issuing session until the index is built and valid (the reply
 /// is a truthful completion signal, as in Postgres), but OTHER
@@ -141,11 +152,7 @@ pub fn createIndex(
     if (existing != null) {
         if (ci.if_not_exists)
             return state.sendCommandComplete("CREATE INDEX");
-        return replyErrorCode(
-            state,
-            pgwire.sqlstate.duplicate_table,
-            "index already exists",
-        );
+        return replyIndexExists(state);
     }
     // One index per column, of either kind — dml's `Set.index`
     // invariant.
@@ -161,12 +168,15 @@ pub fn createIndex(
     // what's needed.
     const column_id = col.column_id;
     _names.checkNew(eng.forest, read_ts, ns, &.{name}) catch |err|
-        return replyNameError(
-            state,
-            err,
-            pgwire.sqlstate.duplicate_table,
-            "index already exists",
-        );
+        switch (err) {
+            error.NameExists => return replyIndexExists(state),
+            else => return replyNameError(
+                state,
+                err,
+                pgwire.sqlstate.duplicate_table,
+                "index already exists",
+            ),
+        };
 
     var changes = [_]zdb.manifest.TreeChange{zdb.manifest.newTableChange(
         if (ci.unique) .unique_index else .posting_index,
