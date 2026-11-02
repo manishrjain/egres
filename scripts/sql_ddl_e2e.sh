@@ -49,6 +49,88 @@ stop_server() {
     wait "$SERVER_PID" 2>/dev/null || true
 }
 
+# A crash: no shutdown path runs, so recovery sees what a power cut
+# leaves.
+crash_server() {
+    kill -KILL "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+}
+
+# admin <command>: one line to the admin port, the reply on stdout. The
+# server keeps the connection open after replying, so a short quiet gap
+# after the first bytes marks the reply's end.
+admin() {
+    python3 - "$1" <<'PY'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", 5210), timeout=5)
+s.sendall(sys.argv[1].encode() + b"\n")
+out = b""
+try:
+    while True:
+        b = s.recv(65536)
+        if not b:
+            break
+        out += b
+        s.settimeout(0.3)
+except socket.timeout:
+    pass
+print(out.decode(errors="replace"))
+PY
+}
+
+# The WAL's last index, from the node's row of `admin raft`.
+last_index() {
+    admin raft | grep -oE 'last=[0-9]+' | head -1 | cut -d= -f2
+}
+
+# one_entry <desc> <conninfo> <sql>: the statement succeeds and adds
+# exactly one DDL manifest entry and no data entry: its catalog and
+# name rows ride in the DDL entry, not in a Mutations entry of their own.
+one_entry() {
+    local desc=$1 conn=$2 stmt=$3 lo hi out dump ddl data
+    lo=$(last_index)
+    if ! out=$(psql "$conn" -X -c "$stmt" 2>&1) || grep -q ERROR <<<"$out"; then
+        bad "$desc — got: $out"; return
+    fi
+    hi=$(last_index)
+    dump=$(admin "raft entry $((lo + 1)) $hi")
+    ddl=$(grep -cE 'cmd=(create|drop|branch)_(tree|ns|table)' \
+        <<<"$dump" || true)
+    data=$(grep -c 'detail=Mutations' <<<"$dump" || true)
+    if [ "$ddl" = 1 ] && [ "$data" = 0 ]; then ok "$desc"; else
+        bad "$desc — $ddl DDL and $data data entries in ($lo, $hi]"; fi
+}
+
+# crash_checks <suffix>: what a crash after CREATE TABLE c<suffix>,
+# CREATE then DROP TABLE d<suffix> and CREATE DATABASE e<suffix> must
+# leave: all of each statement, names and catalog agreeing.
+crash_checks() {
+    local s=$1
+    expect "c$s takes rows after a crash" "INSERT 0 1" \
+        psql "$E" -X -c "INSERT INTO c$s VALUES (1, 'x');"
+    expect "c$s reads after a crash" "(1 row)" \
+        psql "$E" -X -c "SELECT * FROM c$s;"
+    expect "c$s name kept after a crash" "already exists" \
+        psql "$E" -X -c "CREATE TABLE c$s (a int);"
+    expect "c${s}_pkey name kept after a crash" "already exists" \
+        psql "$E" -X -c "CREATE TABLE c${s}_pkey (a int);"
+    expect "d$s name freed after a crash" "CREATE TABLE" \
+        psql "$E" -X -c "CREATE TABLE d$s (b text, n int);"
+    # A statement that needs the database: SELECT 1 answers without one.
+    expect "e$s database after a crash" "CREATE TABLE" \
+        psql "host=127.0.0.1 port=3210 dbname=e$s sslmode=disable" \
+        -X -c "CREATE TABLE probe (a int);"
+}
+
+# crash_ddl <suffix>: the statements crash_checks looks for.
+crash_ddl() {
+    local s=$1
+    psql "$E" -X -qc "CREATE TABLE c$s (id int PRIMARY KEY, v text);" >/dev/null
+    psql "$E" -X -qc "CREATE TABLE d$s (a int);" >/dev/null
+    psql "$E" -X -qc "DROP TABLE d$s;" >/dev/null
+    psql "$E" -X -qc "CREATE DATABASE e$s;" >/dev/null
+}
+
 zig build
 rm -rf "$DATA" && mkdir -p "$DATA" /tmp/zdb
 start_server
@@ -98,10 +180,45 @@ expect "DROP TABLE on an index is rejected" "cannot DROP TABLE an index" \
 expect "CREATE TABLE mine_pkey" "CREATE TABLE" psql "$E" -X -c "CREATE TABLE mine_pkey (a int);"
 expect "PK index name collision fails CREATE" "already exists" \
     psql "$E" -X -c "CREATE TABLE mine (id int PRIMARY KEY);"
+expect "user index named <t>_pkey refused" "already exists" \
+    psql "$E" -X -c "CREATE INDEX post_restart_pkey ON mine_pkey (a);"
+# The parser cuts a typed name to 63 bytes; a generated index name may
+# be longer (here <63 bytes>_pkey), as it always could be.
+L63=$(printf 'a%.0s' $(seq 1 63))
+expect "63-byte table with a PRIMARY KEY" "CREATE TABLE" \
+    psql "$E" -X -c "CREATE TABLE ${L63} (id int PRIMARY KEY);"
+expect "drop the 63-byte table" "DROP TABLE" \
+    psql "$E" -X -c "DROP TABLE ${L63};"
+
+# --- one raft entry per DDL statement ---------------------------------------
+# Each statement's trees, catalog rows and name rows commit together, in
+# one manifest entry and no data entry. CREATE INDEX is not checked here:
+# its merge transaction and mark-valid are data entries by design.
+one_entry "CREATE TABLE is one entry" "$E" \
+    "CREATE TABLE oe (id int PRIMARY KEY, v text);"
+one_entry "CREATE TABLE AS is one entry" "$E" "CREATE TABLE oe2 AS TABLE oe;"
+one_entry "CREATE TABLE AS WITH NO DATA is one entry" "$E" \
+    "CREATE TABLE oe3 AS TABLE oe WITH NO DATA;"
+psql "$E" -X -qc "CREATE INDEX oe_v ON oe (v);" >/dev/null
+one_entry "DROP INDEX is one entry" "$E" "DROP INDEX oe_v;"
+one_entry "DROP TABLE is one entry" "$E" "DROP TABLE oe2;"
+one_entry "CREATE DATABASE is one entry" "$E" "CREATE DATABASE oedb;"
+one_entry "CREATE DATABASE TEMPLATE is one entry" "$E" \
+    "CREATE DATABASE oedb2 TEMPLATE oedb;"
+one_entry "DROP DATABASE is one entry" "$E" "DROP DATABASE oedb2;"
+psql "$E" -X -qc "DROP DATABASE oedb;" >/dev/null
+psql "$E" -X -qc "DROP TABLE oe;" >/dev/null
+psql "$E" -X -qc "DROP TABLE oe3;" >/dev/null
+
+# --- crash, then WAL replay -------------------------------------------------
+crash_ddl 1
+crash_server
+start_server
+crash_checks 1
 
 # --- restart from a raft snapshot: names must ride in the snapshot ----------
 # Once a snapshot is taken the WAL below it is gone, so the database and
-# table names have to be in the snapshot itself (engine.replayNames).
+# table names have to be in the snapshot itself.
 # A tiny memtable, flushed as soon as it is frozen, makes the rows
 # below flush, which lets the snapshot reach past the CREATE TABLE; the
 # snapshot flags make the leader take one within a second or two.
@@ -117,6 +234,9 @@ for _ in $(seq 1 50); do
         grep -q "become-leader" "$LOG" 2>/dev/null; then break; fi
     sleep 0.2
 done
+# DDL the snapshot below covers, so the crash restart after it replays
+# these entries' trees while their rows come from SSTs.
+crash_ddl 2
 psql "$E" -X -qc "CREATE TABLE snap_t (a int PRIMARY KEY, s text);" >/dev/null
 pad=$(head -c 200 /dev/zero | tr '\0' x)
 rows=$(for i in $(seq 1 40); do printf "(%d,'%s')," "$i" "$pad"; done)
@@ -188,6 +308,13 @@ expect "table name survives a snapshot restart" "already exists" \
     psql "$E" -X -c "CREATE TABLE snap_t (a int PRIMARY KEY);"
 expect "post_restart still known" "already exists" \
     psql "$E" -X -c "CREATE TABLE post_restart (a int4 PRIMARY KEY);"
+
+# --- crash, then recovery from the snapshot ---------------------------------
+# The snapshots above cover crash_ddl 2's entries, so this recovery
+# replays their trees and reads their rows from SSTs.
+crash_server
+start_server
+crash_checks 2
 psql "$E" -X -qc "DROP TABLE snap_t;" >/dev/null
 
 # --- per-database name scoping + drop cascades ------------------------------

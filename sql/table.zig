@@ -3,7 +3,7 @@
 
 //! Reconstructing a user table's schema from its catalog rows.
 //!
-//! CREATE TABLE writes one catalog row per column (server.writeCatalogRows);
+//! CREATE TABLE writes one catalog row per column (ddl.catalogRowKvs);
 //! this reads them back so INSERT/SELECT can encode/decode the table's rows.
 //! The catalog tree (catalog.table_id) holds every table's columns keyed
 //! (table_id, column_id) big-endian, so the 4-byte table_id prefix scans
@@ -112,6 +112,8 @@ pub const Index = struct {
     /// it; a writer bumps its read_ts to it before probing.
     valid_ts: u64,
     column: *const Column,
+    /// The index's name, as its catalog row records it.
+    name: String,
 
     /// Whether the backfill is still running: no statement reads the
     /// index, and no writer bumps to its `valid_ts`.
@@ -367,6 +369,7 @@ pub fn loadTableSchema(
             .unique = def.unique,
             .valid_ts = def.valid_ts,
             .column = col,
+            .name = def.name,
         };
     }
 
@@ -403,7 +406,10 @@ pub fn loadIndexes(
     while (try cur.next()) |item| {
         const value = item.newest().value;
         try _row.unmarshalRow(alloc, index_catalog_ps, value, &.{}, &scratch);
-        try out.append(alloc, try _catalog.decodeIndex(&scratch));
+        var def = try _catalog.decodeIndex(&scratch);
+        // The name borrows `scratch`, which the next row overwrites.
+        def.name = try alloc.dupe(u8, def.name);
+        try out.append(alloc, def);
     }
     return out.toOwnedSlice(alloc);
 }

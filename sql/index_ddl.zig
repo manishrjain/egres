@@ -30,8 +30,11 @@ const String = _value.String;
 const log = std.log.scoped(.sql);
 const replyError = _server.replyError;
 const replyErrorCode = _server.replyErrorCode;
+const replyNameReadFailed = _server.replyNameReadFailed;
 const replyLockErr = _server.replyLockErr;
 const catalogRowKvs = _ddl.catalogRowKvs;
+const replyNameError = _ddl.replyNameError;
+const _names = @import("names.zig");
 
 /// CREATE [UNIQUE] INDEX — the online-backfill protocol. Blocks the
 /// issuing session until the index is built and valid (the reply
@@ -96,12 +99,14 @@ pub fn createIndex(
     if (!try self.ddlReady(state)) return;
 
     const ns = try self.sessionNamespace(state) orelse return;
-    const base_tid = eng.forest.manifest.lookupTable(ns, ci.table) orelse
-        return replyErrorCode(
-            state,
-            pgwire.sqlstate.undefined_table,
-            "table does not exist",
-        );
+    const read_ts = eng.node.appliedTs();
+    const found = _names.tableId(eng.forest, read_ts, ns, ci.table) catch |err|
+        return replyNameReadFailed(state, ci.table, err);
+    const base_tid = found orelse return replyErrorCode(
+        state,
+        pgwire.sqlstate.undefined_table,
+        "table does not exist",
+    );
     const base_key: zdb.kv.TableKey = .{
         .namespace = ns,
         .table_id = base_tid,
@@ -131,7 +136,9 @@ pub fn createIndex(
     // column limit, which is about a SECOND index on the column.
     const name = ci.name orelse
         try _table.indexName(arloc, ci.table, ci.column, .plain);
-    if (eng.forest.manifest.lookupTable(ns, name) != null) {
+    const existing = _names.tableId(eng.forest, read_ts, ns, name) catch |err|
+        return replyNameReadFailed(state, name, err);
+    if (existing != null) {
         if (ci.if_not_exists)
             return state.sendCommandComplete("CREATE INDEX");
         return replyErrorCode(
@@ -153,6 +160,13 @@ pub fn createIndex(
     // `t` (and `col` into it) dangle past forgetTable below; keep
     // what's needed.
     const column_id = col.column_id;
+    _names.checkNew(eng.forest, read_ts, ns, &.{name}) catch |err|
+        return replyNameError(
+            state,
+            err,
+            pgwire.sqlstate.duplicate_table,
+            "index already exists",
+        );
 
     var changes = [_]zdb.manifest.TreeChange{zdb.manifest.newTableChange(
         name,
@@ -187,6 +201,7 @@ pub fn createIndex(
         .column_id = column_id,
         .unique = ci.unique,
         .valid_ts = _catalog.IndexDef.building,
+        .name = name,
     };
     var build = IndexBuild{
         .handler = self,
@@ -201,14 +216,18 @@ pub fn createIndex(
     build.takeBarrier();
     defer build.dropBarrier();
 
-    // The index tree and its `building` catalog row commit as one
-    // entry, so a crash leaves both or neither. A failed proposal
-    // created nothing.
-    var mc = created.change;
-    mc.rows = .{
-        .namespace = ns,
-        .kvs = try catalogRowKvs(self, arloc, base_key, &.{}, &.{def}),
+    // The index tree, its `building` catalog row and its name row
+    // commit as one entry, so a crash leaves all or none. A failed
+    // proposal's outcome is unknown: the entry can still commit after
+    // a lost leadership, leaving a `building` index that DROP INDEX
+    // removes.
+    const catalog_row = try catalogRowKvs(self, arloc, base_key, &.{}, &.{def});
+    var create_rows = [_]zen.KeyValueStruct{
+        catalog_row[0],
+        try _names.tableNameKv(arloc, ns, name, index_tid),
     };
+    var mc = created.change;
+    mc.rows = .{ .namespace = ns, .kvs = &create_rows };
     eng.proposeMC(mc, .apply) catch |err| {
         logCreateIndexErr(name, "propose", err);
         return replyError(state, "create index failed");
@@ -552,6 +571,7 @@ const IndexBuild = struct {
             self.ns,
             self.def.base_table_id,
             self.def.index_table_id,
+            self.name,
         ) catch |rerr| logCreateIndexErr(self.name, "remove", rerr);
         if (err == error.DuplicateKey)
             return replyErrorCode(
@@ -768,7 +788,13 @@ pub fn dropIndex(
     if (!try self.ddlReady(state)) return;
 
     const ns = try self.sessionNamespace(state) orelse return;
-    const index_tid = eng.forest.manifest.lookupTable(ns, di.name) orelse {
+    const found = _names.tableId(
+        eng.forest,
+        eng.node.appliedTs(),
+        ns,
+        di.name,
+    ) catch |err| return replyNameReadFailed(state, di.name, err);
+    const index_tid = found orelse {
         if (di.missing_ok) return state.sendCommandComplete("DROP INDEX");
         return replyErrorCode(
             state,
@@ -826,7 +852,7 @@ pub fn dropIndex(
     table_lock.lock(@src());
     defer table_lock.unlock();
 
-    removeIndex(self, a, ns, base_tid, index_tid) catch |err| {
+    removeIndex(self, a, ns, base_tid, index_tid, di.name) catch |err| {
         logDropIndexErr(di.name, "remove", err);
         return replyError(state, "drop index failed");
     };
@@ -838,19 +864,21 @@ pub fn dropIndex(
     try state.sendCommandComplete("DROP INDEX");
 }
 
-/// Remove an index: tombstone its catalog row and drop its tree in one
-/// entry, then reload the base table's schema. A drop entry applies its
-/// rows before removing trees, so no node ever holds a live IndexDef
-/// pointing at a dead tree (reads would see silently-empty results; and
-/// unlike dropTable's tolerated catalog garbage, a live IndexDef row
-/// would resurrect the index on the next schema load). The caller holds
-/// the base table's exclusive lock; this must not take it.
+/// Remove an index: tombstone its catalog row and its name row and drop
+/// its tree in one entry, then reload the base table's schema. A drop
+/// entry applies its rows before removing trees, so no node ever holds
+/// a live IndexDef pointing at a dead tree (reads would see
+/// silently-empty results; and unlike dropTable's tolerated catalog
+/// garbage, a live IndexDef row would resurrect the index on the next
+/// schema load). The caller holds the base table's exclusive lock; this
+/// must not take it.
 fn removeIndex(
     self: *Handler,
     a: std.mem.Allocator,
     ns: u64,
     base_tid: u32,
     index_tid: u32,
+    name: String,
 ) !void {
     const eng = self.srv.engine;
     const ck = _catalog.encodeIndexKey(base_tid, index_tid);
@@ -859,11 +887,11 @@ fn removeIndex(
         .table_id = _catalog.index_table_id,
         .primary = &ck,
     }).marshal(a);
-    var kvs = [_]zen.KeyValueStruct{.{
+    var kvs = [_]zen.KeyValueStruct{ .{
         .key = wire_key,
         .value = "",
         .meta = (zdb.kv.Meta{ .kind = .deleted }).toByte(),
-    }};
+    }, try _names.tombstone(a, ns, name) };
     var mc = try eng.forest.buildTableDrop(a, ns, &.{index_tid});
     mc.rows = .{ .namespace = ns, .kvs = &kvs };
     try eng.proposeMC(mc, .apply);

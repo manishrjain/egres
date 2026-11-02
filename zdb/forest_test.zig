@@ -499,9 +499,9 @@ test "forest: drop_ns removes every table and forgets the id counter" {
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
-    // Namespace 7 with five tables: the default + column + index catalogs
-    // (installed by ns_create), a system tree at a reserved table_id, and an
-    // allocated, named user table.
+    // Namespace 7 with six tables: the default, column and index catalogs
+    // and names (installed by ns_create), a system tree at a reserved
+    // table_id, and an allocated, named user table.
     const nc = (try f.buildNsCreate(alloc, .{ .given = 7 }, "seven")).change;
     defer alloc.free(nc.tree_changes);
     try f.applyTrees(1, nc);
@@ -521,7 +521,7 @@ test "forest: drop_ns removes every table and forgets the id counter" {
 
     const sys = try buildCreateTree(f, alloc, .{
         .namespace = 7,
-        .table_id = 3,
+        .table_id = 5,
     }, .posting_index);
     defer alloc.free(sys.tree_changes);
     try f.applyTrees(1, sys);
@@ -538,15 +538,15 @@ test "forest: drop_ns removes every table and forgets the id counter" {
         f.manifest.lookupTable(7, "users"),
     );
 
-    // Drop the namespace: one delete per tree across all five tables.
+    // Drop the namespace: one delete per tree across all six tables.
     const dc = try f.buildNsDrop(alloc, 7);
     defer alloc.free(dc.tree_changes);
-    try std.testing.expectEqual(@as(usize, 5), dc.tree_changes.len);
+    try std.testing.expectEqual(@as(usize, 6), dc.tree_changes.len);
     try std.testing.expectEqual(_manifest.Command.drop_ns, dc.cmd);
     try f.applyTrees(1, dc);
 
     try std.testing.expect(!f.hasNamespace(7));
-    try std.testing.expect(!f.hasTable(.{ .namespace = 7, .table_id = 3 }));
+    try std.testing.expect(!f.hasTable(.{ .namespace = 7, .table_id = 5 }));
     try std.testing.expect(!f.hasTable(.{
         .namespace = 7,
         .table_id = _manifest.catalog_table_id,
@@ -1151,7 +1151,7 @@ test "forest: ns_create installs default + catalog trees, idempotent re-apply" {
 
     const nc = (try f.buildNsCreate(alloc, .{ .given = 9 }, "nine")).change;
     defer alloc.free(nc.tree_changes);
-    try std.testing.expectEqual(@as(usize, 3), nc.tree_changes.len);
+    try std.testing.expectEqual(@as(usize, 4), nc.tree_changes.len);
     try f.applyTrees(1, nc);
     try std.testing.expect(f.hasTable(.{ .namespace = 9, .table_id = 0 }));
     try std.testing.expect(f.hasTable(.{

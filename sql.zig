@@ -24,6 +24,8 @@
 //!         choreography.
 //! index_ddl: CREATE/DROP INDEX, with CREATE INDEX's online backfill
 //!         for posting and unique indexes.
+//! names:  table 3 of every namespace — table, index and database
+//!         names as rows, and the lookups and checks over them.
 //! dml:    INSERT / SELECT / DELETE / UPDATE statement bodies.
 //! pred:   Pred — a WHERE bound to its table (columns, typed literals)
 //!         and its SQL three-valued evaluation per row.
@@ -50,6 +52,7 @@ pub const oracle = @import("sql/oracle.zig");
 pub const server = @import("sql/server.zig");
 pub const ddl = @import("sql/ddl.zig");
 pub const index_ddl = @import("sql/index_ddl.zig");
+pub const names = @import("sql/names.zig");
 pub const dml = @import("sql/dml.zig");
 pub const exec = @import("sql/exec.zig");
 pub const plan = @import("sql/plan.zig");

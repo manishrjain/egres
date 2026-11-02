@@ -27,6 +27,7 @@ const _dml = @import("dml.zig");
 const _exec = @import("exec.zig");
 const _row = @import("row.zig");
 const _key = @import("key.zig");
+const _names = @import("names.zig");
 const _schema = @import("schema.zig");
 const _table = @import("table.zig");
 const _txn = @import("txn.zig");
@@ -39,7 +40,7 @@ const log = std.log.scoped(.sql);
 const String = _value.String;
 
 /// The default database, present from a node's very first boot — created
-/// by the WAL's genesis entry (see egres seedGenesis), never at runtime.
+/// by the WAL's genesis entries (see egres seedGenesis), never at runtime.
 /// Sessions that name no database land here (psql defaults dbname to the
 /// user name; that also misses and falls back per onStartup).
 pub const default_database = "egres";
@@ -63,9 +64,8 @@ pub const Server = struct {
     /// Compiled layout of the INDEX catalog table's rows (table 2), the
     /// same compiled-in schema in every namespace — one compile serves all.
     index_catalog_ps: _schema.PhysicalSchema,
-    /// Serializes DDL: the leader-side name-uniqueness checks in
-    /// buildNsCreate/buildCreateTable are only sound if one DDL
-    /// runs at a time.
+    /// Serializes DDL: the leader-side name-uniqueness checks
+    /// (names.checkNew) are only sound if one DDL runs at a time.
     ddl_mu: fiber.Mutex(.tracked) = .{},
     /// Per-database txn state (see Database), keyed by namespace id.
     /// Heap entries so held pointers stay valid across map growth, and a
@@ -557,9 +557,18 @@ pub const Handler = struct {
     pub fn onStartup(self: *Handler, state: *pgwire.ConnState, params: pgwire.proto.StartupParams) !void {
         _ = state;
         const requested = params.database orelse "";
-        self.namespace = self.srv.engine.forest.manifest.lookupNamespace(
-            if (requested.len > 0) requested else default_database,
-        ) orelse 0;
+        const eng = self.srv.engine;
+        const name = if (requested.len > 0) requested else default_database;
+        // A failed read answers like a missing database: the session
+        // gets 3D000 on its first statement.
+        self.namespace = _names.namespaceId(
+            eng.forest,
+            eng.node.appliedTs(),
+            name,
+        ) catch |err| blk: {
+            log.err("startup: database '{s}': {s}", .{ name, @errorName(err) });
+            break :blk null;
+        } orelse 0;
         // The database is the tenant: every statement on this fiber is
         // charged to it from here. A name that resolved to nothing
         // stays on the system's, and is refused per statement anyway.
@@ -569,6 +578,34 @@ pub const Handler = struct {
                 utils.coarseMs(),
             );
         }
+    }
+
+    /// The table_id `name` names in the session's namespace `ns`, read
+    /// at the node's latest applied timestamp (never the transaction's:
+    /// see names.zig). Null after replying 42P01 for a missing table or
+    /// XX000 for a failed read.
+    pub fn resolveTable(
+        self: *Handler,
+        state: *pgwire.ConnState,
+        ns: u64,
+        name: String,
+    ) !?u32 {
+        const eng = self.srv.engine;
+        const id = _names.tableId(
+            eng.forest,
+            eng.node.appliedTs(),
+            ns,
+            name,
+        ) catch |err| {
+            try replyNameReadFailed(state, name, err);
+            return null;
+        };
+        if (id == null) try replyErrorCode(
+            state,
+            pgwire.sqlstate.undefined_table,
+            "table does not exist",
+        );
+        return id;
     }
 
     /// The session's namespace if it still exists, else a SQL error and null.
@@ -1296,6 +1333,17 @@ pub fn replyError(state: *pgwire.ConnState, msg: String) !void {
         .code = pgwire.sqlstate.internal_error,
         .message = msg,
     });
+}
+
+/// A name row that could not be read: the statement gets XX000 and the
+/// session stays open, as for any storage read that fails mid-statement.
+pub fn replyNameReadFailed(
+    state: *pgwire.ConnState,
+    name: String,
+    err: anyerror,
+) !void {
+    log.err("name '{s}': read: {s}", .{ name, @errorName(err) });
+    try replyError(state, "name lookup failed");
 }
 
 pub fn replyErrorCode(state: *pgwire.ConnState, code: [5]u8, msg: String) !void {

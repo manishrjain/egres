@@ -107,7 +107,10 @@ pub fn buildNsCreate(
         .given => |n| n,
     };
     std.debug.assert(namespace_id > 0);
-    if (self.hasNamespace(namespace_id)) return error.NamespaceAlreadyExists;
+    // The system namespace has no default table, so hasNamespace
+    // misses it; genesis made it, and nothing creates it again.
+    if (namespace_id == _manifest.system_namespace or
+        self.hasNamespace(namespace_id)) return error.NamespaceAlreadyExists;
     if (self.manifest.lookupNamespace(name)) |_| return error.NameExists;
 
     // One tree per system table: the default (raw-KV) table plus the SQL

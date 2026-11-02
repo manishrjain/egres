@@ -172,62 +172,158 @@ const probe_help =
 const log = std.log.scoped(.egres);
 
 /// The default database, present from a node's very first boot — created by
-/// the WAL's genesis entry (see seedGenesis), never at runtime. The SQL
+/// the WAL's genesis entries (see seedGenesis), never at runtime. The SQL
 /// layer owns the name (sessions with no database fall back to it).
 const default_database = sql.default_database;
 
-/// Seed a fresh WAL with the deterministic genesis prefix: entry 1 creates
-/// the default database at the first user namespace id ('egres' is ns 16 on
-/// every cluster). Every node writes the same bytes — fixed ids, term 0,
-/// fixed timestamp — so raft's log matching holds across fresh nodes, and
-/// the entry is committed by construction (HardState.commit_index covers
-/// it): engine recovery applies it before any election or client traffic.
-/// A restarted or joining node with a non-empty WAL skips this.
+const genesis_entries = 3;
+
+/// Seed a fresh WAL with the deterministic genesis prefix, three
+/// manifest entries:
+///   1. new_memtable — a real memtable before any row: rows applied
+///      into the startup placeholder would be thrown away;
+///   2. create_ns of the system namespace (its names table);
+///   3. create_ns of the default database at the first user namespace
+///      id ('egres' is ns 16 on every cluster), carrying its name row
+///      in the system namespace.
+/// Every node writes the same bytes — fixed ids, term 0, fixed
+/// timestamps — so raft's log matching holds across fresh nodes, and
+/// the entries are committed by construction (HardState.commit_index
+/// covers them): engine recovery applies them before any election or
+/// client traffic. A crash while seeding can keep a prefix of the
+/// entries; the next start appends the rest, since they are the same
+/// bytes. Any other non-empty WAL is left alone, including an older
+/// build's genesis, which the engine's startup check then refuses.
 fn seedGenesis(allocator: std.mem.Allocator, wal: *raft.DiskWAL) !void {
-    if (wal.lastIndex() != 0) return;
+    const have = wal.lastIndex();
+    if (have >= genesis_entries) return;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arloc = arena.allocator();
+    const sys_ns = zdb.manifest.system_namespace;
+    const db_ns = zdb.manifest.first_namespace;
 
     // Same trees as forest.buildNsCreate — one per system table,
     // posting indexes as there; tree 0 (the raw-KV default table)
     // carries the database name.
     const sys = zdb.manifest.namespace_system_table_ids;
-    var tc: [sys.len]zdb.manifest.TreeChange = undefined;
-    for (sys, &tc) |table_id, *c|
+    var db_trees: [sys.len]zdb.manifest.TreeChange = undefined;
+    for (sys, &db_trees) |table_id, *c|
         c.* = zdb.manifest.createTreeChange(
             zdb.kv.makeTreeId(table_id, 0),
-            zdb.manifest.first_namespace,
+            db_ns,
             "",
             "",
             .posting_index,
         );
-    tc[0].name = @constCast(default_database);
-    const payload = try zdb.buffers.marshalRoot(allocator, zdb.manifest.ManifestChange{
-        .cmd = .create_ns,
-        .tree_changes = &tc,
-        .sstable_changes = &.{},
-        .memtable_id = 0,
-    });
-    defer allocator.free(payload);
+    db_trees[0].name = @constCast(default_database);
+    var name_row = [_]zdb.buffers.KeyValueStruct{
+        try sql.names.dbNameKv(arloc, default_database, db_ns),
+    };
 
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(allocator);
-    var writer = try raft.buffers.LogEntryWriter.initWithBuf(allocator, &buf);
-    defer writer.deinit();
-    try writer.set(.{
-        .index = 1,
-        .term = 0,
-        .timestamp = 1, // fixed; real HLC values are far larger
-        .data = payload,
-        .entry_type = .manifest,
-    });
-    _ = try writer.finishWithTail();
-    const data = try buf.toOwnedSlice(allocator);
-    var entry = try raft.buffers.LogEntryBuffer.initWithTail(allocator, data, .owned);
-    defer entry.deinit();
+    const sys_tables = zdb.manifest.system_namespace_trees;
+    var sys_trees: [sys_tables.len]zdb.manifest.TreeChange = undefined;
+    for (sys_tables, &sys_trees) |table_id, *c|
+        c.* = zdb.manifest.createTreeChange(
+            zdb.kv.makeTreeId(table_id, 0),
+            sys_ns,
+            "",
+            "",
+            .posting_index,
+        );
 
-    try wal.addEntries(&.{entry});
+    const changes = [_]zdb.manifest.ManifestChange{
+        .{
+            .cmd = .new_memtable,
+            .tree_changes = &.{},
+            .sstable_changes = &.{},
+            .memtable_id = 0,
+        },
+        .{
+            .cmd = .create_ns,
+            .tree_changes = &sys_trees,
+            .sstable_changes = &.{},
+            .memtable_id = 0,
+        },
+        .{
+            .cmd = .create_ns,
+            .tree_changes = &db_trees,
+            .sstable_changes = &.{},
+            .memtable_id = 0,
+            .rows = .{ .namespace = sys_ns, .kvs = &name_row },
+        },
+    };
+
+    comptime std.debug.assert(changes.len == genesis_entries);
+    if (have > 0 and !try isGenesisPrefix(allocator, wal, &changes, have))
+        return;
+    const missing = changes[have..];
+    var entries: [changes.len]raft.buffers.LogEntryBuffer = undefined;
+    var built: usize = 0;
+    defer for (entries[0..built]) |*e| e.deinit();
+    for (missing, entries[0..missing.len], have + 1..) |mc, *entry, index| {
+        const payload = try zdb.buffers.marshalRoot(arloc, mc);
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(allocator);
+        var writer = try raft.buffers.LogEntryWriter.initWithBuf(
+            allocator,
+            &buf,
+        );
+        defer writer.deinit();
+        try writer.set(.{
+            .index = index,
+            .term = 0,
+            .timestamp = index, // fixed; real HLC values are far larger
+            .data = payload,
+            .entry_type = .manifest,
+        });
+        _ = try writer.finishWithTail();
+        const data = try buf.toOwnedSlice(allocator);
+        entry.* = try raft.buffers.LogEntryBuffer.initWithTail(
+            allocator,
+            data,
+            .owned,
+        );
+        built += 1;
+    }
+
+    try wal.addEntries(entries[0..built]);
     try wal.sync();
-    try wal.setHardState(.{ .commit_index = 1 });
+    try wal.setHardState(.{ .commit_index = changes.len });
     log.info("seeded genesis: database '{s}' -> ns={d}", .{ default_database, zdb.manifest.first_namespace });
+}
+
+/// True if the WAL's first `have` entries are `changes`' first `have`,
+/// byte for byte at term 0: an interrupted seed of this build.
+fn isGenesisPrefix(
+    allocator: std.mem.Allocator,
+    wal: *raft.DiskWAL,
+    changes: []const zdb.manifest.ManifestChange,
+    have: u64,
+) !bool {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arloc = arena.allocator();
+    var result = try wal.entriesRange(.{ .lo = 1, .hi = have + 1 });
+    defer result.deinit();
+    if (result.entries.len != have) return false;
+    var scratch: std.ArrayList(u8) = .empty;
+    for (result.entries, changes[0..result.entries.len]) |stored, mc| {
+        if (stored.term != 0) return false;
+        const reader = raft.buffers.LogEntryReader.parseRoot(stored.bytes) catch
+            return false;
+        scratch.clearRetainingCapacity();
+        const payload = try utils.compression.maybeUnpack(
+            arloc,
+            reader.codec(),
+            reader.data(),
+            &scratch,
+        );
+        const want = try zdb.buffers.marshalRoot(arloc, mc);
+        if (!std.mem.eql(u8, payload, want)) return false;
+    }
+    return true;
 }
 
 fn deinitWithLog(comptime msg: String, ptr: anytype) void {

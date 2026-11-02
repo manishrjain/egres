@@ -68,8 +68,9 @@ pub const TreeState = struct {
 pub const TreeKind = _zen.TreeKindEnum;
 
 /// table_ids 0–15 are reserved per namespace (0 = raw-KV / default table,
-/// 1 = the namespace's SQL catalog, the rest for future system tables); user
-/// tables start here. nextTableId floors every namespace's counter at this.
+/// 1 = the SQL column catalog, 2 = the index catalog, 3 = names, the rest
+/// for future system tables); user tables start here. nextTableId floors
+/// every namespace's counter at this.
 pub const first_table_id: u32 = 16;
 
 /// The namespace's SQL catalog table (schema rows for its tables). Its tree
@@ -80,14 +81,35 @@ pub const catalog_table_id: u32 = 1;
 /// its tree is born with the namespace.
 pub const index_catalog_table_id: u32 = 2;
 
-/// Every tree a namespace is born with, by table_id: the default raw-KV
-/// table plus the SQL catalogs. forest.buildNsCreate and the genesis
-/// seeder both loop over this — extend the list to add a system tree.
-pub const namespace_system_table_ids =
-    [_]u32{ 0, catalog_table_id, index_catalog_table_id };
+/// Names, in every namespace that has them: in a database, its table
+/// and index names (name -> table_id); in the system namespace, the
+/// database names (name -> namespace id). Rows the SQL layer owns; zdb
+/// only creates the tree.
+pub const names_table_id: u32 = 3;
 
-/// namespaces 1–15 are reserved for future engine use. User databases start
-/// here. nextNamespace floors next_ns_id at this value.
+/// Every tree a database namespace is born with, by table_id: the
+/// default raw-KV table, the SQL catalogs and the names table.
+/// forest.buildNsCreate and the genesis seeder both loop over this —
+/// extend the list to add a system tree.
+pub const namespace_system_table_ids = [_]u32{
+    0,
+    catalog_table_id,
+    index_catalog_table_id,
+    names_table_id,
+};
+
+/// The system namespace: not a database, so it has no raw-KV table and
+/// no SQL catalog, only the trees in `system_namespace_trees`. Genesis
+/// creates it; no login can reach it.
+pub const system_namespace: u64 = 1;
+
+/// The system namespace's trees, by table_id. Kept apart from
+/// `namespace_system_table_ids`, which is what a database is born with.
+pub const system_namespace_trees = [_]u32{names_table_id};
+
+/// namespaces 1–15 are reserved for the engine (1 is the system
+/// namespace). User databases start here. nextNamespace floors
+/// next_ns_id at this value.
 pub const first_namespace: u64 = 16;
 
 /// In-memory manifest state. Durability comes from the Raft log + periodic

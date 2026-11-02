@@ -72,12 +72,14 @@ const Fixture = struct {
             .unique = true,
             .valid_ts = built_ts,
             .column = &columns[0],
+            .name = "t_pkey",
         };
         indexes[1] = .{
             .index_table_id = b_index_id,
             .unique = false,
             .valid_ts = built_ts,
             .column = &columns[1],
+            .name = "t_b_idx",
         };
         return .{ .arena = arena, .tbl = .{
             .columns = columns,

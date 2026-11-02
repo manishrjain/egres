@@ -112,8 +112,8 @@ test "sql.catalog: an index descriptor round-trips through an index row" {
 
     var ips = try sql.compile(alloc, catalog.index_logical_schema, 1);
     defer ips.deinit(alloc);
-    try testing.expectEqual(@as(usize, 5), ips.columns.len);
-    try testing.expectEqual(@as(u16, 0), ips.n_varlen); // all fixed-width
+    try testing.expectEqual(@as(usize, 6), ips.columns.len);
+    try testing.expectEqual(@as(u16, 1), ips.n_varlen); // the name
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
@@ -126,13 +126,14 @@ test "sql.catalog: an index descriptor round-trips through an index row" {
         .column_id = 1,
         .unique = true,
         .valid_ts = catalog.IndexDef.building, // the non-default value
+        .name = "users_name_idx",
     };
     const vals = catalog.encodeIndex(def);
     const bytes = try sql.marshalRow(alloc, &ips, &vals, &buf);
     try sql.unmarshalRow(alloc, &ips, bytes, &[_]u32{}, &r);
 
     const got = try catalog.decodeIndex(&r);
-    try testing.expectEqual(def, got);
+    try testing.expectEqualDeep(def, got);
 }
 
 test "sql.catalog: index row keys sort by (base, index) and share a prefix" {

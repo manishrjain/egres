@@ -506,6 +506,7 @@ pub const Engine = struct {
         // loop can't propose SST ids that replay is about to install.
         try self.recoverFromSnapshot();
         self.node.applyCommits();
+        try checkSystemNamespace(self.forest);
 
         try self.bg.spawn(.{}, runRaft, .{&self.raft_rt});
         try self.bg.spawn(.{}, runCompactions, .{self});
@@ -518,6 +519,22 @@ pub const Engine = struct {
                 runGovernor,
                 .{self},
             );
+    }
+
+    /// Refuses a data directory written before names became rows. Its
+    /// databases have no names tree and there is no system namespace,
+    /// so no name resolves and new name rows would be dropped at
+    /// flush. Genesis creates namespace 1 before any database, so a
+    /// database without it means an older build; a fresh node has none.
+    pub fn checkSystemNamespace(forest: *Forest) !void {
+        if (forest.manifest.next_ns_id <= _manifest.first_namespace) return;
+        if (forest.hasTable(.{
+            .namespace = _manifest.system_namespace,
+            .table_id = _manifest.names_table_id,
+        })) return;
+        log.err("data directory is from an older build (no system " ++
+            "namespace): wipe it and reload", .{});
+        return error.OldDataDirectory;
     }
 
     /// Sizes the block cache from the rest of the process's memory

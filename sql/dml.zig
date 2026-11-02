@@ -44,10 +44,9 @@ const replyErrorCode = _server.replyErrorCode;
 const replyLockErr = _server.replyLockErr;
 
 pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !void {
-    const eng = self.srv.engine;
     const ns = try self.sessionNamespace(state) orelse return;
-    const table_id = eng.forest.manifest.lookupTable(ns, ins.table) orelse
-        return replyErrorCode(state, pgwire.sqlstate.undefined_table, "table does not exist");
+    const table_id = try self.resolveTable(state, ns, ins.table) orelse
+        return;
     const table_key: zdb.kv.TableKey = .{
         .namespace = ns,
         .table_id = table_id,
@@ -197,10 +196,9 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
 }
 
 pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !void {
-    const eng = self.srv.engine;
     const ns = try self.sessionNamespace(state) orelse return;
-    const table_id = eng.forest.manifest.lookupTable(ns, sel.table) orelse
-        return replyErrorCode(state, pgwire.sqlstate.undefined_table, "table does not exist");
+    const table_id = try self.resolveTable(state, ns, sel.table) orelse
+        return;
     const table_key: zdb.kv.TableKey = .{
         .namespace = ns,
         .table_id = table_id,
@@ -312,15 +310,9 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
 }
 
 pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !void {
-    const eng = self.srv.engine;
-
     const ns = try self.sessionNamespace(state) orelse return;
-    const table_id = eng.forest.manifest.lookupTable(ns, del.table) orelse
-        return replyErrorCode(
-            state,
-            pgwire.sqlstate.undefined_table,
-            "table does not exist",
-        );
+    const table_id = try self.resolveTable(state, ns, del.table) orelse
+        return;
     const table_key: zdb.kv.TableKey = .{
         .namespace = ns,
         .table_id = table_id,
@@ -413,15 +405,9 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
 }
 
 pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void {
-    const eng = self.srv.engine;
-
     const ns = try self.sessionNamespace(state) orelse return;
-    const table_id = eng.forest.manifest.lookupTable(ns, up.table) orelse
-        return replyErrorCode(
-            state,
-            pgwire.sqlstate.undefined_table,
-            "table does not exist",
-        );
+    const table_id = try self.resolveTable(state, ns, up.table) orelse
+        return;
     const table_key: zdb.kv.TableKey = .{
         .namespace = ns,
         .table_id = table_id,
@@ -960,14 +946,9 @@ pub fn describeRows(
     table: String,
     projection: _parse.Projection,
 ) !void {
-    const eng = self.srv.engine;
     const ns = try self.sessionNamespace(state) orelse return;
-    const table_id = eng.forest.manifest.lookupTable(ns, table) orelse
-        return replyErrorCode(
-            state,
-            pgwire.sqlstate.undefined_table,
-            "table does not exist",
-        );
+    const table_id = try self.resolveTable(state, ns, table) orelse
+        return;
     const table_key: zdb.kv.TableKey = .{
         .namespace = ns,
         .table_id = table_id,
