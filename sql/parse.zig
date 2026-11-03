@@ -285,8 +285,21 @@ pub const Select = struct {
     for_update: bool = false,
     /// LIMIT n: stop after n rows. null = every row (LIMIT ALL too).
     limit: ?usize = null,
+    /// OFFSET n: the first n rows, after the ordering, are dropped.
+    offset: usize = 0,
+    /// ORDER BY, first key first; empty = the source's order.
+    order_by: []const OrderBy = &.{},
     /// How many `$n` values Bind must supply: the highest index used.
     param_count: u16 = 0,
+};
+
+/// One ORDER BY key, `expr [ASC | DESC] [NULLS FIRST | LAST]`, with
+/// Postgres's defaults: ASC puts NULLs last, DESC first. `ORDER BY 2`
+/// and `ORDER BY alias` are the target's expression (parseOrderBy).
+pub const OrderBy = struct {
+    expr: Expr,
+    desc: bool,
+    nulls_first: bool,
 };
 
 /// One target of a SELECT without FROM: a constant and its output
@@ -1457,41 +1470,53 @@ fn funcName(fc: *const c.FuncCall) ?String {
 }
 
 /// SELECT [exprs|*|count(*)] FROM one_table [WHERE ...] [FOR UPDATE]
-/// [LIMIT n], or constants with no FROM (parseSelectRow). Joins,
-/// subqueries and ORDER BY / GROUP BY / OFFSET / DISTINCT are
-/// rejected.
+/// [ORDER BY ...] [LIMIT n] [OFFSET n], or constants with no FROM
+/// (parseSelectRow). Joins, subqueries and GROUP BY / DISTINCT /
+/// HAVING are rejected.
 fn parseSelect(
     alloc: std.mem.Allocator,
     ss: *const c.SelectStmt,
 ) parser.ParseError!Stmt {
-    if (ss.sortClause != null or ss.groupClause != null or
-        ss.distinctClause != null or ss.havingClause != null or
-        ss.limitOffset != null)
-        return invalid(
-            "ORDER BY / GROUP BY / OFFSET / DISTINCT are not supported",
-        );
+    if (ss.groupClause != null or ss.distinctClause != null or
+        ss.havingClause != null)
+        return invalid("GROUP BY / DISTINCT / HAVING are not supported");
 
-    // LIMIT: an integer literal, or ALL (a NULL constant: no limit).
-    // A parameter, an expression, or WITH TIES is refused (the vendored
-    // grammar rejects WITH TIES itself today; the check is for one that
-    // does not, so it can never pass as a plain LIMIT).
+    // LIMIT and OFFSET: an integer literal, or LIMIT ALL (a NULL
+    // constant: no limit). A parameter, an expression, or WITH TIES is
+    // refused (the vendored grammar rejects WITH TIES itself today;
+    // the check is for one that does not, so it can never pass as a
+    // plain LIMIT).
+    if (ss.limitOption == c.LIMIT_OPTION_WITH_TIES)
+        return invalid("FETCH ... WITH TIES is not supported");
     var limit: ?usize = null;
     if (ss.limitCount != null) {
-        if (ss.limitOption == c.LIMIT_OPTION_WITH_TIES)
-            return invalid("FETCH ... WITH TIES is not supported");
         const ac = parser.cast(c.A_Const, ss.limitCount) orelse
             return invalid("only an integer literal LIMIT is supported");
         if (!ac.isnull) {
-            if (ac.val.node.type != c.T_Integer)
+            const n = intConst(ac) orelse
                 return invalid("only an integer literal LIMIT is supported");
-            const n = ac.val.ival.ival;
             if (n < 0) return invalid("LIMIT must not be negative");
             limit = @intCast(n);
         }
     }
+    var offset: usize = 0;
+    if (ss.limitOffset != null) {
+        const ac = parser.cast(c.A_Const, ss.limitOffset) orelse
+            return invalid("only an integer literal OFFSET is supported");
+        if (!ac.isnull) {
+            const n = intConst(ac) orelse
+                return invalid("only an integer literal OFFSET is supported");
+            if (n < 0) return invalid("OFFSET must not be negative");
+            offset = @intCast(n);
+        }
+    }
 
     const from = parser.items(ss.fromClause);
-    if (from.len == 0) return parseSelectRow(alloc, ss, limit);
+    if (from.len == 0) {
+        if (ss.sortClause != null or ss.limitOffset != null)
+            return invalid("ORDER BY and OFFSET need a FROM");
+        return parseSelectRow(alloc, ss, limit);
+    }
     if (from.len != 1)
         return invalid("SELECT must read exactly one table");
     const rv = parser.cast(c.RangeVar, from[0].ptr_value) orelse
@@ -1535,14 +1560,111 @@ fn parseSelect(
         for_update = true;
     }
 
+    var order_by: []const OrderBy = &.{};
+    if (ss.sortClause != null) {
+        if (count_star)
+            return invalid("ORDER BY is not allowed with count(*)");
+        order_by = switch (try parseOrderBy(
+            alloc,
+            &params,
+            ss.sortClause,
+            projection,
+        )) {
+            .keys => |keys| keys,
+            .invalid => |msg| return .{ .invalid = msg },
+        };
+    }
+
     return .{ .select = .{
         .table = try dup(alloc, rv.relname),
         .projection = projection,
         .where = where,
         .for_update = for_update,
         .limit = limit,
+        .offset = offset,
+        .order_by = order_by,
         .param_count = params.count,
     } };
+}
+
+/// An integer constant's value; null for a constant of another kind.
+fn intConst(ac: *const c.A_Const) ?i64 {
+    if (ac.val.node.type != c.T_Integer) return null;
+    return ac.val.ival.ival;
+}
+
+const ParsedOrderBy = union(enum) { keys: []const OrderBy, invalid: String };
+
+/// `SELECT n, name AS who FROM t ORDER BY who DESC, 1, n + 1`: each key
+/// is an expression over the row, bound as a target is. An ordinal is
+/// the target in that position and a bare name that is a target's
+/// output name is that target's expression, the names Postgres
+/// resolves first; `*` has no targets to point at. USING is refused.
+fn parseOrderBy(
+    alloc: std.mem.Allocator,
+    params: *ParamTally,
+    list: [*c]const c.List,
+    projection: Projection,
+) parser.ParseError!ParsedOrderBy {
+    const items = parser.items(list);
+    const keys = try alloc.alloc(OrderBy, items.len);
+    for (items, keys) |cell, *key| {
+        const sb = parser.cast(c.SortBy, cell.ptr_value) orelse
+            return .{ .invalid = "unsupported ORDER BY" };
+        const desc = switch (sb.sortby_dir) {
+            c.SORTBY_DEFAULT, c.SORTBY_ASC => false,
+            c.SORTBY_DESC => true,
+            else => return .{ .invalid = "ORDER BY USING is not supported" },
+        };
+        const nulls_first = switch (sb.sortby_nulls) {
+            c.SORTBY_NULLS_FIRST => true,
+            c.SORTBY_NULLS_LAST => false,
+            else => desc,
+        };
+        const targets: []const Target = switch (projection) {
+            .targets => |t| t,
+            else => &.{},
+        };
+        const node = parser.asNode(sb.node);
+        const expr = switch (try orderKeyExpr(alloc, params, node, targets)) {
+            .expr => |e| e,
+            .invalid => |msg| return .{ .invalid = msg },
+        };
+        key.* = .{ .expr = expr, .desc = desc, .nulls_first = nulls_first };
+    }
+    return .{ .keys = keys };
+}
+
+/// One ORDER BY key's expression: `ORDER BY 2` is the second target's,
+/// `ORDER BY who` the target named who when there is one, else the
+/// expression itself.
+fn orderKeyExpr(
+    alloc: std.mem.Allocator,
+    params: *ParamTally,
+    node: ?*c.Node,
+    targets: []const Target,
+) parser.ParseError!ParsedExpr {
+    if (constant(node)) |ac| if (ac.val.node.type == c.T_Integer) {
+        const n = ac.val.ival.ival;
+        if (n < 1 or n > targets.len)
+            return ParsedExpr.reject("ORDER BY position is not in select list");
+        return .{ .expr = targets[@intCast(n - 1)].expr };
+    };
+    if (try bareName(alloc, node)) |name| {
+        for (targets) |t| {
+            if (std.mem.eql(u8, t.name, name)) return .{ .expr = t.expr };
+        }
+    }
+    return parseExpr(alloc, params, node);
+}
+
+/// An unqualified column reference's name, copied; null for anything
+/// else, a qualified `t.who` included: only a bare name can be an
+/// output name.
+fn bareName(alloc: std.mem.Allocator, p: anytype) parser.ParseError!?String {
+    const cr = parser.cast(c.ColumnRef, p) orelse return null;
+    if (parser.items(cr.fields).len != 1) return null;
+    return lastName(alloc, cr.fields);
 }
 
 /// Whether a call is an aggregate: one of the standard five by name,

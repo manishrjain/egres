@@ -3,7 +3,7 @@
 
 //! The planner: the one place that chooses index vs. scan. A bound
 //! Pred (pred.zig) in, a tree of exec nodes out — `materialize →
-//! (seq_scan | fetch(bitmap))` — with the WHOLE predicate re-checked
+//! [sort →] (seq_scan | fetch(bitmap))` — with the WHOLE predicate re-checked
 //! on the source, so a bitmap only has to be a SUPERSET of the rows
 //! and no remainder is ever computed. Files form a DAG: plan → exec →
 //! pred; dml.zig calls `plan` and drives the tree.
@@ -42,6 +42,12 @@ pub const Options = struct {
     /// counts the ones that pass the predicate into `Batch.counted`
     /// instead of appending them.
     count_only: bool = false,
+    /// ORDER BY: the bound keys, first key first; empty = the source's
+    /// order. A Sort node gathers every row before the first goes out.
+    order_by: []const _exec.SortKey = &.{},
+    /// OFFSET: rows dropped before the first one produced, after the
+    /// ordering.
+    offset: usize = 0,
 };
 
 pub const Plan = struct {
@@ -88,8 +94,17 @@ pub fn plan(
             .count_only = opts.count_only,
         } };
     }
+    var child = src;
+    if (opts.order_by.len > 0) {
+        child = try arloc.create(RowNode);
+        child.* = .{ .sort = .{ .child = src, .keys = opts.order_by } };
+    }
     const root = try arloc.create(RowNode);
-    root.* = .{ .materialize = .{ .child = src, .remaining = opts.limit } };
+    root.* = .{ .materialize = .{
+        .child = child,
+        .remaining = opts.limit,
+        .skip = opts.offset,
+    } };
     return .{ .root = root };
 }
 

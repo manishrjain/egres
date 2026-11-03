@@ -24,6 +24,7 @@ const log = std.log.scoped(.sql);
 const Forest = zdb.forest.Forest;
 const Item = zdb.kv.Item;
 const Key = zdb.kv.Key;
+const Value = @import("value.zig").Value;
 const KeyRange = zdb.kv.KeyRange;
 const Pred = _pred.Pred;
 const Txn = _txn.Txn;
@@ -469,6 +470,7 @@ pub const RowNode = union(enum) {
     seq_scan: SeqScan,
     fetch: Fetch,
     filter: Filter,
+    sort: Sort,
     materialize: Materialize,
 
     // Explicit error set: Filter and Materialize recurse into RowNode.next,
@@ -478,6 +480,7 @@ pub const RowNode = union(enum) {
             .seq_scan => |*n| n.next(ctx, b),
             .fetch => |*n| n.next(ctx, b),
             .filter => |*n| n.next(ctx, b),
+            .sort => |*n| n.next(ctx, b),
             .materialize => |*n| n.next(ctx, b),
         };
     }
@@ -490,6 +493,7 @@ pub const RowNode = union(enum) {
             .seq_scan => |*n| n.deinit(),
             .fetch => |*n| n.deinit(),
             .filter => |*n| n.child.deinit(),
+            .sort => |*n| n.child.deinit(),
             .materialize => |*n| n.child.deinit(),
         }
     }
@@ -744,6 +748,103 @@ pub const Filter = struct {
     }
 };
 
+/// One ORDER BY key: the expression over the row and its direction.
+pub const SortKey = struct {
+    node: *const _expr.Node,
+    desc: bool,
+    nulls_first: bool,
+};
+
+/// `SELECT * FROM t ORDER BY n DESC, name`: every row of the child,
+/// sorted by the keys, then handed out by reference. The first `next`
+/// drains the child into the statement arena and evaluates each key
+/// once per row — with the arena as scratch, so a computed text key
+/// outlives the row's scratch — and std.mem.sort keeps equal keys in
+/// the child's order. LIMIT and OFFSET belong to the Materialize above
+/// and so apply to the sorted rows.
+pub const Sort = struct {
+    child: *RowNode,
+    keys: []const SortKey,
+    sorted: ?[]const Item = null,
+    pos: usize = 0,
+
+    const Keyed = struct { item: Item, cells: []const Value };
+
+    pub fn next(self: *Sort, ctx: *ExecCtx, batch: *Batch) anyerror!bool {
+        const rows = self.sorted orelse try self.gather(ctx, batch);
+        batch.reset();
+        const n = batch.appendRefs(rows[self.pos..]);
+        self.pos += n;
+        return n > 0;
+    }
+
+    /// Every row of the child, keyed and sorted. The child's fills take
+    /// the whole cap whatever the caller's row_limit, which is put back
+    /// for the handing out.
+    fn gather(self: *Sort, ctx: *ExecCtx, batch: *Batch) anyerror![]const Item {
+        const row_limit = batch.row_limit;
+        defer batch.row_limit = row_limit;
+        batch.row_limit = row_cap;
+
+        var keyed: std.ArrayList(Keyed) = .empty;
+        while (try self.child.next(ctx, batch)) {
+            var it = batch.selected();
+            while (it.next()) |row| {
+                const item = try row.dupe(ctx.arloc);
+                const cells = try ctx.arloc.alloc(Value, self.keys.len);
+                const r: _expr.Row = .{
+                    .scratch = ctx.arloc,
+                    .tbl = ctx.tbl,
+                    .item = item,
+                };
+                for (self.keys, cells) |key, *cell|
+                    cell.* = try key.node.cell(r);
+
+                try keyed.append(ctx.arloc, .{ .item = item, .cells = cells });
+            }
+        }
+        std.mem.sort(Keyed, keyed.items, self.keys, lessThan);
+
+        // ORDER BY n over a whole table: the sort is one unbounded
+        // step, charged here so a stop lands before any row goes out.
+        try fiber.ctx().maybeYield();
+
+        const rows = try ctx.arloc.alloc(Item, keyed.items.len);
+        for (keyed.items, rows) |k, *slot| slot.* = k.item;
+        self.sorted = rows;
+        return rows;
+    }
+
+    fn lessThan(keys: []const SortKey, a: Keyed, b: Keyed) bool {
+        return orderKeys(keys, a.cells, b.cells) == .lt;
+    }
+};
+
+/// The order of two rows by their key cells: the first key that
+/// differs decides, reversed under DESC; a NULL goes before every
+/// value under NULLS FIRST and after under NULLS LAST, whatever the
+/// direction, and two NULLs tie.
+pub fn orderKeys(
+    keys: []const SortKey,
+    a: []const Value,
+    b: []const Value,
+) std.math.Order {
+    for (keys, a, b) |key, x, y| {
+        const ord = orderCell(key, x, y);
+        if (ord != .eq) return ord;
+    }
+    return .eq;
+}
+
+fn orderCell(key: SortKey, x: Value, y: Value) std.math.Order {
+    const x_null = x == .null_value;
+    const y_null = y == .null_value;
+    if (x_null and y_null) return .eq;
+    if (x_null or y_null) return if (x_null == key.nulls_first) .lt else .gt;
+    const ord = _expr.compare(x, y);
+    return if (key.desc) ord.invert() else ord;
+}
+
 /// The root of every plan. Bounds the result (LIMIT) and, when the
 /// statement locks (ctx.lock), gathers and locks every row before the
 /// first one goes out: the DML write bodies take that slice through
@@ -755,29 +856,49 @@ pub const Materialize = struct {
     child: *RowNode,
     /// Rows still to produce; null = unbounded.
     remaining: ?usize = null,
+    /// OFFSET: rows still to drop before the first one produced.
+    skip: usize = 0,
     rows: ?[]const Item = null,
     pos: usize = 0,
 
     /// One fill of the child. This root is the one writer of the
     /// batch's row_limit, set before every fill: the cap, or under a
-    /// LIMIT what remains, so a source places no more than that. A
-    /// filter above a source can only clear bits, so selected ≤ placed
-    /// ≤ remaining and the count stays exact either way (the filter
-    /// merely underfills). Nothing left → false without touching the
-    /// child: LIMIT 0 opens no cursor and records no read.
+    /// LIMIT what remains plus what OFFSET still drops, so a source
+    /// places no more than that. A filter above a source can only
+    /// clear bits, so selected ≤ placed ≤ remaining and the count stays
+    /// exact either way (the filter merely underfills). Nothing left →
+    /// false without touching the child: LIMIT 0 opens no cursor and
+    /// records no read. A fill OFFSET emptied is pulled again; one a
+    /// count-only scan left empty is the count, and goes up as is.
     fn fill(self: *Materialize, ctx: *ExecCtx, batch: *Batch) anyerror!bool {
-        const remaining = self.remaining orelse {
-            batch.row_limit = row_cap;
-            return self.child.next(ctx, batch);
-        };
-        if (remaining == 0) {
-            batch.reset();
-            return false;
+        while (true) {
+            if (self.remaining) |remaining| {
+                if (remaining == 0) {
+                    batch.reset();
+                    return false;
+                }
+                batch.row_limit = @min(row_cap, remaining +| self.skip);
+            } else {
+                batch.row_limit = row_cap;
+            }
+            if (!try self.child.next(ctx, batch)) return false;
+
+            const placed = batch.sel.count();
+            self.dropSkipped(batch);
+            const kept = batch.sel.count();
+            if (self.remaining) |remaining| self.remaining = remaining - kept;
+            if (kept > 0 or placed == 0) return true;
         }
-        batch.row_limit = @min(row_cap, remaining);
-        const valid = try self.child.next(ctx, batch);
-        self.remaining = remaining - batch.sel.count();
-        return valid;
+    }
+
+    /// `OFFSET 2`: the first two selected rows, across fills, are
+    /// unselected.
+    fn dropSkipped(self: *Materialize, batch: *Batch) void {
+        var it = batch.sel.iterator(.{});
+        while (self.skip > 0) : (self.skip -= 1) {
+            const i = it.next() orelse return;
+            batch.sel.unset(i);
+        }
     }
 
     /// Every selected row of the child, copied into the statement arena

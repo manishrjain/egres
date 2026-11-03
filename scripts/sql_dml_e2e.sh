@@ -407,7 +407,55 @@ expect "LIMIT above the result" "(1 row)" \
     q "SELECT id FROM big WHERE id = 7 LIMIT 5;"
 expect "FOR UPDATE LIMIT" "(2 rows)" q "SELECT id FROM big FOR UPDATE LIMIT 2;"
 expect "negative LIMIT rejected" "negative" q "SELECT id FROM big LIMIT -1;"
-expect "OFFSET rejected" "OFFSET" q "SELECT id FROM big LIMIT 1 OFFSET 1;"
+expect "ORDER BY DESC LIMIT across batches" "5000" \
+    v "SELECT id FROM big ORDER BY id DESC LIMIT 1;"
+expect "OFFSET past a batch" "(3500 rows)" q "SELECT id FROM big OFFSET 1500;"
+expect "LIMIT with OFFSET" "1501" v "SELECT id FROM big LIMIT 1 OFFSET 1500;"
+
+# --- ORDER BY: keys, directions, NULLs, OFFSET -------------------------
+# The ids in result order, one line: "3 1 4 2 ".
+seq_() { psql "$E" -X -tA -c "$1" | tr '\n' ' '; }
+expect "CREATE TABLE for ORDER BY" "CREATE TABLE" \
+    q "CREATE TABLE ob (id int4, n int4, s text);"
+expect "INSERT rows with NULLs" "INSERT 0 4" \
+    q "INSERT INTO ob VALUES (1, 3, 'b'), (2, NULL, 'a'), (3, 1, 'c'),
+       (4, 3, NULL);"
+expect "ORDER BY: NULLs last, ties in source order" "3 1 4 2 " \
+    seq_ "SELECT id FROM ob ORDER BY n;"
+expect "ORDER BY DESC: NULLs first" "2 1 4 3 " \
+    seq_ "SELECT id FROM ob ORDER BY n DESC;"
+expect "ORDER BY NULLS FIRST" "2 3 1 4 " \
+    seq_ "SELECT id FROM ob ORDER BY n NULLS FIRST;"
+expect "ORDER BY DESC NULLS LAST" "1 4 3 2 " \
+    seq_ "SELECT id FROM ob ORDER BY n DESC NULLS LAST;"
+expect "ORDER BY two keys" "3 4 1 2 " \
+    seq_ "SELECT id FROM ob ORDER BY n, id DESC;"
+expect "ORDER BY text" "2 1 3 4 " seq_ "SELECT id FROM ob ORDER BY s;"
+expect "ORDER BY an expression" "1 4 3 2 " \
+    seq_ "SELECT id FROM ob ORDER BY n * -1;"
+expect "ORDER BY an ordinal" "3|4 1|3 |2 3|1 " \
+    seq_ "SELECT n, id FROM ob ORDER BY 2 DESC;"
+expect "ORDER BY an output name" "4 3 2 1 " \
+    seq_ "SELECT id AS k FROM ob ORDER BY k DESC;"
+expect "ORDER BY with WHERE" "4 3 1 " \
+    seq_ "SELECT id FROM ob WHERE n IS NOT NULL ORDER BY id DESC;"
+expect "ORDER BY then LIMIT" "3 " seq_ "SELECT id FROM ob ORDER BY n LIMIT 1;"
+expect "OFFSET after the ordering" "3 4 " \
+    seq_ "SELECT id FROM ob ORDER BY id OFFSET 2;"
+expect "LIMIT and OFFSET" "2 " \
+    seq_ "SELECT id FROM ob ORDER BY id LIMIT 1 OFFSET 1;"
+expect "OFFSET past the end" "(0 rows)" q "SELECT id FROM ob OFFSET 9;"
+expect "count(*) OFFSET 1 drops the row" "(0 rows)" \
+    q "SELECT count(*) FROM ob OFFSET 1;"
+expect "ORDER BY under FOR UPDATE" "4 3 2 1 " \
+    seq_ "SELECT id FROM ob ORDER BY id DESC FOR UPDATE;"
+expect "ORDER BY position past the targets" "not in select list" \
+    q "SELECT id FROM ob ORDER BY 2;"
+expect "ORDER BY with count(*) refused" "not allowed" \
+    q "SELECT count(*) FROM ob ORDER BY 1;"
+expect "ORDER BY without FROM refused" "need a FROM" q "SELECT 1 ORDER BY 1;"
+expect "negative OFFSET rejected" "negative" q "SELECT id FROM ob OFFSET -1;"
+expect "DROP the ORDER BY table" "DROP TABLE" q "DROP TABLE ob;"
 
 expect "DELETE 5000 rows" "DELETE 5000" q "DELETE FROM big;"
 expect "big is empty" "(0 rows)" q "SELECT id FROM big;"

@@ -103,9 +103,10 @@ FROM one_table
 | `WHERE` | Partial | See below. |
 | `FOR UPDATE` | Yes | Locks every matching row for the rest of the transaction. Not with `count(*)`. |
 | `FOR SHARE`, `NOWAIT`, `SKIP LOCKED`, `FOR UPDATE OF` | Not&nbsp;yet | |
-| `LIMIT n` with an integer literal, `LIMIT ALL` | Yes | |
-| `LIMIT` with a parameter or expression, `OFFSET`, `FETCH ... WITH TIES` | Not&nbsp;yet | |
-| `ORDER BY`, `GROUP BY`, `DISTINCT`, `HAVING` | Not&nbsp;yet | |
+| `LIMIT n` with an integer literal, `LIMIT ALL`, `OFFSET n` | Yes | Applied after `ORDER BY`. |
+| `ORDER BY` | Yes | Any target expression, an ordinal, or an output name, each `ASC` or `DESC` with `NULLS FIRST` or `NULLS LAST`; the defaults are Postgres's. The matched rows are sorted in memory; an index is not yet read in order. |
+| `LIMIT` with a parameter or expression, `FETCH ... WITH TIES`, `ORDER BY ... USING` | Not&nbsp;yet | |
+| `GROUP BY`, `DISTINCT`, `HAVING` | Not&nbsp;yet | |
 
 Rows come back in `egid` order, which is insertion order, whether a scan or an index produced them.
 

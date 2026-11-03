@@ -582,6 +582,61 @@ test "sql.parse: IS DISTINCT FROM, IS TRUE and a bare boolean column" {
     try testing.expectEqualStrings("b", not_bare.select.where.?.and_[1].not.cmp.lhs.column);
 }
 
+test "sql.parse: ORDER BY keys, ordinals, output names and OFFSET" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Directions and NULL placement: ASC puts NULLs last, DESC first,
+    // unless said otherwise.
+    const s = try parse.statement(
+        alloc,
+        "SELECT a, b AS who FROM t ORDER BY a, b DESC, a NULLS FIRST, " ++
+            "b DESC NULLS LAST OFFSET 3;",
+    );
+    const keys = s.select.order_by;
+    try testing.expectEqual(@as(usize, 4), keys.len);
+    try testing.expectEqualStrings("a", keys[0].expr.column);
+    try testing.expect(!keys[0].desc and !keys[0].nulls_first);
+    try testing.expect(keys[1].desc and keys[1].nulls_first);
+    try testing.expect(!keys[2].desc and keys[2].nulls_first);
+    try testing.expect(keys[3].desc and !keys[3].nulls_first);
+    try testing.expectEqual(@as(usize, 3), s.select.offset);
+
+    // ORDER BY 2 is the second target; ORDER BY who the target named
+    // who; a name that is no target's is the row's column; an
+    // expression binds a $n.
+    const r = try parse.statement(
+        alloc,
+        "SELECT a + 1 AS n, b AS who FROM t ORDER BY 1, who, c, a * $1;",
+    );
+    const rk = r.select.order_by;
+    try testing.expect(rk[0].expr == .binop);
+    try testing.expectEqualStrings("b", rk[1].expr.column);
+    try testing.expectEqualStrings("c", rk[2].expr.column);
+    try testing.expectEqual(@as(u16, 1), rk[3].expr.binop.rhs.literal.param);
+    try testing.expectEqual(@as(u16, 1), r.select.param_count);
+
+    const cases = [_]struct { sql: String, needle: String }{
+        .{ .sql = "SELECT a FROM t ORDER BY 2;", .needle = "select list" },
+        .{ .sql = "SELECT * FROM t ORDER BY 1;", .needle = "select list" },
+        .{
+            .sql = "SELECT count(*) FROM t ORDER BY 1;",
+            .needle = "not allowed",
+        },
+        .{ .sql = "SELECT 1 ORDER BY 1;", .needle = "need a FROM" },
+        .{ .sql = "SELECT a FROM t ORDER BY a USING <;", .needle = "USING" },
+        .{ .sql = "SELECT a FROM t OFFSET -1;", .needle = "negative" },
+        .{ .sql = "SELECT a FROM t OFFSET $1;", .needle = "literal OFFSET" },
+    };
+    for (cases) |case| {
+        const stmt = try parse.statement(alloc, case.sql);
+        try testing.expect(stmt == .invalid);
+        const msg = stmt.invalid;
+        try testing.expect(std.mem.indexOf(u8, msg, case.needle) != null);
+    }
+}
+
 test "sql.parse: LIMIT takes an integer literal; ALL and NULL mean none" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -610,8 +665,8 @@ test "sql.parse: SELECT rejections carry a reason" {
     defer arena.deinit();
     const alloc = arena.allocator();
     const cases = [_]struct { sql: String, needle: String }{
-        .{ .sql = "SELECT * FROM t ORDER BY a;", .needle = "ORDER BY" },
-        .{ .sql = "SELECT * FROM t LIMIT 3 OFFSET 1;", .needle = "OFFSET" },
+        .{ .sql = "SELECT * FROM t GROUP BY a;", .needle = "GROUP BY" },
+        .{ .sql = "SELECT DISTINCT a FROM t;", .needle = "DISTINCT" },
         .{ .sql = "SELECT * FROM t LIMIT -1;", .needle = "negative" },
         .{ .sql = "SELECT * FROM t LIMIT 1 + 1;", .needle = "integer literal" },
         .{ .sql = "SELECT * FROM t LIMIT $1;", .needle = "integer literal" },

@@ -243,11 +243,20 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
     // frozen by our locks.
     // count(*) counts every match and keeps no row bytes; its LIMIT
     // bounds the one output row, not the rows counted.
+    const keys = (try sortKeysOrReply(
+        state,
+        arloc,
+        tbl,
+        sel.order_by,
+        self.portal.params,
+    )) orelse return;
     var plan = (try planFor(state, arloc, tbl, sel.where, self.portal.params, .{
         .read_ts = tx.read_ts,
         .keep_value = !is_count,
         .limit = if (is_count) null else sel.limit,
         .count_only = is_count,
+        .order_by = keys,
+        .offset = if (is_count) 0 else sel.offset,
     })) orelse return;
     defer plan.deinit();
 
@@ -304,8 +313,9 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
             emitter.emit(row) catch |err| return replyEmitErr(state, err);
         }
     }
-    // count(*) is one row — which only LIMIT 0 drops.
-    if (is_count and (sel.limit orelse 1) > 0) try emitter.emitCount(count);
+    // count(*) is one row — which only LIMIT 0 or an OFFSET drops.
+    if (is_count and sel.offset == 0 and (sel.limit orelse 1) > 0)
+        try emitter.emitCount(count);
 
     if (suspended) return state.sendPortalSuspended();
     try state.sendCommandComplete(try std.fmt.allocPrint(arloc, "SELECT {d}", .{emitter.count}));
@@ -1406,6 +1416,39 @@ fn planFor(
             return null;
     }
     return try _plan.plan(arloc, tbl, pred, opts);
+}
+
+/// `SELECT * FROM t ORDER BY n DESC, name`: each key bound over the row
+/// as a target is (expr.bind, no column), with its direction. null =
+/// the error was sent.
+fn sortKeysOrReply(
+    state: *pgwire.ConnState,
+    arloc: std.mem.Allocator,
+    tbl: *const _table.Table,
+    order_by: []const _parse.OrderBy,
+    params: pgwire.Params,
+) !?[]const _exec.SortKey {
+    const keys = try arloc.alloc(_exec.SortKey, order_by.len);
+    for (order_by, keys) |ob, *key| {
+        const node = _expr.bind(
+            arloc,
+            tbl,
+            ob.expr,
+            null,
+            params,
+            null,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            try _expr.replyBindErr(state, arloc, err, null);
+            return null;
+        };
+        key.* = .{
+            .node = node,
+            .desc = ob.desc,
+            .nulls_first = ob.nulls_first,
+        };
+    }
+    return keys;
 }
 
 /// litToValue plus INSERT's client-facing error mapping, and the one

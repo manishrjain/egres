@@ -788,3 +788,40 @@ test "sql.exec: materialize with lock and a limit locks the limited rows" {
     try testing.expectEqual(@as(usize, 100), b.sel.count());
     try testing.expect(!try node.next(&ctx, &b));
 }
+
+test "sql.exec: orderKeys: direction, NULLs, and the first key that differs" {
+    const int = struct {
+        fn of(n: i32) Value {
+            return .{ .int4 = n };
+        }
+    }.of;
+    const leaf = sql.expr.Node{ .value = .null_value };
+    const K = exec.SortKey;
+    const asc = K{ .node = &leaf, .desc = false, .nulls_first = false };
+    const desc = K{ .node = &leaf, .desc = true, .nulls_first = true };
+    const asc_nf = K{ .node = &leaf, .desc = false, .nulls_first = true };
+    const ord = exec.orderKeys;
+    const lt = std.math.Order.lt;
+    const gt = std.math.Order.gt;
+    const eq = std.math.Order.eq;
+    const nul = Value.null_value;
+
+    try testing.expectEqual(lt, ord(&.{asc}, &.{int(1)}, &.{int(2)}));
+    try testing.expectEqual(gt, ord(&.{desc}, &.{int(1)}, &.{int(2)}));
+    try testing.expectEqual(eq, ord(&.{asc}, &.{int(2)}, &.{int(2)}));
+    // ASC: NULL after every value; DESC: before; NULLS FIRST on ASC too.
+    try testing.expectEqual(gt, ord(&.{asc}, &.{nul}, &.{int(9)}));
+    try testing.expectEqual(lt, ord(&.{desc}, &.{nul}, &.{int(9)}));
+    try testing.expectEqual(lt, ord(&.{asc_nf}, &.{nul}, &.{int(9)}));
+    try testing.expectEqual(eq, ord(&.{asc}, &.{nul}, &.{nul}));
+    // The second key decides a tie on the first.
+    try testing.expectEqual(
+        gt,
+        ord(&.{ asc, desc }, &.{ int(1), int(5) }, &.{ int(1), int(7) }),
+    );
+    // Numbers of different kinds compare by value.
+    try testing.expectEqual(
+        lt,
+        ord(&.{asc}, &.{.{ .int8 = 2 }}, &.{.{ .float8 = 2.5 }}),
+    );
+}
