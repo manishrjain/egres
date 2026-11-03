@@ -104,7 +104,7 @@ FROM one_table
 | `FOR UPDATE` | Yes | Locks every matching row for the rest of the transaction. Not with `count(*)`. |
 | `FOR SHARE`, `NOWAIT`, `SKIP LOCKED`, `FOR UPDATE OF` | Not&nbsp;yet | |
 | `LIMIT n` with an integer literal, `LIMIT ALL`, `OFFSET n` | Yes | Applied after `ORDER BY`. |
-| `ORDER BY` | Yes | Any target expression, an ordinal, or an output name, each `ASC` or `DESC` with `NULLS FIRST` or `NULLS LAST`; the defaults are Postgres's. The matched rows are sorted in memory; an index is not yet read in order. |
+| `ORDER BY` | Yes | Any target expression, an ordinal, or an output name, each `ASC` or `DESC` with `NULLS FIRST` or `NULLS LAST`; the defaults are Postgres's. One `ASC` key on an indexed column, with the `WHERE` on that column or absent, is read from the index in order with no sort; everything else sorts the matched rows in memory. `DESC` from an index waits on a reverse cursor. |
 | `LIMIT` with a parameter or expression, `FETCH ... WITH TIES`, `ORDER BY ... USING` | Not&nbsp;yet | |
 | `GROUP BY`, `DISTINCT`, `HAVING` | Not&nbsp;yet | |
 

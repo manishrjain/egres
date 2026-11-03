@@ -109,13 +109,15 @@ const Fixture = struct {
         self.arena.deinit();
     }
 
-    /// The plan of `SELECT * FROM t WHERE <where>`.
+    /// The plan of `SELECT * FROM t WHERE <where>`; an empty `where`
+    /// is no WHERE at all.
     fn planFor(
         self: *Fixture,
         where: String,
         opts: sql.plan.Options,
     ) !Plan {
         const a = self.arena.allocator();
+        if (where.len == 0) return sql.plan.plan(a, &self.tbl, null, opts);
         const text = try std.fmt.allocPrint(
             a,
             "SELECT * FROM t WHERE {s}",
@@ -125,6 +127,19 @@ const Fixture = struct {
         const pred = try a.create(Pred);
         pred.* = try sql.pred.bind(a, &self.tbl, stmt.select.where.?, .{});
         return sql.plan.plan(a, &self.tbl, pred, opts);
+    }
+
+    /// `ORDER BY <name> [DESC] [NULLS FIRST]`'s key, bound to the
+    /// column as dml's sortKeysOrReply binds it.
+    fn sortKey(
+        self: *Fixture,
+        name: String,
+        desc: bool,
+        nulls_first: bool,
+    ) !sql.exec.SortKey {
+        const node = try self.arena.allocator().create(sql.expr.Node);
+        node.* = .{ .column = self.tbl.column(name).? };
+        return .{ .node = node, .desc = desc, .nulls_first = nulls_first };
     }
 };
 
@@ -137,11 +152,37 @@ fn source(p: *const Plan) *RowNode {
 fn bitmapOf(p: *const Plan) !*const BitmapNode {
     const src = source(p);
     try testing.expect(src.* == .fetch);
-    return src.fetch.bnode;
+    return src.fetch.egids.set.node;
 }
 
 fn expectScan(p: *const Plan) !void {
     try testing.expect(source(p).* == .seq_scan);
+}
+
+/// The source must be a fetch over an index walk with these bounds,
+/// and nothing sorts above it.
+fn expectWalk(
+    p: *const Plan,
+    index_table_id: u32,
+    unique: bool,
+    lo: String,
+    hi: String,
+) !void {
+    const src = source(p);
+    try testing.expect(src.* == .fetch);
+    try testing.expect(src.fetch.egids == .walk);
+    const range = src.fetch.egids.walk.range;
+    try testing.expectEqual(index_table_id, range.index_table_id);
+    try testing.expectEqual(unique, range.unique);
+    try testing.expectEqualSlices(u8, lo, range.lo);
+    try testing.expectEqualSlices(u8, hi, range.hi);
+}
+
+/// A Sort sits under the root; its child is the source.
+fn expectSorted(p: *const Plan) !*RowNode {
+    const src = source(p);
+    try testing.expect(src.* == .sort);
+    return src.sort.child;
 }
 
 fn expectLookup(
@@ -555,4 +596,97 @@ test "sql.plan: an expression leaf scans; a bare-column leaf beside it indexes" 
     defer mixed.deinit();
     try expectLookup(try bitmapOf(&mixed), pkey_index_id, true, try int4Key(fx.arena.allocator(), 1));
     try testing.expect(source(&mixed).fetch.pred.?.* == .and_);
+}
+
+test "sql.plan: ORDER BY on an indexed column walks the index in key order" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    const a = fx.arena.allocator();
+    const k1 = try int4Key(a, 1);
+    const after1 = try std.mem.concat(a, u8, &.{ k1, &.{0} });
+    const k5 = try int4Key(a, 5);
+    const after5 = try std.mem.concat(a, u8, &.{ k5, &.{0} });
+    const from = sql.key.values_from;
+    const end = sql.key.values_end;
+    const keys_end = sql.key.keys_end;
+    const by_b = sql.plan.Options{
+        .read_ts = read_ts,
+        .order_by = &.{try fx.sortKey("b", false, false)},
+    };
+
+    // No WHERE: the whole index, NULL's entry last. A term on the
+    // column narrows the walk; `=` is one key's span.
+    var whole = try fx.planFor("", by_b);
+    defer whole.deinit();
+    try expectWalk(&whole, b_index_id, false, from, keys_end);
+    var gt = try fx.planFor("b > 1", by_b);
+    defer gt.deinit();
+    try expectWalk(&gt, b_index_id, false, after1, end);
+    try testing.expect(source(&gt).fetch.pred.?.* == .cmp);
+    var between = try fx.planFor("b > 1 AND b <= 5", by_b);
+    defer between.deinit();
+    try expectWalk(&between, b_index_id, false, after1, after5);
+    var eq = try fx.planFor("b = 5", by_b);
+    defer eq.deinit();
+    try expectWalk(&eq, b_index_id, false, k5, after5);
+    var unique = try fx.planFor("a >= 1", .{
+        .read_ts = read_ts,
+        .order_by = &.{try fx.sortKey("a", false, false)},
+    });
+    defer unique.deinit();
+    try expectWalk(&unique, pkey_index_id, true, k1, end);
+
+    // A term on another column, or one no range answers, sorts the
+    // bitmap's rows instead: the walk would read the table through
+    // the index.
+    var other = try fx.planFor("b > 1 AND a = 1", by_b);
+    defer other.deinit();
+    const under = try expectSorted(&other);
+    try testing.expect(under.* == .fetch and under.fetch.egids == .set);
+    var or_ = try fx.planFor("b > 1 OR b < 0", by_b);
+    defer or_.deinit();
+    _ = try expectSorted(&or_);
+    var ne = try fx.planFor("b <> 1", by_b);
+    defer ne.deinit();
+    try testing.expect((try expectSorted(&ne)).* == .seq_scan);
+    var null_cmp = try fx.planFor("b = NULL", by_b);
+    defer null_cmp.deinit();
+    _ = try expectSorted(&null_cmp);
+
+    // The index order is ASC NULLS LAST and nothing else; two keys or
+    // an unindexed column sort too.
+    var desc = try fx.planFor("", .{
+        .read_ts = read_ts,
+        .order_by = &.{try fx.sortKey("b", true, false)},
+    });
+    defer desc.deinit();
+    _ = try expectSorted(&desc);
+    var nulls_first = try fx.planFor("", .{
+        .read_ts = read_ts,
+        .order_by = &.{try fx.sortKey("b", false, true)},
+    });
+    defer nulls_first.deinit();
+    _ = try expectSorted(&nulls_first);
+    var two = try fx.planFor("", .{
+        .read_ts = read_ts,
+        .order_by = &.{
+            try fx.sortKey("b", false, false),
+            try fx.sortKey("a", false, false),
+        },
+    });
+    defer two.deinit();
+    _ = try expectSorted(&two);
+    var on_c = try fx.planFor("", .{
+        .read_ts = read_ts,
+        .order_by = &.{try fx.sortKey("c", false, false)},
+    });
+    defer on_c.deinit();
+    try testing.expect((try expectSorted(&on_c)).* == .seq_scan);
+    // An index still being built is not walked either.
+    var early = try fx.planFor("", .{
+        .read_ts = built_ts - 1,
+        .order_by = &.{try fx.sortKey("b", false, false)},
+    });
+    defer early.deinit();
+    _ = try expectSorted(&early);
 }

@@ -457,6 +457,54 @@ expect "ORDER BY without FROM refused" "need a FROM" q "SELECT 1 ORDER BY 1;"
 expect "negative OFFSET rejected" "negative" q "SELECT id FROM ob OFFSET -1;"
 expect "DROP the ORDER BY table" "DROP TABLE" q "DROP TABLE ob;"
 
+# The same orders read from an index in key order: one ASC key on an
+# indexed column, the WHERE on that column or absent. The block's
+# output on one line, like seq_.
+txseq_() { tx "$1" | tr '\n' ' '; }
+expect "CREATE TABLE with indexes for ORDER BY" "CREATE INDEX" \
+    txseq_ "CREATE TABLE obi (id int4 PRIMARY KEY, n int4, s text);
+CREATE INDEX obi_n ON obi (n);"
+expect "INSERT rows under the indexes" "INSERT 0 4" \
+    q "INSERT INTO obi VALUES (1, 3, 'b'), (2, NULL, 'a'), (3, 1, 'c'),
+       (4, 3, NULL);"
+expect "index walk: NULLs last, ties by egid" "3 1 4 2 " \
+    seq_ "SELECT id FROM obi ORDER BY n;"
+expect "index walk: a range on the key" "1 4 " \
+    seq_ "SELECT id FROM obi WHERE n > 1 ORDER BY n;"
+expect "index walk: two bounds" "3 " \
+    seq_ "SELECT id FROM obi WHERE n >= 1 AND n < 3 ORDER BY n;"
+expect "index walk: an equality" "1 4 " \
+    seq_ "SELECT id FROM obi WHERE n = 3 ORDER BY n;"
+expect "index walk: LIMIT reads that many" "3 1 " \
+    seq_ "SELECT id FROM obi ORDER BY n LIMIT 2;"
+expect "index walk: OFFSET" "4 2 " \
+    seq_ "SELECT id FROM obi ORDER BY n OFFSET 2;"
+expect "unique index walk" "1 2 3 4 " seq_ "SELECT id FROM obi ORDER BY id;"
+expect "unique index walk with a range" "3 4 " \
+    seq_ "SELECT id FROM obi WHERE id > 2 ORDER BY id;"
+expect "index walk under FOR UPDATE" "1 2 3 4 " \
+    seq_ "SELECT id FROM obi ORDER BY id FOR UPDATE;"
+expect "index walk sees this txn's writes" "5 4 3 2 " \
+    txseq_ "BEGIN;
+INSERT INTO obi VALUES (5, 0, 'e');
+UPDATE obi SET n = 9 WHERE id = 3;
+DELETE FROM obi WHERE id = 1;
+SELECT id FROM obi ORDER BY n;
+ROLLBACK;"
+expect "unique walk sees this txn's writes" "2 3 4 5 " \
+    txseq_ "BEGIN;
+INSERT INTO obi VALUES (5, 0, 'e');
+DELETE FROM obi WHERE id = 1;
+SELECT id FROM obi ORDER BY id;
+ROLLBACK;"
+expect "rolled back: the walk is unchanged" "3 1 4 2 " \
+    seq_ "SELECT id FROM obi ORDER BY n;"
+expect "DESC on the indexed column still sorts" "2 1 4 3 " \
+    seq_ "SELECT id FROM obi ORDER BY n DESC;"
+expect "a WHERE off the key sorts" "3 1 " \
+    seq_ "SELECT id FROM obi WHERE id < 4 AND n <= 3 ORDER BY n;"
+expect "DROP the indexed ORDER BY table" "DROP TABLE" q "DROP TABLE obi;"
+
 expect "DELETE 5000 rows" "DELETE 5000" q "DELETE FROM big;"
 expect "big is empty" "(0 rows)" q "SELECT id FROM big;"
 

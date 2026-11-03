@@ -21,11 +21,15 @@ const Txn = sql.txn.Txn;
 const Forest = zdb.forest.Forest;
 const Config = zdb.config.Config;
 const Item = zdb.kv.Item;
+const Key = zdb.kv.Key;
+const Meta = zdb.kv.Meta;
 const Value = sql.value.Value;
 const zroar = zdb.zroar;
 
 const ns: u64 = 16;
 const tid: u32 = 16;
+/// A posting index's table id, for the tests that create one.
+const itid: u32 = 17;
 const read_ts: u64 = 500;
 
 /// Builds a fixture's committed rows under the table's layout.
@@ -250,6 +254,53 @@ fn tinyItem(primary: *const [8]u8, value: String) Item {
         },
         .versions = .{ .one = .{ .ts = 1, .meta = .{}, .value = value } },
     };
+}
+
+/// Commit a txn's wire kvs into the forest the way apply does: every
+/// write stamped with the commit ts, then forest.put.
+fn commit(
+    a: std.mem.Allocator,
+    fx: *Fixture,
+    tx: *Txn,
+    commit_ts: u64,
+) !void {
+    const kvs = try tx.wireKvs(a);
+    const items = try a.alloc(Item, kvs.len);
+    for (kvs, items) |kv, *item| {
+        item.* = .{
+            .key = Key.init(kv.key),
+            .versions = .{ .one = .{
+                .ts = commit_ts,
+                .meta = Meta.fromByte(kv.meta),
+                .value = kv.value,
+            } },
+        };
+    }
+    try fx.forest.put(items);
+}
+
+fn int4Key(a: std.mem.Allocator, v: i32) ![]u8 {
+    return sql.key.encodeIndexKey(a, .{ .int4 = v }, null);
+}
+
+/// Every egid a fetch over `walk` hands out, in order.
+fn walkEgids(
+    a: std.mem.Allocator,
+    ctx: *exec.ExecCtx,
+    walk: exec.IndexWalk,
+) ![]const u64 {
+    var b = try Batch.init(testing.allocator);
+    defer b.deinit();
+    var node = RowNode{ .fetch = .{ .egids = .{ .walk = walk } } };
+    defer node.deinit();
+    var out: std.ArrayList(u64) = .empty;
+    while (try node.next(ctx, &b)) {
+        var it = b.selected();
+        while (it.next()) |r| {
+            try out.append(a, sql.key.decodeEgid(r.key.primary).?);
+        }
+    }
+    return out.toOwnedSlice(a);
 }
 
 fn firstEgid(b: *const Batch) u64 {
@@ -517,7 +568,7 @@ test "sql.exec: fetch: no row locks of its own, held row across batches" {
     var leaf = BitmapNode{ .egids = bm };
 
     // The fetch owns its bitmap tree: one deinit frees the leaf too.
-    var node = RowNode{ .fetch = .{ .bnode = &leaf } };
+    var node = RowNode{ .fetch = .{ .egids = .{ .set = .{ .node = &leaf } } } };
     defer node.deinit();
     try testing.expectEqual(@as(usize, 0), tx.held_rows.items.len);
     var batches: usize = 0;
@@ -561,7 +612,10 @@ test "sql.exec: fetch: a bitmap wider than one chunk, with a residual" {
         .eq,
         .{ .text = "y" },
     );
-    var node = RowNode{ .fetch = .{ .bnode = &leaf, .pred = &pred } };
+    var node = RowNode{ .fetch = .{
+        .egids = .{ .set = .{ .node = &leaf } },
+        .pred = &pred,
+    } };
     defer node.deinit();
 
     var total: usize = 0;
@@ -689,7 +743,10 @@ test "sql.exec: materialize over a fetch locks the output rows only" {
         .eq,
         .{ .text = "x" },
     );
-    var fetch = RowNode{ .fetch = .{ .bnode = &leaf, .pred = &pred } };
+    var fetch = RowNode{ .fetch = .{
+        .egids = .{ .set = .{ .node = &leaf } },
+        .pred = &pred,
+    } };
     var node = RowNode{ .materialize = .{ .child = &fetch } };
     defer node.deinit();
 
@@ -823,5 +880,74 @@ test "sql.exec: orderKeys: direction, NULLs, and the first key that differs" {
     try testing.expectEqual(
         lt,
         ord(&.{asc}, &.{.{ .int8 = 2 }}, &.{.{ .float8 = 2.5 }}),
+    );
+}
+
+test "sql.exec: fetch over an index walk: key order, pending ops merged" {
+    var fx = try Fixture.setup(&alternatingRows);
+    defer fx.teardown();
+    _ = try createTree(fx.forest, .{
+        .namespace = ns,
+        .table_id = itid,
+    }, .{}, .posting_index);
+    const a = fx.arena.allocator();
+    const k5 = try int4Key(a, 5);
+    const k10 = try int4Key(a, 10);
+    const k20 = try int4Key(a, 20);
+    const k30 = try int4Key(a, 30);
+    const k_null = try sql.key.encodeIndexKey(a, .null_value, null);
+
+    // Committed postings: 10 → {2, 5}, 20 → {1, 6}, 30 → {3}, NULL →
+    // {4}. The rows' own a is their egid; the walk trusts the index,
+    // as a statement does, and nothing here re-checks it.
+    {
+        var tx = fx.txn();
+        defer tx.deinit();
+        try tx.putPosting(itid, k10, 2, .add);
+        try tx.putPosting(itid, k10, 5, .add);
+        try tx.putPosting(itid, k20, 1, .add);
+        try tx.putPosting(itid, k20, 6, .add);
+        try tx.putPosting(itid, k30, 3, .add);
+        try tx.putPosting(itid, k_null, 4, .add);
+        try commit(a, &fx, &tx, 300);
+    }
+
+    var tx = fx.txn();
+    defer tx.deinit();
+    var ctx = fx.ctx(&tx, false);
+    const whole = exec.IndexRange{
+        .index_table_id = itid,
+        .lo = sql.key.values_from,
+        .hi = sql.key.keys_end,
+        .unique = false,
+    };
+    // Keys ascending, NULL's last, egids ascending within a key.
+    try testing.expectEqualSlices(
+        u64,
+        &.{ 2, 5, 1, 6, 3, 4 },
+        try walkEgids(a, &ctx, .{ .range = whole }),
+    );
+
+    // Pending in this txn: a key only it knows (5 → {7}) takes its
+    // turn first; 30 is emptied and skipped; 10 swaps 5 for 8.
+    try tx.putPosting(itid, k5, 7, .add);
+    try tx.putPosting(itid, k30, 3, .remove);
+    try tx.putPosting(itid, k10, 5, .remove);
+    try tx.putPosting(itid, k10, 8, .add);
+    try testing.expectEqualSlices(
+        u64,
+        &.{ 7, 2, 8, 1, 6, 4 },
+        try walkEgids(a, &ctx, .{ .range = whole }),
+    );
+    // A range: from 10, and values_end leaves NULL's entry out.
+    try testing.expectEqualSlices(
+        u64,
+        &.{ 2, 8, 1, 6 },
+        try walkEgids(a, &ctx, .{ .range = .{
+            .index_table_id = itid,
+            .lo = k10,
+            .hi = sql.key.values_end,
+            .unique = false,
+        } }),
     );
 }

@@ -78,6 +78,9 @@ const tag_null: u8 = 0x01;
 /// after them all. A range with no bound on one side ends at these.
 pub const values_from: String = &.{tag_value};
 pub const values_end: String = &.{tag_null};
+/// The bound past every key, NULL's included: [values_from, keys_end)
+/// is the whole index in its order, values ascending then NULL.
+pub const keys_end: String = &.{ tag_null, 0 };
 
 /// The memcomparable index-key encoding of `v`: [tag_value] ++ value
 /// encoding, or the single [tag_null] byte for NULL. With `buf` the

@@ -435,7 +435,7 @@ pub const BitmapNode = union(enum) {
         return acc;
     }
 
-    fn rangeOf(ctx: *ExecCtx, r: IndexRange) KeyRange {
+    pub fn rangeOf(ctx: *ExecCtx, r: IndexRange) KeyRange {
         return .{
             .left = .{
                 .namespace = ctx.tx.ns,
@@ -590,31 +590,159 @@ pub const SeqScan = struct {
 ///
 /// TODO: For select count(*) queries, we don't need to fetch the rows. We can
 /// just return based on cardinality of the bitmaps.
+/// Where a Fetch's egids come from: a set, evaluated once and read in
+/// egid order, or an index walked in key order, for a row order the
+/// index already has. Either hands out one egid per `next`.
+pub const EgidSource = union(enum) {
+    set: Set,
+    walk: IndexWalk,
+
+    /// The evaluated set and a bookmark into it (the bitmap is
+    /// unbounded and rows go out a batch at a time; zroar has no
+    /// seek). The iterator points at `bm`: not movable once open.
+    pub const Set = struct {
+        node: *BitmapNode,
+        bm: ?zroar.Bitmap = null,
+        it: ?zroar.Iterator = null,
+    };
+
+    fn open(self: *EgidSource, ctx: *ExecCtx) !void {
+        switch (self.*) {
+            .set => |*s| {
+                s.bm = try s.node.eval(ctx);
+                s.it = s.bm.?.iterator();
+            },
+            .walk => |*w| try w.open(ctx),
+        }
+    }
+
+    fn next(self: *EgidSource, ctx: *ExecCtx) !?u64 {
+        return switch (self.*) {
+            .set => |*s| s.it.?.next(),
+            .walk => |*w| try w.next(ctx),
+        };
+    }
+
+    /// How many egids to expect, for sizing a chunk: a set's size; a
+    /// walk's is unknown, so what the caller asked for this fill.
+    fn sizeHint(self: *const EgidSource, row_limit: usize) usize {
+        return switch (self.*) {
+            .set => |s| @intCast(s.bm.?.getCardinality()),
+            .walk => row_limit,
+        };
+    }
+
+    /// Whether every egid came from an index (a missing row is then
+    /// corruption, not a literal that named no row).
+    fn fromIndex(self: *const EgidSource) bool {
+        return switch (self.*) {
+            .set => |s| s.node.fromIndex(),
+            .walk => true,
+        };
+    }
+
+    /// Also frees a set's bitmap tree: the planner built it for this
+    /// source.
+    fn deinit(self: *EgidSource) void {
+        switch (self.*) {
+            .set => |*s| {
+                if (s.bm) |*bm| bm.deinit();
+                s.bm = null;
+                s.it = null;
+                s.node.deinit();
+            },
+            .walk => |*w| w.deinit(),
+        }
+    }
+};
+
+/// `SELECT * FROM t WHERE n >= 5 ORDER BY n`: the index on n between
+/// the bounds, walked in key order — values ascending, then NULL —
+/// each key's egids handed out ascending, so rows with equal n come
+/// out by egid. The cursor merges this txn's pending entries in, a
+/// posting's delta folded over the committed chain; a key whose rows
+/// this txn all removed folds to nothing and is passed over. Recorded
+/// as a scan, as any range is.
+pub const IndexWalk = struct {
+    range: IndexRange,
+    cursor: ?Forest.Cursor = null,
+    /// The key in hand's egids and a bookmark into it. The iterator
+    /// points at `egids`: not movable once open.
+    egids: ?zroar.Bitmap = null,
+    it: ?zroar.Iterator = null,
+    keys_seen: usize = 0,
+
+    fn open(self: *IndexWalk, ctx: *ExecCtx) !void {
+        const r = self.range;
+        ctx.tx.recordScan();
+        self.cursor = try ctx.tx.forest.openCursor(
+            ctx.tx.allocator,
+            .{ .namespace = ctx.tx.ns, .table_id = r.index_table_id },
+            BitmapNode.rangeOf(ctx, r),
+            .{
+                .read_ts = ctx.tx.read_ts,
+                .pending = try ctx.tx.materializedWrites(),
+                // A posting is its whole chain; a unique entry one row.
+                .num_versions = if (r.unique) 1 else std.math.maxInt(u32),
+            },
+        );
+    }
+
+    /// The next egid in key order; null at the end of the range.
+    fn next(self: *IndexWalk, ctx: *ExecCtx) !?u64 {
+        if (self.range.unique) {
+            const entry = (try self.cursor.?.next()) orelse return null;
+            return _key.decodeEgid(entry.newest().value) orelse
+                return error.CorruptIndexEntry;
+        }
+        while (true) {
+            if (self.it) |*it| if (it.next()) |egid| return egid;
+            if (!try self.nextKey(ctx)) return null;
+        }
+    }
+
+    /// The next key's egids, folded. false = the range is done.
+    fn nextKey(self: *IndexWalk, ctx: *ExecCtx) !bool {
+        const cursor = &self.cursor.?;
+        const entry = (try cursor.next()) orelse return false;
+        // One yield point per hundred keys: a key is one fold.
+        self.keys_seen += 1;
+        if (self.keys_seen % 100 == 0) try fiber.ctx().maybeYield();
+
+        if (self.egids) |*bm| bm.deinit();
+        self.egids = null;
+        self.it = null;
+        self.egids = try cursor.bitmap(ctx.tx.allocator, &entry);
+        self.it = self.egids.?.iterator();
+        return true;
+    }
+
+    fn deinit(self: *IndexWalk) void {
+        if (self.egids) |*bm| bm.deinit();
+        self.egids = null;
+        self.it = null;
+        if (self.cursor) |*c| c.deinit();
+        self.cursor = null;
+    }
+};
+
 pub const Fetch = struct {
-    bnode: *BitmapNode,
+    egids: EgidSource,
     pred: ?*const Pred = null,
     keep_value: bool = true,
-    /// The evaluated set and a bookmark into it (the bitmap is
-    /// unbounded and rows go out a batch at a time; zroar has no seek).
-    /// The iterator points at `bm`: the node is NOT movable after its
-    /// first next.
-    bm: ?zroar.Bitmap = null,
-    it: ?zroar.Iterator = null,
     /// The chunk in hand: its keys, the batch result, and the next key
-    /// to place. `key_bytes` is the storage, 8 bytes per egid key;
-    /// `key_slices` the table over it that multiGet takes, one slice per
-    /// slot; `keys` the prefix of that table in use. Both are sized once
-    /// to the chunk capacity — the bitmap's cardinality, capped at one
-    /// batch fill — and overwritten per chunk. Sized to the set rather
-    /// than the cap: a point read pulls one egid, and a cap-sized pair
-    /// of buffers was a 24 KiB allocation (poison-filled in a safe
-    /// build) per statement.
-    keys: []String = &.{},
-    key_slices: []String = &.{},
+    /// to place. `key_bytes` is the storage, 8 bytes per egid key, and
+    /// `keys` the slices over it that multiGet takes. Both are sized
+    /// once to the chunk capacity — the source's size hint, capped at
+    /// one batch fill — and refilled per chunk. Sized to the source
+    /// rather than the cap: a point read pulls one egid, and a
+    /// cap-sized pair of buffers was a 24 KiB allocation (poison-filled
+    /// in a safe build) per statement.
+    keys: std.ArrayList(String) = .empty,
     key_bytes: []u8 = &.{},
     res: ?Forest.MultiGet = null,
     chunk_pos: usize = 0,
-    from_index: bool = false,
+    opened: bool = false,
     done: bool = false,
 
     pub fn next(self: *Fetch, ctx: *ExecCtx, batch: *Batch) !bool {
@@ -623,17 +751,15 @@ pub const Fetch = struct {
         if (self.done) return false;
         try fiber.ctx().maybeYield();
 
-        if (self.bm == null) {
-            self.bm = try self.bnode.eval(ctx);
-
-            self.it = self.bm.?.iterator();
-            self.from_index = self.bnode.fromIndex(); // For debug assert
-            const cap: usize = @intCast(@max(1, @min(
+        if (!self.opened) {
+            try self.egids.open(ctx);
+            self.opened = true;
+            const cap: usize = @max(1, @min(
                 row_cap,
-                self.bm.?.getCardinality(),
-            )));
+                self.egids.sizeHint(batch.row_limit),
+            ));
             self.key_bytes = try ctx.arloc.alloc(u8, cap * 8);
-            self.key_slices = try ctx.arloc.alloc(String, cap);
+            try self.keys.ensureTotalCapacityPrecise(ctx.arloc, cap);
         }
 
         while (!batch.full()) {
@@ -643,12 +769,12 @@ pub const Fetch = struct {
                     break;
                 }
             }
-            if (self.chunk_pos == self.keys.len) {
+            if (self.chunk_pos == self.keys.items.len) {
                 self.res.?.deinit();
                 self.res = null;
                 continue;
             }
-            const key = self.keys[self.chunk_pos];
+            const key = self.keys.items[self.chunk_pos];
             const item = self.res.?.item(key) orelse {
                 self.missing(ctx, key);
                 self.chunk_pos += 1;
@@ -668,19 +794,18 @@ pub const Fetch = struct {
         return batch.numRows() > 0;
     }
 
-    /// Pull up to `limit` egids from the bitmap into the chunk buffers
-    /// and read them in one batch. false = the bitmap is exhausted.
+    /// Pull up to `limit` egids from the source into the chunk buffers
+    /// and read them in one batch. false = the source is exhausted.
     fn fetchKeys(self: *Fetch, ctx: *ExecCtx, limit: usize) !bool {
-        var n: usize = 0;
-        while (n < @min(limit, self.key_slices.len)) : (n += 1) {
-            const egid = self.it.?.next() orelse break;
-            const key = self.key_bytes[n * 8 ..][0..8];
+        self.keys.clearRetainingCapacity();
+        while (self.keys.items.len < @min(limit, self.keys.capacity)) {
+            const egid = (try self.egids.next(ctx)) orelse break;
+            const key = self.key_bytes[self.keys.items.len * 8 ..][0..8];
             key.* = _key.encodeEgid(egid);
-            self.key_slices[n] = key;
+            self.keys.appendAssumeCapacity(key);
         }
-        if (n == 0) return false;
-        self.keys = self.key_slices[0..n];
-        self.res = try ctx.tx.multiGet(ctx.table_id, self.keys);
+        if (self.keys.items.len == 0) return false;
+        self.res = try ctx.tx.multiGet(ctx.table_id, self.keys.items);
         self.chunk_pos = 0;
         return true;
     }
@@ -690,7 +815,7 @@ pub const Fetch = struct {
     /// atomically) — logged loudly, then still skipped so the
     /// statement answers from the rows that do exist.
     fn missing(self: *const Fetch, ctx: *ExecCtx, key: String) void {
-        if (!self.from_index) return;
+        if (!self.egids.fromIndex()) return;
         log.err(
             "corrupt index entry: an index names egid={d}, " ++
                 "no such row in table={d}",
@@ -704,14 +829,10 @@ pub const Fetch = struct {
         return if (self.keep_value) .copy else .none;
     }
 
-    /// Also frees the bitmap tree: the planner built it for this node.
     pub fn deinit(self: *Fetch) void {
         if (self.res) |*res| res.deinit();
         self.res = null;
-        if (self.bm) |*bm| bm.deinit();
-        self.bm = null;
-        self.it = null;
-        self.bnode.deinit();
+        self.egids.deinit();
     }
 };
 

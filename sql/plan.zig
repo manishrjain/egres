@@ -3,10 +3,11 @@
 
 //! The planner: the one place that chooses index vs. scan. A bound
 //! Pred (pred.zig) in, a tree of exec nodes out — `materialize →
-//! [sort →] (seq_scan | fetch(bitmap))` — with the WHOLE predicate re-checked
-//! on the source, so a bitmap only has to be a SUPERSET of the rows
-//! and no remainder is ever computed. Files form a DAG: plan → exec →
-//! pred; dml.zig calls `plan` and drives the tree.
+//! [sort →] (seq_scan | fetch(bitmap | walk))` — with the WHOLE
+//! predicate re-checked on the source, so a bitmap only has to be a
+//! SUPERSET of the rows and no remainder is ever computed. Files form
+//! a DAG: plan → exec → pred; dml.zig calls `plan` and drives the
+//! tree.
 
 const std = @import("std");
 const zdb = @import("zdb");
@@ -20,6 +21,8 @@ const _value = @import("value.zig");
 const String = _value.String;
 
 const BitmapNode = _exec.BitmapNode;
+const IndexRange = _exec.IndexRange;
+const IndexWalk = _exec.IndexWalk;
 const Pred = _pred.Pred;
 const RowNode = _exec.RowNode;
 const zroar = zdb.zroar;
@@ -43,7 +46,9 @@ pub const Options = struct {
     /// instead of appending them.
     count_only: bool = false,
     /// ORDER BY: the bound keys, first key first; empty = the source's
-    /// order. A Sort node gathers every row before the first goes out.
+    /// order. An index walked in key order is the ordering when it can
+    /// be (walkFor); else a Sort node gathers every row before the
+    /// first goes out.
     order_by: []const _exec.SortKey = &.{},
     /// OFFSET: rows dropped before the first one produced, after the
     /// ordering.
@@ -53,7 +58,8 @@ pub const Options = struct {
 pub const Plan = struct {
     /// Always a Materialize — the root that bounds the result and, for
     /// a locking statement (ExecCtx.lock), gathers and locks it — over
-    /// the source: a seq_scan, or a fetch over the bitmap tree.
+    /// the source: a seq_scan, or a fetch over a bitmap tree or an
+    /// index walk.
     root: *RowNode,
 
     /// Frees the tree's resources; the nodes' memory belongs to the
@@ -74,28 +80,37 @@ pub fn plan(
     pred: ?*const Pred,
     opts: Options,
 ) !Plan {
-    var bitmap: ?BitmapNode = null;
-    if (pred) |p| bitmap = try bitmapFor(arloc, tbl, opts.read_ts, p);
-    errdefer if (bitmap) |*bm| bm.deinit();
-
     const src = try arloc.create(RowNode);
-    if (bitmap) |bm| {
-        const bnode = try arloc.create(BitmapNode);
-        bnode.* = bm;
+    const walk = try walkFor(arloc, tbl, opts.read_ts, pred, opts.order_by);
+    if (walk) |w| {
         src.* = .{ .fetch = .{
-            .bnode = bnode,
+            .egids = .{ .walk = w },
             .pred = pred,
             .keep_value = opts.keep_value,
         } };
     } else {
-        src.* = .{ .seq_scan = .{
-            .pred = pred,
-            .keep_value = opts.keep_value,
-            .count_only = opts.count_only,
-        } };
+        var bitmap: ?BitmapNode = null;
+        if (pred) |p| bitmap = try bitmapFor(arloc, tbl, opts.read_ts, p);
+        errdefer if (bitmap) |*bm| bm.deinit();
+
+        if (bitmap) |bm| {
+            const bnode = try arloc.create(BitmapNode);
+            bnode.* = bm;
+            src.* = .{ .fetch = .{
+                .egids = .{ .set = .{ .node = bnode } },
+                .pred = pred,
+                .keep_value = opts.keep_value,
+            } };
+        } else {
+            src.* = .{ .seq_scan = .{
+                .pred = pred,
+                .keep_value = opts.keep_value,
+                .count_only = opts.count_only,
+            } };
+        }
     }
     var child = src;
-    if (opts.order_by.len > 0) {
+    if (walk == null and opts.order_by.len > 0) {
         child = try arloc.create(RowNode);
         child.* = .{ .sort = .{ .child = src, .keys = opts.order_by } };
     }
@@ -106,6 +121,57 @@ pub fn plan(
         .skip = opts.offset,
     } };
     return .{ .root = root };
+}
+
+/// `SELECT * FROM t WHERE n > 5 ORDER BY n`: the index on n walked in
+/// key order IS the ordering — ASC with NULLs last, the key encoding's
+/// own — so the rows need no sort. Only for one key, a bare indexed
+/// column, and a WHERE that is comparisons on that column (each one
+/// narrows the walk) or absent: any other term would have the walk
+/// read the table through the index and filter, which a bitmap on
+/// that term plus a sort beats without knowing the table. DESC and
+/// NULLS FIRST wait on a reverse cursor.
+fn walkFor(
+    arloc: std.mem.Allocator,
+    tbl: *const _table.Table,
+    read_ts: u64,
+    pred: ?*const Pred,
+    order_by: []const _exec.SortKey,
+) Error!?IndexWalk {
+    if (order_by.len != 1) return null;
+
+    const key = order_by[0];
+    if (key.desc or key.nulls_first) return null;
+
+    const col = switch (key.node.*) {
+        .column => |col| col,
+        else => return null,
+    };
+    const idx = validIndex(tbl, col, read_ts) orelse return null;
+
+    var range = IndexRange{
+        .index_table_id = idx.index_table_id,
+        .lo = _key.values_from,
+        .hi = _key.keys_end,
+        .unique = idx.unique,
+    };
+    const terms: []const Pred = if (pred) |p| p.topLevelAnds() else &.{};
+    for (terms) |*term| {
+        const cmp = switch (term.*) {
+            .cmp => |cmp| cmp,
+            else => return null,
+        };
+        if (cmp.lhs.* != .column or cmp.lhs.column != col) return null;
+        const val = switch (cmp.rhs.*) {
+            .value => |val| val,
+            else => return null,
+        };
+        if (val == .null_value) return null;
+        const term_range = (try termRange(arloc, idx, cmp.op, val)) orelse
+            return null;
+        range.intersect(term_range);
+    }
+    return .{ .range = range };
 }
 
 /// The egid set `p` can be answered from — a SUPERSET of its rows
@@ -236,36 +302,51 @@ fn lookup(
 }
 
 /// `col op v` on an index, for `< <= > >=`: the entries between two
-/// memcomparable bounds, [lo, hi). Every value key starts with the
-/// value tag and NULL's lone tag byte sorts after them all, so an open
-/// side ends at those (key.values_from / values_end); the key followed
-/// by a zero byte is the smallest key above it, which makes a bound
-/// exclusive on the left or inclusive on the right. `<>` reads nothing
-/// from an index (null), nor does a value with no encoding.
+/// memcomparable bounds, [lo, hi), read into one bitmap. `=` is
+/// lookup's, a point read.
 fn rangeLookup(
     arloc: std.mem.Allocator,
     idx: *const _table.Index,
     op: _parse.CmpOp,
     val: _value.Value,
 ) Error!?BitmapNode {
+    std.debug.assert(op != .eq and op != .same);
+    const range = (try termRange(arloc, idx, op, val)) orelse return null;
+    return .{ .index_range = range };
+}
+
+/// The index-key bounds [lo, hi) of `col op v`, for `= < <= > >=`.
+/// Every value key starts with the value tag and NULL's lone tag byte
+/// sorts after them all, so an open side ends at those
+/// (key.values_from / values_end); the key followed by a zero byte is
+/// the smallest key above it, which makes a bound exclusive on the
+/// left or inclusive on the right. `<>` has no bounds (null), nor
+/// does a value with no encoding.
+fn termRange(
+    arloc: std.mem.Allocator,
+    idx: *const _table.Index,
+    op: _parse.CmpOp,
+    val: _value.Value,
+) Error!?IndexRange {
     const key = _key.encodeIndexKey(arloc, val, null) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return null;
     };
     const after = try std.mem.concat(arloc, u8, &.{ key, &.{0} });
     const lo: String, const hi: String = switch (op) {
+        .eq, .same => .{ key, after },
         .lt => .{ _key.values_from, key },
         .le => .{ _key.values_from, after },
         .gt => .{ after, _key.values_end },
         .ge => .{ key, _key.values_end },
-        .eq, .ne, .differs, .same => return null,
+        .ne, .differs => return null,
     };
-    return .{ .index_range = .{
+    return .{
         .index_table_id = idx.index_table_id,
         .lo = lo,
         .hi = hi,
         .unique = idx.unique,
-    } };
+    };
 }
 
 /// `egid = N`: the one-id set. Literal sets are built here and owned
