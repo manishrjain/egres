@@ -79,7 +79,54 @@ test "sql.value: textToValue reads literals and rejects unsupported types" {
     try testing.expectError(error.InvalidBool, toValue(testing.allocator, .bool_, "maybe"));
     // Types this slice can't parse.
     try testing.expectError(error.UnsupportedType, toValue(testing.allocator, .time, "10:00"));
-    try testing.expectError(error.UnsupportedType, toValue(testing.allocator, .uuid, "x"));
+}
+
+test "sql.value: textToValue parses UUID text" {
+    const expected = [16]u8{
+        0x00, 0x11, 0x22, 0x33,
+        0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xaa, 0xbb,
+        0xcc, 0xdd, 0xee, 0xff,
+    };
+    // valid uuid formats i.e Postgres supported
+    const valid = [_]String{
+        "00112233-4455-6677-8899-aabbccddeeff",
+        "00112233-4455-6677-8899-AABBCCDDEEFF",
+        "00112233445566778899aabbccddeeff",
+        "{00112233-4455-6677-8899-aabbccddeeff}",
+        "0011-2233-4455-6677-8899-aabb-ccdd-eeff",
+        "{0011-22334455-66778899-aabbccddeeff}",
+    };
+
+    for (valid) |text| {
+        const parsed = try value.textToValue(testing.allocator, .uuid, text);
+        try testing.expectEqualSlices(u8, &expected, &parsed.uuid);
+    }
+
+    // rejected formats
+    const invalid = [_]String{
+        "",
+        "{",
+        "00112233445566778899aabbccddeef",
+        "00112233445566778899aabbccddeeff0",
+        "g0112233445566778899aabbccddeeff",
+        "0g112233445566778899aabbccddeeff",
+        "00-112233445566778899aabbccddeeff",
+        "0011--2233445566778899aabbccddeeff",
+        "00112233445566778899aabbccddeeff-",
+        "{00112233445566778899aabbccddeeff",
+        "00112233445566778899aabbccddeeff}",
+        "{00112233445566778899aabbccddeeff}x",
+        " 00112233445566778899aabbccddeeff",
+        "00112233445566778899aabbccddeeff ",
+    };
+
+    for (invalid) |text| {
+        try testing.expectError(
+            error.InvalidUuid,
+            value.textToValue(testing.allocator, .uuid, text),
+        );
+    }
 }
 
 test "sql.value: timestamps parse from and format to Postgres text" {
@@ -190,6 +237,24 @@ test "sql.value: valueToText renders text-format output" {
     }
 }
 
+test "sql.value: valueToText formats UUID canonically" {
+    const uuid = [16]u8{
+        0x00, 0x11, 0x22, 0x33,
+        0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xaa, 0xbb,
+        0xcc, 0xdd, 0xee, 0xff,
+    };
+    var buf: [36]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    try value.valueToText(&w, null, .{ .uuid = uuid });
+
+    try testing.expectEqualStrings(
+        "00112233-4455-6677-8899-aabbccddeeff",
+        w.buffered(),
+    );
+}
+
 test "sql.value: pgTypeOid widens unsigned ints" {
     try testing.expectEqual(pgwire.oid.bool_, value.pgTypeOid(.bool_));
     try testing.expectEqual(pgwire.oid.int4, value.pgTypeOid(.int4));
@@ -198,6 +263,7 @@ test "sql.value: pgTypeOid widens unsigned ints" {
     try testing.expectEqual(pgwire.oid.numeric, value.pgTypeOid(.uint8)); // widen
     try testing.expectEqual(pgwire.oid.text, value.pgTypeOid(.text));
     try testing.expectEqual(pgwire.oid.date, value.pgTypeOid(.date));
+    try testing.expectEqual(pgwire.oid.uuid, value.pgTypeOid(.uuid));
     try testing.expectEqual(pgwire.oid.text, value.pgTypeOid(.time)); // no dedicated oid yet
     try testing.expectEqual(pgwire.oid.timestamp, value.pgTypeOid(.timestamp));
     const tstz = value.pgTypeOid(.timestamptz);
@@ -346,6 +412,20 @@ test "sql.value: valueToBinary is the advertised type's wire format" {
         },
         .{ .v = .{ .text = "hé" }, .bytes = "hé" },
         .{ .v = .{ .bytea = &.{ 0, 1 } }, .bytes = &.{ 0, 1 } },
+        .{
+            .v = .{ .uuid = .{
+                0x00, 0x11, 0x22, 0x33,
+                0x44, 0x55, 0x66, 0x77,
+                0x88, 0x99, 0xaa, 0xbb,
+                0xcc, 0xdd, 0xee, 0xff,
+            } },
+            .bytes = &.{
+                0x00, 0x11, 0x22, 0x33,
+                0x44, 0x55, 0x66, 0x77,
+                0x88, 0x99, 0xaa, 0xbb,
+                0xcc, 0xdd, 0xee, 0xff,
+            },
+        },
     };
     for (cases) |case| {
         var aw: std.Io.Writer.Allocating = .init(testing.allocator);

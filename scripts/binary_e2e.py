@@ -11,6 +11,7 @@ any failure.
 import datetime as dt
 import sys
 from decimal import Decimal
+from uuid import UUID
 
 import psycopg
 
@@ -93,6 +94,19 @@ def main(dsn):
     check("binary params: read back", bin_.fetchone(),
           (False, 5, 10**12, 3.5, "x", b"\xff", dt.date(1999, 12, 31),
            dt.datetime(1999, 12, 31, 23, 59, 59)))
+
+    # --- UUID binary parameter and result ------------------------------
+    uid = UUID("00112233-4455-6677-8899-aabbccddeeff")
+    text.execute("CREATE TABLE bu (id int PRIMARY KEY, uid uuid)")
+    bin_.execute("INSERT INTO bu VALUES (1, %b)", (uid,))
+    bin_.execute("SELECT uid FROM bu WHERE id = 1")
+    row = bin_.fetchone()
+
+    check("UUID: result OID", bin_.pgresult.ftype(0), 2950)
+    check("UUID: result format is binary", bin_.pgresult.fformat(0), 1)
+    check("UUID: binary round-trip", row, (uid,))
+
+    text.execute("DROP TABLE bu")
 
     # --- past the prepare threshold: a named statement ----------------
     for i in range(7):

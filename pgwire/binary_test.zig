@@ -71,6 +71,7 @@ test "isBinarySupported covers expected OIDs" {
     try testing.expect(binary.isBinarySupported(types.oid.int4));
     try testing.expect(binary.isBinarySupported(types.oid.bool_));
     try testing.expect(binary.isBinarySupported(types.oid.float8));
+    try testing.expect(binary.isBinarySupported(types.oid.uuid));
     try testing.expect(!binary.isBinarySupported(types.oid.text));
     try testing.expect(!binary.isBinarySupported(types.oid.numeric));
 }
