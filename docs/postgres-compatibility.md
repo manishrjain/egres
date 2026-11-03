@@ -176,12 +176,15 @@ CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (column);
 | `text`, `varchar`, `varchar(n)`, `char(n)` | Yes | Values are valid UTF-8 (`22021` otherwise); a value longer than `n` returns `22001`. |
 | `bytea` | Yes | Hex form in text, `'\x00ff'`, as `bytea_output = 'hex'`. |
 | `date`, `timestamp`, `timestamptz` | Yes | |
-| `time`, `interval`, `uuid` | Partial | The column can be declared and holds `NULL`. Writing a value into it or comparing against it: not yet (`0A000`). |
+| `uuid` | Yes | Postgres text input and canonical output; see below. |
+| `time`, `interval` | Partial | Only `NULL`; other values return `0A000`. |
 | `time with time zone` | Not&nbsp;yet | |
 | `numeric`, `decimal`, `numeric(p, s)` | Yes | Exact, up to 38 digits, where Postgres allows more: a longer value is `22003`, and an arithmetic result past 38 digits keeps as many fractional digits as fit, rounded half away from zero. A value is rounded to the column's scale, half away from zero, and must fit its precision. Printed with every digit of its scale (`12.50`). `NaN` and `Infinity` are not accepted. |
 | `serial`, `bigserial` | Not&nbsp;yet | `egid` gives an insertion-ordered id today. |
 | `json`, `jsonb` | Not&nbsp;yet | |
 | Arrays, `enum`, composite, range, `money`, `inet`, `bit`, `tsvector`, geometric types | Not&nbsp;yet | |
+
+UUID input accepts upper- or lowercase hex digits, optional enclosing braces, and optional hyphens between groups of four hex digits, as in Postgres. Output is always lowercase in `8-4-4-4-12` form, such as `00112233-4455-6677-8899-aabbccddeeff`. Invalid UUID text returns `22P02`. UUID generation functions are not supported.
 
 Assignments in `SET` follow Postgres: any integer into any numeric column with a range check (`22003` on overflow), floats into floats, strings into strings. A float into an integer column returns `42804`. Division by zero returns `22012`.
 

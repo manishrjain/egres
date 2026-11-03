@@ -457,6 +457,27 @@ expect "index on a date column" "CREATE INDEX" q "CREATE INDEX dt_d ON dt (d);"
 expect "indexed date lookup" "(1 row)" q "SELECT id FROM dt WHERE d = '2001-01-01';"
 expect "DROP date table" "DROP TABLE" q "DROP TABLE dt;"
 
+# --- uuid: alternate input, canonical output, equality and index -------
+uuid_input='{00112233445566778899AABBCCDDEEFF}'
+uuid_text='00112233-4455-6677-8899-aabbccddeeff'
+uuid_next='ffeeddcc-bbaa-9988-7766-554433221100'
+expect "CREATE table with a UUID column" "CREATE TABLE" \
+    q "CREATE TABLE ut (id int PRIMARY KEY, uid uuid);"
+expect "INSERT alternate UUID spelling" "INSERT 0 1" q "INSERT INTO ut VALUES (1, '$uuid_input');"
+expect "UUID reads back canonically" "^$uuid_text$" v "SELECT uid FROM ut WHERE id = 1;"
+expect "WHERE accepts equivalent UUID spelling" "^1$" v "SELECT id FROM ut WHERE uid = '$uuid_text';"
+expect "malformed UUID is 22P02" "22P02:" \
+    psql "$E" -X -v VERBOSITY=verbose \
+    -c "INSERT INTO ut VALUES (2, 'not-a-uuid');"
+expect "rejected UUID did not insert a row" "^1$" v "SELECT count(*) FROM ut;"
+expect "index on a UUID column" "CREATE INDEX" q "CREATE INDEX ut_uid ON ut (uid);"
+expect "indexed UUID lookup accepts alternate spelling" "^1$" v "SELECT id FROM ut WHERE uid = '$uuid_input';"
+expect "UPDATE a UUID" "UPDATE 1" q "UPDATE ut SET uid = '$uuid_next' WHERE id = 1;"
+expect "updated UUID reads back" "^$uuid_next$" v "SELECT uid FROM ut WHERE id = 1;"
+expect "updated UUID found through index" "^1$" v "SELECT id FROM ut WHERE uid = '$uuid_next';"
+expect "old UUID index entry no longer matches" "^0$" v "SELECT count(*) FROM ut WHERE uid = '$uuid_text';"
+expect "DROP UUID table" "DROP TABLE" q "DROP TABLE ut;"
+
 # --- SELECT without FROM, SET and RESET: what a driver sends on connect --
 expect "SELECT 1" "(1 row)" q "SELECT 1;"
 expect "SELECT 1 value" "1" v "SELECT 1;"

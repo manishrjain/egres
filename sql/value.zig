@@ -240,9 +240,9 @@ pub const Row = struct {
 /// Parse a SQL literal into a typed cell of column type `ty`. The returned
 /// `text` Value BORROWS `text` (the caller keeps it alive until the row
 /// is marshaled); a `bytea` in hex form is decoded into `alloc`. NULL is
-/// handled by the caller, not here. Numeric/bool/date/timestamp parse
+/// handled by the caller, not here. Numeric/bool/date/timestamp/UUID parse
 /// failures surface as errors (the executor maps them to 22P02); types
-/// this slice can't parse (time, interval, uuid) return
+/// this slice can't parse (time, interval) return
 /// `error.UnsupportedType` (→ 0A000).
 pub fn textToValue(alloc: std.mem.Allocator, ty: Type, text: String) !Value {
     return switch (ty) {
@@ -261,7 +261,8 @@ pub fn textToValue(alloc: std.mem.Allocator, ty: Type, text: String) !Value {
         .timestamptz => .{ .timestamptz = try date.parseTimestamp(text, true) },
         .date => .{ .date = try date.parseDate(text) },
         .numeric => .{ .numeric = try Numeric.parse(text) },
-        .time, .interval, .uuid => error.UnsupportedType,
+        .uuid => .{ .uuid = try textToUuid(text) },
+        .time, .interval => error.UnsupportedType,
     };
 }
 
@@ -312,6 +313,39 @@ fn textToBool(text: String) !bool {
     if (eqlAny(text, &.{ "t", "true", "1", "yes", "on" })) return true;
     if (eqlAny(text, &.{ "f", "false", "0", "no", "off" })) return false;
     return error.InvalidBool;
+}
+
+fn textToUuid(text: String) ![16]u8 {
+    var bytes: [16]u8 = undefined;
+    var pos: usize = 0;
+    const has_braces = text.len > 0 and text[0] == '{';
+    if (has_braces) pos += 1;
+
+    for (&bytes, 0..) |*byte, byte_idx| {
+        if (text.len - pos < 2) return error.InvalidUuid;
+
+        const high = std.fmt.charToDigit(text[pos], 16) catch
+            return error.InvalidUuid;
+        const low = std.fmt.charToDigit(text[pos + 1], 16) catch
+            return error.InvalidUuid;
+
+        byte.* = (high << 4) | low;
+        pos += 2;
+        if (byte_idx % 2 == 1 and byte_idx < bytes.len - 1 and
+            pos < text.len and text[pos] == '-')
+        {
+            pos += 1;
+        }
+    }
+
+    if (has_braces) {
+        if (pos >= text.len or text[pos] != '}')
+            return error.InvalidUuid;
+        pos += 1;
+    }
+
+    if (pos != text.len) return error.InvalidUuid;
+    return bytes;
 }
 
 fn eqlAny(text: String, options: []const String) bool {
@@ -372,11 +406,9 @@ pub fn valueToText(w: *std.Io.Writer, col: ?*const Column, v: Value) !void {
         .text => |s| try w.writeAll(s),
         // Postgres's hex form, as bytea_output = 'hex' sends it.
         .bytea => |b| try w.print("\\x{x}", .{b}),
-        // Every numeric payload renders via {d}; `inline` binds the capture
-        // to each tag's concrete type. time/interval/uuid can't be inserted
-        // this slice, so a live value never actually reaches those tags —
-        // they degrade to the raw fields rather than crash.
-        // TODO: proper Postgres text formats for them.
+        // `inline` keeps each numeric payload's concrete type for {d}.
+        // time/interval text input is unsupported; their output remains
+        // raw fields until Postgres text codecs are added.
         inline .int2,
         .int4,
         .int8,
@@ -391,7 +423,13 @@ pub fn valueToText(w: *std.Io.Writer, col: ?*const Column, v: Value) !void {
         .timestamp => |us| try date.formatTimestamp(w, us, false),
         .timestamptz => |us| try date.formatTimestamp(w, us, true),
         .interval => |iv| try w.print("{d}mon {d}d {d}us", .{ iv.months, iv.days, iv.micros }),
-        .uuid => |u| try w.print("{x}", .{u}),
+        .uuid => |u| try w.print("{x}-{x}-{x}-{x}-{x}", .{
+            u[0..4],
+            u[4..6],
+            u[6..8],
+            u[8..10],
+            u[10..16],
+        }),
         .numeric => |d| try d.format(w),
     }
 }
@@ -400,8 +438,9 @@ pub fn valueToText(w: *std.Io.Writer, col: ?*const Column, v: Value) !void {
 /// advertised as (pgTypeOid): the integers and floats big-endian, an
 /// unsigned widened like its OID, uint8 as a numeric, the time types
 /// counted from the 2000 epoch, strings and bytea as their bytes with
-/// a `char(n)` padded as in text. A type advertised as text (time,
-/// interval, uuid) sends its text: that is text's binary format.
+/// a `char(n)` padded as in text, and UUID as its 16 raw bytes. A type
+/// advertised as text (time, interval) sends its text: that is text's
+/// binary format.
 pub fn valueToBinary(w: *std.Io.Writer, col: ?*const Column, v: Value) !void {
     switch (v) {
         .null_value => {}, // caller handles null out-of-band
@@ -426,7 +465,8 @@ pub fn valueToBinary(w: *std.Io.Writer, col: ?*const Column, v: Value) !void {
         ),
         .bytea => |b| try w.writeAll(b),
         .numeric => |d| try pgwire.binary.encodeNumeric(w, d.coef, d.scale),
-        .text, .time, .interval, .uuid => try valueToText(w, col, v),
+        .uuid => |u| try w.writeAll(&u),
+        .text, .time, .interval => try valueToText(w, col, v),
     }
 }
 
@@ -563,7 +603,8 @@ pub fn pgTypeOid(ty: Type) pgwire.Oid {
         .varchar => pgwire.oid.varchar,
         .bytea => pgwire.oid.bytea,
         .numeric => pgwire.oid.numeric,
-        .text, .time, .interval, .uuid => pgwire.oid.text,
+        .uuid => pgwire.oid.uuid,
+        .text, .time, .interval => pgwire.oid.text,
     };
 }
 

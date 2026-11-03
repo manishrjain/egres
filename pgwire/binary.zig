@@ -163,6 +163,7 @@ pub fn isBinarySupported(oid: _types.Oid) bool {
         _types.oid.int8,
         _types.oid.float4,
         _types.oid.float8,
+        _types.oid.uuid,
         => true,
         else => false,
     };
