@@ -74,12 +74,11 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
     var ret: ?Outputs = null;
     if (ins.returning) |projection| {
         ret = (try projectionOrReply(
+            self,
             state,
             arloc,
             tbl,
             projection,
-            self.params,
-            self.result_formats,
         )) orelse return;
     }
 
@@ -120,7 +119,7 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
                 lit,
                 col,
                 tx.start_us,
-                self.params,
+                self.portal.params,
             )) orelse return;
         }
         // NOT NULL is checked on the proposed row, before ON CONFLICT
@@ -221,19 +220,18 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
 
     const is_count = sel.projection == .count_star;
     const proj = (try projectionOrReply(
+        self,
         state,
         arloc,
         tbl,
         sel.projection,
-        self.params,
-        self.result_formats,
     )) orelse return;
     var emitter = RowEmitter{
         .state = state,
         .tbl = tbl,
         .proj = proj,
         .scratch = .init(tx.allocator),
-        .limit = self.max_rows,
+        .limit = self.portal.max_rows,
     };
     defer emitter.scratch.deinit();
 
@@ -245,7 +243,7 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
     // frozen by our locks.
     // count(*) counts every match and keeps no row bytes; its LIMIT
     // bounds the one output row, not the rows counted.
-    var plan = (try planFor(state, arloc, tbl, sel.where, self.params, .{
+    var plan = (try planFor(state, arloc, tbl, sel.where, self.portal.params, .{
         .read_ts = tx.read_ts,
         .keep_value = !is_count,
         .limit = if (is_count) null else sel.limit,
@@ -344,12 +342,11 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
     var ret: ?Outputs = null;
     if (del.returning) |projection| {
         ret = (try projectionOrReply(
+            self,
             state,
             arloc,
             tbl,
             projection,
-            self.params,
-            self.result_formats,
         )) orelse return;
     }
 
@@ -357,7 +354,7 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
     // anything else scans; no WHERE → tombstone every live row.
     // Materialize gathers the matches and locks every one; then they
     // are tombstoned from the gathered rows.
-    var plan = (try planFor(state, arloc, tbl, del.where, self.params, .{
+    var plan = (try planFor(state, arloc, tbl, del.where, self.portal.params, .{
         .read_ts = tx.read_ts,
         // Indexed tables keep the old bytes so every index entry —
         // a unique key's tombstone, a posting's remove — can be
@@ -446,12 +443,11 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
     var ret: ?Outputs = null;
     if (up.returning) |projection| {
         ret = (try projectionOrReply(
+            self,
             state,
             arloc,
             tbl,
             projection,
-            self.params,
-            self.result_formats,
         )) orelse return;
     }
 
@@ -463,7 +459,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
     // anything else scans; no WHERE → rewrite every live row.
     // Materialize gathers each match's PRE-image and locks every
     // one; the rewrite happens post-lock.
-    var plan = (try planFor(state, arloc, tbl, up.where, self.params, .{
+    var plan = (try planFor(state, arloc, tbl, up.where, self.portal.params, .{
         .read_ts = tx.read_ts,
     })) orelse return;
     defer plan.deinit();
@@ -736,7 +732,7 @@ fn resolveConflicts(
             arloc,
             tbl,
             cond,
-            self.params,
+            self.portal.params,
         )) orelse return false;
     };
 
@@ -906,7 +902,7 @@ fn bindSets(
             tbl,
             col,
             clause.value,
-            self.params,
+            self.portal.params,
             excluded,
         )) orelse return null;
         set.* = .{ .node = node, .col = col };
@@ -995,7 +991,7 @@ pub fn describeRows(
     const resolved = blk: {
         // state.send* can block below. Release the table hold here itself.
         defer hold.release();
-        const r = projectionOf(arloc, hold.tbl, projection, self.params);
+        const r = projectionOf(arloc, hold.tbl, projection, self.portal.params);
         if (r) |proj| {
             for (proj.fields) |*fd| fd.name = try arloc.dupe(u8, fd.name);
         } else |_| {}
@@ -1006,7 +1002,8 @@ pub fn describeRows(
         if (err == error.OutOfMemory) return err;
         return _expr.replyBindErr(state, arloc, err, null);
     };
-    if (!try applyFormats(state, proj.fields, self.result_formats)) return;
+    if (!try applyFormats(state, proj.fields, self.portal.result_wirefmts))
+        return;
     try state.sendRowDescription(proj.fields);
 }
 
@@ -1031,12 +1028,11 @@ fn describeRowsLoad(
         return replyError(state, "failed to load table schema");
     };
     const proj = (try projectionOrReply(
+        self,
         state,
         arloc,
         tbl,
         projection,
-        self.params,
-        self.result_formats,
     )) orelse return;
     try state.sendRowDescription(proj.fields);
 }
@@ -1053,7 +1049,7 @@ pub fn selectRow(
     defer arena.deinit();
     const arloc = arena.allocator();
     const fields = try selectRowFields(arloc, sr);
-    if (!try applyFormats(state, fields, self.result_formats)) return;
+    if (!try applyFormats(state, fields, self.portal.result_wirefmts)) return;
     if (self.mode == .simple) try state.sendRowDescription(fields);
     const emit = (sr.limit orelse 1) > 0;
     if (emit) {
@@ -1064,7 +1060,7 @@ pub fn selectRow(
             const v: _value.Value = switch (cell.value) {
                 .null_value => .null_value,
                 .int => |n| .{ .int8 = n },
-                .float => |text| if (fd.format_code == 1) .{
+                .float => |text| if (fd.wirefmt == .binary) .{
                     .numeric = _value.Numeric.parse(text) catch
                         return replyErrorCode(
                             state,
@@ -1076,7 +1072,7 @@ pub fn selectRow(
                 .bool_ => |b| .{ .bool_ = b },
                 else => unreachable, // the parser keeps only constants
             };
-            try writeCell(&dw, fd.format_code, null, v);
+            try writeCell(&dw, fd.wirefmt, null, v);
         }
         try dw.finish();
     }
@@ -1093,7 +1089,7 @@ pub fn describeSelectRow(
     var arena = fiber.ctx().newArena();
     defer arena.deinit();
     const fields = try selectRowFields(arena.allocator(), sr);
-    if (!try applyFormats(state, fields, self.result_formats)) return;
+    if (!try applyFormats(state, fields, self.portal.result_wirefmts)) return;
     try state.sendRowDescription(fields);
 }
 
@@ -1136,7 +1132,7 @@ fn projectionOf(
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
     projection: _parse.Projection,
-    params: _parse.Params,
+    params: pgwire.Params,
 ) _expr.BindError!Outputs {
     var outs: std.ArrayList(*const Node) = .empty;
     var names: std.ArrayList(String) = .empty;
@@ -1177,29 +1173,30 @@ fn projectionOf(
             .type_modifier = _value.pgTypeModifier(
                 if (col) |c| c.type_mod else null,
             ),
-            .format_code = 0,
+            .wirefmt = .text,
         };
     }
     return .{ .outs = outs.items, .fields = fields };
 }
 
-/// projectionOf with the reply and the portal's result formats
-/// applied: null = the error was sent. `select`'s RowEmitter takes
-/// the expressions.
+/// projectionOf over the statement in flight, with the reply and the
+/// portal's result formats applied: null = the error was sent.
+/// `select`'s RowEmitter takes the expressions.
 fn projectionOrReply(
+    self: *Handler,
     state: *pgwire.ConnState,
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
     projection: _parse.Projection,
-    params: _parse.Params,
-    formats: []const i16,
 ) !?Outputs {
+    const params = self.portal.params;
     const proj = projectionOf(arloc, tbl, projection, params) catch |err| {
         if (err == error.OutOfMemory) return err;
         try _expr.replyBindErr(state, arloc, err, null);
         return null;
     };
-    if (!try applyFormats(state, proj.fields, formats)) return null;
+    if (!try applyFormats(state, proj.fields, self.portal.result_wirefmts))
+        return null;
     return proj;
 }
 
@@ -1209,14 +1206,14 @@ fn projectionOrReply(
 fn applyFormats(
     state: *pgwire.ConnState,
     fields: []pgwire.FieldDescription,
-    formats: []const i16,
+    wirefmts: []const pgwire.WireFormat,
 ) !bool {
-    if (formats.len == 0) return true;
-    if (formats.len == 1) {
-        for (fields) |*fd| fd.format_code = formats[0];
+    if (wirefmts.len == 0) return true;
+    if (wirefmts.len == 1) {
+        for (fields) |*fd| fd.wirefmt = wirefmts[0];
         return true;
     }
-    if (formats.len != fields.len) {
+    if (wirefmts.len != fields.len) {
         var buf: [128]u8 = undefined;
         try replyErrorCode(
             state,
@@ -1224,12 +1221,12 @@ fn applyFormats(
             std.fmt.bufPrint(
                 &buf,
                 "bind message has {d} result formats but query has {d} columns",
-                .{ formats.len, fields.len },
+                .{ wirefmts.len, fields.len },
             ) catch unreachable,
         );
         return false;
     }
-    for (fields, formats) |*fd, format| fd.format_code = format;
+    for (fields, wirefmts) |*fd, wirefmt| fd.wirefmt = wirefmt;
     return true;
 }
 
@@ -1260,7 +1257,7 @@ fn sendReturning(
         .tbl = tbl,
         .proj = proj,
         .scratch = .init(tx.allocator),
-        .limit = self.max_rows,
+        .limit = self.portal.max_rows,
     };
     defer emitter.scratch.deinit();
 
@@ -1335,7 +1332,7 @@ pub const RowEmitter = struct {
                 self.tbl.parseCol(item, c)
             else
                 try node.cell(row);
-            try writeCell(&dw, fd.format_code, col, v);
+            try writeCell(&dw, fd.wirefmt, col, v);
         }
         try dw.finish();
         self.count += 1;
@@ -1345,7 +1342,7 @@ pub const RowEmitter = struct {
     pub fn emitCount(self: *RowEmitter, count: u64) !void {
         var dw = try self.state.beginDataRow(1);
         const v: _value.Value = .{ .int8 = @intCast(count) };
-        try writeCell(&dw, self.proj.fields[0].format_code, null, v);
+        try writeCell(&dw, self.proj.fields[0].wirefmt, null, v);
         try dw.finish();
         self.count += 1;
     }
@@ -1355,13 +1352,13 @@ pub const RowEmitter = struct {
 /// format, 0 text or 1 binary (applyFormats admits no other code).
 fn writeCell(
     dw: *pgwire.proto.DataRowWriter,
-    format: i16,
+    wirefmt: pgwire.WireFormat,
     col: ?*const _table.Column,
     v: _value.Value,
 ) !void {
     if (v == .null_value) return dw.writeNull();
     const w = try dw.beginColumn();
-    if (format == 1) {
+    if (wirefmt == .binary) {
         try _value.valueToBinary(w, col, v);
     } else {
         try _value.valueToText(w, col, v);
@@ -1400,7 +1397,7 @@ fn planFor(
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
     where: ?_parse.Where,
-    params: _parse.Params,
+    params: pgwire.Params,
     opts: _plan.Options,
 ) !?_plan.Plan {
     var pred: ?*const Pred = null;
@@ -1422,7 +1419,7 @@ fn coerceLiteral(
     lit: _parse.Literal,
     col: _table.Column,
     now_us: i64,
-    params: _parse.Params,
+    params: pgwire.Params,
 ) !?_value.Value {
     if (lit == .current_timestamp) {
         return switch (col.ty) {

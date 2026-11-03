@@ -200,7 +200,7 @@ pub fn bind(
     tbl: *const Table,
     expr: _parse.Expr,
     target: ?*const Column,
-    params: _parse.Params,
+    params: pgwire.Params,
     excluded: ?[]const Value,
 ) BindError!*const Node {
     const node = try arloc.create(Node);
@@ -208,8 +208,8 @@ pub fn bind(
         // `SELECT n + $1 FROM t` under a statement's Describe: no
         // value for $1 yet, so the leaf is the type Parse declared.
         .literal => |lit| node.* = if (lit == .param and
-            !params.bound(lit.param))
-            .{ .param = params.declared(lit.param) }
+            !_parse.paramBound(params, lit.param))
+            .{ .param = _parse.paramDeclared(params, lit.param) }
         else
             .{ .value = try literalValue(arloc, lit, target, params) },
         .column => |name| node.* = .{
@@ -264,7 +264,7 @@ fn literalValue(
     arloc: std.mem.Allocator,
     lit: _parse.Literal,
     target: ?*const Column,
-    params: _parse.Params,
+    params: pgwire.Params,
 ) BindError!Value {
     if (target) |col| {
         return _parse.litToValue(
@@ -289,7 +289,7 @@ fn literalValue(
         .bool_ => |b| .{ .bool_ = b },
         .null_value => .null_value,
         .param => |n| {
-            const v = params.untyped(n) catch |err| switch (err) {
+            const v = _parse.untypedParam(params, n) catch |err| switch (err) {
                 error.UnsupportedType => return error.UnsupportedValue,
                 else => return error.InvalidValue,
             };
@@ -357,7 +357,7 @@ pub fn bindOrReply(
     tbl: *const Table,
     target: *const Column,
     expr: _parse.Expr,
-    params: _parse.Params,
+    params: pgwire.Params,
     excluded: ?[]const Value,
 ) !?*const Node {
     return bind(arloc, tbl, expr, target, params, excluded) catch |err| {

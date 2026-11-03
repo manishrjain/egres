@@ -367,17 +367,11 @@ pub const Handler = struct {
     /// Which protocol the statement in flight came in on. Set by the
     /// two entry points (onQuery, onExecute) before runStatement.
     mode: Mode = .simple,
-    /// The Bind values for the statement in flight (Execute), empty
-    /// for a simple query. Every `$n` a statement carries resolves
-    /// here (parse.litToValue).
-    params: _parse.Params = .{},
-    /// Execute's row limit for the statement in flight; 0 = every
-    /// row, always so for a simple query.
-    max_rows: u32 = 0,
-    /// The portal's result formats for the Execute or Describe in
-    /// progress: empty = all text, one code = every column, else one
-    /// per column (dml.applyFormats).
-    result_formats: []const i16 = &.{},
+    /// The portal of the statement in flight: Bind's values, which
+    /// every `$n` resolves from (parse.litToValue), its result formats
+    /// (dml.applyFormats) and Execute's row limit. The empty portal
+    /// for a simple query.
+    portal: pgwire.Portal = .{},
     /// Parsed statements by SQL text, for the extended protocol: a
     /// prepared statement is parsed once per session, and the
     /// unnamed statement re-sent with the same text hits the same
@@ -761,7 +755,7 @@ pub const Handler = struct {
     /// after.
     pub fn onQuery(self: *Handler, state: *pgwire.ConnState, sql_text: String) !void {
         self.mode = .simple;
-        self.params = .{};
+        self.portal = .{};
         state.error_sent = false;
         defer self.failBlockOnError(state);
 
@@ -789,18 +783,8 @@ pub const Handler = struct {
         ctx: pgwire.ExecuteCtx,
     ) !void {
         self.mode = .extended;
-        self.params = .{
-            .values = ctx.params,
-            .formats = ctx.param_formats,
-            .oids = ctx.param_oids,
-        };
-        self.max_rows = ctx.max_rows;
-        self.result_formats = ctx.result_formats;
-        defer {
-            self.params = .{};
-            self.max_rows = 0;
-            self.result_formats = &.{};
-        }
+        self.portal = ctx.portal;
+        defer self.portal = .{};
 
         state.error_sent = false;
         defer self.failBlockOnError(state);
@@ -812,15 +796,15 @@ pub const Handler = struct {
 
         const stmt = (try self.cachedStatement(ctx.sql)) orelse
             return replySyntaxError(state);
-        fiber.ctx().record("bound {d} params", .{ctx.params.len});
+        fiber.ctx().record("bound {d} params", .{ctx.portal.params.values.len});
         const needed = stmt.paramCount();
-        if (needed != ctx.params.len) {
+        if (needed != ctx.portal.params.values.len) {
             var buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(
                 &buf,
                 "bind message supplies {d} parameters, " ++
                     "but prepared statement requires {d}",
-                .{ ctx.params.len, needed },
+                .{ ctx.portal.params.values.len, needed },
             ) catch unreachable;
             return replyErrorCode(
                 state,
@@ -845,16 +829,8 @@ pub const Handler = struct {
         // SELECT target or a RETURNING list binds as Execute will bind
         // it. A statement's Describe has none yet, only the types
         // Parse declared: `SELECT n + $1 FROM t` describes by those.
-        self.params = .{
-            .values = ctx.params,
-            .formats = ctx.param_formats,
-            .oids = ctx.param_oids,
-        };
-        self.result_formats = ctx.result_formats;
-        defer {
-            self.params = .{};
-            self.result_formats = &.{};
-        }
+        self.portal = ctx.portal;
+        defer self.portal = .{};
         state.error_sent = false;
         defer self.failBlockOnError(state);
         defer if (state.error_sent) {

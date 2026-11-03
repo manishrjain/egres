@@ -522,7 +522,7 @@ pub fn encodeRowDescription(
         try w.writeInt(u32, f.type_oid, .big);
         try w.writeInt(i16, f.type_size, .big);
         try w.writeInt(i32, f.type_modifier, .big);
-        try w.writeInt(i16, f.format_code, .big);
+        try w.writeInt(i16, @intFromEnum(f.wirefmt), .big);
     }
 }
 

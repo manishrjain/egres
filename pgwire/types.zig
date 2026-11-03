@@ -48,15 +48,19 @@ pub const pg_epoch_unix_us: i64 = 946_684_800_000_000;
 /// The same epoch in days, for a `date`.
 pub const pg_epoch_unix_days: i32 = 10_957;
 
-/// One column descriptor for a result set. `format_code = 0` means text.
-/// `type_modifier = -1` means "no modifier" (e.g. for varchar(N), N is
-/// encoded here; we don't carry varchars yet).
+/// How a parameter or a result column travels: the wire's format code,
+/// 0 or 1. Bind validates the code, so nothing after it holds another.
+pub const WireFormat = enum(i16) { text = 0, binary = 1 };
+
+/// One column descriptor for a result set. `wirefmt` is text unless
+/// Bind asked for binary. `type_modifier = -1` means "no modifier" (e.g.
+/// for varchar(N), N is encoded here; we don't carry varchars yet).
 pub const FieldDescription = struct {
     name: String,
     type_oid: Oid = oid.text,
     type_size: i16 = -1,
     type_modifier: i32 = -1,
-    format_code: i16 = 0,
+    wirefmt: WireFormat = .text,
     /// Optional table OID + attribute number; 0/0 means "not from a
     /// table" (literal/expression). Defaulted to 0/0 because we have
     /// no catalog/query plan to derive real values from.

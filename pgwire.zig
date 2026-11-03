@@ -30,6 +30,8 @@ pub const Event = conn_state.Event;
 pub const Phase = conn_state.Phase;
 pub const ExecuteCtx = conn_state.ExecuteCtx;
 pub const DescribeCtx = conn_state.DescribeCtx;
+pub const Params = conn_state.Params;
+pub const Portal = conn_state.Portal;
 pub const DescribeKind = conn_state.DescribeKind;
 
 // Parser — libpg_query, the parse tree read in place.
@@ -40,6 +42,7 @@ pub const ErrorInfo = parser.ErrorInfo;
 
 // Shared protocol types.
 pub const FieldDescription = types.FieldDescription;
+pub const WireFormat = types.WireFormat;
 pub const Oid = types.Oid;
 pub const oid = types.oid;
 pub const TxStatus = types.TxStatus;

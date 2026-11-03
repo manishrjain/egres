@@ -91,7 +91,7 @@ const Fixture = struct {
     fn bindWith(
         self: *const Fixture,
         assignment: String,
-        params: sql.parse.Params,
+        params: pgwire.Params,
     ) expr.BindError!Set {
         return self.bindFull(assignment, params, null);
     }
@@ -109,7 +109,7 @@ const Fixture = struct {
     fn bindFull(
         self: *const Fixture,
         assignment: String,
-        params: sql.parse.Params,
+        params: pgwire.Params,
         excluded: ?[]const Value,
     ) expr.BindError!Set {
         const text = try std.fmt.allocPrint(
@@ -290,9 +290,9 @@ test "sql.expr: bind — a $n is typed by its column, or by its text" {
     defer arena.deinit();
     const fx = try Fixture.init(arena.allocator());
 
-    const text = sql.parse.Params{
+    const text = pgwire.Params{
         .values = &.{ "5", "x", null, "1.5" },
-        .formats = &.{ 0, 0, 0, 0 },
+        .wirefmts = &.{ .text, .text, .text, .text },
     };
     // At the root: a cell of the target column, as a quoted literal is.
     const root = try fx.bindWith("a = $1", text);
@@ -323,9 +323,9 @@ test "sql.expr: bind — a $n is typed by its column, or by its text" {
     // A binary value is its declared type, at the root (cast to the
     // column: an int8 into the int4 column) and under an operator.
     // With no declared type its bytes cannot be read.
-    const binary = sql.parse.Params{
+    const binary = pgwire.Params{
         .values = &.{ &.{ 0, 0, 0, 0, 0, 0, 0, 5 }, &.{ 0, 0, 0, 5 } },
-        .formats = &.{ 1, 1 },
+        .wirefmts = &.{ .binary, .binary },
         .oids = &.{pgwire.oid.int8},
     };
     const typed = try fx.bindWith("a = $1", binary);
@@ -340,7 +340,7 @@ test "sql.expr: bind — a $n is typed by its column, or by its text" {
     // Before Bind, as a statement's Describe binds: the declared type
     // with no value, and none declared is resolved by the operator,
     // as a NULL is.
-    const declared = sql.parse.Params{ .oids = &.{pgwire.oid.int4} };
+    const declared = pgwire.Params{ .oids = &.{pgwire.oid.int4} };
     const desc = try fx.bindWith("a = a + $1", declared);
     try testing.expectEqual(@as(?Type, .int4), desc.root.binop.rhs.param);
     try testing.expectEqual(@as(?Type, .int8), desc.root.binop.ty);

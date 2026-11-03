@@ -697,9 +697,10 @@ test "ext: Parse + Bind + Execute + Sync surfaces execute event" {
     const ev_exec = try s.nextEvent();
     try testing.expect(ev_exec == .execute);
     try testing.expectEqualStrings("SELECT $1", ev_exec.execute.sql);
-    try testing.expectEqual(@as(usize, 1), ev_exec.execute.params.len);
-    try testing.expect(ev_exec.execute.params[0] != null);
-    try testing.expectEqualStrings("42", ev_exec.execute.params[0].?);
+    const exec_params = ev_exec.execute.portal.params;
+    try testing.expectEqual(@as(usize, 1), exec_params.values.len);
+    try testing.expect(exec_params.values[0] != null);
+    try testing.expectEqualStrings("42", exec_params.values[0].?);
 
     // Now finish the command (handler would emit row + cmd_complete).
     try s.sendCommandComplete("SELECT 1");
@@ -765,16 +766,20 @@ test "ext: Bind with binary param format is accepted, surfaces format" {
     const ev = try s.nextEvent();
     try testing.expect(ev == .execute);
     try testing.expectEqualStrings("SELECT $1", ev.execute.sql);
-    try testing.expectEqual(@as(usize, 1), ev.execute.params.len);
-    try testing.expectEqual(@as(usize, 1), ev.execute.param_formats.len);
-    try testing.expectEqual(@as(i16, 1), ev.execute.param_formats[0]);
-    try testing.expect(ev.execute.params[0] != null);
+    const bound = ev.execute.portal.params;
+    try testing.expectEqual(@as(usize, 1), bound.values.len);
+    try testing.expectEqual(@as(usize, 1), bound.wirefmts.len);
+    try testing.expectEqual(
+        pgwire.WireFormat.binary,
+        bound.wirefmts[0],
+    );
+    try testing.expect(bound.values[0] != null);
     // The bytes are the raw binary payload — handler is responsible
     // for decoding via pgwire.binary.decodeInt4.
     try testing.expectEqualSlices(
         u8,
         &.{ 0, 0, 0, 7 },
-        ev.execute.params[0].?,
+        bound.values[0].?,
     );
 
     // Wrap up so out has a clean tail; not asserted further but

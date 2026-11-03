@@ -1045,7 +1045,7 @@ fn paramCol(ty: sql.Type, n: ?u32) sql.table.Column {
 
 /// `$index` of `params` as a cell of a `ty` column.
 fn bindParam(
-    params: parse.Params,
+    params: pgwire.Params,
     index: u16,
     ty: sql.Type,
     n: ?u32,
@@ -1063,9 +1063,9 @@ test "sql.parse: Params bind $n text and binary values to a column" {
 
     // Text values take the literal path: column-typed parsing and the
     // string rules (char(n) stripped and length-checked); NULL is NULL.
-    const text = parse.Params{
+    const text = pgwire.Params{
         .values = &.{ "42", "hi ", null, "2000-02-29", "abcd", "x" },
-        .formats = &.{ 0, 0, 0, 0, 0, 0 },
+        .wirefmts = &.{ .text, .text, .text, .text, .text, .text },
     };
     try expectEqual(Value{ .int4 = 42 }, try bindParam(text, 1, .int4, null));
     const kept = try bindParam(text, 2, .text, null);
@@ -1098,12 +1098,12 @@ test "sql.parse: Params bind $n text and binary values to a column" {
     const minus_two = [_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe };
     const big = [_]u8{ 0, 0, 0, 1, 0, 0, 0, 0 };
     const oid = pgwire.oid;
-    const binary = parse.Params{
+    const binary = pgwire.Params{
         .values = &.{
             &.{ 0, 0, 0, 42 }, &.{1}, &minus_two, &f8_bytes, "hi", &.{ 0, 42 },
             &big,              "12",
         },
-        .formats = &.{ 1, 1, 1, 1, 1, 1, 1, 1 },
+        .wirefmts = &([_]pgwire.WireFormat{.binary} ** 8),
         .oids = &.{
             oid.int4, oid.bool_,   oid.int8, oid.float8, oid.text, oid.int2,
             oid.int8, oid.varchar,
@@ -1129,9 +1129,9 @@ test "sql.parse: Params bind $n text and binary values to a column" {
     try expectError(error.IntOutOfRange, bindParam(binary, 7, .int4, null));
     try expectEqual(Value{ .int4 = 12 }, try bindParam(binary, 8, .int4, null));
     // The wrong width for the declared type.
-    const short = parse.Params{
+    const short = pgwire.Params{
         .values = &.{ &.{ 0, 42 }, &.{ 0, 0, 0, 1 } },
-        .formats = &.{ 1, 1 },
+        .wirefmts = &.{ .binary, .binary },
         .oids = &.{oid.int4},
     };
     try expectError(error.BadLength, bindParam(short, 1, .int4, null));
@@ -1139,9 +1139,9 @@ test "sql.parse: Params bind $n text and binary values to a column" {
     try expectError(error.UnsupportedType, bindParam(short, 2, .int4, null));
 
     // A per-param format list decides per value.
-    const mixed = parse.Params{
+    const mixed = pgwire.Params{
         .values = &.{ "7", &.{ 0, 0, 0, 8 } },
-        .formats = &.{ 0, 1 },
+        .wirefmts = &.{ .text, .binary },
         .oids = &.{ oid.int4, oid.int4 },
     };
     try expectEqual(Value{ .int4 = 7 }, try bindParam(mixed, 1, .int4, null));

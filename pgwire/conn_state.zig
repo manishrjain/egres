@@ -26,6 +26,7 @@ const utils = @import("utils");
 const String = utils.String;
 const _proto = @import("proto.zig");
 const _types = @import("types.zig");
+const WireFormat = _types.WireFormat;
 /// `-Dversion`: the release tag, or `dev`.
 const egres_version: String = @import("build_options").version;
 
@@ -51,7 +52,7 @@ pub const Statement = struct {
 };
 
 /// A portal bound to a statement by Bind. Owned by the registry.
-pub const Portal = struct {
+pub const PortalEntry = struct {
     stmt_name: []u8,
     /// An Execute stopped at its row limit with rows left. Postgres
     /// resumes such a portal on the next Execute; here the next
@@ -59,64 +60,66 @@ pub const Portal = struct {
     /// it. A Bind to the same name replaces the portal.
     suspended: bool = false,
     /// Per-param raw bytes; null = SQL NULL. The interpretation
-    /// (text vs binary) is dictated by `param_formats`, which is
+    /// (text vs binary) is dictated by `param_wirefmts`, which is
     /// expanded out per-param so handlers don't have to redo the
     /// 0-length / 1-length / per-param dispatch from the wire.
     params: []?[]u8,
-    /// One format code per param; same length as `params`.
-    /// 0 = text, 1 = binary.
-    param_formats: []i16,
-    result_formats: []i16,
+    /// One format per param; same length as `params`.
+    param_wirefmts: []WireFormat,
+    result_wirefmts: []WireFormat,
 };
 
-/// Resolved view of an Execute: the SQL we'd run plus the bound
-/// param values. Slices borrow from the portal's owned storage and
-/// stay valid until the portal is closed (or until Sync if it's the
-/// unnamed portal — see Postgres protocol §3.4).
+/// A portal's parameters as a handler reads them: the Bind values,
+/// each value's format, and the types Parse declared. Slices borrow
+/// the portal's and the statement's owned storage.
+pub const Params = struct {
+    /// Per-param bytes; null = SQL NULL. Empty before Bind, as for a
+    /// statement's Describe.
+    values: []const ?String = &.{},
+    /// One per value. A binary value is decoded by its declared type
+    /// (pgwire.binary has the primitive decoders).
+    wirefmts: []const WireFormat = &.{},
+    /// The types Parse declared, by position; shorter than `values`
+    /// (or empty) when the client left them to the backend, and 0 for
+    /// an individual unspecified one.
+    oids: []const u32 = &.{},
+};
+
+/// A portal as a handler runs it: the Bind values, the formats the
+/// result columns go out in, and Execute's row limit. The empty value
+/// is a simple query's: no params, every column text, every row.
+/// Slices borrow from the portal's owned storage and stay valid until
+/// the portal is closed (or until Sync if it's the unnamed portal —
+/// see Postgres protocol §3.4).
+pub const Portal = struct {
+    params: Params = .{},
+    /// One format per result column. Wire conventions: empty means
+    /// "all text"; length 1 means "apply to every column"; otherwise
+    /// per-column. We pass the raw shape through so the handler can
+    /// mirror the spec rather than expanding here.
+    result_wirefmts: []const WireFormat = &.{},
+    /// The Execute's row limit; 0 = every row.
+    max_rows: u32 = 0,
+};
+
+/// Resolved view of an Execute: the SQL we'd run and the portal.
 pub const ExecuteCtx = struct {
     sql: String,
-    params: []const ?String,
-    /// One format code per param (0=text, 1=binary). Same length
-    /// as `params`. The handler is responsible for decoding each
-    /// param's bytes according to its format — see
-    /// `pgwire.binary` for the primitive binary decoders.
-    param_formats: []const i16,
-    /// The parameter types the client declared in Parse, by position;
-    /// shorter than `params` (or empty) when it left them to the
-    /// backend, and 0 for an individual unspecified one. A binary
-    /// value is decoded by its declared type.
-    param_oids: []const u32,
-    /// One format code per result column. Wire conventions: empty
-    /// means "all text"; length 1 means "apply to every column";
-    /// otherwise per-column. We pass the raw shape through so the
-    /// handler can mirror the spec rather than expanding here.
-    result_formats: []const i16,
-    /// The Execute's row limit; 0 = every row.
-    max_rows: u32,
+    portal: Portal,
 };
 
 pub const DescribeKind = _proto.DescribeKind;
 
-/// Resolved view of a Describe. For 'statement' kind, `params` is
-/// empty (Bind hasn't happened yet). For 'portal' kind, `params`
-/// holds the bound values + per-param formats. The state machine has
-/// already emitted ParameterDescription before surfacing this event
-/// for the statement kind, so the handler only owes RowDescription /
-/// NoData.
+/// Resolved view of a Describe. For 'statement' kind, the portal has
+/// no values (Bind hasn't happened yet), only the declared types. For
+/// 'portal' kind it is the portal, with no row limit. The state
+/// machine has already emitted ParameterDescription before surfacing
+/// this event for the statement kind, so the handler only owes
+/// RowDescription / NoData.
 pub const DescribeCtx = struct {
     kind: DescribeKind,
     sql: String,
-    params: []const ?String,
-    /// Per-param format codes (text/binary). Empty for statement
-    /// kind; same length as `params` for portal kind.
-    param_formats: []const i16 = &.{},
-    /// The portal's result formats, as ExecuteCtx carries them: the
-    /// RowDescription reports the code each column will use. Empty
-    /// for statement kind.
-    result_formats: []const i16 = &.{},
-    /// The types Parse declared, by position, 0 for unspecified: a
-    /// statement's Describe has no values and types a `$n` by these.
-    param_oids: []const u32 = &.{},
+    portal: Portal = .{},
 };
 
 pub const Event = union(enum) {
@@ -232,7 +235,7 @@ pub const ConnState = struct {
     statements: std.StringHashMapUnmanaged(Statement) = .{},
     /// Registry of portals by name. Empty string is the unnamed
     /// portal, overwritten on each Bind to "".
-    portals: std.StringHashMapUnmanaged(Portal) = .{},
+    portals: std.StringHashMapUnmanaged(PortalEntry) = .{},
     /// The name of the portal the current Execute runs, the map's own
     /// key (valid until that portal is dropped), so sendPortalSuspended
     /// can mark it.
@@ -272,12 +275,12 @@ pub const ConnState = struct {
         self.alloc.free(s.param_oids);
     }
 
-    fn freePortal(self: *ConnState, p: *Portal) void {
+    fn freePortal(self: *ConnState, p: *PortalEntry) void {
         self.alloc.free(p.stmt_name);
         for (p.params) |maybe| if (maybe) |bytes| self.alloc.free(bytes);
         self.alloc.free(p.params);
-        self.alloc.free(p.param_formats);
-        self.alloc.free(p.result_formats);
+        self.alloc.free(p.param_wirefmts);
+        self.alloc.free(p.result_wirefmts);
     }
 
     /// DEALLOCATE name / DEALLOCATE ALL: drop the prepared statement(s)
@@ -676,15 +679,17 @@ pub const ConnState = struct {
         // Expand the wire-shape param_formats (size 0 / 1 / N) into
         // a per-param array so handlers don't have to redo the
         // dispatch. 0 → all text; 1 → broadcast that single code.
-        const pfmt_dup = self.alloc.alloc(i16, b.params.len) catch
+        // The codes were checked above, so the enum conversion holds.
+        const pwirefmts = self.alloc.alloc(WireFormat, b.params.len) catch
             return error.OutOfMemory;
-        errdefer self.alloc.free(pfmt_dup);
+        errdefer self.alloc.free(pwirefmts);
         if (b.param_formats.len == 0) {
-            for (pfmt_dup) |*slot| slot.* = 0;
+            for (pwirefmts) |*slot| slot.* = .text;
         } else if (b.param_formats.len == 1) {
-            for (pfmt_dup) |*slot| slot.* = b.param_formats[0];
+            for (pwirefmts) |*slot| slot.* = @enumFromInt(b.param_formats[0]);
         } else if (b.param_formats.len == b.params.len) {
-            @memcpy(pfmt_dup, b.param_formats);
+            for (pwirefmts, b.param_formats) |*slot, f|
+                slot.* = @enumFromInt(f);
         } else {
             try self.extError(
                 "Bind: param_formats count must be 0, 1, or n_params",
@@ -693,9 +698,12 @@ pub const ConnState = struct {
             return;
         }
 
-        const rfmt_dup = self.alloc.dupe(i16, b.result_formats) catch
-            return error.OutOfMemory;
-        errdefer self.alloc.free(rfmt_dup);
+        const rwirefmts = self.alloc.alloc(
+            WireFormat,
+            b.result_formats.len,
+        ) catch return error.OutOfMemory;
+        errdefer self.alloc.free(rwirefmts);
+        for (rwirefmts, b.result_formats) |*slot, f| slot.* = @enumFromInt(f);
 
         const portal_name_dup = self.alloc.dupe(u8, b.portal_name) catch
             return error.OutOfMemory;
@@ -704,8 +712,8 @@ pub const ConnState = struct {
         try self.portals.put(self.alloc, portal_name_dup, .{
             .stmt_name = stmt_dup,
             .params = params_dup,
-            .param_formats = pfmt_dup,
-            .result_formats = rfmt_dup,
+            .param_wirefmts = pwirefmts,
+            .result_wirefmts = rwirefmts,
         });
         try _proto.encodeBindComplete(self.out);
     }
@@ -750,11 +758,15 @@ pub const ConnState = struct {
         self.exec_portal = entry.key_ptr.*;
         return .{ .execute = .{
             .sql = stmt.sql,
-            .params = @ptrCast(portal.params),
-            .param_formats = portal.param_formats,
-            .param_oids = stmt.param_oids,
-            .result_formats = portal.result_formats,
-            .max_rows = e.max_rows,
+            .portal = .{
+                .params = .{
+                    .values = @ptrCast(portal.params),
+                    .wirefmts = portal.param_wirefmts,
+                    .oids = stmt.param_oids,
+                },
+                .result_wirefmts = portal.result_wirefmts,
+                .max_rows = e.max_rows,
+            },
         } };
     }
 
@@ -783,8 +795,7 @@ pub const ConnState = struct {
                 return .{ .describe = .{
                     .kind = .statement,
                     .sql = stmt.sql,
-                    .params = &.{},
-                    .param_oids = stmt.param_oids,
+                    .portal = .{ .params = .{ .oids = stmt.param_oids } },
                 } };
             },
             .portal => {
@@ -805,10 +816,14 @@ pub const ConnState = struct {
                 return .{ .describe = .{
                     .kind = .portal,
                     .sql = stmt.sql,
-                    .params = @ptrCast(portal.params),
-                    .param_formats = portal.param_formats,
-                    .result_formats = portal.result_formats,
-                    .param_oids = stmt.param_oids,
+                    .portal = .{
+                        .params = .{
+                            .values = @ptrCast(portal.params),
+                            .wirefmts = portal.param_wirefmts,
+                            .oids = stmt.param_oids,
+                        },
+                        .result_wirefmts = portal.result_wirefmts,
+                    },
                 } };
             },
         }

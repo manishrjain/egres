@@ -920,113 +920,107 @@ fn valueLiteral(
     };
 }
 
-pub const Params = struct {
-    values: []const ?String = &.{},
-    formats: []const i16 = &.{},
-    /// The types the client declared in Parse, by position; may be
-    /// shorter than `values`, and 0 is "unspecified".
-    oids: []const u32 = &.{},
+/// `$index` of `params`, the portal's Bind values (pgwire.Params), as a
+/// cell of `col`. A text value takes the path a quoted literal takes —
+/// column-typed parsing, the string types' length rules — whatever
+/// type the client declared, as Postgres reads an unknown-typed
+/// literal. A binary value is decoded by its declared type
+/// (`binaryValue`) and then assigned to the column's
+/// (value.valueToColumn): a driver sends an int8 for a bigint column
+/// and an int4 for an int one, and a column of another width or kind
+/// takes it the way SET assigns a number. An index past what Bind
+/// supplied is `error.UnboundParam` (the runner checks the count
+/// first, so only a bug reaches it).
+pub fn paramToValue(
+    params: pgwire.Params,
+    alloc: std.mem.Allocator,
+    index: u16,
+    col: *const Column,
+) !_value.Value {
+    if (index == 0 or index > params.values.len) return error.UnboundParam;
 
-    /// `$index` as a cell of `col`. A text value takes the path a
-    /// quoted literal takes — column-typed parsing, the string types'
-    /// length rules — whatever type the client declared, as Postgres
-    /// reads an unknown-typed literal. A binary value is decoded by
-    /// its declared type (`binaryValue`) and then assigned to the
-    /// column's (value.valueToColumn): a driver sends an int8 for a
-    /// bigint column and an int4 for an int one, and a column of
-    /// another width or kind takes it the way SET assigns a number.
-    /// An index past what Bind supplied is `error.UnboundParam` (the
-    /// runner checks the count first, so only a bug reaches it).
-    pub fn toValue(
-        self: Params,
-        alloc: std.mem.Allocator,
-        index: u16,
-        col: *const Column,
-    ) !_value.Value {
-        if (index == 0 or index > self.values.len) return error.UnboundParam;
-
-        const bytes = self.values[index - 1] orelse return .null_value;
-        if (self.isBinary(index)) {
-            const typed = try self.binaryValue(index, bytes);
-            return _value.valueToColumn(alloc, typed, col);
-        }
-        return _value.textToColumn(alloc, col, bytes);
+    const bytes = params.values[index - 1] orelse return .null_value;
+    if (isBinary(params, index)) {
+        const typed = try binaryValue(params, index, bytes);
+        return _value.valueToColumn(alloc, typed, col);
     }
+    return _value.textToColumn(alloc, col, bytes);
+}
 
-    /// `$index` with no column to type it (a placeholder under a SET
-    /// operator): a binary value as its declared type, a text value as
-    /// `.text` for the caller to read (expr.literalValue reads a
-    /// number when it is one), null for SQL NULL.
-    pub fn untyped(self: Params, index: u16) !_value.Value {
-        if (index == 0 or index > self.values.len) return error.UnboundParam;
-        const bytes = self.values[index - 1] orelse return .null_value;
-        if (self.isBinary(index)) return self.binaryValue(index, bytes);
-        return .{ .text = bytes };
-    }
+/// `$index` with no column to type it (a placeholder under a SET
+/// operator): a binary value as its declared type, a text value as
+/// `.text` for the caller to read (expr.literalValue reads a
+/// number when it is one), null for SQL NULL.
+pub fn untypedParam(params: pgwire.Params, index: u16) !_value.Value {
+    if (index == 0 or index > params.values.len) return error.UnboundParam;
+    const bytes = params.values[index - 1] orelse return .null_value;
+    if (isBinary(params, index)) return binaryValue(params, index, bytes);
+    return .{ .text = bytes };
+}
 
-    /// Whether Bind supplied `$index`: false before Bind, when a
-    /// statement's Describe binds `SELECT n + $1 FROM t` by type alone.
-    pub fn bound(self: Params, index: u16) bool {
-        return index >= 1 and index <= self.values.len;
-    }
+/// Whether Bind supplied `$index`: false before Bind, when a
+/// statement's Describe binds `SELECT n + $1 FROM t` by type alone.
+pub fn paramBound(params: pgwire.Params, index: u16) bool {
+    return index >= 1 and index <= params.values.len;
+}
 
-    /// The type Parse declared for `$index`, null when it declared none
-    /// or one with no cell here (value.typeFromOid).
-    pub fn declared(self: Params, index: u16) ?_value.Type {
-        if (index == 0 or index > self.oids.len) return null;
-        return _value.typeFromOid(self.oids[index - 1]);
-    }
+/// The type Parse declared for `$index`, null when it declared none
+/// or one with no cell here (value.typeFromOid).
+pub fn paramDeclared(params: pgwire.Params, index: u16) ?_value.Type {
+    if (index == 0 or index > params.oids.len) return null;
+    return _value.typeFromOid(params.oids[index - 1]);
+}
 
-    fn isBinary(self: Params, index: u16) bool {
-        return index <= self.formats.len and self.formats[index - 1] == 1;
-    }
+fn isBinary(params: pgwire.Params, index: u16) bool {
+    return index <= params.wirefmts.len and
+        params.wirefmts[index - 1] == .binary;
+}
 
-    /// A binary-format value as a cell of the type the client declared
-    /// for `$index`: the primitives pgwire.binary decodes, bytea and
-    /// uuid (raw bytes), and the string types (their binary format is
-    /// the text itself). A declared type with no decoder here, or none
-    /// declared, is `error.UnsupportedType`: the bytes cannot be read.
-    fn binaryValue(self: Params, index: u16, bytes: String) !_value.Value {
-        const binary = pgwire.binary;
-        const pg_epoch_us = pgwire.types.pg_epoch_unix_us;
-        const oid: u32 = if (index <= self.oids.len)
-            self.oids[index - 1]
+/// A binary-format value as a cell of the type the client declared
+/// for `$index`: the primitives pgwire.binary decodes, bytea and
+/// uuid (raw bytes), and the string types (their binary format is
+/// the text itself). A declared type with no decoder here, or none
+/// declared, is `error.UnsupportedType`: the bytes cannot be read.
+fn binaryValue(params: pgwire.Params, index: u16, bytes: String) !_value.Value {
+    const binary = pgwire.binary;
+    const pg_epoch_us = pgwire.types.pg_epoch_unix_us;
+    const oid: u32 = if (index <= params.oids.len)
+        params.oids[index - 1]
+    else
+        0;
+    return switch (oid) {
+        pgwire.oid.bool_ => .{ .bool_ = try binary.decodeBool(bytes) },
+        pgwire.oid.int2 => .{ .int2 = try binary.decodeInt2(bytes) },
+        pgwire.oid.int4 => .{ .int4 = try binary.decodeInt4(bytes) },
+        pgwire.oid.int8 => .{ .int8 = try binary.decodeInt8(bytes) },
+        pgwire.oid.float4 => .{ .float4 = try binary.decodeFloat4(bytes) },
+        pgwire.oid.float8 => .{ .float8 = try binary.decodeFloat8(bytes) },
+        // The binary time types count from the 2000 epoch; storage
+        // from 1970 (value.zig).
+        pgwire.oid.date => .{
+            .date = try binary.decodeInt4(bytes) +
+                pgwire.types.pg_epoch_unix_days,
+        },
+        pgwire.oid.timestamp => .{
+            .timestamp = try binary.decodeInt8(bytes) + pg_epoch_us,
+        },
+        pgwire.oid.timestamptz => .{
+            .timestamptz = try binary.decodeInt8(bytes) + pg_epoch_us,
+        },
+        pgwire.oid.bytea => .{ .bytea = bytes },
+        pgwire.oid.numeric => .{
+            .numeric = try _value.Numeric.decodeBinary(bytes),
+        },
+        pgwire.oid.uuid => if (bytes.len == 16)
+            .{ .uuid = bytes[0..16].* }
         else
-            0;
-        return switch (oid) {
-            pgwire.oid.bool_ => .{ .bool_ = try binary.decodeBool(bytes) },
-            pgwire.oid.int2 => .{ .int2 = try binary.decodeInt2(bytes) },
-            pgwire.oid.int4 => .{ .int4 = try binary.decodeInt4(bytes) },
-            pgwire.oid.int8 => .{ .int8 = try binary.decodeInt8(bytes) },
-            pgwire.oid.float4 => .{ .float4 = try binary.decodeFloat4(bytes) },
-            pgwire.oid.float8 => .{ .float8 = try binary.decodeFloat8(bytes) },
-            // The binary time types count from the 2000 epoch; storage
-            // from 1970 (value.zig).
-            pgwire.oid.date => .{
-                .date = try binary.decodeInt4(bytes) +
-                    pgwire.types.pg_epoch_unix_days,
-            },
-            pgwire.oid.timestamp => .{
-                .timestamp = try binary.decodeInt8(bytes) + pg_epoch_us,
-            },
-            pgwire.oid.timestamptz => .{
-                .timestamptz = try binary.decodeInt8(bytes) + pg_epoch_us,
-            },
-            pgwire.oid.bytea => .{ .bytea = bytes },
-            pgwire.oid.numeric => .{
-                .numeric = try _value.Numeric.decodeBinary(bytes),
-            },
-            pgwire.oid.uuid => if (bytes.len == 16)
-                .{ .uuid = bytes[0..16].* }
-            else
-                error.BadLength,
-            pgwire.oid.text, pgwire.oid.varchar, pgwire.oid.bpchar => .{
-                .text = bytes,
-            },
-            else => error.UnsupportedType,
-        };
-    }
-};
+            error.BadLength,
+        pgwire.oid.text, pgwire.oid.varchar, pgwire.oid.bpchar => .{
+            .text = bytes,
+        },
+        else => error.UnsupportedType,
+    };
+}
 
 /// Coerce a parsed literal to a cell of `col` (value.textToColumn) by
 /// rendering non-string literals to text first (int/bool stringified
@@ -1037,7 +1031,7 @@ pub fn litToValue(
     a: std.mem.Allocator,
     lit: Literal,
     col: *const Column,
-    params: Params,
+    params: pgwire.Params,
 ) !_value.Value {
     const text: String = switch (lit) {
         .null_value => return .null_value,
@@ -1046,7 +1040,7 @@ pub fn litToValue(
         // a position without a transaction time (SET, WHERE) never
         // produces it.
         .current_timestamp => return error.UnsupportedLiteral,
-        .param => |n| return params.toValue(a, n, col),
+        .param => |n| return paramToValue(params, a, n, col),
         .str, .float => |s| s,
         .int => |n| try std.fmt.allocPrint(a, "{d}", .{n}),
         .bool_ => |b| if (b) "t" else "f",

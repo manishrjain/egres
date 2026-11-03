@@ -148,7 +148,7 @@ pub fn bind(
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
     where: _parse.Where,
-    params: _parse.Params,
+    params: pgwire.Params,
 ) BindError!Pred {
     switch (where) {
         .cmp => |f| {
@@ -244,7 +244,7 @@ pub fn bindOrReply(
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
     where: _parse.Where,
-    params: _parse.Params,
+    params: pgwire.Params,
 ) !?*const Pred {
     const p = try arloc.create(Pred);
     p.* = bind(arloc, tbl, where, params) catch |err| {
