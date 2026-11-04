@@ -104,8 +104,11 @@
     ;; lazyfs opens the answer FIFO for writing at startup, which
     ;; blocks until a reader opens; read-write here opens at once and
     ;; stays open to read each answer.
+    ;; Without -f libfuse forks after the mount and the process started
+    ;; here exits, so the daemon is only reachable through the mount and
+    ;; the liveness check below races the fork.
     (let [answers (RandomAccessFile. ^File completed "rw")
-          command [(:lazyfs-binary test) (str mount)
+          command [(:lazyfs-binary test) "-f" (str mount)
                    "--config-path" (str config)
                    "-o" "modules=subdir" "-o" (str "subdir=" root)]
           process (-> (ProcessBuilder. ^java.util.List command)
