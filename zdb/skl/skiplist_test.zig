@@ -434,7 +434,12 @@ fn expectVersions(
     limit: skiplist.Iterator.Limit,
     want: []const u64,
 ) !void {
-    var it = try skiplist.Iterator.init(testing.allocator, sl, limit);
+    var it = try skiplist.Iterator.init(
+        testing.allocator,
+        sl,
+        limit,
+        .forward,
+    );
     defer it.deinit();
     try it.seekRange(Key.inf, Key.inf);
     const item = it.itemRef() orelse return error.TestExpectedItem;
@@ -470,4 +475,92 @@ test "skiplist: iterator limit copies only what a reader can use" {
     try expectVersions(sl, .{ .read_ts = 35, .want = 1 }, &.{30});
     // Nothing visible at 5: empty.
     try expectVersions(sl, .{ .read_ts = 5 }, &.{});
+}
+
+test "skiplist: reverse iterator walks keys descending within the range" {
+    var sl = try skiplist.SkipList.init(testing.allocator);
+    defer sl.release();
+
+    var empty = try skiplist.Iterator.init(
+        testing.allocator,
+        sl,
+        .{},
+        .reverse,
+    );
+    defer empty.deinit();
+    try empty.seekRange(Key.inf, Key.inf);
+    try testing.expect(empty.itemRef() == null);
+
+    for ([_]String{ "5", "2", "8", "1", "9", "3" }) |k| {
+        try sl.put(.{ .primary = k }, 1, k);
+    }
+
+    var it = try skiplist.Iterator.init(
+        testing.allocator,
+        sl,
+        .{},
+        .reverse,
+    );
+    defer it.deinit();
+
+    const Case = struct { start: Key, end: Key, want: []const String };
+    const cases = [_]Case{
+        .{
+            .start = Key.inf,
+            .end = Key.inf,
+            .want = &.{ "9", "8", "5", "3", "2", "1" },
+        },
+        // `end` is a stored key: excluded, the walk starts below it.
+        .{
+            .start = .{ .primary = "2" },
+            .end = .{ .primary = "8" },
+            .want = &.{ "5", "3", "2" },
+        },
+        // Both bounds between keys.
+        .{
+            .start = .{ .primary = "4" },
+            .end = .{ .primary = "7" },
+            .want = &.{"5"},
+        },
+        .{ .start = .{ .primary = "a" }, .end = Key.inf, .want = &.{} },
+        .{ .start = Key.inf, .end = .{ .primary = "1" }, .want = &.{} },
+        .{ .start = .{ .primary = "9" }, .end = Key.inf, .want = &.{"9"} },
+    };
+    for (cases) |c| {
+        try it.seekRange(c.start, c.end);
+        for (c.want) |k| {
+            const item = it.itemRef() orelse return error.TestExpectedItem;
+            try testing.expectEqualStrings(k, item.key.primary);
+            try it.next();
+        }
+        try testing.expect(it.itemRef() == null);
+    }
+}
+
+test "skiplist: a reverse reader steps onto a key inserted below it" {
+    var sl = try skiplist.SkipList.init(testing.allocator);
+    defer sl.release();
+    try sl.put(.{ .primary = "k" }, 1, "k1");
+    try sl.put(.{ .primary = "m" }, 1, "m1");
+
+    var it = try skiplist.Iterator.init(
+        testing.allocator,
+        sl,
+        .{},
+        .reverse,
+    );
+    defer it.deinit();
+    try it.seekRange(Key.inf, Key.inf);
+    try testing.expectEqualStrings("m", it.itemRef().?.key.primary);
+    try it.next();
+    try testing.expectEqualStrings("k", it.itemRef().?.key.primary);
+
+    // The writer links keys on both sides of the parked reader. The
+    // step down follows k's `prev`, swung to the new neighbour.
+    try sl.put(.{ .primary = "j" }, 1, "j1");
+    try sl.put(.{ .primary = "l" }, 1, "l1");
+    try it.next();
+    try testing.expectEqualStrings("j", it.itemRef().?.key.primary);
+    try it.next();
+    try testing.expect(it.itemRef() == null);
 }

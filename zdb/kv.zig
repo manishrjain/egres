@@ -535,6 +535,13 @@ pub const Key = struct {
     }
 };
 
+/// Which way an iterator walks a range `[left, right)`: `forward`
+/// positions at the first key at or past `left` and steps up;
+/// `reverse` positions at the last key below `right` and steps down.
+/// The bounds mean the same either way, and so does a key's version
+/// chain, which stays newest first.
+pub const Direction = enum { forward, reverse };
+
 /// A range of keys, `[left, right)`. A bound of `Key.inf` is no bound
 /// on that side, so the default range is everything (`all`). There is
 /// no empty range: a caller that accumulates one starts from null.

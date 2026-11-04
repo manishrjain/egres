@@ -5,6 +5,8 @@ const std = @import("std");
 const kv = @import("../kv.zig");
 const zbuf = @import("zbuf").zbuf;
 const Key = @import("../kv.zig").Key;
+const Direction = @import("../kv.zig").Direction;
+const KeyRange = @import("../kv.zig").KeyRange;
 const TableKey = @import("../kv.zig").TableKey;
 const Meta = @import("../kv.zig").Meta;
 pub const Item = @import("../kv.zig").Item;
@@ -750,9 +752,35 @@ pub const BlockIterator = struct {
         target_key: String,
         from: usize,
     ) Error!void {
+        const lo = try self.lowerBound(target_key, from);
+        if (lo < self.entryCount()) {
+            try self.setIdx(lo);
+        } else {
+            self.is_valid = false;
+        }
+    }
+
+    /// Seek to the last entry whose primary is below `target_key`.
+    pub fn seekLt(self: *BlockIterator, target_key: String) Error!void {
+        const lo = try self.lowerBound(target_key, 0);
+        if (lo == 0) {
+            self.is_valid = false;
+        } else {
+            try self.setIdx(lo - 1);
+        }
+    }
+
+    /// The index of the first entry at or past `target_key` among the
+    /// entries from `from` on; the count when every one is below it.
+    /// Probes compare stored bytes in place.
+    fn lowerBound(
+        self: *BlockIterator,
+        target_key: String,
+        from: usize,
+    ) Error!usize {
         // This binary search is only possible because we're diffing keys
         // against the base key and not against the previous key.
-        if (target_key.len == 0) return self.setIdx(0);
+        if (target_key.len == 0) return 0;
         if (target_key.len < min_key_len) return error.CorruptTable;
 
         // Bytes the target shares with the base key, computed once for
@@ -772,11 +800,15 @@ pub const BlockIterator = struct {
                 hi = mid;
             }
         }
-        if (lo < self.entryCount()) {
-            try self.setIdx(lo);
-        } else {
+        return lo;
+    }
+
+    pub fn prev(self: *BlockIterator) Error!void {
+        if (self.entry_idx == 0) {
             self.is_valid = false;
+            return;
         }
+        try self.setIdx(self.entry_idx - 1);
     }
 
     pub fn itemRef(self: *const BlockIterator) ?Item {
@@ -884,9 +916,13 @@ pub const TableIterator = struct {
     bi: ?BlockIterator,
     current_block: ?*_cache.Value = null,
     valid: bool,
-    /// Exclusive upper bound, borrowed from the caller of `seekRange`.
-    end_key: ?Key = null,
-    end_bpos: usize = 0, // block index where end_key lives
+    dir: Direction,
+    /// Kept from `seekRange`, bounds borrowed: the walk ends at the
+    /// bound ahead of it, `right` forward and `left` in reverse.
+    range: KeyRange = .all,
+    /// The block that bound falls in, when it is inside the table:
+    /// blocks past it are never opened. Null when it is not.
+    stop_bpos: ?usize = null,
     /// Set by a reader that walks the table once (compaction): raw
     /// bytes are read ahead in spans of up to this many bytes, whole
     /// blocks, and decoded out of the span, so the table costs a few
@@ -898,12 +934,14 @@ pub const TableIterator = struct {
         allocator: std.mem.Allocator,
         table: *Table,
         table_key: TableKey,
+        dir: Direction,
     ) TableIterator {
         table.incrRef();
         return .{
             .allocator = allocator,
             .table = table,
             .table_key = table_key,
+            .dir = dir,
             .bpos = 0,
             .bi = null,
             .current_block = null,
@@ -918,44 +956,60 @@ pub const TableIterator = struct {
         if (self.window) |w| w.free();
     }
 
-    /// Seek to the first entry >= start, stopping before any entry with key >= end.
-    /// Empty start means seek to first; empty end means no upper bound.
-    /// `end` is borrowed, checked on every `next`: its primary must
-    /// outlive the iterator's use of it, as the skiplist iterator's must.
+    /// Position at the first entry of `[start, end)` in the iterator's
+    /// direction: the first at or past `start` forward, the last below
+    /// `end` in reverse. `Key.inf` or a table edge on a side is no
+    /// bound there. The bound the walk ends at is borrowed, checked on
+    /// every `next`: its primary must outlive the iterator's use of it,
+    /// as the skiplist iterator's must.
     pub fn seekRange(self: *TableIterator, start: Key, end: Key) !void {
-        // Set up end bound: none when inf or a table edge.
-        self.end_key = null;
+        if (!start.isInf()) self.assertOwn(start);
         if (!end.isInf()) self.assertOwn(end);
-        if (!end.isInf() and !end.isTableEdge()) {
-            if (end.orderPrimary(self.table.smallest) != .gt) {
-                // end <= smallest: nothing to return.
-                self.valid = false;
-                return;
-            }
-            if (end.orderPrimary(self.table.biggest) != .gt) {
-                // The end key is within this table's key range.
-                self.end_key = end;
-                // Find the block containing end_key: last block with base key <= end.
-                const blocks = self.table.index.blocks;
-                const ei = utils.search(_buffers.BlockIndexStruct, blocks, end, struct {
-                    fn f(ek: Key, b: _buffers.BlockIndexStruct) bool {
-                        return baseKeyOf(b).orderPrimary(ek) == .gt;
-                    }
-                }.f);
-                self.end_bpos = if (ei > 0) ei - 1 else 0;
-            }
+        // The read-ahead window walks a table once, forward.
+        std.debug.assert(self.dir == .forward or self.window_bytes == 0);
+
+        // The block of the bound ahead, when it is inside the table; a
+        // bound beyond the table on the far side means nothing to
+        // return.
+        self.range = .{ .left = start, .right = end };
+        self.stop_bpos = null;
+        switch (self.dir) {
+            .forward => if (!end.isInf() and !end.isTableEdge()) {
+                if (end.orderPrimary(self.table.smallest) != .gt) {
+                    self.valid = false;
+                    return;
+                }
+                if (end.orderPrimary(self.table.biggest) != .gt) {
+                    self.stop_bpos = self.table.blockFor(end) orelse 0;
+                }
+            },
+            .reverse => if (!start.isInf() and !start.isTableEdge()) {
+                if (start.orderPrimary(self.table.biggest) == .gt) {
+                    self.valid = false;
+                    return;
+                }
+                if (start.orderPrimary(self.table.smallest) == .gt) {
+                    self.stop_bpos = self.table.blockFor(start) orelse 0;
+                }
+            },
         }
 
-        // Seek. The landing item can be past `end` (start beyond the
-        // last in-range key lands on whatever follows), so the bound
-        // applies here just as it does after every next().
-        if (!start.isInf()) self.assertOwn(start);
-        if (start.isInf() or start.isTableEdge()) {
-            try self.seekToFirst();
-        } else {
-            try self.seekForward(start);
+        // Seek. The landing item can be past the stop bound (a start
+        // beyond the last in-range key lands on whatever follows), so
+        // the bound applies here just as it does after every next().
+        switch (self.dir) {
+            .forward => if (start.isInf() or start.isTableEdge()) {
+                try self.seekToFirst();
+            } else {
+                try self.seekForward(start);
+            },
+            .reverse => if (end.isInf() or end.isTableEdge()) {
+                try self.seekToLast();
+            } else {
+                try self.seekBackward(end);
+            },
         }
-        self.checkEndKey();
+        self.checkStopKey();
     }
 
     /// A seek key must be a key of the tree this iterator reads for; one
@@ -973,6 +1027,36 @@ pub const TableIterator = struct {
         try self.setBlock(0);
         try self.bi.?.seekToFirst();
         self.valid = self.bi.?.is_valid;
+    }
+
+    fn seekToLast(self: *TableIterator) Error!void {
+        const count = self.table.blockCount();
+        if (count == 0) {
+            self.valid = false;
+            return;
+        }
+        try self.setBlock(count - 1);
+        try self.bi.?.seekToLast();
+        self.valid = self.bi.?.is_valid;
+    }
+
+    /// Position at the last entry below `target`: in the block a seek
+    /// for it lands in, else the last entry of the block before, since
+    /// every entry of the landing block is then at or past the target.
+    fn seekBackward(self: *TableIterator, target: Key) Error!void {
+        self.valid = false;
+        const lo = self.table.blockFor(target) orelse return;
+        if (self.bi == null or self.bpos != lo) try self.setBlock(lo);
+        try self.bi.?.seekLt(target.primary);
+        if (self.bi.?.is_valid) {
+            self.valid = true;
+            return;
+        }
+        if (lo > 0) {
+            try self.setBlock(lo - 1);
+            try self.bi.?.seekToLast();
+            self.valid = self.bi.?.is_valid;
+        }
     }
 
     fn seekForward(self: *TableIterator, target: Key) Error!void {
@@ -1008,47 +1092,65 @@ pub const TableIterator = struct {
         }
     }
 
+    /// Step in the iterator's direction: within the block, else into
+    /// the neighbouring block, unless the stop bound says that block
+    /// holds nothing in range, which saves fetching it.
     pub fn next(self: *TableIterator) Error!void {
         if (!self.valid) return;
-        defer self.checkEndKey(); // Always do it.
+        defer self.checkStopKey(); // Always do it.
 
-        try self.bi.?.next();
-        if (self.bi.?.is_valid) {
-            return;
+        switch (self.dir) {
+            .forward => {
+                try self.bi.?.next();
+                if (self.bi.?.is_valid) return;
+                const next_bpos = self.bpos + 1;
+                if (self.stop_bpos) |stop_bpos| if (next_bpos > stop_bpos) {
+                    self.valid = false;
+                    return;
+                };
+                if (next_bpos >= self.table.blockCount()) {
+                    self.valid = false;
+                    return;
+                }
+                try self.setBlock(next_bpos);
+                try self.bi.?.seekToFirst();
+            },
+            .reverse => {
+                try self.bi.?.prev();
+                if (self.bi.?.is_valid) return;
+                if (self.bpos == 0) {
+                    self.valid = false;
+                    return;
+                }
+                const prev_bpos = self.bpos - 1;
+                if (self.stop_bpos) |stop_bpos| if (prev_bpos < stop_bpos) {
+                    self.valid = false;
+                    return;
+                };
+                try self.setBlock(prev_bpos);
+                try self.bi.?.seekToLast();
+            },
         }
-
-        // End of current block — advance to the next.
-        const next_bpos = self.bpos + 1;
-        if (self.end_key != null and next_bpos > self.end_bpos) {
-            // No need to fetch the block.
-            self.valid = false;
-            return;
-        }
-        if (next_bpos >= self.table.blockCount()) {
-            self.valid = false;
-            return;
-        }
-        try self.setBlock(next_bpos);
-        try self.bi.?.seekToFirst();
         self.valid = self.bi.?.is_valid;
     }
 
-    /// Invalidates the iterator if current item >= end_key.
-    inline fn checkEndKey(self: *TableIterator) void {
+    /// Invalidates the iterator once the current item is past the
+    /// bound ahead: at or past `right` forward, below `left` in reverse.
+    inline fn checkStopKey(self: *TableIterator) void {
         if (!self.valid) return;
-        const ek = self.end_key orelse return;
+        const stop_bpos = self.stop_bpos orelse return;
 
-        if (self.bpos > self.end_bpos) {
+        const past_block = switch (self.dir) {
+            .forward => self.bpos > stop_bpos,
+            .reverse => self.bpos < stop_bpos,
+        };
+        if (past_block) {
             self.valid = false;
             return;
         }
-        if (self.bpos < self.end_bpos) {
-            return;
-        }
+        if (self.bpos != stop_bpos) return;
         const item = self.bi.?.itemRef() orelse return;
-        if (item.key.order(ek) != .lt) {
-            self.valid = false;
-        }
+        if (!self.range.contains(item.key)) self.valid = false;
     }
 
     pub fn itemRef(self: *const TableIterator) ?Item {

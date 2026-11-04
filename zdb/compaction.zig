@@ -829,7 +829,7 @@ fn partitions(
     const window = self.live.cur().compaction_window_bytes;
     const tloc = fiber.allocator(.tenant);
     for (bot, bot_iters) |e, *it| {
-        it.* = TableIterator.init(tloc, e.table, table_key);
+        it.* = TableIterator.init(tloc, e.table, table_key, .forward);
         it.window_bytes = window;
     }
     const n = @min(@max(max, 1), @max(bot.len, 1), out.len);
@@ -847,7 +847,7 @@ fn partitions(
                 else
                     buildTableBoundKey(table_key, bot[hi].table.smallest),
             },
-            .bot = ConcatIterator.init(bot_iters[lo..hi]),
+            .bot = ConcatIterator.init(bot_iters[lo..hi], .forward),
         };
     }
     return out[0..n];
@@ -1069,14 +1069,14 @@ fn runPartition_(
     };
     const window = self.live.cur().compaction_window_bytes;
     for (job.src, 0..) |e, i| {
-        var it = TableIterator.init(tloc, e.table, table_key);
+        var it = TableIterator.init(tloc, e.table, table_key, .forward);
         it.window_bytes = window;
         all_iters[i] = .{ .table = it };
     }
     all_iters[job.src.len] = .{ .concat = part_bot };
 
     // The merge takes every iterator over, the concat included.
-    var merge = MergeIterator.init(tloc, all_iters) catch |err| {
+    var merge = MergeIterator.init(tloc, all_iters, .forward) catch |err| {
         for (all_iters) |*it| it.deinit();
         return err;
     };

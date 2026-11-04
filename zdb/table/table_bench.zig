@@ -129,10 +129,10 @@ fn benchMergeScan(b: *Bench) !void {
         var iters: [num_tables]merge.Iterator = undefined;
         for (tables, 0..) |t, j| {
             iters[j] = .{
-                .table = TableIterator.init(a, t, zero_table_key),
+                .table = TableIterator.init(a, t, zero_table_key, .forward),
             };
         }
-        var m = try merge.MergeIterator.init(a, iters[0..]);
+        var m = try merge.MergeIterator.init(a, iters[0..], .forward);
         defer m.deinit();
 
         try m.seekRange(Key.inf, Key.inf);
@@ -200,10 +200,10 @@ fn benchMergeScanShared(b: *Bench) !void {
         var iters: [shared_sources]merge.Iterator = undefined;
         for (tables, 0..) |t, j| {
             iters[j] = .{
-                .table = TableIterator.init(a, t, zero_table_key),
+                .table = TableIterator.init(a, t, zero_table_key, .forward),
             };
         }
-        var m = try merge.MergeIterator.init(a, iters[0..]);
+        var m = try merge.MergeIterator.init(a, iters[0..], .forward);
         defer m.deinit();
 
         try m.seekRange(Key.inf, Key.inf);
@@ -222,7 +222,7 @@ fn benchPointSeeks(b: *Bench) !void {
     const t = try openStriped(a, 0, 1, single_keys, 4096, value_len);
     defer destroyTable(t);
 
-    var it = TableIterator.init(a, t, zero_table_key);
+    var it = TableIterator.init(a, t, zero_table_key, .forward);
     defer it.deinit();
 
     b.resetTimer();
@@ -457,7 +457,7 @@ fn benchKeyScan(b: *Bench, val_len: usize) !void {
     const t = try openStriped(a, 0, 1, single_keys, 64 * 1024, val_len);
     defer destroyTable(t);
 
-    var it = TableIterator.init(a, t, zero_table_key);
+    var it = TableIterator.init(a, t, zero_table_key, .forward);
     defer it.deinit();
 
     b.resetTimer();
@@ -478,7 +478,7 @@ fn benchFullScan(b: *Bench) !void {
     const t = try openStriped(a, 0, 1, single_keys, 4096, value_len);
     defer destroyTable(t);
 
-    var it = TableIterator.init(a, t, zero_table_key);
+    var it = TableIterator.init(a, t, zero_table_key, .forward);
     defer it.deinit();
 
     b.resetTimer();

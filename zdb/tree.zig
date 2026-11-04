@@ -566,12 +566,14 @@ pub const Tree = struct {
     /// `min_ts`: a table whose newest version (`TableIndex.max_version`)
     /// is at or below it holds nothing the scan wants and is not opened
     /// (Forest.ScanOptions.min_ts); 0 opens every overlapping table.
+    /// `dir` is the way the merge and every source walk the range.
     pub fn openMerge(
         self: *Tree,
         allocator: std.mem.Allocator,
         range: KeyRange,
         min_ts: u64,
         extras: []const Iterator,
+        dir: _kv.Direction,
     ) !MergeIterator {
         // Build iters into a list. Until we hand them off to merge,
         // each iter we created here owns a Table/SkipList ref — on
@@ -620,6 +622,7 @@ pub const Tree = struct {
                                 .namespace = self.namespace,
                                 .table_id = self.tableId(),
                             },
+                            dir,
                         ),
                     });
                 }
@@ -635,17 +638,18 @@ pub const Tree = struct {
                             .namespace = self.namespace,
                             .table_id = self.tableId(),
                         },
+                        dir,
                     );
                     try subs.append(allocator, sub);
                 }
                 if (subs.items.len == 0) continue;
-                const concat = ConcatIterator.init(subs.items);
+                const concat = ConcatIterator.init(subs.items, dir);
                 try iters.append(allocator, .{ .concat = concat });
             }
         }
 
         // merge.deinit now owns iter cleanup.
-        const merge = try MergeIterator.init(allocator, iters.items);
+        const merge = try MergeIterator.init(allocator, iters.items, dir);
         transferred = true;
         return merge;
     }

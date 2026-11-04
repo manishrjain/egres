@@ -333,6 +333,7 @@ pub const Level = struct {
             allocator,
             t,
             lookup.key.tableKey(),
+            .forward,
         );
         defer it.deinit();
 

@@ -71,6 +71,7 @@ fn fillMultiGet(self: *Forest, mg: *MultiGet) !void {
             alloc,
             .{ .pending = mg.opts.pending },
             .{ .read_ts = mg.opts.read_ts, .want = 1 },
+            .forward,
         );
         defer {
             for (srcs) |*it| it.deinit(); // releases each source's skiplist ref
@@ -507,6 +508,7 @@ pub const MultiGet = struct {
             self.allocator,
             tbl,
             self.table_key,
+            .forward,
         ) };
         defer it.deinit();
         for (self.accepted.items) |node| {
@@ -706,14 +708,18 @@ pub const ScanOptions = struct {
     /// them. Costs one refcount pair per block or memtable arena
     /// walked, and keeps those blocks resident until released.
     pin_values: bool = false,
+    /// Which way the range is walked: up from its left bound, or down
+    /// from its right. The bounds, the view and the filters mean the
+    /// same either way; only the order of the items differs.
+    direction: kv.Direction = .forward,
 };
 
-/// Forward scan over `range` within the table `table_key`. The bounds
-/// name primaries of that table, or are `Key.inf` for no bound on that
-/// side (`KeyRange.all` for the whole table). The cursor confines the
-/// range to the table (`KeyRange.limitToTable`), which keeps the scan
-/// from spilling across the namespace-wide memtable into an adjacent
-/// table.
+/// Scan over `range` within the table `table_key`, in
+/// `opts.direction`. The bounds name primaries of that table, or are
+/// `Key.inf` for no bound on that side (`KeyRange.all` for the whole
+/// table). The cursor confines the range to the table
+/// (`KeyRange.limitToTable`), which keeps the scan from spilling
+/// across the namespace-wide memtable into an adjacent table.
 ///
 /// `opts` carries everything else: how many items to return, the view
 /// (as-of timestamp, versions per key, deletions as data or absence), and
@@ -783,12 +789,13 @@ pub fn openCursor(
 /// storage alive even if a flush or compaction has since replaced it in
 /// the manifest — so the cost is residency, not correctness.
 ///
-/// One tree at a time: look up the tree owning `key_range.left`,
-/// snapshot its range, open a merge over the intersection (with a fresh
-/// memtable iter snapshot), drain it, then move `key_range.left` past
-/// the snapshotted right boundary and re-look-up. Re-looking-up per hop
-/// keeps the scan safe against splits firing mid-scan. Per-hop memtable
-/// snapshots also pick up newly-flushed data.
+/// One tree at a time: look up the tree owning `key_range.left` (in
+/// reverse, the one just below `key_range.right`), snapshot its range,
+/// open a merge over the intersection (with a fresh memtable iter
+/// snapshot), drain it, then move the window's near bound past the
+/// snapshotted far edge of the tree and re-look-up. Re-looking-up per
+/// hop keeps the scan safe against splits firing mid-scan. Per-hop
+/// memtable snapshots also pick up newly-flushed data.
 ///
 /// One fiber drives a cursor. `deinit` on every path — an abandoned
 /// cursor pins its tables until then.
@@ -801,8 +808,8 @@ pub const Cursor = struct {
     /// retires the tree, so the range cannot borrow from it).
     arena: std.heap.ArenaAllocator,
     /// The window still to visit: the scan's range at open, confined
-    /// to the table, its left bound advanced past each drained tree's
-    /// snapshotted right edge.
+    /// to the table, its near bound advanced past each drained tree's
+    /// snapshotted far edge.
     key_range: KeyRange,
     opts: ScanOptions,
     /// `opts.num_versions` clamped up to 1 (see ScanOptions).
@@ -874,15 +881,26 @@ pub const Cursor = struct {
             }
 
             // This tree is drained: close it and move the window past
-            // its snapshotted right edge. An unbounded right is the
-            // rightmost tree → done.
+            // its snapshotted far edge. An unbounded edge is the last
+            // tree that way → done.
             merge.deinit();
             self.merge = null;
-            if (self.tree_range.right.isInf()) {
-                self.done = true;
-                return null;
+            switch (self.opts.direction) {
+                .forward => {
+                    if (self.tree_range.right.isInf()) {
+                        self.done = true;
+                        return null;
+                    }
+                    self.key_range.left = self.tree_range.right;
+                },
+                .reverse => {
+                    if (self.tree_range.left.isInf()) {
+                        self.done = true;
+                        return null;
+                    }
+                    self.key_range.right = self.tree_range.left;
+                },
             }
-            self.key_range.left = self.tree_range.right;
         }
         return null;
     }
@@ -929,13 +947,14 @@ pub const Cursor = struct {
         return foldBitmap(alloc, item.versions.slice());
     }
 
-    /// Look up the tree owning `key_range.left`, snapshot its range, and
-    /// open a merge over its intersection with the window. Redoing the
-    /// lookup per hop keeps the scan safe against splits firing between
-    /// hops — we always take whichever tree currently covers the next
-    /// key. Leaves `merge` null and sets `done` when no tree does. An
-    /// empty intersection just opens an empty merge; `next` then hops
-    /// or finishes as usual.
+    /// Look up the tree owning the window's near bound (`key_range.left`
+    /// forward, the keys just below `key_range.right` in reverse),
+    /// snapshot its range, and open a merge over its intersection with
+    /// the window. Redoing the lookup per hop keeps the scan safe
+    /// against splits firing between hops — we always take whichever
+    /// tree currently covers the next key. Leaves `merge` null and sets
+    /// `done` when no tree does. An empty intersection just opens an
+    /// empty merge; `next` then hops or finishes as usual.
     ///
     /// The tree is held by ref (`TableTrees.getTree`) across the range
     /// snapshot and the table selection. A split never mutates a live
@@ -952,7 +971,10 @@ pub const Cursor = struct {
                 self.done = true;
                 return;
             };
-            const tree = trees.getTreeByKey(self.key_range.left) orelse {
+            const tree = switch (self.opts.direction) {
+                .forward => trees.getTreeByKey(self.key_range.left),
+                .reverse => trees.getTreeBelow(self.key_range.right),
+            } orelse {
                 self.done = true;
                 return;
             };
@@ -972,12 +994,14 @@ pub const Cursor = struct {
                     .read_ts = self.opts.read_ts,
                     .want = self.want_versions,
                 },
+                self.opts.direction,
             );
             self.merge = try tree.openMerge(
                 a,
                 visit_range,
                 self.opts.min_ts,
                 srcs,
+                self.opts.direction,
             );
             break :blk visit_range;
         };
@@ -1074,7 +1098,12 @@ pub fn maxKey(
     // Step 1: pin every memtable (active + immutables) — see the doc on
     // why this precedes the tree. `want = 1`: the walk needs keys, not
     // version chains.
-    const iters = try self.memtables.getIterators(allocator, .{}, .{ .want = 1 });
+    const iters = try self.memtables.getIterators(
+        allocator,
+        .{},
+        .{ .want = 1 },
+        .forward,
+    );
     defer {
         for (iters) |*it| it.deinit();
         allocator.free(iters);

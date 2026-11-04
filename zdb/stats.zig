@@ -72,15 +72,14 @@ pub fn writeForestStats(self: *Forest, w: *std.Io.Writer) !void {
             try writeBytes(w, st.chunk_bytes);
             try w.print(" hits={d} ({d:.1}%) misses={d} puts={d} " ++
                 "drops={d} corrupt={d}", .{
-                st.hits,  pct(st.hits, st.hits + st.misses),
+                st.hits,   pct(st.hits, st.hits + st.misses),
                 st.misses, st.puts,
-                st.drops, st.corrupt,
+                st.drops,  st.corrupt,
             });
             // Wastage: pages fetched and never read, over retired slots.
             try w.print(" unread={d}/{d} pages ({d:.1}%) chunks={d}\n", .{
-                st.unread_pages, st.evicted_pages,
-                pct(st.unread_pages, st.evicted_pages),
-                st.unread_chunks,
+                st.unread_pages,                        st.evicted_pages,
+                pct(st.unread_pages, st.evicted_pages), st.unread_chunks,
             });
         }
     }

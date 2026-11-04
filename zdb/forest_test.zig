@@ -1462,7 +1462,7 @@ test "forest: getIterators outlives a concurrent flush+pop" {
 
     // Snapshot under the lock — each skl.Iterator.init bumps
     // refcount before getIterators returns.
-    const iters = try mts.getIterators(alloc, .{}, .{});
+    const iters = try mts.getIterators(alloc, .{}, .{}, .forward);
 
     // Simulate flush completion: drop M_5 from immutables (release fires
     // inside popOldestIfMatches). M_5's refcount goes from 2 → 1
@@ -1972,6 +1972,7 @@ test "forest: a bottom-level compaction discards under the read floor" {
             alloc,
             ents[0].table,
             ns1_table0,
+            .forward,
         );
         defer it.deinit();
         try it.seekRange(Key.inf, Key.inf);
@@ -3001,6 +3002,55 @@ test "cursor: hops across a split like scan does" {
     try std.testing.expect(cur.done);
 }
 
+test "cursor: reverse hops across a split from the upper tree down" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f_live = try flags.Live(Config).create(alloc, .{});
+
+    defer f_live.destroy();
+
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
+    defer f.close();
+    try seedSplitForest(alloc, f);
+
+    // All ten descending: k10 first proves the upper tree was opened
+    // first, k01 last that the hop reached the lower one.
+    var col = ScanCollector{ .alloc = alloc };
+    defer col.deinit();
+    var cur = try f.openCursor(alloc, ns42_table0, .all, .{
+        .direction = .reverse,
+    });
+    defer cur.deinit();
+    try drainCursor(&cur, &col);
+    try std.testing.expectEqual(@as(usize, 10), col.got.items.len);
+    for (col.got.items, 0..) |it, i| {
+        var buf: [8]u8 = undefined;
+        const want = try std.fmt.bufPrint(&buf, "k{d:0>2}", .{10 - i});
+        try std.testing.expectEqualStrings(want, it.key.primary);
+        try std.testing.expectEqualStrings(want, it.newest().value);
+    }
+    try std.testing.expect(cur.done);
+
+    // A range whose ends fall on either side of the boundary, and a cap.
+    var col2 = ScanCollector{ .alloc = alloc };
+    defer col2.deinit();
+    var cur2 = try f.openCursor(alloc, ns42_table0, .{
+        .left = .{ .namespace = 42, .table_id = 0, .primary = "k03" },
+        .right = .{ .namespace = 42, .table_id = 0, .primary = "k08" },
+    }, .{ .direction = .reverse, .max_rows = 4 });
+    defer cur2.deinit();
+    try drainCursor(&cur2, &col2);
+    try std.testing.expectEqual(@as(usize, 4), col2.got.items.len);
+    try std.testing.expectEqualStrings("k07", col2.got.items[0].key.primary);
+    try std.testing.expectEqualStrings("k04", col2.got.items[3].key.primary);
+}
+
 // ---------------------------------------------------------------------------
 // getBitmap (roaring postings)
 // ---------------------------------------------------------------------------
@@ -3528,7 +3578,12 @@ test "forest: deleteFiles unlinks compaction inputs at the retire index" {
     // although the cache dropped it and the file is gone.
     try std.testing.expect(!f.table_cache.contains(pinned.file_id));
     {
-        var it = zdb.table.TableIterator.init(alloc, pinned, ns1_table0);
+        var it = zdb.table.TableIterator.init(
+            alloc,
+            pinned,
+            ns1_table0,
+            .forward,
+        );
         defer it.deinit();
         try it.seekRange(Key.inf, Key.inf);
         try std.testing.expect(it.itemRef() != null);
@@ -3590,7 +3645,7 @@ test "table cache: a table loaded for an install survives an evict before it is 
     // The loader's own ref keeps the table open and readable.
     try std.testing.expectEqual(@as(i32, 1), t.ref.load(.acquire));
     {
-        var it = zdb.table.TableIterator.init(alloc, t, ns1_table0);
+        var it = zdb.table.TableIterator.init(alloc, t, ns1_table0, .forward);
         defer it.deinit();
         try it.seekRange(Key.inf, Key.inf);
         try std.testing.expect(it.itemRef() != null);

@@ -9,6 +9,8 @@ const String = utils.String;
 const Key = @import("../kv.zig").Key;
 const Item = @import("../kv.zig").Item;
 const Version = @import("../kv.zig").Version;
+const Direction = @import("../kv.zig").Direction;
+const KeyRange = @import("../kv.zig").KeyRange;
 
 pub const Error = error{
     OutOfMemory,
@@ -34,11 +36,14 @@ pub const SkipList = struct {
     /// [primary]) and its versions, a chain of version nodes from
     /// `vhead`, newest first. Nodes sort by key. `vhead` is never null
     /// once the node is linked in: a node is built with its first
-    /// version node.
+    /// version node. `prev` is the level-0 neighbour below, the head
+    /// for the first node and null for the head itself: a reverse walk
+    /// steps through it as a forward one steps through `next[0]`.
     pub const Node = struct {
         key: String,
         vhead: Atomic(?*VersionNode),
         next: []Atomic(?*Node),
+        prev: Atomic(?*Node),
     };
 
     // Concurrency contract:
@@ -111,6 +116,7 @@ pub const SkipList = struct {
             .key = &[_]u8{},
             .vhead = Atomic(?*VersionNode).init(null),
             .next = next_arr,
+            .prev = Atomic(?*Node).init(null),
         };
 
         const self = try allocator.create(Self);
@@ -191,6 +197,19 @@ pub const SkipList = struct {
             .node = current.next[0].load(.acquire),
             .exact = false,
         };
+    }
+
+    /// The node holding the largest key, or null for an empty list:
+    /// right along each level from the top, then down.
+    fn lastNode(self: *Self) ?*Node {
+        var current = self.head;
+        var level: usize = self.max_height_seen.load(.acquire) - 1;
+        while (true) {
+            while (current.next[level].load(.acquire)) |next| current = next;
+            if (level == 0) break;
+            level -= 1;
+        }
+        return if (current == self.head) null else current;
     }
 
     /// The newest version of `key` at or below `ts`, or null when the key
@@ -301,6 +320,7 @@ pub const SkipList = struct {
             .key = key_own,
             .vhead = Atomic(?*VersionNode).init(vnode),
             .next = next_arr,
+            .prev = Atomic(?*Node).init(lefties[0] orelse self.head),
         };
 
         // We expect multiple readers, but only expect one writer. So, we
@@ -321,6 +341,12 @@ pub const SkipList = struct {
             } else {
                 self.head.next[level].store(new_node, .release);
             }
+        }
+        // The successor's `prev` is swung after the node is published:
+        // a reverse reader on the successor sees the chain before or
+        // after the insert, both complete, as a forward reader does.
+        if (new_node.next[0].load(.acquire)) |next| {
+            next.prev.store(new_node, .release);
         }
 
         _ = self.node_count.fetchAdd(1, .monotonic);
@@ -353,24 +379,28 @@ pub const SkipList = struct {
     }
 
     pub fn iterator(self: *Self, allocator: Allocator) !Iterator {
-        return Iterator.init(allocator, self, .{});
+        return Iterator.init(allocator, self, .{}, .forward);
     }
 };
 
-/// Forward iterator over a SkipList with a peek/advance API matching the
-/// merge iterator (see zdb/table/merge_iterator.zig): one item per key,
-/// its versions newest first in a buffer the iterator owns, refilled at
+/// Iterator over a SkipList with a peek/advance API matching the merge
+/// iterator (see zdb/table/merge_iterator.zig): one item per key, its
+/// versions newest first in a buffer the iterator owns, refilled at
 /// every position and valid until the next `next`. The values stay in
 /// the arena. `acquire`s the underlying skiplist on init; `release`s on
 /// deinit. Safe to hand across the lifetime of a flush completion: as
 /// long as the iterator holds a ref, the arena stays mapped even after
-/// the immutable's owning slot in `Memtables` is popped.
+/// the immutable's owning slot in `Memtables` is popped. `dir` is
+/// fixed at init: which way `seekRange` positions and `next` steps;
+/// the range bounds mean the same either way.
 pub const Iterator = struct {
     allocator: Allocator,
     skiplist: *SkipList,
     node: ?*SkipList.Node,
     vers: std.ArrayList(Version) = .empty,
-    end_key: Key = Key.inf,
+    dir: Direction,
+    /// Kept from `seekRange`: the walk ends at the bound ahead of it.
+    range: KeyRange = .all,
     limit: Limit,
 
     /// How much of a key's chain a reader needs. `fill` walks the
@@ -389,12 +419,17 @@ pub const Iterator = struct {
         allocator: Allocator,
         skiplist: *SkipList,
         limit: Limit,
+        dir: Direction,
     ) !Iterator {
         skiplist.acquire();
         var it: Iterator = .{
             .allocator = allocator,
             .skiplist = skiplist,
-            .node = skiplist.head.next[0].load(.acquire),
+            .node = switch (dir) {
+                .forward => skiplist.head.next[0].load(.acquire),
+                .reverse => skiplist.lastNode(),
+            },
+            .dir = dir,
             .limit = limit,
         };
         errdefer it.deinit();
@@ -407,17 +442,33 @@ pub const Iterator = struct {
         self.skiplist.release();
     }
 
-    /// Position at the first key >= `start` (inclusive). Empty
-    /// `Key.inf` as `start` means "first node." `end` is an exclusive
-    /// upper bound; `Key.inf` means "no upper bound."
+    /// Position at the first key of `[start, end)` in the iterator's
+    /// direction: the smallest at or past `start` forward, the largest
+    /// below `end` in reverse. `Key.inf` on a side is no bound there.
     pub fn seekRange(self: *Iterator, start: Key, end: Key) !void {
-        self.end_key = end;
-        if (start.isInf()) {
-            self.node = self.skiplist.head.next[0].load(.acquire);
-        } else {
-            self.node = self.skiplist.findNode(start, null).node;
+        self.range = .{ .left = start, .right = end };
+        switch (self.dir) {
+            .forward => if (start.isInf()) {
+                self.node = self.skiplist.head.next[0].load(.acquire);
+            } else {
+                self.node = self.skiplist.findNode(start, null).node;
+            },
+            .reverse => if (end.isInf()) {
+                self.node = self.skiplist.lastNode();
+            } else {
+                // An exact hit is `end` itself, excluded: its `prev` is
+                // the last key below. A miss leaves the level-0
+                // predecessor in `lefties`, the head when there is none.
+                var lefties = [_]?*SkipList.Node{null} ** SkipList.max_height;
+                const found = self.skiplist.findNode(end, &lefties);
+                self.node = if (found.exact)
+                    found.node.?.prev.load(.acquire)
+                else
+                    lefties[0];
+                self.dropHead();
+            },
         }
-        self.checkEnd();
+        self.checkBound();
         try self.fill();
     }
 
@@ -431,15 +482,27 @@ pub const Iterator = struct {
 
     pub fn next(self: *Iterator) !void {
         const node = self.node orelse return;
-        self.node = node.next[0].load(.acquire);
-        self.checkEnd();
+        switch (self.dir) {
+            .forward => self.node = node.next[0].load(.acquire),
+            .reverse => {
+                self.node = node.prev.load(.acquire);
+                self.dropHead();
+            },
+        }
+        self.checkBound();
         try self.fill();
     }
 
-    fn checkEnd(self: *Iterator) void {
-        if (self.end_key.isInf()) return;
+    /// The head is the first node's `prev`: reaching it is the end.
+    fn dropHead(self: *Iterator) void {
+        if (self.node == self.skiplist.head) self.node = null;
+    }
+
+    /// The walk is over once it leaves the range. Only the bound ahead
+    /// can fail: the seek landed inside the one behind.
+    fn checkBound(self: *Iterator) void {
         const node = self.node orelse return;
-        if (Key.init(node.key).order(self.end_key) != .lt) self.node = null;
+        if (!self.range.contains(Key.init(node.key))) self.node = null;
     }
 
     /// Copy the current node's chain into `vers`. A writer may publish

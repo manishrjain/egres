@@ -5,6 +5,8 @@ const std = @import("std");
 const _table = @import("table.zig");
 const _cache = @import("../cache.zig");
 const Key = @import("../kv.zig").Key;
+const Direction = @import("../kv.zig").Direction;
+const KeyRange = @import("../kv.zig").KeyRange;
 const Version = @import("../kv.zig").Version;
 const _skl = @import("../skl/skiplist.zig");
 const utils = @import("utils");
@@ -51,7 +53,8 @@ pub const Pin = union(enum) {
 /// memtable scan (`skl.Iterator`), or a MergeIterator over other
 /// sources. All expose the same `seekRange` / `itemRef` / `next` /
 /// `currentPins` / `deinit` shape, so a reader can take one `*Iterator`
-/// whatever is behind it.
+/// whatever is behind it. Every source walks in one direction, fixed
+/// at its init; a merge takes only sources built for its own.
 pub const Iterator = union(enum) {
     table: _table.TableIterator,
     concat: ConcatIterator,
@@ -63,6 +66,12 @@ pub const Iterator = union(enum) {
         switch (self.*) {
             inline else => |*it| try it.seekRange(start, end),
         }
+    }
+
+    pub fn direction(self: *const Iterator) Direction {
+        return switch (self.*) {
+            inline else => |*it| it.dir,
+        };
     }
 
     /// The pins on the storage backing itemRef()'s values; empty only
@@ -112,20 +121,21 @@ pub const Iterator = union(enum) {
 /// One item per key, drawn from every source that holds it.
 ///
 /// `live` is the sources that still hold an item, sorted by that item's
-/// key (ties by the source's position among the inputs, so a txn's
-/// pending writes, source 0, come first). The sources holding the
-/// smallest key are therefore the first `n_cur` entries, and the item
-/// is built from them: one source's versions as they are, or several
-/// sources' versions sorted by timestamp descending with a repeated
-/// timestamp dropped (a version a flushed memtable and its L0 table
-/// both hold, or a txn's pending write over the committed version it
-/// read; the lower source wins). Source order is not timestamp order —
-/// L0 tables arrive oldest first, and a txn's pending version can be
-/// older than committed memtable versions — which is why the versions
-/// are sorted. `next` takes those sources out, advances them, and puts
-/// each back at its place with a scan from the front: a source in the
-/// middle of a run of keys costs one compare, one that jumped past the
-/// others costs as many as it passed.
+/// key in the walk's direction (ties by the source's position among
+/// the inputs, so a txn's pending writes, source 0, come first). The
+/// sources holding the next key are therefore the first `n_cur`
+/// entries, and the item is built from them: one source's versions as
+/// they are, or several sources' versions sorted by timestamp
+/// descending with a repeated timestamp dropped (a version a flushed
+/// memtable and its L0 table both hold, or a txn's pending write over
+/// the committed version it read; the lower source wins). Source order
+/// is not timestamp order — L0 tables arrive oldest first, and a txn's
+/// pending version can be older than committed memtable versions —
+/// which is why the versions are sorted. `next` takes those sources
+/// out, advances them, and puts each back at its place with a scan
+/// from the front: a source in the middle of a run of keys costs one
+/// compare, one that jumped past the others costs as many as it
+/// passed.
 ///
 /// Nothing is held: the item's key and values point into the sources,
 /// which keep their blocks and arenas pinned until they are advanced,
@@ -168,6 +178,7 @@ pub const MergeIterator = struct {
     };
 
     allocator: std.mem.Allocator,
+    dir: Direction,
     /// Every input, for the merge's lifetime: a source that ran out
     /// leaves `live` but comes back on the next `seekRange`.
     srcs: []*Source,
@@ -184,11 +195,13 @@ pub const MergeIterator = struct {
     /// Scratch for `currentPins`.
     pins: std.ArrayList(Pin) = .empty,
 
-    /// Takes the iterators over: `deinit` releases them. `iters` itself
-    /// stays the caller's; on error nothing was taken.
+    /// Takes the iterators over: `deinit` releases them. Every one
+    /// must have been built to walk in `dir`. `iters` itself stays the
+    /// caller's; on error nothing was taken.
     pub fn init(
         allocator: std.mem.Allocator,
         iters: []const Iterator,
+        dir: Direction,
     ) !MergeIterator {
         const srcs = try allocator.alloc(*Source, iters.len);
         errdefer allocator.free(srcs);
@@ -196,11 +209,16 @@ pub const MergeIterator = struct {
         errdefer for (srcs[0..made]) |src| allocator.destroy(src);
         for (srcs, iters, 0..) |*slot, it, prio| {
             const src = try allocator.create(Source);
+            std.debug.assert(it.direction() == dir);
             src.* = .{ .it = it, .prio = prio };
             slot.* = src;
             made += 1;
         }
-        var self: MergeIterator = .{ .allocator = allocator, .srcs = srcs };
+        var self: MergeIterator = .{
+            .allocator = allocator,
+            .dir = dir,
+            .srcs = srcs,
+        };
         errdefer self.live.deinit(allocator);
         try self.live.ensureTotalCapacity(allocator, iters.len);
         // One pin per source at most.
@@ -220,14 +238,15 @@ pub const MergeIterator = struct {
         self.pins.deinit(self.allocator);
     }
 
-    /// The order of `live`: by key (the full key, since a MultiGet seek
-    /// over the memtables has no end bound and its sources can settle on
-    /// keys of different tables or namespaces), then by prio. The first
-    /// parameter is the context std.sort passes; there is none.
-    fn earlier(_: void, a: *Source, b: *Source) bool {
+    /// The order of `live`: by key in the walk's direction (the full
+    /// key, since a MultiGet seek over the memtables has no end bound
+    /// and its sources can settle on keys of different tables or
+    /// namespaces), then by prio. The direction is the context
+    /// std.sort passes.
+    fn earlier(dir: Direction, a: *Source, b: *Source) bool {
         return switch (a.item.?.key.order(b.item.?.key)) {
-            .lt => true,
-            .gt => false,
+            .lt => dir == .forward,
+            .gt => dir == .reverse,
             .eq => a.prio < b.prio,
         };
     }
@@ -239,7 +258,7 @@ pub const MergeIterator = struct {
             src.item = src.it.itemRef();
             if (src.item != null) self.live.appendAssumeCapacity(src);
         }
-        std.mem.sortUnstable(*Source, self.live.items, {}, earlier);
+        std.mem.sortUnstable(*Source, self.live.items, self.dir, earlier);
         try self.build();
     }
 
@@ -284,7 +303,7 @@ pub const MergeIterator = struct {
             // the smallest key.
             var pos: usize = 0;
             for (self.live.items[1..]) |other| {
-                if (!earlier({}, other, src)) break;
+                if (!earlier(self.dir, other, src)) break;
                 pos += 1;
             }
             const items = self.live.items;
@@ -295,7 +314,7 @@ pub const MergeIterator = struct {
     }
 
     /// Build the item from the sources at the front of `live`, the ones
-    /// holding the smallest key.
+    /// holding the next key in the walk's direction.
     fn build(self: *MergeIterator) Error!void {
         self.n_cur = 0;
         self.cur = null;
@@ -367,12 +386,19 @@ pub const MergeIterator = struct {
 
 pub const ConcatIterator = struct {
     iters: []_table.TableIterator, // caller-owned slice; sorted by smallest key
-    current: usize, // == iters.len when exhausted
-    /// Upper bound carried over from `seekRange` for lazy seeking.
-    end: Key = Key.inf,
+    current: ?usize, // null before a seek and once exhausted
+    dir: Direction,
+    /// Carried over from `seekRange` for the lazy seek of each table
+    /// reached.
+    range: KeyRange = .all,
 
-    pub fn init(iters: []_table.TableIterator) ConcatIterator {
-        return .{ .iters = iters, .current = 0 };
+    /// `iters` were each built to walk in `dir`.
+    pub fn init(
+        iters: []_table.TableIterator,
+        dir: Direction,
+    ) ConcatIterator {
+        for (iters) |*it| std.debug.assert(it.dir == dir);
+        return .{ .iters = iters, .current = null, .dir = dir };
     }
 
     pub fn deinit(self: *ConcatIterator) void {
@@ -382,46 +408,90 @@ pub const ConcatIterator = struct {
     /// Seek the FIRST relevant iter only — subsequent iters get seeked
     /// lazily by `next()` as it advances `current`. Avoids paying the
     /// per-table `setBlock` + decompress cost for tables we may never
-    /// reach (e.g., when the merge upstream stops early).
+    /// reach (e.g., when the merge upstream stops early). The first in
+    /// reverse is the last table holding a key below `end`.
     pub fn seekRange(self: *ConcatIterator, start: Key, end: Key) !void {
-        self.end = end;
+        self.range = .{ .left = start, .right = end };
         if (self.iters.len == 0) return;
 
-        if (start.isInf()) {
-            self.current = 0;
-        } else {
-            // First table whose biggest key >= start.
-            self.current = utils.search(_table.TableIterator, self.iters, start, struct {
-                fn f(sk: Key, it: _table.TableIterator) bool {
-                    return it.table.biggest.orderPrimary(sk) != .lt;
-                }
-            }.f);
-            if (self.current >= self.iters.len) return;
+        switch (self.dir) {
+            .forward => if (start.isInf()) {
+                self.current = 0;
+            } else {
+                // First table whose biggest key >= start.
+                const Pred = struct {
+                    fn f(sk: Key, it: _table.TableIterator) bool {
+                        return it.table.biggest.orderPrimary(sk) != .lt;
+                    }
+                };
+                const idx = utils.search(
+                    _table.TableIterator,
+                    self.iters,
+                    start,
+                    Pred.f,
+                );
+                self.current = if (idx < self.iters.len) idx else null;
+            },
+            .reverse => if (end.isInf()) {
+                self.current = self.iters.len - 1;
+            } else {
+                // First table whose smallest key >= end: it and every
+                // one after hold nothing below `end`.
+                const Pred = struct {
+                    fn f(ek: Key, it: _table.TableIterator) bool {
+                        return it.table.smallest.orderPrimary(ek) != .lt;
+                    }
+                };
+                const above = utils.search(
+                    _table.TableIterator,
+                    self.iters,
+                    end,
+                    Pred.f,
+                );
+                self.current = if (above > 0) above - 1 else null;
+            },
         }
-        try self.iters[self.current].seekRange(start, end);
+        const cur = self.current orelse return;
+        try self.iters[cur].seekRange(start, end);
     }
 
     pub fn itemRef(self: *const ConcatIterator) ?_table.Item {
-        if (self.current >= self.iters.len) return null;
-        return self.iters[self.current].itemRef();
+        const cur = self.current orelse return null;
+        return self.iters[cur].itemRef();
     }
 
     pub fn currentBlock(self: *const ConcatIterator) ?*_cache.Value {
-        if (self.current >= self.iters.len) return null;
-        return self.iters[self.current].currentBlock();
+        const cur = self.current orelse return null;
+        return self.iters[cur].currentBlock();
     }
 
+    /// When the current iter exhausts, move to the neighbouring table
+    /// and lazy-seek it. The handoff side is unbounded: every table
+    /// ahead is by definition entirely past the current one's range,
+    /// so only the range's far bound still applies.
     pub fn next(self: *ConcatIterator) Error!void {
-        if (self.current >= self.iters.len) return;
-        try self.iters[self.current].next();
-        // When the current iter exhausts, advance and lazy-seek the next.
-        // The handoff key is empty: every subsequent iter is by
-        // definition entirely above the current iter's range, so there's
-        // no lower bound to apply — only the upper bound from `end`.
-        while (self.iters[self.current].itemRef() == null) {
-            self.current += 1;
-            if (self.current >= self.iters.len) return;
-            try self.iters[self.current].seekRange(Key.inf, self.end);
+        var cur = self.current orelse return;
+        try self.iters[cur].next();
+        while (self.iters[cur].itemRef() == null) {
+            switch (self.dir) {
+                .forward => {
+                    cur += 1;
+                    if (cur == self.iters.len) {
+                        self.current = null;
+                        return;
+                    }
+                    try self.iters[cur].seekRange(Key.inf, self.range.right);
+                },
+                .reverse => {
+                    if (cur == 0) {
+                        self.current = null;
+                        return;
+                    }
+                    cur -= 1;
+                    try self.iters[cur].seekRange(self.range.left, Key.inf);
+                },
+            }
         }
+        self.current = cur;
     }
 };

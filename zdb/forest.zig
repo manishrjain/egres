@@ -23,6 +23,7 @@ const flags = @import("flags");
 
 const Key = @import("kv.zig").Key;
 const KeyRange = @import("kv.zig").KeyRange;
+const Direction = @import("kv.zig").Direction;
 const TreeKey = @import("kv.zig").TreeKey;
 const TableKey = @import("kv.zig").TableKey;
 const makeTreeId = @import("kv.zig").makeTreeId;
@@ -140,6 +141,14 @@ pub const TableTrees = struct {
         return retain(self.lookup(held, key));
     }
 
+    /// `getTreeByKey` for the keys just below `key`: where a reverse
+    /// scan whose window ends at `key` goes on.
+    pub fn getTreeBelow(self: *TableTrees, key: Key) ?*Tree {
+        const held = self.mu.hold(.shared, @src());
+        defer held.release();
+        return retain(self.lookupBelow(held, key));
+    }
+
     /// `getTree` by tree id.
     pub fn getTreeById(self: *TableTrees, tree_id: u64) ?*Tree {
         const held = self.mu.hold(.shared, @src());
@@ -176,6 +185,29 @@ pub const TableTrees = struct {
         held: Lock.Shared,
         search_key: Key,
     ) ?*Tree {
+        return self.treeAt(held, search_key, .forward);
+    }
+
+    /// The tree holding the keys just below `search_key`, or null if
+    /// none: the last whose left bound is below it.
+    pub fn lookupBelow(
+        self: *const TableTrees,
+        held: Lock.Shared,
+        search_key: Key,
+    ) ?*Tree {
+        return self.treeAt(held, search_key, .reverse);
+    }
+
+    /// The tree whose keys sit at `search_key` (forward) or just below
+    /// it (reverse): the last tree whose left bound is at or below the
+    /// key, or strictly below it. Null when no tree's span reaches
+    /// the keys asked for.
+    fn treeAt(
+        self: *const TableTrees,
+        held: Lock.Shared,
+        search_key: Key,
+        dir: Direction,
+    ) ?*Tree {
         self.mu.assertHeld(held);
         if (self.entries.items.len == 1) return self.entries.items[0];
         if (self.entries.items.len == 0) return null;
@@ -186,7 +218,11 @@ pub const TableTrees = struct {
             const mid = lo + (hi - lo) / 2;
             // The first tree's left is unbounded: below every key.
             const left = self.entries.items[mid].key_range.left;
-            if (left.isInf() or left.order(search_key) != .gt) {
+            const below = left.isInf() or switch (dir) {
+                .forward => left.order(search_key) != .gt,
+                .reverse => left.order(search_key) == .lt,
+            };
+            if (below) {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -195,7 +231,7 @@ pub const TableTrees = struct {
         if (lo == 0) return null;
         const candidate = self.entries.items[lo - 1];
         const right = candidate.key_range.right;
-        if (!right.isInf() and search_key.order(right) == .gt) return null;
+        if (!right.isInf() and right.order(search_key) == .lt) return null;
         return candidate;
     }
 };
@@ -252,8 +288,8 @@ pub const Memtables = struct {
         defer arena.deinit();
         const arloc = arena.allocator();
 
-        const srcs = try self.getIterators(arloc, .{}, .{});
-        var iter = try _mitr.MergeIterator.init(arloc, srcs);
+        const srcs = try self.getIterators(arloc, .{}, .{}, .forward);
+        var iter = try _mitr.MergeIterator.init(arloc, srcs, .forward);
         defer iter.deinit();
         try iter.seekRange(range.left, range.right);
         var copied: usize = 0;
@@ -317,6 +353,7 @@ pub const Memtables = struct {
         allocator: std.mem.Allocator,
         select: Select,
         limit: _skl.Iterator.Limit,
+        dir: Direction,
     ) ![]_mitr.Iterator {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
@@ -354,13 +391,18 @@ pub const Memtables = struct {
         if (select.pending) |p| out.appendAssumeCapacity(.{
             .skiplist = try _skl.Iterator.init(allocator, p, .{
                 .want = limit.want,
-            }),
+            }, dir),
         });
         if (select.current) out.appendAssumeCapacity(.{
-            .skiplist = try _skl.Iterator.init(allocator, self.current, limit),
+            .skiplist = try _skl.Iterator.init(
+                allocator,
+                self.current,
+                limit,
+                dir,
+            ),
         });
         for (imms) |imm| out.appendAssumeCapacity(.{
-            .skiplist = try _skl.Iterator.init(allocator, imm, limit),
+            .skiplist = try _skl.Iterator.init(allocator, imm, limit, dir),
         });
         return out.toOwnedSlice(allocator);
     }
@@ -724,12 +766,17 @@ pub const Forest = struct {
             self.allocator,
             .{ .current = false, .max_bytes = opts.job_max_bytes },
             .{},
+            .forward,
         );
         defer self.allocator.free(srcs);
         if (srcs.len == 0) return null;
 
         const newest_id = srcs[0].skiplist.skiplist.raft_index;
-        var iter = try _mitr.MergeIterator.init(self.allocator, srcs);
+        var iter = try _mitr.MergeIterator.init(
+            self.allocator,
+            srcs,
+            .forward,
+        );
         defer iter.deinit();
         try iter.seekRange(Key.inf, Key.inf);
 

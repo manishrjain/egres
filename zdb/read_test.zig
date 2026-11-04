@@ -472,7 +472,7 @@ test "multiget: prefetch reads the blocks the seeks land in, in one batch" {
 
     // blockFor names the block a seek opens.
     for ([_]String{ "r000", "r150", "r299" }) |k| {
-        var it = zdb.table.TableIterator.init(alloc, tbl, table_key);
+        var it = zdb.table.TableIterator.init(alloc, tbl, table_key, .forward);
         defer it.deinit();
         try it.seekRange(Fixture.key(k), Key.inf);
         try std.testing.expect(it.itemRef() != null);
@@ -679,4 +679,94 @@ test "multiget: postings fold across memtable, L0, tombstones and history" {
     const row_val = row.item("t").?.newest().value;
     try std.testing.expectEqualStrings("row", row_val);
     try std.testing.expectError(error.NotRoaring, row.bitmap(alloc, "t"));
+}
+
+const WantRow = struct { key: String, value: String };
+
+/// A reverse cursor over `range` at read_ts 100 with `pending` merged
+/// in hands out exactly `want`, in that order.
+fn expectReverse(
+    fx: *Fixture,
+    pending: *zdb.skl.SkipList,
+    range: zdb.kv.KeyRange,
+    max_rows: u64,
+    want: []const WantRow,
+) !void {
+    var cur = try fx.f.openCursor(fx.alloc, table_key, range, .{
+        .read_ts = 100,
+        .pending = pending,
+        .max_rows = max_rows,
+        .direction = .reverse,
+    });
+    defer cur.deinit();
+    for (want) |w| {
+        const item = (try cur.next()) orelse return error.TestExpectedItem;
+        try std.testing.expectEqualStrings(w.key, item.key.primary);
+        try std.testing.expectEqualStrings(w.value, item.newest().value);
+    }
+    try std.testing.expect(try cur.next() == null);
+}
+
+test "cursor: reverse walks pending, memtables, L0 and L1 descending" {
+    const alloc = std.testing.allocator;
+    var fx: Fixture = undefined;
+    try fx.setup(alloc);
+    defer fx.teardown();
+
+    // The layering of the multiget test: k01..k10 in L1, k03 and k04
+    // rewritten in L0, k05 and k06 in memtables, k02 deleted, and the
+    // txn's own k07 row and k08 tombstone.
+    const base = [_]String{
+        "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10",
+    };
+    for (base) |k| try fx.put(k, 10, "v1");
+    try fx.flush();
+    try fx.compactL0();
+    try fx.put("k03", 20, "v2");
+    try fx.put("k04", 20, "v2");
+    try fx.flush();
+    try fx.put("k04", 30, "v3");
+    try fx.flush();
+    try fx.put("k05", 40, "v4");
+    try fx.freeze();
+    try fx.put("k06", 50, "v5");
+    try fx.putMeta("k02", 60, "", .{ .kind = .deleted });
+
+    const pending = try zdb.skl.SkipList.initCapacity(alloc, 0);
+    defer pending.release();
+    try pending.putItem(.{
+        .key = Fixture.key("k07"),
+        .versions = .{ .one = .{
+            .ts = zdb.kv.pending_ts,
+            .meta = .{},
+            .value = "pend",
+        } },
+    });
+    try pending.putItem(.{
+        .key = Fixture.key("k08"),
+        .versions = .{ .one = .{
+            .ts = zdb.kv.pending_ts,
+            .meta = .{ .kind = .deleted },
+            .value = "",
+        } },
+    });
+
+    const all = [_]WantRow{
+        .{ .key = "k10", .value = "v1" },
+        .{ .key = "k09", .value = "v1" },
+        .{ .key = "k07", .value = "pend" },
+        .{ .key = "k06", .value = "v5" },
+        .{ .key = "k05", .value = "v4" },
+        .{ .key = "k04", .value = "v3" },
+        .{ .key = "k03", .value = "v2" },
+        .{ .key = "k01", .value = "v1" },
+    };
+    const unbounded = std.math.maxInt(u64);
+    try expectReverse(&fx, pending, .all, unbounded, &all);
+    // A range cuts both ends; a cap stops the walk early.
+    try expectReverse(&fx, pending, .{
+        .left = Fixture.key("k03"),
+        .right = Fixture.key("k08"),
+    }, unbounded, all[2..7]);
+    try expectReverse(&fx, pending, .all, 3, all[0..3]);
 }

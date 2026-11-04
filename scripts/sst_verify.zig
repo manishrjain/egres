@@ -78,6 +78,7 @@ fn verifyOne(
         allocator,
         t,
         .{ .namespace = 0, .table_id = 0 },
+        .forward,
     );
     defer it.deinit();
     it.seekRange(Key.inf, Key.inf) catch |err| {

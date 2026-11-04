@@ -56,7 +56,7 @@ pub const CompactionJobLabels = struct {
 // Millisecond buckets for a compaction's build, merge and write: an
 // L0 merge takes about a second, an L2 merge minutes.
 const compaction_buckets: []const u64 = &.{
-    100,   250,   500,    1000,   2500,   5000,
+    100,   250,   500,   1000,   2500,   5000,
     10000, 30000, 60000, 120000, 300000, 600000,
 };
 pub const CompactionHist =
