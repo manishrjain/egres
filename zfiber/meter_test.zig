@@ -154,7 +154,7 @@ test "tenants: one tenant alone gets the box" {
     ts.tick(t0);
     try expectEqual(32 * hz(), a.cpu.rate.load(.monotonic));
     try expectEqual(1_000_000, a.io.rate.load(.monotonic));
-    try expectEqual(64 * gib, a.mem_share.load(.monotonic));
+    try expectEqual(64 * gib, a.mem_soft_limit.load(.monotonic));
 }
 
 test "tenants: the split is by limit, idle tenants are not in it" {
@@ -184,7 +184,7 @@ test "tenants: the split is by limit, idle tenants are not in it" {
     try near(small.cpu.rate.load(.monotonic), @divTrunc(cpu, 5));
     try expectEqual(@divTrunc(cpu, 6), idle.cpu.rate.load(.monotonic));
     try expect(large.io.rate.load(.monotonic) <= 800_000);
-    const mem = large.mem_share.load(.monotonic);
+    const mem = large.mem_soft_limit.load(.monotonic);
     try expectEqual(@divTrunc(64 * gib * 4, 5), mem);
 }
 
@@ -410,34 +410,42 @@ test "cpu: maybeYield parks a tenant in debt until its rate covers it" {
     try expect(utils.coarseMs() - again < 50);
 }
 
-test "payForMem: a tenant over its share waits only under pressure" {
+test "payForMem: holds the frame, waits only while the pool is full" {
+    // `capacity` is the binary's: the same box every meter test sets,
+    // so the pool is filled by holding, never by shrinking it.
+    meter.capacity = box;
     var t = Tenant.init(41, meter.default_limit, 0);
-    t.mem_share.store(1000, .monotonic);
+    t.mem_soft_limit.store(1000, .monotonic);
     t.holdMem(2000);
     defer t.releaseMem(2000);
 
-    // Over the share with the cache still able to give: no wait.
-    meter.mem_pressure.store(false, .monotonic);
+    // Past the soft limit with the pool open: no wait, and the frame
+    // is held from here.
     var start = utils.coarseMs();
-    try t.payForMem();
+    try t.payForMem(300);
     try expect(utils.coarseMs() - start < 50);
+    try expect(t.mem_held.load(.monotonic) == 2300);
+    t.releaseMem(300);
 
-    // Under pressure: waits the bound out, then refuses.
+    // The pool full, read live: waits the bound out, then refuses and
+    // gives the frame back.
     meter.mem_wait_ms = 100;
     defer meter.mem_wait_ms = 5000;
-    meter.mem_pressure.store(true, .monotonic);
-    defer meter.mem_pressure.store(false, .monotonic);
+    t.holdMem(box.mem_bytes);
+    try expect(meter.memPressure());
     start = utils.coarseMs();
-    try std.testing.expectError(error.MemShare, t.payForMem());
+    try std.testing.expectError(error.MemShare, t.payForMem(300));
     // The coarse clock can read a ms under the sleeps it measures.
     const waited = utils.coarseMs() - start;
     try expect(waited >= 90 and waited <= 2000);
     try expect(t.totals.parked_ms.load(.monotonic) >= 100);
+    try expect(t.mem_held.load(.monotonic) == 2000 + box.mem_bytes);
 
     // Room given back meanwhile: admitted.
-    t.releaseMem(1500);
-    defer t.holdMem(1500);
-    try t.payForMem();
+    t.releaseMem(box.mem_bytes);
+    try t.payForMem(300);
+    t.releaseMem(300);
     // The shared tenant never waits.
-    try meter.shared.payForMem();
+    try meter.shared.payForMem(300);
+    meter.shared.releaseMem(300);
 }

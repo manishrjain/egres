@@ -1302,7 +1302,7 @@ pub const AdminServer = struct {
             meter.capacity.io_pages_per_s,
             meter.capacity.mem_bytes >> 20,
             meter.mem_held_total.load(.monotonic) >> 20,
-            meter.mem_pressure.load(.monotonic),
+            meter.memPressure(),
         });
         try writeTenantLine(w, &meter.shared);
         try meter.tenants.forEach(w, writeTenantLine);
@@ -1328,7 +1328,7 @@ pub const AdminServer = struct {
             t.io.bucket(.fg).balance(),
             t.io.bucket(.bg).balance(),
             t.mem_held.load(.monotonic),
-            t.mem_share.load(.monotonic),
+            t.mem_soft_limit.load(.monotonic),
             t.totals.mem_peak.load(.monotonic),
             t.totals.cpu_ticks.load(.monotonic),
             t.totals.io_pages.load(.monotonic),
@@ -1343,7 +1343,7 @@ pub const AdminServer = struct {
     fn writeTenantMetrics(w: *std.Io.Writer) !void {
         const meter = fiber.meter;
         const held = meter.mem_held_total.load(.monotonic);
-        const pressure = meter.mem_pressure.load(.monotonic);
+        const pressure = meter.memPressure();
         const Metric = struct { String, i64 };
         const box = [_]Metric{
             .{ "egres_meter_capacity_cpu_milli", meter.capacity.cpu_milli },
@@ -1368,7 +1368,7 @@ pub const AdminServer = struct {
         "egres_tenant_cpu_rate_milli",
         "egres_tenant_io_rate_pages",
         "egres_tenant_mem_held_bytes",
-        "egres_tenant_mem_share_bytes",
+        "egres_tenant_mem_soft_limit_bytes",
         "egres_tenant_mem_peak_bytes",
     };
     const tenant_counters = [_]String{
@@ -1391,7 +1391,7 @@ pub const AdminServer = struct {
             t.cpuRateMilli(),
             t.io.rate.load(.monotonic),
             t.mem_held.load(.monotonic),
-            t.mem_share.load(.monotonic),
+            t.mem_soft_limit.load(.monotonic),
             t.totals.mem_peak.load(.monotonic),
         };
         const counters = [_]i64{

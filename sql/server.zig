@@ -496,7 +496,7 @@ pub const Handler = struct {
         switch (ev) {
             .startup_complete => |params| try self.onStartup(state, params),
             .query => |sql| {
-                if (!try self.startCtx(state, sql, .simple))
+                if (!try self.startCtx(state, sql, .{}, .simple))
                     return state.endCommand();
                 defer fiber.ctx().finish();
 
@@ -504,13 +504,16 @@ pub const Handler = struct {
                 try state.endCommand();
             },
             .execute => |ctx| {
-                if (!try self.startCtx(state, ctx.sql, .extended)) return;
+                const params = ctx.portal.params;
+                if (!try self.startCtx(state, ctx.sql, params, .extended))
+                    return;
                 defer fiber.ctx().finish();
 
                 try self.onExecute(state, ctx);
             },
             .describe => |ctx| {
-                if (!try self.startCtx(state, ctx.sql, .extended)) return;
+                if (!try self.startCtx(state, ctx.sql, .{}, .extended))
+                    return;
                 defer fiber.ctx().finish();
 
                 try self.onDescribe(state, ctx);
@@ -552,16 +555,23 @@ pub const Handler = struct {
         self.srv.engine.allocator.destroy(t);
     }
 
-    /// Starts the statement's context, or answers the tenant's memory
-    /// refusal, out of memory, and skips the statement: false. In the
-    /// extended protocol the rest of the batch is skipped to the Sync.
+    /// Starts the statement's context, holding the bytes the statement
+    /// arrived in, `sql` and `params`, on the tenant for its duration,
+    /// or answers the tenant's memory refusal, out of memory, and
+    /// skips the statement: false. In the extended protocol the rest
+    /// of the batch is skipped to the Sync.
     fn startCtx(
         self: *Handler,
         state: *pgwire.ConnState,
         sql: String,
+        params: pgwire.Params,
         mode: Mode,
     ) !bool {
-        fiber.ctx().start(sql, self.txn != null) catch |err| switch (err) {
+        var frame_bytes = sql.len;
+        for (params.values) |value| frame_bytes += if (value) |v| v.len else 0;
+
+        const in_txn = self.txn != null;
+        fiber.ctx().start(sql, in_txn, frame_bytes) catch |err| switch (err) {
             error.MemShare => {
                 try replyMemShare(state);
                 if (mode == .extended) state.ext_failed = true;
@@ -1303,13 +1313,13 @@ pub fn replyErrorCode(state: *pgwire.ConnState, code: [5]u8, msg: String) !void 
     try state.sendError(.{ .code = code, .message = msg });
 }
 
-/// The tenant waited its bound for memory and is still over its share
+/// The tenant waited its bound for memory and is still past its soft limit
 /// (`Tenant.payForMem`): the statement did not start.
 fn replyMemShare(state: *pgwire.ConnState) !void {
     return replyErrorCode(
         state,
         pgwire.sqlstate.out_of_memory,
-        "out of memory: the database is over its memory share",
+        "out of memory: the database is past its memory limit",
     );
 }
 

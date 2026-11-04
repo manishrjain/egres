@@ -18,7 +18,7 @@ command -v psql >/dev/null || { echo "e2e: psql not on PATH"; exit 1; }
 }
 
 for script in sql_ddl_e2e sql_branch_restart_e2e sql_dml_e2e \
-    sql_txn_e2e sql_binary_e2e; do
+    sql_txn_e2e sql_binary_e2e sql_memory_e2e; do
     echo "e2e: scripts/$script.sh ..."
     "scripts/$script.sh"
 done

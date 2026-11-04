@@ -95,6 +95,8 @@ pub const Ctx = struct {
     /// same instance and one started before `install` is never
     /// counted out.
     counted: bool = false,
+    /// The frame's bytes held on the tenant from `start` to `finish`.
+    reserved: i64 = 0,
     /// What every read and write on the fiber runs as; vfs and the
     /// caches look them up with `current()`, nothing passes them. A
     /// fiber sets its own; a spawn copies the spawner's.
@@ -123,18 +125,31 @@ pub const Ctx = struct {
     /// Never written.
     pub var bg: Ctx = .{};
 
-    /// Begins a statement on this context, the current fiber's: waits
-    /// for the tenant's memory (`Tenant.payForMem`) unless the session is
-    /// inside a transaction block, whose statements release what it
-    /// holds; copies the head of `name` (the statement text) into a
-    /// fresh arena, resets the I/O class, counts the statement as in
-    /// flight on the installed Shutdown (`Shutdown.enterCtx`) and on
-    /// its tenant, which is active in the tick's split from here.
-    /// Refused once the process is draining. Needs a running runtime,
-    /// whose allocator backs the arena.
-    pub fn start(self: *Ctx, name: String, in_txn: bool) YieldError!void {
+    /// Begins a statement on this context, the current fiber's: holds
+    /// `frame_bytes`, what the statement arrived in, on the tenant
+    /// until `finish`, and waits for the tenant's memory
+    /// (`Tenant.payForMem`) unless the session is inside a transaction
+    /// block, whose statements release what it holds; copies the head
+    /// of `name` (the statement text) into a fresh arena, resets the
+    /// I/O class, counts the statement as in flight on the installed
+    /// Shutdown (`Shutdown.enterCtx`) and on its tenant, which is
+    /// active in the tick's split from here. Refused once the process
+    /// is draining. Needs a running runtime, whose allocator backs the
+    /// arena.
+    pub fn start(
+        self: *Ctx,
+        name: String,
+        in_txn: bool,
+        frame_bytes: usize,
+    ) YieldError!void {
         std.debug.assert(self.arena == null and self.parent == null);
-        if (!in_txn) try self.tenant.payForMem();
+        const bytes: i64 = @intCast(frame_bytes);
+        if (in_txn) {
+            self.tenant.holdMem(bytes);
+        } else {
+            try self.tenant.payForMem(bytes);
+        }
+        self.reserved = bytes;
         if (_shutdown.installed()) |sd| {
             if (!sd.enterCtx()) return error.Shutdown;
             self.counted = true;
@@ -160,6 +175,7 @@ pub const Ctx = struct {
         if (self.counted) _shutdown.installed().?.leaveCtx();
         if (!offer(self, arena, self.elapsedUs())) arena.deinit();
         const tenant = self.tenant;
+        tenant.releaseMem(self.reserved);
         self.* = .{ .tenant = tenant };
     }
 

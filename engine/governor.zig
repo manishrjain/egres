@@ -97,7 +97,7 @@ pub const Cfg = struct {
             " process uses and the allocator's measured overhead. Set it" ++
             " on a host shared with other processes.",
         .query_ratio = "The fraction of the memory budget statements may" ++
-            " hold in all; past it a database over its share waits for" ++
+            " hold in all; past it a database over its soft limit waits for" ++
             " room, then its statement is refused. The cache takes" ++
             " what statements leave.",
         .query_bytes = "Bytes one statement may hold before it is" ++
@@ -204,8 +204,8 @@ pub const Governor = struct {
 
     /// Reads the counters, moves the ratio and the margin, and applies
     /// the cap. Then the tenants' tick: the statement pool is their
-    /// memory capacity, and a tenant over its share waits while the
-    /// pool is full or the cache is at its floor with nothing to give.
+    /// memory capacity, and a tenant past its soft limit waits while
+    /// the pool is full, which the meter reads live.
     pub fn tick(self: *Governor) void {
         if (self.live) |l| {
             const version = l.version();
@@ -236,15 +236,7 @@ pub const Governor = struct {
         }
 
         const meter = fiber.meter;
-        const held: u64 = @intCast(
-            @max(meter.mem_held_total.load(.monotonic), 0),
-        );
-        const pool = self.queryPool();
-        meter.capacity.mem_bytes = @intCast(pool);
-        meter.mem_pressure.store(
-            held >= pool or cap <= min_cap,
-            .monotonic,
-        );
+        meter.capacity.mem_bytes = @intCast(self.queryPool());
         meter.tenants.tick(utils.coarseMs());
     }
 };

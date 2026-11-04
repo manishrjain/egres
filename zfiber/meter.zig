@@ -39,13 +39,15 @@
 //!
 //! Memory is held, not spent, so it has no bucket: the tick gives
 //! each active tenant a share of `capacity.mem_bytes`, the statement
-//! pool, and a tenant holding more than its share waits
-//! (`payForMem`) only while the pool is full or the cache can give
-//! nothing back (`mem_pressure`, the governor's word). Any other time
-//! it just runs and the cache shrinks. The wait is bounded, since a
-//! waiting statement can hold a lock a running one needs, and ends
-//! in a refusal. A single statement past `query_mem_bytes` is refused
-//! at its next yield.
+//! pool, as its soft limit, and a tenant holding more than that waits
+//! (`payForMem`) only while the pool is full, read live from what
+//! every tenant holds. Any other time it just runs and the cache
+//! shrinks. A statement reserves its
+//! frame's bytes before the wait, so a burst of large statements
+//! fills the pool as it arrives rather than after each is admitted.
+//! The wait is bounded, since a waiting statement can hold a lock a
+//! running one needs, and ends in a refusal. A single statement past
+//! `query_mem_bytes` is refused at its next yield.
 //!
 //! Time is the caller's: every call takes `now_ms`, a monotonic
 //! millisecond clock, so all of it is testable and the runtime passes
@@ -213,10 +215,12 @@ pub const Tenant = struct {
     /// Pages; a write costs the device's write cost in pages.
     io: Resource,
     /// Live bytes held by the tenant's statements and the compactions
-    /// of its trees, and the bytes the last tick gave it: over the
-    /// share under pressure, a statement waits.
+    /// of its trees.
     mem_held: std.atomic.Value(i64) = .init(0),
-    mem_share: std.atomic.Value(i64) = .init(0),
+    /// The tenant's share of the pool, the tick's number. Held past
+    /// it, the tenant waits while the pool is full; with room in the
+    /// pool a spike goes through.
+    mem_soft_limit: std.atomic.Value(i64) = .init(0),
     last_active_ms: std.atomic.Value(i64),
     totals: Totals = .{},
 
@@ -321,21 +325,25 @@ pub const Tenant = struct {
         return .{ .ptr = self, .vtable = _counting.vtable(Tenant) };
     }
 
-    /// Over the memory share, the tick's number, while the cache can
-    /// give nothing back.
+    /// Past the soft limit while the pool is full.
     pub fn overMem(self: *const Tenant) bool {
-        return mem_pressure.load(.monotonic) and
-            self.mem_held.load(.monotonic) > self.mem_share.load(.monotonic);
+        const held = self.mem_held.load(.monotonic);
+        return memPressure() and held > self.mem_soft_limit.load(.monotonic);
     }
 
-    /// Room for a statement: waits while the tenant is over its share
-    /// under pressure, at most `mem_wait_ms`, then refuses. Polls: a
-    /// waiter exists only under pressure, and a wake on every release
-    /// would cost more than a sleep this short.
-    pub fn payForMem(self: *Tenant) error{MemShare}!void {
+    /// Room for a statement that arrived in `hold_bytes`: those are
+    /// held from here, then the wait while the tenant is past its
+    /// soft limit under pressure, at most `mem_wait_ms`; a refusal gives
+    /// them back. Polls: a waiter exists only under pressure, and a
+    /// wake on every release would cost more than a sleep this short.
+    pub fn payForMem(self: *Tenant, hold_bytes: i64) error{MemShare}!void {
+        self.holdMem(hold_bytes);
         var waited: u64 = 0;
         while (self.overMem()) {
-            if (waited >= mem_wait_ms) return error.MemShare;
+            if (waited >= mem_wait_ms) {
+                self.releaseMem(hold_bytes);
+                return error.MemShare;
+            }
             sleepMs(mem_poll_ms);
             waited += mem_poll_ms;
             _ = self.totals.parked_ms.fetchAdd(mem_poll_ms, .monotonic);
@@ -430,7 +438,7 @@ pub var shared: Tenant = .{
     .limit = .{ .cpu_milli = 1, .io_pages_per_s = 1, .mem_bytes = 1 },
     .cpu = Resource.init(never_short, never_short, 0),
     .io = Resource.init(never_short, never_short, 0),
-    .mem_share = .init(never_short),
+    .mem_soft_limit = .init(never_short),
     .last_active_ms = .init(0),
 };
 const never_short: i64 = 1 << 62;
@@ -446,12 +454,16 @@ pub var capacity: Tenant.Limit = .{
     .mem_bytes = 0,
 };
 
-/// The pool is full, or the cache is at its floor: a tenant over its
-/// share waits. The governor's, each tick.
-pub var mem_pressure: std.atomic.Value(bool) = .init(false);
+/// A tenant past its soft limit waits: every tenant's held bytes
+/// together fill the pool, read live. No pool until the governor's
+/// first tick sizes it.
+pub fn memPressure() bool {
+    const pool = capacity.mem_bytes;
+    return pool > 0 and mem_held_total.load(.monotonic) >= pool;
+}
 
 /// Live bytes every tenant holds, the shared one included: against
-/// the pool, the governor's pressure flag.
+/// the pool, `memPressure`.
 pub var mem_held_total: std.atomic.Value(i64) = .init(0);
 
 /// A statement's live bytes past which its next yield refuses it;
@@ -570,7 +582,7 @@ pub const Tenants = struct {
 
     /// Splits `capacity`, less what the shared tenant spent since the last
     /// tick, among the active tenants by their limits, and sets each
-    /// one's rates and memory share. An idle tenant keeps its last
+    /// one's rates and memory soft limit. An idle tenant keeps its last
     /// rates: it is not in the sum, and it has nothing to spend them
     /// on.
     pub fn tick(self: *Tenants, now_ms: i64) void {
@@ -606,7 +618,7 @@ pub const Tenants = struct {
             const io = share(left_io, lim.io_pages_per_s, sum.io_pages_per_s);
             tenant.cpu.setRate(cpu, burstFor(cpu));
             tenant.io.setRate(io, burstFor(io));
-            tenant.mem_share.store(
+            tenant.mem_soft_limit.store(
                 share(capacity.mem_bytes, lim.mem_bytes, sum.mem_bytes),
                 .monotonic,
             );
