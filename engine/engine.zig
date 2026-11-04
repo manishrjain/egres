@@ -1036,6 +1036,12 @@ pub const Engine = struct {
         // stalls writes.
         fiber.ctx().class = .fg;
         const interval: u64 = 200;
+        // After a failure the next attempt waits, doubling up to this:
+        // a flush that failed on a full disk or an unreachable store
+        // fails again at once, and every attempt rebuilds the whole
+        // job. Short, since frozen memtables brake writes.
+        const max_retry_ms: u64 = 3000;
+        var retry_ms: u64 = 0;
         var last_flush_ms: ?i64 = null;
         while (!self.node.isShuttingDown()) {
             if (!self.node.isLeader() or !self.flushDue(last_flush_ms)) {
@@ -1043,9 +1049,15 @@ pub const Engine = struct {
                     return;
                 continue;
             }
-            self.proposeFlush() catch |err| {
-                log.err("proposeFlush failed: {s}", .{@errorName(err)});
-            };
+            if (self.proposeFlush()) |_| {
+                retry_ms = 0;
+            } else |err| {
+                retry_ms = @min(@max(retry_ms * 2, 250), max_retry_ms);
+                utils.logEvery(.err, 30, "proposeFlush failed: {s}; " ++
+                    "retrying in {d} ms", .{ @errorName(err), retry_ms });
+                if (self.node.shutdown.waitForStart(.shutdown, retry_ms))
+                    return;
+            }
             last_flush_ms = utils.coarseMs();
         }
     }
