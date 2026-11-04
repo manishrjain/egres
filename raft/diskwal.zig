@@ -256,12 +256,11 @@ pub const wal = struct {
     pub fn openPath(
         path: String,
         alloc: std.mem.Allocator,
-        opts_in: OpenOptions,
+        opts: OpenOptions,
     ) !wal {
-        const cache_capacity = opts_in.cache_capacity;
         // The header takes the first MiB; a log file needs room past it.
-        std.debug.assert(opts_in.log_file_size >= log_file_offset + (1 << 20));
-        const vfs = opts_in.vfs orelse _vfs.g();
+        std.debug.assert(opts.log_file_size >= log_file_offset + (1 << 20));
+        const vfs = opts.vfs orelse _vfs.g();
         const io = utils.context.g().io;
         const cwd = std.Io.Dir.cwd();
         cwd.access(io, path, .{}) catch |err| switch (err) {
@@ -270,11 +269,11 @@ pub const wal = struct {
         };
         // Settle `.auto` once, here: every log file created under this
         // wal then sees a plain on/off.
-        var opts = opts_in;
-        opts.prezero = opts_in.prezero.resolve(path);
-        if (opts_in.prezero == .auto and !builtin.is_test) {
+        var settled = opts;
+        settled.prezero = opts.prezero.resolve(path);
+        if (opts.prezero == .auto and !builtin.is_test) {
             log.info("{s}: prezero {s} (fs magic 0x{x})", .{
-                path, @tagName(opts.prezero), _vfs.fsMagic(path) orelse 0,
+                path, @tagName(settled.prezero), _vfs.fsMagic(path) orelse 0,
             });
         }
         const dir_copy = try alloc.dupe(u8, path);
@@ -313,7 +312,7 @@ pub const wal = struct {
             .allocator = alloc,
             .vfs = vfs,
             .dir_path = dir_copy,
-            .opts = opts,
+            .opts = settled,
             .next_fid = 0,
         };
         errdefer next_log.deinit();
@@ -335,10 +334,14 @@ pub const wal = struct {
                 alloc,
                 path,
                 next_log.takeFid(),
-                opts,
+                settled,
             ));
 
-            var entry_cache = try EntryCache.init(alloc, cache_capacity);
+            var entry_cache = try EntryCache.init(
+                alloc,
+                opts.cache_len,
+                opts.cache_bytes,
+            );
             errdefer entry_cache.deinit();
 
             return .{
@@ -348,7 +351,7 @@ pub const wal = struct {
                 .files = files,
                 .current = &files.items[files.items.len - 1],
                 .cache = entry_cache,
-                .opts = opts,
+                .opts = settled,
                 .next = next_log,
                 .buf = LogBuf.init(alloc),
             };
@@ -424,19 +427,23 @@ pub const wal = struct {
                 alloc,
                 path,
                 next_log.takeFid(),
-                opts,
+                settled,
             );
         } else try LogFile.openCurrent(
             vfs,
             alloc,
             path,
             found_fids.items[found_fids.items.len - 1],
-            opts,
+            settled,
         );
 
         try opened.append(alloc, cur_lf);
 
-        var entry_cache = try EntryCache.init(alloc, cache_capacity);
+        var entry_cache = try EntryCache.init(
+            alloc,
+            opts.cache_len,
+            opts.cache_bytes,
+        );
         errdefer entry_cache.deinit();
 
         next_log.bumpFid(cur_lf.fid);
@@ -447,7 +454,7 @@ pub const wal = struct {
             .files = opened,
             .current = &opened.items[opened.items.len - 1],
             .cache = entry_cache,
-            .opts = opts,
+            .opts = settled,
             .next = next_log,
             .buf = LogBuf.init(alloc),
         };
@@ -737,7 +744,7 @@ pub const wal = struct {
             // If the cache is about to evict an entry that hasn't been
             // pwritten yet, flush write_buf first. Otherwise reads of the
             // evicted index would miss in cache AND on disk.
-            if (self.cache.isFull()) {
+            if (self.cache.wouldEvict(bytes.len)) {
                 if (self.cache.oldestIndex()) |oldest| {
                     if (oldest > self.buf.syncedIndex()) {
                         try self.syncLocked();
@@ -1224,6 +1231,10 @@ pub const EntryCache = struct {
     buf: []CachedEntry,
     head: usize, // index of oldest entry in buf
     len: usize, // number of live entries
+    /// Bytes the live entries hold, and the most they may: past it
+    /// the oldest go, so a cache of 16 MiB rows is bounded too.
+    bytes: usize,
+    max_bytes: usize,
     hits: u64,
     misses: u64,
 
@@ -1233,13 +1244,19 @@ pub const EntryCache = struct {
         bytes: String, // allocator-owned
     };
 
-    pub fn init(allocator: std.mem.Allocator, capacity: usize) !EntryCache {
-        const buf = try allocator.alloc(CachedEntry, capacity);
+    pub fn init(
+        allocator: std.mem.Allocator,
+        max_len: usize,
+        max_bytes: usize,
+    ) !EntryCache {
+        const buf = try allocator.alloc(CachedEntry, max_len);
         return .{
             .allocator = allocator,
             .buf = buf,
             .head = 0,
             .len = 0,
+            .bytes = 0,
+            .max_bytes = max_bytes,
             .hits = 0,
             .misses = 0,
         };
@@ -1256,6 +1273,7 @@ pub const EntryCache = struct {
         }
         self.head = 0;
         self.len = 0;
+        self.bytes = 0;
     }
 
     /// Raft index of the oldest entry — the one a full-cache `append`
@@ -1265,26 +1283,32 @@ pub const EntryCache = struct {
         return self.buf[self.head].index;
     }
 
-    /// True if the next `append` would have to evict an existing entry.
-    pub fn isFull(self: *const EntryCache) bool {
-        return self.buf.len > 0 and self.len == self.buf.len;
+    /// Whether an `append` of `n` bytes evicts the oldest entry: the
+    /// ring is full, or the bytes held would pass `max_bytes`.
+    pub fn wouldEvict(self: *const EntryCache, n: usize) bool {
+        if (self.buf.len == 0 or self.len == 0) return false;
+        return self.len == self.buf.len or self.bytes + n > self.max_bytes;
     }
 
     pub fn append(self: *EntryCache, index: u64, term_val: u64, bytes: String) !void {
         if (self.buf.len == 0) return;
 
         const owned = try self.allocator.dupe(u8, bytes);
+        // The oldest go until the entry fits. One past the cap on its
+        // own is kept: a reader must find every unsynced entry here.
+        while (self.wouldEvict(owned.len)) self.dropOldest();
+        const tail = (self.head + self.len) % self.buf.len;
+        self.buf[tail] = .{ .index = index, .term = term_val, .bytes = owned };
+        self.len += 1;
+        self.bytes += owned.len;
+    }
 
-        if (self.len == self.buf.len) {
-            // Ring full — overwrite oldest.
-            self.allocator.free(self.buf[self.head].bytes);
-            self.buf[self.head] = .{ .index = index, .term = term_val, .bytes = owned };
-            self.head = (self.head + 1) % self.buf.len;
-        } else {
-            const tail = (self.head + self.len) % self.buf.len;
-            self.buf[tail] = .{ .index = index, .term = term_val, .bytes = owned };
-            self.len += 1;
-        }
+    fn dropOldest(self: *EntryCache) void {
+        const oldest = &self.buf[self.head];
+        self.bytes -= oldest.bytes.len;
+        self.allocator.free(oldest.bytes);
+        self.head = (self.head + 1) % self.buf.len;
+        self.len -= 1;
     }
 
     /// O(1) lookup by raft index.
@@ -1317,7 +1341,9 @@ pub const EntryCache = struct {
         }
         const keep: usize = @intCast(@min(from_index - base, self.len));
         for (keep..self.len) |i| {
-            self.allocator.free(self.buf[(self.head + i) % self.buf.len].bytes);
+            const dropped = self.buf[(self.head + i) % self.buf.len].bytes;
+            self.bytes -= dropped.len;
+            self.allocator.free(dropped);
         }
         self.len = keep;
     }
@@ -1328,10 +1354,6 @@ pub const EntryCache = struct {
         const base = self.buf[self.head].index;
         if (before_index <= base) return;
         const drop: usize = @intCast(@min(before_index - base, self.len));
-        for (0..drop) |i| {
-            self.allocator.free(self.buf[(self.head + i) % self.buf.len].bytes);
-        }
-        self.head = (self.head + drop) % self.buf.len;
-        self.len -= drop;
+        for (0..drop) |_| self.dropOldest();
     }
 };

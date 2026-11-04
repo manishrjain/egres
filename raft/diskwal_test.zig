@@ -220,7 +220,7 @@ test "diskwal entriesRange type filter reads only that type" {
     // A cache of 8 entries: most of the log is read from disk, which
     // is the path the filter has to get right.
     var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{
-        .cache_capacity = 8,
+        .cache_len = 8,
     });
     defer ds.deinit();
 
@@ -887,7 +887,7 @@ const EntryCache = raft.diskwal.EntryCache;
 
 test "entry cache basic append and lookup" {
     const alloc = std.testing.allocator;
-    var cache = try EntryCache.init(alloc, 8);
+    var cache = try EntryCache.init(alloc, 8, 1 << 20);
     defer cache.deinit();
 
     try cache.append(1, 1, "hello");
@@ -908,9 +908,42 @@ test "entry cache basic append and lookup" {
     try std.testing.expect(cache.lookup(4) == null);
 }
 
+test "entry cache byte cap evicts the oldest, keeps one oversized" {
+    const alloc = std.testing.allocator;
+    var cache = try EntryCache.init(alloc, 8, 10);
+    defer cache.deinit();
+
+    try cache.append(1, 1, "aaaa");
+    try cache.append(2, 1, "bbbb");
+    // 12 bytes would pass the cap: the oldest goes.
+    try cache.append(3, 1, "cccc");
+    try std.testing.expect(cache.lookup(1) == null);
+    try std.testing.expect(cache.lookup(2) != null);
+    try std.testing.expect(cache.lookup(3) != null);
+    try std.testing.expectEqual(@as(usize, 8), cache.bytes);
+
+    // One entry past the cap on its own empties the rest and stays.
+    try cache.append(4, 1, "dddddddddddd");
+    try std.testing.expect(cache.lookup(2) == null);
+    try std.testing.expect(cache.lookup(3) == null);
+    try std.testing.expect(cache.lookup(4) != null);
+    try std.testing.expectEqual(@as(usize, 12), cache.bytes);
+
+    // The next entry, however small, evicts it.
+    try cache.append(5, 1, "e");
+    try std.testing.expect(cache.lookup(4) == null);
+    try std.testing.expect(cache.lookup(5) != null);
+    try std.testing.expectEqual(@as(usize, 1), cache.bytes);
+
+    // Truncation keeps the count honest too.
+    try cache.append(6, 1, "ff");
+    cache.truncateFrom(6);
+    try std.testing.expectEqual(@as(usize, 1), cache.bytes);
+}
+
 test "entry cache ring wraparound evicts oldest" {
     const alloc = std.testing.allocator;
-    var cache = try EntryCache.init(alloc, 4);
+    var cache = try EntryCache.init(alloc, 4, 1 << 20);
     defer cache.deinit();
 
     // Fill to capacity.
@@ -938,7 +971,7 @@ test "entry cache ring wraparound evicts oldest" {
 
 test "entry cache truncateFrom drops tail" {
     const alloc = std.testing.allocator;
-    var cache = try EntryCache.init(alloc, 8);
+    var cache = try EntryCache.init(alloc, 8, 1 << 20);
     defer cache.deinit();
 
     try cache.append(1, 1, "a");
@@ -961,7 +994,7 @@ test "entry cache truncateFrom drops tail" {
 
 test "entry cache evictBefore drops head" {
     const alloc = std.testing.allocator;
-    var cache = try EntryCache.init(alloc, 8);
+    var cache = try EntryCache.init(alloc, 8, 1 << 20);
     defer cache.deinit();
 
     try cache.append(5, 1, "a");
@@ -984,7 +1017,7 @@ test "entry cache evictBefore drops head" {
 
 test "entry cache clear frees all entries" {
     const alloc = std.testing.allocator;
-    var cache = try EntryCache.init(alloc, 4);
+    var cache = try EntryCache.init(alloc, 4, 1 << 20);
     defer cache.deinit();
 
     try cache.append(1, 1, "abc");
@@ -998,7 +1031,7 @@ test "entry cache clear frees all entries" {
 
 test "entry cache wraparound with truncateFrom and evictBefore" {
     const alloc = std.testing.allocator;
-    var cache = try EntryCache.init(alloc, 4);
+    var cache = try EntryCache.init(alloc, 4, 1 << 20);
     defer cache.deinit();
 
     // Fill and wrap around so head != 0.

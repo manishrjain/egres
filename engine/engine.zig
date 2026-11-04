@@ -1062,6 +1062,17 @@ pub const Engine = struct {
         }
     }
 
+    /// Frozen memtables above which writes stall: as many as hold a
+    /// quarter of the memory budget, never fewer than one over the
+    /// brake's start count. No budget, no stall. `opts` is the
+    /// caller's copy of the live options.
+    fn memtableStallCount(opts: zdb.config.Config) u32 {
+        const gov = _governor.g() orelse return std.math.maxInt(u32);
+        const from_budget = gov.total / 4 / opts.table_bytes;
+        const floor = opts.memtable_backpressure_start_count + 1;
+        return @intCast(@max(from_budget, floor));
+    }
+
     fn flushDue(self: *Engine, last_flush_ms: ?i64) bool {
         const opts = self.forest.live.cur();
         const waiting = self.forest.memtables.immutableCount();
@@ -1390,6 +1401,7 @@ pub const Engine = struct {
     /// anything else on the node. See `Options.backpressure_step_ms`
     /// for the curve. `kvs` are the batch's marshaled keys.
     pub fn applyWriteBackpressure(self: *Engine, kvs: []const zdb_bufs.KeyValueStruct) void {
+        const stall_poll_ms: u64 = 50;
         const opts = self.forest.live.cur();
         // Every key: a batch is in key order, a table's rows before
         // its index entries, so a prefix never reaches the index trees.
@@ -1404,9 +1416,24 @@ pub const Engine = struct {
             rest = rest[n..];
         }
 
+        // Past the stall count a write waits for a flush to land, not
+        // for a sleep to pass. The sleep curve below only slows writes,
+        // and a sustained writer pushed through it to hundreds of
+        // frozen memtables; what they hold, a restart rebuilds before
+        // it serves (Engine.start), so the pile is what a replay can
+        // be killed on.
+        const stall = memtableStallCount(opts);
+        var frozen = self.forest.memtables.immutableCount();
+        while (frozen > stall and !self.node.isShuttingDown()) {
+            utils.logEvery(.warn, 10, "writes stalled: {d} frozen " ++
+                "memtables, over {d}", .{ frozen, stall });
+            metrics.g().write_backpressure_ms.observe(stall_poll_ms);
+            fiber.sleepMs(stall_poll_ms);
+            frozen = self.forest.memtables.immutableCount();
+        }
+
         // Memtables waiting for a flush brake every write the same way;
         // one curve, so the larger excess over its start count decides.
-        const frozen = self.forest.memtables.immutableCount();
         const excess = @max(
             l0 -| opts.l0_backpressure_start_count,
             frozen -| opts.memtable_backpressure_start_count,

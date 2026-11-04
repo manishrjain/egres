@@ -71,7 +71,8 @@ pub const Config = struct {
     // milliseconds before proposing, capped at `backpressure_max_ms`,
     // where excess is how far a count is above its start count; the
     // larger of the two sleeps applies. This is a *trigger*, not a
-    // cap: the count may still grow past it, writes just slow down.
+    // cap: the count may still grow past it, writes just slow down,
+    // until the memtable stall (Engine.memtableStallCount) holds them.
     // With defaults, at the trigger 0 ms; +5 over it 100 ms; +25 hits
     // the cap of 500 ms. The values come from the memtable brake, set
     // against an observed runaway (below); the L0 brake ran 1 ms per

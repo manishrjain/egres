@@ -63,7 +63,7 @@ fn benchOne(
     const dir = try tmp.dir.realPathFileAlloc(io, ".", b.alloc);
     defer b.alloc.free(dir);
 
-    var dwal = try diskwal.DiskWAL.openPath(dir, b.alloc, .{ .cache_capacity = 0 });
+    var dwal = try diskwal.DiskWAL.openPath(dir, b.alloc, .{ .cache_len = 0 });
     defer dwal.deinit();
 
     const payload = try b.alloc.alloc(u8, payload_size);
@@ -302,7 +302,7 @@ fn benchLoad(b: *Bench, batch_size: u32, mode: Compress) !void {
     defer if (tmp == null) vfs.deleteTree(dir) catch {};
 
     var dwal = try diskwal.DiskWAL.openPath(dir, b.alloc, .{
-        .cache_capacity = 0,
+        .cache_len = 0,
     });
     defer dwal.deinit();
 

@@ -111,8 +111,11 @@ pub const OpenOptions = struct {
     /// The VFS the log files and meta open through, which carries the
     /// WAL device's limiter. Null = the global one.
     vfs: ?*const _vfs.VFS = null,
-    /// Entries kept in memory for reads (`EntryCache`).
-    cache_capacity: usize = 1024,
+    /// Entries kept in memory for reads (`EntryCache`), and the bytes
+    /// they may hold together: a cache of large rows is bounded by
+    /// the bytes, of small ones by the count.
+    cache_len: usize = 1024,
+    cache_bytes: usize = 64 << 20,
     /// Log file size. Every log file is created at this size, zero-filled
     /// (see `prezero`), before it is written to, so no append ever grows
     /// a file: a write that grows a file journals the size (6 ms on the
