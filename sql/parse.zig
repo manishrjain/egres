@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const pgwire = @import("pgwire");
+const fiber = @import("zfiber");
 const parser = pgwire.parser;
 const _funcs = @import("funcs.zig");
 const _value = @import("value.zig");
@@ -1061,6 +1062,23 @@ pub fn litToValue(
     return _value.textToColumn(a, col, text);
 }
 
+/// How much of the fiber's stack a WHERE or an expression may take
+/// while it parses. Every NOT, AND, OR, operator or call operand is
+/// one more parseWhere or parseExpr frame, and a few thousand of
+/// them overrun the 1 MiB fiber stack; the fault wedges the runtime
+/// instead of failing the query. The planner and the evaluator walk
+/// the same tree later from a shallower frame, so the budget is a
+/// share of the stack, not the parser's alone. A written query
+/// stays far under it; a deeper one is refused.
+const max_parse_stack: usize = 256 * 1024;
+
+/// Whether the parse has recursed past `max_parse_stack`. Off a
+/// fiber there is no budget to run out of.
+fn pastStackBudget() bool {
+    const used = fiber.stackUsed() orelse return false;
+    return used > max_parse_stack;
+}
+
 /// A parsed WHERE tree or a rejection reason (borrowed).
 const ParsedWhere = union(enum) {
     where: Where,
@@ -1115,6 +1133,8 @@ fn parseWhere(
     params: *ParamTally,
     p: ?*c.Node,
 ) parser.ParseError!ParsedWhere {
+    if (pastStackBudget())
+        return ParsedWhere.reject("statement nested too deeply");
     if (parser.cast(c.BoolExpr, p)) |be| {
         const args = parser.items(be.args);
         if (be.boolop == c.NOT_EXPR) {
@@ -1148,7 +1168,8 @@ fn parseWhere(
             c.IS_NOT_NULL => true,
             else => return ParsedWhere.reject("unsupported WHERE clause"),
         };
-        const operand = switch (try leafExpr(alloc, params, parser.asNode(nt.arg))) {
+        const arg = parser.asNode(nt.arg);
+        const operand = switch (try leafExpr(alloc, params, arg)) {
             .expr => |e| e,
             .invalid => |msg| return .{ .invalid = msg },
         };
@@ -1165,7 +1186,8 @@ fn parseWhere(
             c.IS_NOT_UNKNOWN => .{ .unknown, true },
             else => return ParsedWhere.reject("unsupported WHERE clause"),
         };
-        const operand = switch (try leafExpr(alloc, params, parser.asNode(bt.arg))) {
+        const arg = parser.asNode(bt.arg);
+        const operand = switch (try leafExpr(alloc, params, arg)) {
             .expr => |e| e,
             .invalid => |msg| return .{ .invalid = msg },
         };
@@ -1191,7 +1213,8 @@ fn parseWhere(
         return ParsedWhere.reject("unsupported WHERE clause");
     if (isExcludedRef(ae.lexpr) or isExcludedRef(ae.rexpr))
         return ParsedWhere.reject("EXCLUDED is not supported in a WHERE");
-    const lhs = switch (try leafExpr(alloc, params, parser.asNode(ae.lexpr))) {
+    const left = parser.asNode(ae.lexpr);
+    const lhs = switch (try leafExpr(alloc, params, left)) {
         .expr => |e| e,
         .invalid => |msg| return .{ .invalid = msg },
     };
@@ -1205,7 +1228,8 @@ fn parseWhere(
                         "only = <> < <= > >= comparisons are supported in WHERE",
                     ),
             };
-            const rhs = switch (try leafExpr(alloc, params, parser.asNode(ae.rexpr))) {
+            const right = parser.asNode(ae.rexpr);
+            const rhs = switch (try leafExpr(alloc, params, right)) {
                 .expr => |e| e,
                 .invalid => |msg| return .{ .invalid = msg },
             };
@@ -1219,7 +1243,8 @@ fn parseWhere(
             if (vals.len == 0) return ParsedWhere.reject("IN takes a list of values");
             const kids = try alloc.alloc(Where, vals.len);
             for (vals, kids) |val, *kid| {
-                const rhs = switch (try leafExpr(alloc, params, parser.asNode(val.ptr_value))) {
+                const node = parser.asNode(val.ptr_value);
+                const rhs = switch (try leafExpr(alloc, params, node)) {
                     .expr => |e| e,
                     .invalid => |msg| return .{ .invalid = msg },
                 };
@@ -1238,11 +1263,13 @@ fn parseWhere(
                 return ParsedWhere.reject("BETWEEN takes two bounds");
             const bounds = parser.items(list);
             if (bounds.len != 2) return ParsedWhere.reject("BETWEEN takes two bounds");
-            const lo = switch (try leafExpr(alloc, params, parser.asNode(bounds[0].ptr_value))) {
+            const lo_node = parser.asNode(bounds[0].ptr_value);
+            const lo = switch (try leafExpr(alloc, params, lo_node)) {
                 .expr => |e| e,
                 .invalid => |msg| return .{ .invalid = msg },
             };
-            const hi = switch (try leafExpr(alloc, params, parser.asNode(bounds[1].ptr_value))) {
+            const hi_node = parser.asNode(bounds[1].ptr_value);
+            const hi = switch (try leafExpr(alloc, params, hi_node)) {
                 .expr => |e| e,
                 .invalid => |msg| return .{ .invalid = msg },
             };
@@ -1268,7 +1295,9 @@ fn cmpOf(lhs: *const Expr, op: CmpOp, rhs: *const Expr) Where {
     return .{ .cmp = .{ .lhs = lhs, .op = op, .rhs = rhs } };
 }
 
-/// One side of a WHERE leaf, parsed into its own arena cell.
+/// One side of a WHERE leaf, parsed into its own arena cell at the
+/// leaf's own nesting level: the leaf is no deeper than its
+/// comparison.
 const ParsedLeaf = union(enum) { expr: *const Expr, invalid: String };
 
 fn leafExpr(
@@ -1320,6 +1349,8 @@ fn parseExpr(
     params: *ParamTally,
     p: ?*c.Node,
 ) parser.ParseError!ParsedExpr {
+    if (pastStackBudget())
+        return ParsedExpr.reject("statement nested too deeply");
     if (constant(p)) |ac| {
         const lit = try literalFrom(arloc, ac);
         if (lit == .unsupported)
@@ -1383,13 +1414,15 @@ fn parseExpr(
 
     if (ae.rexpr == null) return ParsedExpr.reject(bad_op);
     const rhs = try arloc.create(Expr);
-    rhs.* = switch (try parseExpr(arloc, params, parser.asNode(ae.rexpr))) {
+    const right = parser.asNode(ae.rexpr);
+    rhs.* = switch (try parseExpr(arloc, params, right)) {
         .expr => |e| e,
         .invalid => |msg| return .{ .invalid = msg },
     };
     const lhs = try arloc.create(Expr);
     if (ae.lexpr != null) {
-        lhs.* = switch (try parseExpr(arloc, params, parser.asNode(ae.lexpr))) {
+        const left = parser.asNode(ae.lexpr);
+        lhs.* = switch (try parseExpr(arloc, params, left)) {
             .expr => |e| e,
             .invalid => |msg| return .{ .invalid = msg },
         };

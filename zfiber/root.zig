@@ -47,6 +47,7 @@ pub const currentWorker = _rt.currentWorker;
 pub const currentWorkerOrNull = _rt.currentWorkerOrNull;
 pub const currentFiber = _rt.currentFiber;
 pub const currentFiberOrNull = _rt.currentFiberOrNull;
+pub const stackUsed = _rt.stackUsed;
 pub const dumpFibers = _rt.dumpFibers;
 pub const dumpWorkerCpu = _rt.dumpWorkerCpu;
 pub const profile = @import("profile.zig");

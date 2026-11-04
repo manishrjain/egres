@@ -1581,6 +1581,15 @@ pub fn currentFiberOrNull() ?*Fiber {
     return w.current_fiber;
 }
 
+/// Bytes of the current fiber's stack in use at the caller's frame,
+/// or null off a fiber. A recursion over input of unbounded depth
+/// checks this against its budget on every step, so it fails the
+/// request instead of running into the guard page.
+pub inline fn stackUsed() ?usize {
+    const f = currentFiberOrNull() orelse return null;
+    return f.coro.context.stack_info.base - @frameAddress();
+}
+
 /// Write a per-worker CPU-time distribution: each worker's `cpu_total_ns`
 /// (the cumulative fiber-execution time charged to it) in ms, with a `#` bar,
 /// followed by total / min / max / avg and a max/avg imbalance ratio (1.0 ==

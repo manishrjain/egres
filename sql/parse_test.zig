@@ -1524,3 +1524,81 @@ test "sql.parse: expressions stand in SELECT targets and on both WHERE sides" {
     try testing.expectEqualStrings("nullif", terms[3].is_null.expr.call.func.name);
     try testing.expect(!terms[3].is_null.negate);
 }
+
+fn repeat(alloc: std.mem.Allocator, piece: String, n: usize) ![]u8 {
+    const out = try alloc.alloc(u8, piece.len * n);
+    for (0..n) |i| @memcpy(out[i * piece.len ..][0..piece.len], piece);
+    return out;
+}
+
+test "sql.parse: a WHERE or expression nested past the budget is refused" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Far past the parse stack budget whatever the build: a level
+    // costs up to 5 KiB in Debug and 1 KiB in ReleaseSafe, so the
+    // budget is 50 to 400 levels. The rejection comes from the budget,
+    // not the guard page, and either frame may be the one that
+    // crosses it, so both rejections carry the same message.
+    const deep = 2000;
+    const opens = try repeat(alloc, "(1 + ", deep);
+    const closes = try repeat(alloc, ")", deep);
+    const cases = [_]struct { sql: String, needle: String }{
+        .{
+            .sql = try std.mem.concat(alloc, u8, &.{
+                "SELECT id FROM t WHERE ", try repeat(alloc, "NOT ", deep),
+                "id = 1",
+            }),
+            .needle = "statement nested too deeply",
+        },
+        .{
+            .sql = try std.mem.concat(alloc, u8, &.{
+                "SELECT id FROM t WHERE ",
+                try repeat(alloc, "(id = 1 AND ", deep),
+                "id = 1",
+                closes,
+            }),
+            .needle = "statement nested too deeply",
+        },
+        .{
+            .sql = try std.mem.concat(alloc, u8, &.{
+                "SELECT id FROM t WHERE id = ", opens, "1", closes,
+            }),
+            .needle = "statement nested too deeply",
+        },
+        .{
+            .sql = try std.mem.concat(alloc, u8, &.{
+                "UPDATE t SET v = ", opens, "1", closes,
+            }),
+            .needle = "statement nested too deeply",
+        },
+        .{
+            .sql = try std.mem.concat(alloc, u8, &.{
+                "SELECT ", try repeat(alloc, "coalesce(", deep), "1", closes,
+                " FROM t",
+            }),
+            .needle = "statement nested too deeply",
+        },
+    };
+    for (cases) |case| {
+        const stmt = try parse.statement(alloc, case.sql);
+        try testing.expect(stmt == .invalid);
+        const msg = stmt.invalid;
+        try testing.expect(std.mem.indexOf(u8, msg, case.needle) != null);
+    }
+
+    // Under the budget in every build, nesting is a query like any
+    // other.
+    const fine = 32;
+    const nots = try std.mem.concat(alloc, u8, &.{
+        "SELECT id FROM t WHERE ", try repeat(alloc, "NOT ", fine), "id = 1",
+    });
+    try testing.expect((try parse.statement(alloc, nots)) == .select);
+    const sums = try std.mem.concat(alloc, u8, &.{
+        "UPDATE t SET v = ", try repeat(alloc, "(1 + ", fine),
+        "1",                 try repeat(alloc, ")", fine),
+    });
+    try testing.expect((try parse.statement(alloc, sums)) == .update);
+}
