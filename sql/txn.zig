@@ -5,10 +5,12 @@
 //! implicit (one statement, auto-commit) today; interactive
 //! (BEGIN..COMMIT) changes only its lifetime. Pending writes live in a
 //! private skiplist — the memtable structure — holding full marshaled
-//! keys at ts = read_ts. Point read-your-own-writes is a skiplist get;
-//! scans can merge the skiplist in as one more iterator source; commit
-//! walks it in key order into the flat wire kv list. Nothing touches
-//! shared storage before commit; rollback just drops the skiplist.
+//! keys at kv.pending_ts, above every committed version. Reads merge
+//! the skiplist in as the first source, so a pending row shadows the
+//! committed one and a pending posting delta folds over the committed
+//! chain; commit walks it in key order into the flat wire kv list.
+//! Nothing touches shared storage before commit; rollback just drops
+//! the skiplist.
 
 const std = @import("std");
 const utils = @import("utils");
@@ -16,6 +18,7 @@ const fiber = @import("zfiber");
 const zdb = @import("zdb");
 
 const zen = zdb.buffers;
+const zroar = zdb.zroar;
 const Item = zdb.kv.Item;
 const Key = zdb.kv.Key;
 const Forest = zdb.forest.Forest;
@@ -140,11 +143,10 @@ pub const Txn = struct {
     /// a key another txn committed above our snapshot advances read_ts to
     /// that commit — after revalidating every prior read (see bump
     /// notes there) and forcing the current statement to restart at the
-    /// new snapshot. Pending entries are inserted at the read_ts in
-    /// effect at their put: at-or-above every committed version the txn
-    /// can see, and visible to its own scans. The commit timestamp is
-    /// raft's, not ours — apply rewrites every wire key's ts to the
-    /// commit entry's HLC.
+    /// new snapshot. Pending entries carry kv.pending_ts, above every
+    /// committed version and visible to the txn's own reads at any
+    /// snapshot. The commit timestamp is raft's, not ours — apply
+    /// rewrites every wire key's ts to the commit entry's HLC.
     ///
     /// The forest counts this txn among its open reads at `read_ts`
     /// (`Forest.read_marks`), which holds the read floor at or below it
@@ -171,6 +173,24 @@ pub const Txn = struct {
     /// value+meta in place (putItem's exact-match path) — last write
     /// wins within the txn. Owns its arena; released in deinit.
     writes: ?*zdb.skl.SkipList = null,
+    /// Pending secondary-index posting ops, per index key: the egids
+    /// this txn adds to and removes from the committed posting, as
+    /// bitmaps, so an op is O(1) and an opposite op on one egid
+    /// cancels. Keyed by the marshaled index Key. A dirty key is
+    /// written to `writes` as one RoaringDelta before any read merges
+    /// the write set (materializePostings).
+    postings: std.StringHashMapUnmanaged(Posting) = .empty,
+
+    pub const Posting = struct {
+        adds: zroar.Bitmap,
+        removes: zroar.Bitmap,
+        dirty: bool = true,
+
+        fn deinit(self: *Posting) void {
+            self.adds.deinit();
+            self.removes.deinit();
+        }
+    };
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -200,13 +220,26 @@ pub const Txn = struct {
         self.prev.deinit(self.allocator);
         self.cur.deinit(self.allocator);
         if (self.writes) |w| w.release();
+        self.dropPostings();
         self.dropSavepointsFrom(0);
         self.savepoints.deinit(self.allocator);
+    }
+
+    fn dropPostings(self: *Txn) void {
+        var it = self.postings.iterator();
+        while (it.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            e.value_ptr.deinit();
+        }
+        self.postings.deinit(self.allocator);
+        self.postings = .empty;
     }
 
     /// SAVEPOINT `name`: remember the write set as it stands. A name
     /// may repeat; RELEASE and ROLLBACK TO address the newest.
     pub fn savepoint(self: *Txn, name: String) !void {
+        // The write set holds every posting, so the snapshot does too.
+        try self.materializePostings();
         const copy = if (self.writes) |w|
             try snapshotWrites(self.allocator, w)
         else
@@ -249,6 +282,9 @@ pub const Txn = struct {
 
         if (self.writes) |w| w.release();
         self.writes = restored;
+        // The cache is ahead of the restored set: a key reloads from it
+        // on its next op (postingFor).
+        self.dropPostings();
 
         const since = self.held_rows.items[sp.held_rows_idx..];
         self.db.row_locks.releaseMany(since, self.id);
@@ -488,7 +524,7 @@ pub const Txn = struct {
                 .primary = primary,
             },
             .versions = .{ .one = .{
-                .ts = self.read_ts,
+                .ts = zdb.kv.pending_ts,
                 .meta = meta,
                 .value = val,
             } },
@@ -505,35 +541,29 @@ pub const Txn = struct {
     }
 
     /// A pending secondary-index posting op: add/remove this row's
-    /// egid under an index key. Rides the writes skiplist under
-    /// key = {ns, index table, primary = index_key} with the version's
-    /// TIMESTAMP holding the EGID — the one place a pending version's
-    /// ts is not a timestamp — so one index key's ops form a
-    /// contiguous run (egids descending, versions sort ts DESC) and the
-    /// same (index_key, egid) always lands on the same node. The op is
-    /// the 1-byte value; `noop` marks an annihilated pair and never
-    /// reaches the wire.
-    pub const PostingOp = enum(u8) { add, remove, noop };
+    /// egid under an index key.
+    pub const PostingOp = enum(u8) { add, remove };
 
-    /// Meta for pending posting entries: the discriminator wireKvs
-    /// uses to tell posting runs from row versions (row writes are
-    /// never roaring).
+    /// Meta for pending posting entries: a RoaringDelta, the shape a
+    /// committed posting delta has, so a read folds it over the
+    /// committed chain like any other, and wireKvs tells posting items
+    /// from row versions by it (row writes are never roaring).
     const posting_meta: Meta = .{ .kind = .delta, .encoding = .roaring };
 
     /// Record `op` for (index key, egid) — no locks: posting deltas
     /// commute, and the ROW's lock already serializes add/remove of
-    /// one egid (docs/transactions.md, lock classes).
+    /// one egid (docs/design/transactions.md, lock classes).
     ///
-    /// Annihilation, not last-write-wins: ops for one (index_key,
+    /// Cancellation, not last-write-wins: ops for one (index_key,
     /// egid) strictly alternate within a txn — a remove is only
     /// emitted when the pending-aware row currently maps to this
     /// index key, an add only when it doesn't, and egids are never
-    /// reused after a delete. An opposite pending op therefore
-    /// cancels to `noop` (the pair nets to "no change vs committed
-    /// state"), and a later op re-opens the slot. This keeps the wire
-    /// delta the EXACT diff: UPDATE 3→5→3 emits nothing at all — no
-    /// spurious record, and no spurious oracle bump for concurrent
-    /// readers of an index key this txn net-changed nothing on.
+    /// reused after a delete. An opposite op therefore takes the
+    /// pending one out (the pair nets to "no change vs committed
+    /// state"), and a later op puts it back. This keeps the delta the
+    /// EXACT diff: UPDATE 3→5→3 emits nothing at all — no spurious
+    /// record, and no spurious oracle bump for concurrent readers of
+    /// an index key this txn net-changed nothing on.
     pub fn putPosting(
         self: *Txn,
         table_id: u32,
@@ -543,99 +573,116 @@ pub const Txn = struct {
     ) !void {
         // egid 0 never exists (allocation starts at 1).
         std.debug.assert(egid != 0);
-        std.debug.assert(op != .noop);
+        const posting = try self.postingFor(table_id, index_key);
+        switch (op) {
+            .add => if (!posting.removes.remove(egid)) {
+                _ = try posting.adds.set(egid);
+            },
+            .remove => if (!posting.adds.remove(egid)) {
+                _ = try posting.removes.set(egid);
+            },
+        }
+        posting.dirty = true;
+    }
+
+    /// The pending ops under one index key, created on first touch:
+    /// from the delta `writes` already holds for it when there is one
+    /// (a ROLLBACK TO rebuilt the write set and dropped the cache),
+    /// else empty.
+    fn postingFor(self: *Txn, table_id: u32, index_key: String) !*Posting {
         const key = Key{
             .namespace = self.ns,
             .table_id = table_id,
             .primary = index_key,
         };
-        const w = try self.pendingWrites();
-        var next = op;
-        // getVersion is MVCC-style (newest version <= ts), so require
-        // the exact egid before treating it as this egid's slot.
-        if (w.getVersion(key, egid)) |ver| {
-            if (ver.ts == egid) {
-                const cur: PostingOp = @enumFromInt(ver.value[0]);
-                std.debug.assert(cur != op); // alternation, see above
-                // Same op stays itself (idempotent — must not
-                // annihilate even though the assert says it can't
-                // happen); noop re-opens; opposite ops cancel.
-                next = if (cur == op or cur == .noop) op else .noop;
-            }
+        const marshaled = try key.marshal(self.allocator);
+        const gop = try self.postings.getOrPut(self.allocator, marshaled);
+        if (gop.found_existing) {
+            self.allocator.free(marshaled);
+            return gop.value_ptr;
         }
-        try w.putItem(.{ .key = key, .versions = .{ .one = .{
-            .ts = egid,
-            .meta = posting_meta,
-            .value = &.{@intFromEnum(next)},
-        } } });
-    }
+        errdefer {
+            self.postings.removeByPtr(gop.key_ptr);
+            self.allocator.free(marshaled);
+        }
 
-    /// Read-your-own-writes for index reads: apply this txn's pending
-    /// posting ops for one index key onto a bitmap of committed egids
-    /// (which the caller owns — getBitmap results are).
-    pub fn overlayPostings(
-        self: *Txn,
-        table_id: u32,
-        index_key: String,
-        bm: *zdb.zroar.Bitmap,
-    ) !void {
-        const w = self.writes orelse return;
-        var it = try w.iterator(self.allocator);
-        defer it.deinit();
-        const probe = Key{
-            .namespace = self.ns,
-            .table_id = table_id,
-            .primary = index_key,
+        gop.value_ptr.* = .{
+            .adds = try zroar.Bitmap.init(self.allocator),
+            .removes = try zroar.Bitmap.init(self.allocator),
+            .dirty = false,
         };
-        // The seek lands on the key's item, or on the next key when it
-        // has none. A version's ts is the egid here.
-        try it.seekRange(probe, Key.inf);
-        const item = it.itemRef() orelse return;
-        if (item.key.order(probe) != .eq) return;
-        for (item.versions.slice()) |ver| {
-            switch (@as(PostingOp, @enumFromInt(ver.value[0]))) {
-                .add => _ = try bm.set(ver.ts),
-                .remove => _ = bm.remove(ver.ts),
-                .noop => {},
-            }
+        errdefer gop.value_ptr.deinit();
+
+        // Build it from what's already there in self.writes.
+        const w = self.writes orelse return gop.value_ptr;
+        const ver = w.getVersion(key, zdb.kv.pending_ts) orelse
+            return gop.value_ptr;
+        const r = try zen.RoaringDeltaReader.init(ver.value, 0);
+        for (0..r.addsLen()) |i| {
+            _ = try gop.value_ptr.adds.set(try r.addsAt(@intCast(i)));
+        }
+        for (0..r.removesLen()) |i| {
+            _ = try gop.value_ptr.removes.set(try r.removesAt(@intCast(i)));
+        }
+        return gop.value_ptr;
+    }
+
+    /// Every dirty posting written to `writes` as its RoaringDelta,
+    /// one version per key at pending_ts, replaced in place: the write
+    /// set then holds everything a read merges and the wire carries.
+    /// A key whose ops all cancelled is an empty delta, a no-op to a
+    /// read; wireKvs leaves it out.
+    ///
+    /// It's OK to do this without a lock, because a call to this func won't be
+    /// run concurrently.
+    fn materializePostings(self: *Txn) !void {
+        var it = self.postings.iterator();
+        while (it.next()) |e| {
+            const posting = e.value_ptr;
+            if (!posting.dirty) continue;
+
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(self.allocator);
+            try encodeDelta(self.allocator, posting, &buf);
+
+            const w = try self.pendingWrites();
+            try w.putItem(.{
+                .key = Key.init(e.key_ptr.*),
+                .versions = .{ .one = .{
+                    .ts = zdb.kv.pending_ts,
+                    .meta = posting_meta,
+                    .value = buf.items,
+                } },
+            });
+            posting.dirty = false;
         }
     }
 
-    /// Read-your-own-writes for an index range: this txn's pending
-    /// posting ops on every key in [lo, hi) of `table_id`, applied to
-    /// `bm`, the union of the committed postings there. Removes before
-    /// adds: a row this txn moved between two keys of the range is
-    /// removed under its committed key and added under its new one,
-    /// and only that order leaves it present. The ops are the exact
-    /// diff against committed state (putPosting annihilates pairs), so
-    /// the range needs no per-key fold.
-    pub fn overlayPostingsInRange(
-        self: *Txn,
-        table_id: u32,
-        lo: String,
-        hi: String,
-        bm: *zdb.zroar.Bitmap,
+    /// `posting` as RoaringDelta bytes, validated: one op slot per
+    /// (key, egid) makes the lists disjoint by construction, so a
+    /// failure here is a bug, and erroring beats a corrupt posting.
+    fn encodeDelta(
+        a: std.mem.Allocator,
+        posting: *const Posting,
+        out: *std.ArrayList(u8),
     ) !void {
-        const w = self.writes orelse return;
-        var it = try w.iterator(self.allocator);
-        defer it.deinit();
-        try it.seekRange(
-            .{ .namespace = self.ns, .table_id = table_id, .primary = lo },
-            .{ .namespace = self.ns, .table_id = table_id, .primary = hi },
-        );
-        var adds = try zdb.zroar.Bitmap.init(self.allocator);
-        defer adds.deinit();
-        while (it.itemRef()) |item| : (try it.next()) {
-            // A version's ts is the egid here.
-            for (item.versions.slice()) |ver| {
-                switch (@as(PostingOp, @enumFromInt(ver.value[0]))) {
-                    .add => _ = try adds.set(ver.ts),
-                    .remove => _ = bm.remove(ver.ts),
-                    .noop => {},
-                }
-            }
-        }
-        try bm.orInPlace(&adds);
+        const adds = try posting.adds.toArray(a);
+        defer a.free(adds);
+        const removes = try posting.removes.toArray(a);
+        defer a.free(removes);
+        const delta = zen.RoaringDeltaStruct{
+            .adds = adds,
+            .removes = removes,
+        };
+        _ = try delta.marshalTo(a, out);
+        try zdb.validate.validateDelta(out.items);
+    }
+
+    /// The write set as a read merges it (ScanOptions.pending), every
+    /// pending posting materialized first. null = nothing written.
+    pub fn materializedWrites(self: *Txn) !?*zdb.skl.SkipList {
+        try self.materializePostings();
+        return self.writes;
     }
 
     /// The rows `keys` name in `table_id` as this txn sees them, in one
@@ -644,11 +691,11 @@ pub const Txn = struct {
     /// would resurrect the shadowed version) — else the forest at
     /// read_ts. Callers read at read_ts, never latest: after a lock's
     /// bump check, read_ts already covers the newest committed version
-    /// of any key this txn writes. Pending entries sit at-or-below
-    /// read_ts, so the batch sees them. Scans get the same overlay by
-    /// merging `writes` in as a source. The result borrows `keys` and
-    /// holds its pins until `deinit`; `item(key)` is null for an
-    /// absent row.
+    /// of any key this txn writes. Scans get the same overlay by
+    /// merging the write set in as a source. The result borrows `keys`
+    /// and holds its pins until `deinit`; `item(key)` is null for an
+    /// absent row, and `bitmap(key)` folds a posting, pending delta
+    /// included.
     ///
     /// Every key is recorded in `reads` — absent keys included (their
     /// absence shaped results, and a later commit of one is a conflict
@@ -670,29 +717,27 @@ pub const Txn = struct {
             .table_id = table_id,
         }, keys, .{
             .read_ts = self.read_ts,
-            .pending = self.writes,
+            .pending = try self.materializedWrites(),
         });
     }
 
     /// The pending write set as wire kvs in key order — the commit
-    /// payload. Row keys/values point into the txn arena (valid until
-    /// deinit); posting deltas and the array itself come from `a`. A
-    /// key re-put across a read_ts bump leaves versions at both
-    /// stamps in the skiplist; an item's versions are newest first, so
-    /// its newest is exactly the txn's final state. Posting items
-    /// (meta roaring) are the exception: their versions are one op
-    /// per egid, folded into a single RoaringDelta kv.
+    /// payload. Keys and values point into the txn arena (valid until
+    /// deinit); the array itself comes from `a`. A key holds one
+    /// pending version (same-stamp re-puts replace), the txn's final
+    /// state of it. A posting whose ops all cancelled is an empty
+    /// delta and is left out: nothing to record, and no oracle bump
+    /// for readers of a key this txn net-changed nothing on.
     pub fn wireKvs(self: *Txn, a: std.mem.Allocator) ![]zen.KeyValueStruct {
         var kvs: std.ArrayList(zen.KeyValueStruct) = .empty;
-        const w = self.writes orelse return kvs.toOwnedSlice(a);
+        const w = (try self.materializedWrites()) orelse
+            return kvs.toOwnedSlice(a);
+
         var it = try w.iterator(self.allocator);
         defer it.deinit();
         while (it.itemRef()) |item| : (try it.next()) {
             const ver = item.newest();
-            if (ver.meta.isRoaring()) {
-                try flattenPostings(a, &kvs, item);
-                continue;
-            }
+            if (ver.meta.isRoaring() and try emptyDelta(ver.value)) continue;
             try kvs.append(a, .{
                 .key = try item.key.marshal(a),
                 .value = ver.value,
@@ -702,45 +747,8 @@ pub const Txn = struct {
         return kvs.toOwnedSlice(a);
     }
 
-    /// Fold one index key's pending posting ops (one per egid, egids
-    /// descending) into a single RoaringDelta wire kv — or nothing,
-    /// when every op annihilated to noop.
-    fn flattenPostings(
-        a: std.mem.Allocator,
-        kvs: *std.ArrayList(zen.KeyValueStruct),
-        item: Item,
-    ) !void {
-        var adds: std.ArrayList(u64) = .empty;
-        var removes: std.ArrayList(u64) = .empty;
-        for (item.versions.slice()) |ver| {
-            // A version's ts is being used as a proxy for egid.
-            switch (@as(PostingOp, @enumFromInt(ver.value[0]))) {
-                .add => try adds.append(a, ver.ts),
-                .remove => try removes.append(a, ver.ts),
-                .noop => {},
-            }
-        }
-        const delta = zen.RoaringDeltaStruct{
-            .adds = adds.items,
-            .removes = removes.items,
-        };
-        if (delta.adds.len == 0 and delta.removes.len == 0) return;
-
-        // The run yields egids descending; the delta wants ascending.
-        std.mem.reverse(u64, delta.adds);
-        std.mem.reverse(u64, delta.removes);
-
-        var buf: std.ArrayList(u8) = .empty;
-        _ = try delta.marshalTo(a, &buf);
-        // The write-side gate. One op slot per (key, egid) makes the
-        // lists disjoint by construction; a failure here is a bug,
-        // and erroring the commit beats proposing a corrupt posting.
-        try zdb.validate.validateDelta(buf.items);
-
-        try kvs.append(a, .{
-            .key = try item.key.marshal(a),
-            .value = buf.items,
-            .meta = posting_meta.toByte(),
-        });
+    fn emptyDelta(value: String) !bool {
+        const r = try zen.RoaringDeltaReader.init(value, 0);
+        return r.addsLen() == 0 and r.removesLen() == 0;
     }
 };

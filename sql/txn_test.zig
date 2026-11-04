@@ -152,13 +152,14 @@ test "txn: multiGet reads pending first, then the forest at read_ts" {
     // Absent key: null.
     try testing.expectEqual(null, try lookupOne(&tx, "nope"));
 
-    // A pending write shadows the committed row; it sits at read_ts.
+    // A pending write shadows the committed row; it carries the
+    // pending stamp, above every committed version.
     try tx.put(tid, "k1", "new", .{});
     const found = (try lookupOne(&tx, "k1")) orelse
         return error.TestExpectedRow;
     defer found.free(testing.allocator);
     try testing.expectEqualSlices(u8, "new", found.newest().value);
-    try testing.expectEqual(read_ts, found.newest().ts);
+    try testing.expectEqual(zdb.kv.pending_ts, found.newest().ts);
 }
 
 test "txn: pending tombstone hides the committed row, no resurrection" {
@@ -520,9 +521,9 @@ test "txn: opposite posting ops annihilate; a later op re-opens" {
     defer arena.deinit();
 
     // add→remove cancels (insert-then-delete of a fresh row);
-    // remove→add cancels (UPDATE 3→5→3's home key); an all-noop run
-    // emits NOTHING on the wire — no spurious record, no oracle
-    // touch for concurrent readers of that index key.
+    // remove→add cancels (UPDATE 3→5→3's home key); a key whose ops
+    // all cancelled emits NOTHING on the wire — no spurious record,
+    // no oracle touch for concurrent readers of that index key.
     try tx.putPosting(itid, "k", 1, .add);
     try tx.putPosting(itid, "k", 1, .remove);
     try tx.putPosting(itid, "j", 2, .remove);
@@ -600,7 +601,7 @@ fn putWire(
     try fx.forest.put(items.items);
 }
 
-test "txn: overlayPostings applies pending ops onto a committed bitmap" {
+test "txn: pending posting ops fold over the committed bitmap on read" {
     var fx = try Fixture.setup(&.{});
     defer fx.teardown();
     _ = try createTree(fx.forest, .{
@@ -610,7 +611,8 @@ test "txn: overlayPostings applies pending ops onto a committed bitmap" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    // Committed posting under "blue": {2, 4}.
+    // Committed posting under "blue": {2, 4}; and a delta above the
+    // snapshot (read_ts 500) that no read of this txn may see.
     {
         var tx = fx.txn();
         defer tx.deinit();
@@ -618,30 +620,79 @@ test "txn: overlayPostings applies pending ops onto a committed bitmap" {
         try tx.putPosting(itid, "blue", 4, .add);
         try putWire(&arena, &fx, &tx, 400);
     }
+    {
+        var tx = fx.txn();
+        defer tx.deinit();
+        try tx.putPosting(itid, "blue", 6, .add);
+        try putWire(&arena, &fx, &tx, 600);
+    }
 
     var tx = fx.txn();
     defer tx.deinit();
-    // Pending: add 9, remove 4, and an annihilated pair on 7 (noop —
-    // must stay invisible). "red" ops must not bleed into "blue".
+    // Pending: add 9, remove 4, and a cancelled pair on 7 (must stay
+    // invisible). "red" ops must not bleed into "blue".
     try tx.putPosting(itid, "blue", 9, .add);
     try tx.putPosting(itid, "blue", 4, .remove);
     try tx.putPosting(itid, "blue", 7, .add);
     try tx.putPosting(itid, "blue", 7, .remove);
     try tx.putPosting(itid, "red", 5, .add);
 
-    var bm = try fx.forest.getBitmap(testing.allocator, .{
-        .key = .{ .namespace = ns, .table_id = itid, .primary = "blue" },
-        .read_ts = read_ts,
-    });
+    var res = try tx.multiGet(itid, &.{"blue"});
+    defer res.deinit();
+    var bm = try res.bitmap(testing.allocator, "blue");
     defer bm.deinit();
-    try tx.overlayPostings(itid, "blue", &bm);
-
     try testing.expectEqual(2, bm.getCardinality());
     try testing.expect(bm.contains(2));
     try testing.expect(bm.contains(9));
     try testing.expect(!bm.contains(4));
+    try testing.expect(!bm.contains(6));
     try testing.expect(!bm.contains(7));
-    try testing.expect(!bm.contains(5));
+
+    // A key only the pending set knows reads as its adds.
+    var red_res = try tx.multiGet(itid, &.{"red"});
+    defer red_res.deinit();
+    var red = try red_res.bitmap(testing.allocator, "red");
+    defer red.deinit();
+    try testing.expectEqual(1, red.getCardinality());
+    try testing.expect(red.contains(5));
+}
+
+test "txn: posting ops survive a savepoint and rewind on ROLLBACK TO" {
+    var fx = try Fixture.setup(&.{});
+    defer fx.teardown();
+    _ = try createTree(fx.forest, .{
+        .namespace = ns,
+        .table_id = itid,
+    }, .{}, .posting_index);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var tx = fx.txn();
+    defer tx.deinit();
+    try tx.putPosting(itid, "blue", 1, .add);
+    try tx.savepoint("s");
+    try tx.putPosting(itid, "blue", 2, .add);
+    try tx.putPosting(itid, "blue", 1, .remove);
+    try testing.expect(try tx.rollbackToSavepoint("s"));
+
+    // Back to {add 1}; a later op on the key builds on that, not on
+    // the ops rolled back.
+    try tx.putPosting(itid, "blue", 3, .add);
+    var res = try tx.multiGet(itid, &.{"blue"});
+    defer res.deinit();
+    var bm = try res.bitmap(testing.allocator, "blue");
+    defer bm.deinit();
+    try testing.expectEqual(2, bm.getCardinality());
+    try testing.expect(bm.contains(1));
+    try testing.expect(bm.contains(3));
+
+    const kvs = try wireKvsArena(&arena, &tx);
+    try testing.expectEqual(1, kvs.len);
+    const r = try zdb.buffers.RoaringDeltaReader.init(kvs[0].value, 0);
+    try testing.expectEqual(2, r.addsLen());
+    try testing.expectEqual(1, try r.addsAt(0));
+    try testing.expectEqual(3, try r.addsAt(1));
+    try testing.expectEqual(0, r.removesLen());
 }
 
 test "txn: wireKvs emits key order regardless of insert order" {

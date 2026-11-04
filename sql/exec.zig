@@ -365,23 +365,13 @@ pub const BitmapNode = union(enum) {
     /// point read of the INDEX key, not a scan: any commit changing
     /// this key's membership writes a posting delta under this exact
     /// key, so one identity hash revalidates the whole result on a
-    /// later read_ts bump — phantom-free. Own pending posting ops are
-    /// overlaid. A corrupt posting fails the statement loudly.
+    /// later read_ts bump — phantom-free. The txn's own pending delta
+    /// folds in with the rest. A corrupt posting fails the statement
+    /// loudly.
     fn postingLookup(ctx: *ExecCtx, lu: IndexLookup) !zroar.Bitmap {
-        const pk = Key{
-            .namespace = ctx.tx.ns,
-            .table_id = lu.index_table_id,
-            .primary = lu.key,
-        };
-        try ctx.tx.recordRead(pk);
-        var bm = try ctx.tx.forest.getBitmap(ctx.tx.allocator, .{
-            .key = pk,
-            .read_ts = ctx.tx.read_ts,
-        });
-        errdefer bm.deinit();
-
-        try ctx.tx.overlayPostings(lu.index_table_id, lu.key, &bm);
-        return bm;
+        var res = try ctx.tx.multiGet(lu.index_table_id, &.{lu.key});
+        defer res.deinit();
+        return res.bitmap(ctx.tx.allocator, lu.key);
     }
 
     /// `WHERE <unique col> op v`: every entry between the bounds, each
@@ -399,7 +389,10 @@ pub const BitmapNode = union(enum) {
             alloc,
             .{ .namespace = ctx.tx.ns, .table_id = ir.index_table_id },
             rangeOf(ctx, ir),
-            .{ .read_ts = ctx.tx.read_ts, .pending = ctx.tx.writes },
+            .{
+                .read_ts = ctx.tx.read_ts,
+                .pending = try ctx.tx.materializedWrites(),
+            },
         );
         defer cursor.deinit();
         while (try cursor.next()) |entry| {
@@ -411,10 +404,10 @@ pub const BitmapNode = union(enum) {
     }
 
     /// `WHERE <indexed col> op v` through posting bitmaps: one cursor
-    /// over the committed index between the bounds, each key's chain
-    /// folded and unioned, then this txn's pending ops on the range
-    /// overlaid in one pass. Cheaper than a table scan while the range
-    /// is selective, which is the planner's bet for now.
+    /// over the index between the bounds, this txn's pending deltas
+    /// merged in, each key's chain folded and unioned. Cheaper than a
+    /// table scan while the range is selective, which is the planner's
+    /// bet for now.
     fn postingRange(ctx: *ExecCtx, r: IndexRange) !zroar.Bitmap {
         const alloc = ctx.tx.allocator;
         ctx.tx.recordScan();
@@ -427,6 +420,7 @@ pub const BitmapNode = union(enum) {
             .{
                 .read_ts = ctx.tx.read_ts,
                 .num_versions = std.math.maxInt(u32),
+                .pending = try ctx.tx.materializedWrites(),
             },
         );
         defer cursor.deinit();
@@ -438,7 +432,6 @@ pub const BitmapNode = union(enum) {
             defer part.deinit();
             try acc.orInPlace(&part);
         }
-        try ctx.tx.overlayPostingsInRange(r.index_table_id, r.lo, r.hi, &acc);
         return acc;
     }
 
@@ -536,7 +529,7 @@ pub const SeqScan = struct {
                 .all,
                 .{
                     .read_ts = ctx.tx.read_ts,
-                    .pending = ctx.tx.writes,
+                    .pending = try ctx.tx.materializedWrites(),
                     .pin_values = self.keep_value,
                 },
             );

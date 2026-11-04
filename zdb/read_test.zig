@@ -206,15 +206,15 @@ test "multiget: rows resolve across pending writes, memtables, L0 and L1" {
     try fx.put("k06", 50, "v5");
     try fx.putMeta("k02", 60, "", .{ .kind = .deleted });
 
-    // The txn's own writes at read_ts: a row and a tombstone over a
-    // committed row.
+    // The txn's own writes, at the pending stamp: a row and a
+    // tombstone over a committed row.
     const read_ts: u64 = 100;
     const pending = try zdb.skl.SkipList.initCapacity(alloc, 0);
     defer pending.release();
     try pending.putItem(.{
         .key = Fixture.key("k07"),
         .versions = .{ .one = .{
-            .ts = read_ts,
+            .ts = zdb.kv.pending_ts,
             .meta = .{},
             .value = "pend",
         } },
@@ -222,7 +222,7 @@ test "multiget: rows resolve across pending writes, memtables, L0 and L1" {
     try pending.putItem(.{
         .key = Fixture.key("k08"),
         .versions = .{ .one = .{
-            .ts = read_ts,
+            .ts = zdb.kv.pending_ts,
             .meta = .{ .kind = .deleted },
             .value = "",
         } },

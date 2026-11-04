@@ -242,12 +242,12 @@ pub const MultiGet = struct {
         /// Versions above this are not visible. Must be at or above
         /// `Forest.snapshotTs` for the entry points that check it.
         read_ts: u64 = std.math.maxInt(u64),
-        /// Rows only: a txn's private writes, the first source (src 0
-        /// of the memtable merge, as in ScanOptions.pending), so a
-        /// pending write wins over every committed version and a
-        /// pending tombstone reads as absent with no fallback. Not
-        /// for postings: their pending ops are per-egid entries the
-        /// sql layer overlays itself (Txn.overlayPostings).
+        /// A txn's private writes, the first source (src 0 of the
+        /// memtable merge, as in ScanOptions.pending). Its versions sit
+        /// at kv.pending_ts, so a pending row wins over every committed
+        /// version, a pending tombstone reads as absent with no
+        /// fallback, and a pending posting delta is the newest of its
+        /// chain, folded over the committed ones.
         pending: ?*_skl.SkipList = null,
         /// Rows only: hand back a tombstone version as an item
         /// (getRaw).
@@ -270,13 +270,14 @@ pub const MultiGet = struct {
         /// next source down starts strictly below what was consumed (a
         /// version that re-surfaces at a lower source after a flush
         /// or compaction arrives above it and is skipped); read_ts
-        /// before that.
+        /// before that, and never above it: a pending version taken
+        /// first sits at kv.pending_ts and bounds nothing.
         pub fn maxTs(self: *const Node, read_ts: u64) u64 {
             if (self.versions.items.len == 0) return read_ts;
             const oldest = self.versions.getLast();
             // Real HLC timestamps are never 0: no wrap.
             std.debug.assert(oldest.ts > 0);
-            return oldest.ts - 1;
+            return @min(read_ts, oldest.ts - 1);
         }
 
         /// Nothing more is wanted: the oldest taken is a state or a
@@ -373,8 +374,6 @@ pub const MultiGet = struct {
         alloc: std.mem.Allocator,
         key: String,
     ) !zroar.Bitmap {
-        // Pending posting ops are the sql layer's to overlay.
-        std.debug.assert(self.opts.pending == null);
         return foldBitmap(alloc, self.find(key).versions.items);
     }
 
@@ -694,10 +693,11 @@ pub const ScanOptions = struct {
     /// written during its backfill). Memtables are always opened.
     min_ts: u64 = 0,
     /// A transaction's private pending-write skiplist, merged in as
-    /// the highest-priority source (src 0) so the txn sees its own
-    /// uncommitted writes. Its entries carry ts = read_ts, which the
-    /// visibility filter admits and which wins equal-key ties against
-    /// committed versions (lower src wins in the merge). null = none.
+    /// the first source (src 0) so the txn sees its own uncommitted
+    /// writes. Its entries carry kv.pending_ts, which the visibility
+    /// filter admits at any read_ts and which sorts them newest in a
+    /// key's chain: a pending row shadows the committed ones, a
+    /// pending posting delta folds over them. null = none.
     pending: ?*_skl.SkipList = null,
     /// Cursor only. Off: an item's value is a borrow valid until the
     /// following `next`. On: the cursor holds the storage behind
@@ -926,7 +926,6 @@ pub const Cursor = struct {
         item: *const Item,
     ) !zroar.Bitmap {
         std.debug.assert(self.want_versions == std.math.maxInt(u32));
-        std.debug.assert(self.opts.pending == null);
         return foldBitmap(alloc, item.versions.slice());
     }
 

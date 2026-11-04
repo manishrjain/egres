@@ -349,8 +349,12 @@ pub const Memtables = struct {
         const extra: usize = @as(usize, @intFromBool(select.pending != null)) +
             @intFromBool(select.current);
         try out.ensureTotalCapacityPrecise(allocator, extra + imms.len);
+        // Pending versions sit at kv.pending_ts, above any read_ts:
+        // their iterator takes every version.
         if (select.pending) |p| out.appendAssumeCapacity(.{
-            .skiplist = try _skl.Iterator.init(allocator, p, limit),
+            .skiplist = try _skl.Iterator.init(allocator, p, .{
+                .want = limit.want,
+            }),
         });
         if (select.current) out.appendAssumeCapacity(.{
             .skiplist = try _skl.Iterator.init(allocator, self.current, limit),

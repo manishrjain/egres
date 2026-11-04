@@ -92,6 +92,14 @@ pub const Meta = packed struct(u8) {
     }
 };
 
+/// The stamp of a transaction's own pending writes, above every
+/// committed timestamp: they sort newest in any merge and shadow
+/// nothing by accident, since a committed version can never carry it.
+/// `Item.visibleAt` admits it at any read_ts. Only a txn's private
+/// write set holds versions at it; the commit stamps them with the
+/// real HLC.
+pub const pending_ts: u64 = std.math.maxInt(u64);
+
 /// One version of a row: when it was committed (ts), what it holds
 /// (value), and what's true about it (meta).
 pub const Version = struct {
@@ -149,12 +157,14 @@ pub const Item = struct {
     /// with `ts <=` it. Null when every version is newer. A walk from
     /// the newest, not a binary search: reads are almost always at or
     /// near the newest version, so the first compare usually decides.
+    /// The versions at or below `ts`, newest first — a pending one
+    /// (`pending_ts`) always among them — or null when there is none.
     pub fn visibleAt(self: Item, ts: u64) ?Item {
         switch (self.versions) {
-            .one => |ver| return if (ver.ts <= ts) self else null,
+            .one => |ver| return if (visible(ver, ts)) self else null,
             .many => |vers| {
                 for (vers, 0..) |ver, i| {
-                    if (ver.ts <= ts) {
+                    if (visible(ver, ts)) {
                         return .{
                             .key = self.key,
                             .versions = .{ .many = vers[i..] },
@@ -164,6 +174,10 @@ pub const Item = struct {
                 return null;
             },
         }
+    }
+
+    fn visible(ver: Version, ts: u64) bool {
+        return ver.ts <= ts or ver.ts == pending_ts;
     }
 
     /// The chain a read folds: the versions down to and including the

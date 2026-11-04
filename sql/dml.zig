@@ -1746,7 +1746,6 @@ fn groupOps(
             egid = changes[ik.row].egid;
         },
         .remove => removes += 1,
-        .noop => unreachable,
     };
     return .{ .adds = adds, .removes = removes, .egid = egid };
 }

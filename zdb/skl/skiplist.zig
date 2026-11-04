@@ -220,10 +220,7 @@ pub const SkipList = struct {
 
     /// Write every version of `item`. A version at a timestamp the key
     /// already holds replaces that one; any other goes into the chain at
-    /// its timestamp, whatever order versions arrive in. A txn's pending
-    /// posting ops carry the egid in the timestamp and arrive in egid
-    /// order, and a row re-put after a read_ts bump lands above its
-    /// first write, so no ordering is assumed.
+    /// its timestamp, whatever order versions arrive in.
     pub fn putItem(self: *Self, item: Item) Error!void {
         var lefties = [_]?*Node{null} ** max_height;
         const found = self.findNode(item.key, &lefties);
