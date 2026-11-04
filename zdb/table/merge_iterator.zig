@@ -324,7 +324,7 @@ pub const MergeIterator = struct {
         self.n_cur = 1;
         while (self.n_cur < self.live.items.len) : (self.n_cur += 1) {
             const item = self.live.items[self.n_cur].item.?;
-            if (item.key.order(first.key) != .eq) break;
+            if (!item.key.eq(first.key)) break;
         }
         if (self.n_cur == 1) {
             self.cur = first;
@@ -421,7 +421,7 @@ pub const ConcatIterator = struct {
                 // First table whose biggest key >= start.
                 const Pred = struct {
                     fn f(sk: Key, it: _table.TableIterator) bool {
-                        return it.table.biggest.orderPrimary(sk) != .lt;
+                        return it.table.biggest.gePrimary(sk);
                     }
                 };
                 const idx = utils.search(
@@ -439,7 +439,7 @@ pub const ConcatIterator = struct {
                 // one after hold nothing below `end`.
                 const Pred = struct {
                     fn f(ek: Key, it: _table.TableIterator) bool {
-                        return it.table.smallest.orderPrimary(ek) != .lt;
+                        return it.table.smallest.gePrimary(ek);
                     }
                 };
                 const above = utils.search(

@@ -121,7 +121,7 @@ pub const Level = struct {
         } else {
             std.mem.sort(TableEntry, self.tables.items, {}, struct {
                 fn lt(_: void, a: TableEntry, b: TableEntry) bool {
-                    return a.table.smallest.orderPrimary(b.table.smallest) == .lt;
+                    return a.table.smallest.ltPrimary(b.table.smallest);
                 }
             }.lt);
         }
@@ -221,7 +221,7 @@ pub const Level = struct {
         else
             utils.search(TableEntry, items, kr.left, struct {
                 fn f(kl: Key, e: TableEntry) bool {
-                    return kl.orderPrimary(e.table.biggest) != .gt;
+                    return kl.lePrimary(e.table.biggest);
                 }
             }.f);
         // First table where kr.right < smallest (no longer overlapping).
@@ -230,7 +230,7 @@ pub const Level = struct {
         else
             utils.search(TableEntry, items, kr.right, struct {
                 fn f(right_key: Key, e: TableEntry) bool {
-                    return right_key.orderPrimary(e.table.smallest) == .lt;
+                    return right_key.ltPrimary(e.table.smallest);
                 }
             }.f);
         return items[left..right];
@@ -303,7 +303,7 @@ pub const Level = struct {
         // First table whose biggest key >= search_key.
         const lo = utils.search(TableEntry, self.tables.items, search_key, struct {
             fn f(sk: Key, e: TableEntry) bool {
-                return e.table.biggest.orderPrimary(sk) != .lt;
+                return e.table.biggest.gePrimary(sk);
             }
         }.f);
         if (lo >= self.tables.items.len) return;
@@ -313,7 +313,7 @@ pub const Level = struct {
         // Verify the key can actually be in this table: a table whose
         // smallest primary is greater than the search primary cannot hold
         // the key at any timestamp.
-        if (e.table.smallest.orderPrimary(search_key) == .gt) return;
+        if (e.table.smallest.gtPrimary(search_key)) return;
         if (!e.table.containsPrimary(search_key.primary)) return;
 
         try out.append(allocator, e);
@@ -340,7 +340,7 @@ pub const Level = struct {
         try it.seekRange(lookup.key, Key.inf);
 
         const found = it.itemRef() orelse return null;
-        if (found.key.order(lookup.key) != .eq) return null;
+        if (!found.key.eq(lookup.key)) return null;
 
         const vis = found.visibleAt(lookup.read_ts) orelse return null;
         return try vis.dupe(allocator);

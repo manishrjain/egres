@@ -498,7 +498,7 @@ pub fn buildSplit(
     defer held.release();
     for (left_tree.levels, 0..) |*llv, llv_idx| {
         for (llv.entries(held)) |tbe| {
-            if (tbe.table.smallest.orderPrimary(split_key) != .lt) { // .eq or .gt
+            if (tbe.table.smallest.gePrimary(split_key)) {
                 // Right-only: remove from old tree, add to new tree.
                 try table_changes.append(alloc, _manifest.deleteSSTableChange(
                     tbe.id,
@@ -513,9 +513,7 @@ pub fn buildSplit(
                     @intCast(llv_idx),
                     tbe.table.extent,
                 ));
-            } else if (tbe.table.biggest.orderPrimary(
-                split_key,
-            ) != .lt) { // .eq or .gt
+            } else if (tbe.table.biggest.gePrimary(split_key)) {
                 // order: smallest key < split key <= biggest key
                 // Therefore, the split key falls within the table.
                 // Shared: keep in old tree, also add to new tree.

@@ -558,7 +558,7 @@ pub const MultiGet = struct {
         // is a hot row of the next table with thousands of versions.
         try it.seekRange(start, start.after());
         while (it.itemRef()) |found| {
-            if (found.key.order(start) != .eq) return;
+            if (!found.key.eq(start)) return;
             if (found.visibleAt(node.maxTs(read_ts))) |vis| {
                 var buf: [1]Pin = undefined;
                 try self.take(node, vis.chain(), it.currentPins(&buf));
@@ -1127,7 +1127,7 @@ pub fn maxKey(
                 const b = items[items.len - 1].table.biggest; // rightmost
                 if (b.primary.len == 0) continue;
 
-                if (best_sst == null or b.orderPrimary(best_sst.?) == .gt) {
+                if (best_sst == null or b.gtPrimary(best_sst.?)) {
                     best_sst = b;
                 }
             }
@@ -1148,7 +1148,7 @@ pub fn maxKey(
     for (iters) |*it| {
         try it.seekRange(range.left, range.right);
         while (it.skiplist.itemRef()) |item| : (try it.skiplist.next()) {
-            if (best == null or item.key.order(best.?) == .gt) best = item.key;
+            if (best == null or item.key.gt(best.?)) best = item.key;
         }
     }
 

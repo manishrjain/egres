@@ -432,7 +432,7 @@ pub const Builder = struct {
         // Keys of one table are keys of one tree, so their primaries
         // alone order them.
         if (self.last_key.items.len > 0) {
-            if (key.orderPrimary(self.lastKey()) != .gt) {
+            if (key.lePrimary(self.lastKey())) {
                 return error.KeyOrderViolation;
             }
         }

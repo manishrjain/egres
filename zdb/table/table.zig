@@ -392,7 +392,7 @@ pub const Table = struct {
         const Base = _buffers.BlockIndexStruct;
         const above = utils.search(Base, blocks, target, struct {
             fn f(sk: Key, b: Base) bool {
-                return baseKeyOf(b).orderPrimary(sk) == .gt;
+                return baseKeyOf(b).gtPrimary(sk);
             }
         }.f);
         return if (above > 0) above - 1 else 0;
@@ -409,7 +409,7 @@ pub const Table = struct {
         const Base = _buffers.BlockIndexStruct;
         const from = utils.search(Base, blocks, k, struct {
             fn f(sk: Key, b: Base) bool {
-                return baseKeyOf(b).orderPrimary(sk) != .lt;
+                return baseKeyOf(b).gePrimary(sk);
             }
         }.f);
         const last = blocks[blocks.len - 1];
@@ -975,20 +975,20 @@ pub const TableIterator = struct {
         self.stop_bpos = null;
         switch (self.dir) {
             .forward => if (!end.isInf() and !end.isTableEdge()) {
-                if (end.orderPrimary(self.table.smallest) != .gt) {
+                if (end.lePrimary(self.table.smallest)) {
                     self.valid = false;
                     return;
                 }
-                if (end.orderPrimary(self.table.biggest) != .gt) {
+                if (end.lePrimary(self.table.biggest)) {
                     self.stop_bpos = self.table.blockFor(end) orelse 0;
                 }
             },
             .reverse => if (!start.isInf() and !start.isTableEdge()) {
-                if (start.orderPrimary(self.table.biggest) == .gt) {
+                if (start.gtPrimary(self.table.biggest)) {
                     self.valid = false;
                     return;
                 }
-                if (start.orderPrimary(self.table.smallest) == .gt) {
+                if (start.gtPrimary(self.table.smallest)) {
                     self.stop_bpos = self.table.blockFor(start) orelse 0;
                 }
             },
@@ -1073,7 +1073,7 @@ pub const TableIterator = struct {
         var from: usize = 0;
         if (self.bi != null and self.bpos == lo) {
             if (self.bi.?.itemRef()) |cur| {
-                if (cur.key.orderPrimary(target) != .gt) from = self.bi.?.entry_idx;
+                if (cur.key.lePrimary(target)) from = self.bi.?.entry_idx;
             }
         } else {
             try self.setBlock(lo);

@@ -79,7 +79,7 @@ pub const TableTrees = struct {
     }
 
     fn lessByLeft(_: void, a: *Tree, b: *Tree) bool {
-        return a.key_range.left.order(b.key_range.left) == .lt;
+        return a.key_range.left.lt(b.key_range.left);
     }
 
     /// Add a tree and keep entries sorted by key_range.left. Takes over the
@@ -219,8 +219,8 @@ pub const TableTrees = struct {
             // The first tree's left is unbounded: below every key.
             const left = self.entries.items[mid].key_range.left;
             const below = left.isInf() or switch (dir) {
-                .forward => left.order(search_key) != .gt,
-                .reverse => left.order(search_key) == .lt,
+                .forward => left.le(search_key),
+                .reverse => left.lt(search_key),
             };
             if (below) {
                 lo = mid + 1;
@@ -231,7 +231,7 @@ pub const TableTrees = struct {
         if (lo == 0) return null;
         const candidate = self.entries.items[lo - 1];
         const right = candidate.key_range.right;
-        if (!right.isInf() and right.order(search_key) == .lt) return null;
+        if (!right.isInf() and right.lt(search_key)) return null;
         return candidate;
     }
 };

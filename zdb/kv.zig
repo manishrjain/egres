@@ -522,16 +522,46 @@ pub const Key = struct {
         );
     }
 
+    /// `order` as a predicate, so a bound check reads as the compare
+    /// it means: `a.le(b)`, not `a.order(b) != .gt`.
+    pub fn lt(self: Key, other: Key) bool {
+        return self.order(other) == .lt;
+    }
+    pub fn le(self: Key, other: Key) bool {
+        return self.order(other) != .gt;
+    }
+    pub fn eq(self: Key, other: Key) bool {
+        return self.order(other) == .eq;
+    }
+    pub fn ge(self: Key, other: Key) bool {
+        return self.order(other) != .lt;
+    }
+    pub fn gt(self: Key, other: Key) bool {
+        return self.order(other) == .gt;
+    }
+
+    /// `orderPrimary` as a predicate, as `lt`..`gt` are for `order`.
+    pub fn ltPrimary(self: Key, other: Key) bool {
+        return self.orderPrimary(other) == .lt;
+    }
+    pub fn lePrimary(self: Key, other: Key) bool {
+        return self.orderPrimary(other) != .gt;
+    }
+    pub fn eqPrimary(self: Key, other: Key) bool {
+        return self.orderPrimary(other) == .eq;
+    }
+    pub fn gePrimary(self: Key, other: Key) bool {
+        return self.orderPrimary(other) != .lt;
+    }
+    pub fn gtPrimary(self: Key, other: Key) bool {
+        return self.orderPrimary(other) == .gt;
+    }
+
     /// Length of the marshaled key: 0 for `inf`, the prefix plus the
     /// primary otherwise.
     pub inline fn len(self: Key) usize {
         if (self.bound == .inf) return 0;
         return 12 + self.primary.len;
-    }
-
-    /// Same primary key, ignoring namespace/table_id.
-    pub fn equalPrimary(self: Key, other: Key) bool {
-        return std.mem.eql(u8, self.primary, other.primary);
     }
 };
 
@@ -553,8 +583,8 @@ pub const KeyRange = struct {
 
     /// Whether `key` is inside `[left, right)`.
     pub fn contains(self: KeyRange, key: Key) bool {
-        if (!self.left.isInf() and key.order(self.left) == .lt) return false;
-        if (!self.right.isInf() and key.order(self.right) != .lt) return false;
+        if (!self.left.isInf() and key.lt(self.left)) return false;
+        if (!self.right.isInf() and key.ge(self.right)) return false;
         return true;
     }
 
@@ -588,10 +618,10 @@ pub const KeyRange = struct {
     pub fn overlapsWith(self: KeyRange, other: KeyRange) bool {
         // [other.left, other.right] ... [self.left, self.right]
         if (!other.right.isInf() and !self.left.isInf() and
-            other.right.order(self.left) == .lt) return false;
+            other.right.lt(self.left)) return false;
         // [self.left, self.right] ... [other.left, other.right]
         if (!self.right.isInf() and !other.left.isInf() and
-            self.right.order(other.left) == .lt) return false;
+            self.right.lt(other.left)) return false;
         return true;
     }
 
@@ -614,13 +644,13 @@ pub const KeyRange = struct {
     /// The "leftmost" lower bound (= min); an unbounded one wins.
     fn looser_left(a: Key, b: Key) Key {
         if (a.isInf() or b.isInf()) return Key.inf;
-        return if (a.order(b) == .lt) a else b;
+        return if (a.lt(b)) a else b;
     }
 
     /// The "rightmost" upper bound (= max); an unbounded one wins.
     fn looser_right(a: Key, b: Key) Key {
         if (a.isInf() or b.isInf()) return Key.inf;
-        return if (a.order(b) == .gt) a else b;
+        return if (a.gt(b)) a else b;
     }
 
     /// Pick the "rightmost" lower bound (= max). An unbounded one means
@@ -628,7 +658,7 @@ pub const KeyRange = struct {
     fn tighter_left(a: Key, b: Key) Key {
         if (a.isInf()) return b;
         if (b.isInf()) return a;
-        return if (a.order(b) == .gt) a else b;
+        return if (a.gt(b)) a else b;
     }
 
     /// Pick the "leftmost" upper bound (= min). An unbounded one means
@@ -636,7 +666,7 @@ pub const KeyRange = struct {
     fn tighter_right(a: Key, b: Key) Key {
         if (a.isInf()) return b;
         if (b.isInf()) return a;
-        return if (a.order(b) == .lt) a else b;
+        return if (a.lt(b)) a else b;
     }
 };
 
