@@ -499,8 +499,23 @@ SELECT id FROM obi ORDER BY id;
 ROLLBACK;"
 expect "rolled back: the walk is unchanged" "3 1 4 2 " \
     seq_ "SELECT id FROM obi ORDER BY n;"
-expect "DESC on the indexed column still sorts" "2 1 4 3 " \
+expect "reverse index walk: NULLs first, ties by egid" "2 1 4 3 " \
     seq_ "SELECT id FROM obi ORDER BY n DESC;"
+expect "reverse walk over a range" "1 4 " \
+    seq_ "SELECT id FROM obi WHERE n > 1 ORDER BY n DESC;"
+expect "reverse walk with LIMIT" "2 1 " \
+    seq_ "SELECT id FROM obi ORDER BY n DESC LIMIT 2;"
+expect "reverse unique walk" "4 3 2 1 " \
+    seq_ "SELECT id FROM obi ORDER BY id DESC;"
+expect "reverse walk sees this txn's writes" "2 3 4 5 " \
+    txseq_ "BEGIN;
+INSERT INTO obi VALUES (5, 0, 'e');
+UPDATE obi SET n = 9 WHERE id = 3;
+DELETE FROM obi WHERE id = 1;
+SELECT id FROM obi ORDER BY n DESC;
+ROLLBACK;"
+expect "DESC NULLS LAST sorts" "1 4 3 2 " \
+    seq_ "SELECT id FROM obi ORDER BY n DESC NULLS LAST;"
 expect "a WHERE off the key sorts" "3 1 " \
     seq_ "SELECT id FROM obi WHERE id < 4 AND n <= 3 ORDER BY n;"
 expect "DROP the indexed ORDER BY table" "DROP TABLE" q "DROP TABLE obi;"

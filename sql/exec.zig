@@ -658,13 +658,15 @@ pub const EgidSource = union(enum) {
 
 /// `SELECT * FROM t WHERE n >= 5 ORDER BY n`: the index on n between
 /// the bounds, walked in key order — values ascending, then NULL —
-/// each key's egids handed out ascending, so rows with equal n come
-/// out by egid. The cursor merges this txn's pending entries in, a
-/// posting's delta folded over the committed chain; a key whose rows
-/// this txn all removed folds to nothing and is passed over. Recorded
-/// as a scan, as any range is.
+/// or, for `ORDER BY n DESC`, in reverse; each key's egids are handed
+/// out ascending either way, so rows with equal n come out by egid.
+/// The cursor merges this txn's pending entries in, a posting's delta
+/// folded over the committed chain; a key whose rows this txn all
+/// removed folds to nothing and is passed over. Recorded as a scan,
+/// as any range is.
 pub const IndexWalk = struct {
     range: IndexRange,
+    dir: zdb.kv.Direction = .forward,
     cursor: ?Forest.Cursor = null,
     /// The key in hand's egids and a bookmark into it. The iterator
     /// points at `egids`: not movable once open.
@@ -684,11 +686,12 @@ pub const IndexWalk = struct {
                 .pending = try ctx.tx.materializedWrites(),
                 // A posting is its whole chain; a unique entry one row.
                 .num_versions = if (r.unique) 1 else std.math.maxInt(u32),
+                .direction = self.dir,
             },
         );
     }
 
-    /// The next egid in key order; null at the end of the range.
+    /// The next egid in the walk's order; null at the end of the range.
     fn next(self: *IndexWalk, ctx: *ExecCtx) !?u64 {
         if (self.range.unique) {
             const entry = (try self.cursor.?.next()) orelse return null;

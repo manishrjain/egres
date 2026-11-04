@@ -10,6 +10,7 @@
 const std = @import("std");
 const testing = std.testing;
 const sql = @import("sql");
+const zdb = @import("zdb");
 const String = sql.value.String;
 
 const BitmapNode = sql.exec.BitmapNode;
@@ -167,10 +168,12 @@ fn expectWalk(
     unique: bool,
     lo: String,
     hi: String,
+    dir: zdb.kv.Direction,
 ) !void {
     const src = source(p);
     try testing.expect(src.* == .fetch);
     try testing.expect(src.fetch.egids == .walk);
+    try testing.expectEqual(dir, src.fetch.egids.walk.dir);
     const range = src.fetch.egids.walk.range;
     try testing.expectEqual(index_table_id, range.index_table_id);
     try testing.expectEqual(unique, range.unique);
@@ -618,23 +621,23 @@ test "sql.plan: ORDER BY on an indexed column walks the index in key order" {
     // column narrows the walk; `=` is one key's span.
     var whole = try fx.planFor("", by_b);
     defer whole.deinit();
-    try expectWalk(&whole, b_index_id, false, from, keys_end);
+    try expectWalk(&whole, b_index_id, false, from, keys_end, .forward);
     var gt = try fx.planFor("b > 1", by_b);
     defer gt.deinit();
-    try expectWalk(&gt, b_index_id, false, after1, end);
+    try expectWalk(&gt, b_index_id, false, after1, end, .forward);
     try testing.expect(source(&gt).fetch.pred.?.* == .cmp);
     var between = try fx.planFor("b > 1 AND b <= 5", by_b);
     defer between.deinit();
-    try expectWalk(&between, b_index_id, false, after1, after5);
+    try expectWalk(&between, b_index_id, false, after1, after5, .forward);
     var eq = try fx.planFor("b = 5", by_b);
     defer eq.deinit();
-    try expectWalk(&eq, b_index_id, false, k5, after5);
+    try expectWalk(&eq, b_index_id, false, k5, after5, .forward);
     var unique = try fx.planFor("a >= 1", .{
         .read_ts = read_ts,
         .order_by = &.{try fx.sortKey("a", false, false)},
     });
     defer unique.deinit();
-    try expectWalk(&unique, pkey_index_id, true, k1, end);
+    try expectWalk(&unique, pkey_index_id, true, k1, end, .forward);
 
     // A term on another column, or one no range answers, sorts the
     // bitmap's rows instead: the walk would read the table through
@@ -653,14 +656,27 @@ test "sql.plan: ORDER BY on an indexed column walks the index in key order" {
     defer null_cmp.deinit();
     _ = try expectSorted(&null_cmp);
 
-    // The index order is ASC NULLS LAST and nothing else; two keys or
-    // an unindexed column sort too.
+    // DESC, NULLs first, is the index order reversed, over the same
+    // range a WHERE narrows it to; the other two NULL placements, two
+    // keys and an unindexed column sort.
     var desc = try fx.planFor("", .{
+        .read_ts = read_ts,
+        .order_by = &.{try fx.sortKey("b", true, true)},
+    });
+    defer desc.deinit();
+    try expectWalk(&desc, b_index_id, false, from, keys_end, .reverse);
+    var desc_gt = try fx.planFor("b > 1", .{
+        .read_ts = read_ts,
+        .order_by = &.{try fx.sortKey("b", true, true)},
+    });
+    defer desc_gt.deinit();
+    try expectWalk(&desc_gt, b_index_id, false, after1, end, .reverse);
+    var desc_nulls_last = try fx.planFor("", .{
         .read_ts = read_ts,
         .order_by = &.{try fx.sortKey("b", true, false)},
     });
-    defer desc.deinit();
-    _ = try expectSorted(&desc);
+    defer desc_nulls_last.deinit();
+    _ = try expectSorted(&desc_nulls_last);
     var nulls_first = try fx.planFor("", .{
         .read_ts = read_ts,
         .order_by = &.{try fx.sortKey("b", false, true)},

@@ -940,14 +940,28 @@ test "sql.exec: fetch over an index walk: key order, pending ops merged" {
         try walkEgids(a, &ctx, .{ .range = whole }),
     );
     // A range: from 10, and values_end leaves NULL's entry out.
+    const from10 = exec.IndexRange{
+        .index_table_id = itid,
+        .lo = k10,
+        .hi = sql.key.values_end,
+        .unique = false,
+    };
     try testing.expectEqualSlices(
         u64,
         &.{ 2, 8, 1, 6 },
-        try walkEgids(a, &ctx, .{ .range = .{
-            .index_table_id = itid,
-            .lo = k10,
-            .hi = sql.key.values_end,
-            .unique = false,
-        } }),
+        try walkEgids(a, &ctx, .{ .range = from10 }),
+    );
+
+    // ORDER BY n DESC: keys descending, NULL's first, the same range
+    // and pending fold; egids within a key still ascend.
+    try testing.expectEqualSlices(
+        u64,
+        &.{ 4, 1, 6, 2, 8, 7 },
+        try walkEgids(a, &ctx, .{ .range = whole, .dir = .reverse }),
+    );
+    try testing.expectEqualSlices(
+        u64,
+        &.{ 1, 6, 2, 8 },
+        try walkEgids(a, &ctx, .{ .range = from10, .dir = .reverse }),
     );
 }

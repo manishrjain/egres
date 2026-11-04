@@ -125,12 +125,13 @@ pub fn plan(
 
 /// `SELECT * FROM t WHERE n > 5 ORDER BY n`: the index on n walked in
 /// key order IS the ordering — ASC with NULLs last, the key encoding's
-/// own — so the rows need no sort. Only for one key, a bare indexed
-/// column, and a WHERE that is comparisons on that column (each one
-/// narrows the walk) or absent: any other term would have the walk
-/// read the table through the index and filter, which a bitmap on
-/// that term plus a sort beats without knowing the table. DESC and
-/// NULLS FIRST wait on a reverse cursor.
+/// own — so the rows need no sort; `ORDER BY n DESC`, NULLs first, is
+/// the same walk in reverse. The two other NULL placements sort. Only
+/// for one key, a bare indexed column, and a WHERE that is comparisons
+/// on that column (each one narrows the walk) or absent: any other
+/// term would have the walk read the table through the index and
+/// filter, which a bitmap on that term plus a sort beats without
+/// knowing the table.
 fn walkFor(
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
@@ -141,7 +142,8 @@ fn walkFor(
     if (order_by.len != 1) return null;
 
     const key = order_by[0];
-    if (key.desc or key.nulls_first) return null;
+    if (key.desc != key.nulls_first) return null;
+    const dir: zdb.kv.Direction = if (key.desc) .reverse else .forward;
 
     const col = switch (key.node.*) {
         .column => |col| col,
@@ -171,7 +173,7 @@ fn walkFor(
             return null;
         range.intersect(term_range);
     }
-    return .{ .range = range };
+    return .{ .range = range, .dir = dir };
 }
 
 /// The egid set `p` can be answered from — a SUPERSET of its rows
