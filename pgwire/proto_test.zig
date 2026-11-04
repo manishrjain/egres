@@ -392,6 +392,43 @@ test "ConnState: Query event surfaces SQL text" {
     try testing.expectEqual(conn_state.Phase.in_query, s.phase);
 }
 
+test "ConnState: a frame holds its own body only" {
+    const a = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+
+    // Startup, a Query with a 2 MiB SQL text, then the golden one.
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(a);
+    try input.appendSlice(a, &hexToBytes(startup_golden_hex));
+    const big_len: usize = 2 << 20;
+    try input.append(a, 'Q');
+    try input.appendSlice(a, &std.mem.toBytes(
+        std.mem.nativeToBig(u32, @intCast(4 + big_len + 1)),
+    ));
+    try input.appendNTimes(a, 'x', big_len);
+    try input.append(a, 0);
+    try input.appendSlice(a, &hexToBytes(query_golden_hex));
+
+    var rdr = std.Io.Reader.fixed(input.items);
+    var s = conn_state.ConnState.init(a, &rdr, &aw.writer, .{});
+    defer s.deinit();
+
+    _ = try s.nextEvent(); // drive past startup
+    const big = try s.nextEvent();
+    try testing.expectEqual(big_len, big.query.len);
+    // Sized to the body, not a step past it, and gone once the
+    // driver is done with the event.
+    try testing.expectEqual(big_len + 1, s.frame.len);
+    s.releaseBuffers();
+    try testing.expectEqual(0, s.frame.len);
+    try testing.expectEqual(0, s.scratch_out.writer.buffer.len);
+
+    const small = try s.nextEvent();
+    try testing.expectEqualStrings("SELECT 1", small.query);
+    try testing.expectEqual("SELECT 1\x00".len, s.frame.len);
+}
+
 test "ConnState: Terminate transitions to closed" {
     const a = std.testing.allocator;
     var aw: std.Io.Writer.Allocating = .init(a);

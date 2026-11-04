@@ -26,7 +26,7 @@ test "ctx: no statement means record is a no-op; off a fiber, bg" {
 
 test "ctx: records carry labels and offsets, a slow statement is kept" {
     const qctx = fiber.ctx();
-    try qctx.start("select 1", false, 0);
+    try qctx.start("select 1", false);
     try std.testing.expect(qctx.arena != null);
 
     fiber.ctx().record("first", .{});
@@ -74,7 +74,7 @@ fn noteClass(out: *std.atomic.Value(u8)) void {
 
 test "ctx: helpers record into the statement, a detached fiber does not" {
     const qctx = fiber.ctx();
-    try qctx.start("select 2", false, 0);
+    try qctx.start("select 2", false);
     defer qctx.finish();
 
     var h = try fiber.spawn(.{}, recordHelper, .{});
@@ -108,7 +108,7 @@ test "ctx: a bucket keeps the newest traces and drops the oldest" {
     for (&names, 0..) |*name, i| {
         name.* = .{ 'r', 'i', 'n', 'g', '0' + @as(u8, @intCast(i)) };
         const qctx = fiber.ctx();
-        try qctx.start(name, false, 0);
+        try qctx.start(name, false);
         qctx.start_mono_us -= 200_000;
         qctx.finish();
     }
@@ -127,14 +127,14 @@ test "ctx: a statement counts on the tenant, which outlives it" {
     qctx.tenant = &t;
     defer qctx.tenant = &meter.shared;
 
-    try qctx.start("select 1", false, 0);
+    try qctx.start("select 1", false);
     try std.testing.expectEqual(1, t.totals.statements.load(.monotonic));
     try std.testing.expect(t.isActive(t.last_active_ms.load(.monotonic)));
     qctx.finish();
     // Reset to a fresh fiber's, except for whose it is.
     try std.testing.expectEqual(&t, qctx.tenant);
     try std.testing.expect(qctx.arena == null);
-    try qctx.start("select 2", false, 0);
+    try qctx.start("select 2", false);
     qctx.finish();
     try std.testing.expectEqual(2, t.totals.statements.load(.monotonic));
 }
@@ -145,7 +145,7 @@ test "ctx: a statement's arenas count on it and its tenant, to the cap" {
     const qctx = fiber.ctx();
     qctx.tenant = &t;
     defer qctx.tenant = &meter.shared;
-    try qctx.start("select 1", false, 0);
+    try qctx.start("select 1", false);
     defer qctx.finish();
     var arena = qctx.newArena();
     defer arena.deinit();

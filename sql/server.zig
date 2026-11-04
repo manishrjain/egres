@@ -304,7 +304,10 @@ fn handleConn(self: *Server, stream: fiber.net.Stream) void {
     var s = stream;
     defer s.close();
 
-    var handler = Handler{ .srv = self };
+    var handler = Handler{
+        .srv = self,
+        .alloc = self.engine.allocator,
+    };
     // LIFO: deinit (roll back any open txn — locks released, pending
     // writes dropped) runs BEFORE the socket closes above. Covers clean
     // Terminate and every error exit from serve.
@@ -379,6 +382,10 @@ pub const Handler = struct {
     /// overflows (max_parsed). The simple path keeps its per-query
     /// arena and never looks here.
     parsed: std.StringHashMapUnmanaged(*ParsedStmt) = .empty,
+    /// What `parsed` and the row batch are made on: the engine's until
+    /// startup resolves the session's database, then that tenant's,
+    /// so both count against the tenant's pool.
+    alloc: std.mem.Allocator,
     /// The session's namespace, resolved once from the startup packet's
     /// database (Postgres resolves at connect too). 0 = the name didn't
     /// exist at connect; every query then fails with 3D000. Re-validated
@@ -415,14 +422,14 @@ pub const Handler = struct {
         }
         if (self.exec_batch) |*b| b.deinit();
         self.clearParsed();
-        self.parsed.deinit(self.srv.engine.allocator);
+        self.parsed.deinit(self.alloc);
     }
 
     fn clearParsed(self: *Handler) void {
         var it = self.parsed.valueIterator();
         while (it.next()) |entry| {
             entry.*.arena.deinit();
-            self.srv.engine.allocator.destroy(entry.*);
+            self.alloc.destroy(entry.*);
         }
         self.parsed.clearRetainingCapacity();
     }
@@ -434,11 +441,10 @@ pub const Handler = struct {
         if (self.parsed.get(sql)) |entry| return entry.stmt;
         if (self.parsed.count() >= max_parsed) self.clearParsed();
 
-        const gpa = self.srv.engine.allocator;
-        const entry = try gpa.create(ParsedStmt);
-        errdefer gpa.destroy(entry);
+        const entry = try self.alloc.create(ParsedStmt);
+        errdefer self.alloc.destroy(entry);
 
-        entry.arena = std.heap.ArenaAllocator.init(gpa);
+        entry.arena = std.heap.ArenaAllocator.init(self.alloc);
         errdefer entry.arena.deinit();
 
         const arloc = entry.arena.allocator();
@@ -446,7 +452,7 @@ pub const Handler = struct {
             error.OutOfMemory => return err,
             error.SyntaxError => return null,
         };
-        try self.parsed.put(gpa, try arloc.dupe(u8, sql), entry);
+        try self.parsed.put(self.alloc, try arloc.dupe(u8, sql), entry);
         return entry.stmt;
     }
 
@@ -474,6 +480,10 @@ pub const Handler = struct {
                 return replyShutdown(state);
 
             const ev = try session.nextEvent();
+            // The frame and the reply scratch are the tenant's memory:
+            // given back once the statement is answered, not held
+            // while the session idles.
+            defer state.releaseBuffers();
             self.dispatch(state, ev) catch |err| switch (err) {
                 error.Shutdown => return replyShutdown(state),
                 else => return err,
@@ -496,7 +506,7 @@ pub const Handler = struct {
         switch (ev) {
             .startup_complete => |params| try self.onStartup(state, params),
             .query => |sql| {
-                if (!try self.startCtx(state, sql, .{}, .simple))
+                if (!try self.startCtx(state, sql, .simple))
                     return state.endCommand();
                 defer fiber.ctx().finish();
 
@@ -504,15 +514,14 @@ pub const Handler = struct {
                 try state.endCommand();
             },
             .execute => |ctx| {
-                const params = ctx.portal.params;
-                if (!try self.startCtx(state, ctx.sql, params, .extended))
+                if (!try self.startCtx(state, ctx.sql, .extended))
                     return;
                 defer fiber.ctx().finish();
 
                 try self.onExecute(state, ctx);
             },
             .describe => |ctx| {
-                if (!try self.startCtx(state, ctx.sql, .{}, .extended))
+                if (!try self.startCtx(state, ctx.sql, .extended))
                     return;
                 defer fiber.ctx().finish();
 
@@ -545,7 +554,7 @@ pub const Handler = struct {
     /// The session's row batch, made on first use.
     pub fn batch(self: *Handler) !*_exec.Batch {
         if (self.exec_batch == null) {
-            self.exec_batch = try _exec.Batch.init(self.srv.engine.allocator);
+            self.exec_batch = try _exec.Batch.init(self.alloc);
         }
         return &self.exec_batch.?;
     }
@@ -555,23 +564,17 @@ pub const Handler = struct {
         self.srv.engine.allocator.destroy(t);
     }
 
-    /// Starts the statement's context, holding the bytes the statement
-    /// arrived in, `sql` and `params`, on the tenant for its duration,
-    /// or answers the tenant's memory refusal, out of memory, and
-    /// skips the statement: false. In the extended protocol the rest
-    /// of the batch is skipped to the Sync.
+    /// Starts the statement's context, or answers the tenant's memory
+    /// refusal, out of memory, and skips the statement: false. In the
+    /// extended protocol the rest of the batch is skipped to the Sync.
     fn startCtx(
         self: *Handler,
         state: *pgwire.ConnState,
         sql: String,
-        params: pgwire.Params,
         mode: Mode,
     ) !bool {
-        var frame_bytes = sql.len;
-        for (params.values) |value| frame_bytes += if (value) |v| v.len else 0;
-
         const in_txn = self.txn != null;
-        fiber.ctx().start(sql, in_txn, frame_bytes) catch |err| switch (err) {
+        fiber.ctx().start(sql, in_txn) catch |err| switch (err) {
             error.MemShare => {
                 try replyMemShare(state);
                 if (mode == .extended) state.ext_failed = true;
@@ -583,7 +586,6 @@ pub const Handler = struct {
     }
 
     pub fn onStartup(self: *Handler, state: *pgwire.ConnState, params: pgwire.proto.StartupParams) !void {
-        _ = state;
         const requested = params.database orelse "";
         self.namespace = self.srv.engine.forest.manifest.lookupNamespace(
             if (requested.len > 0) requested else default_database,
@@ -597,6 +599,11 @@ pub const Handler = struct {
                 utils.coarseMs(),
             );
         }
+        // What the connection reads and keeps from here, frames,
+        // prepared statements and their parsed forms, is the
+        // tenant's memory.
+        self.alloc = fiber.allocator(.tenant);
+        state.useSessionAllocator(self.alloc);
     }
 
     /// The session's namespace if it still exists, else a SQL error and null.

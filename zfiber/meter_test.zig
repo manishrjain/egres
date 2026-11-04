@@ -410,7 +410,7 @@ test "cpu: maybeYield parks a tenant in debt until its rate covers it" {
     try expect(utils.coarseMs() - again < 50);
 }
 
-test "payForMem: holds the frame, waits only while the pool is full" {
+test "payForMem: waits only while the pool is full" {
     // `capacity` is the binary's: the same box every meter test sets,
     // so the pool is filled by holding, never by shrinking it.
     meter.capacity = box;
@@ -419,33 +419,26 @@ test "payForMem: holds the frame, waits only while the pool is full" {
     t.holdMem(2000);
     defer t.releaseMem(2000);
 
-    // Past the soft limit with the pool open: no wait, and the frame
-    // is held from here.
+    // Past the soft limit with the pool open: no wait.
     var start = utils.coarseMs();
-    try t.payForMem(300);
+    try t.payForMem();
     try expect(utils.coarseMs() - start < 50);
-    try expect(t.mem_held.load(.monotonic) == 2300);
-    t.releaseMem(300);
 
-    // The pool full, read live: waits the bound out, then refuses and
-    // gives the frame back.
+    // The pool full, read live: waits the bound out, then refuses.
     meter.mem_wait_ms = 100;
     defer meter.mem_wait_ms = 5000;
     t.holdMem(box.mem_bytes);
     try expect(meter.memPressure());
     start = utils.coarseMs();
-    try std.testing.expectError(error.MemShare, t.payForMem(300));
+    try std.testing.expectError(error.MemShare, t.payForMem());
     // The coarse clock can read a ms under the sleeps it measures.
     const waited = utils.coarseMs() - start;
     try expect(waited >= 90 and waited <= 2000);
     try expect(t.totals.parked_ms.load(.monotonic) >= 100);
-    try expect(t.mem_held.load(.monotonic) == 2000 + box.mem_bytes);
 
     // Room given back meanwhile: admitted.
     t.releaseMem(box.mem_bytes);
-    try t.payForMem(300);
-    t.releaseMem(300);
+    try t.payForMem();
     // The shared tenant never waits.
-    try meter.shared.payForMem(300);
-    meter.shared.releaseMem(300);
+    try meter.shared.payForMem();
 }

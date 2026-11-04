@@ -124,11 +124,11 @@ pub const DescribeCtx = struct {
 
 pub const Event = union(enum) {
     /// Completed startup parameter parse. Slices borrow from
-    /// `scratch_in`; copy them out before the next `nextEvent` call,
-    /// which resets scratch_in.
+    /// `frame`; copy them out before `releaseBuffers` or the next
+    /// `nextEvent` call.
     startup_complete: _proto.StartupParams,
-    /// A simple Query message arrived. `sql` borrows from `scratch_in`
-    /// and is invalidated on the next `nextEvent` call.
+    /// A simple Query message arrived. `sql` borrows from `frame`
+    /// until `releaseBuffers` or the next `nextEvent` call.
     query: String,
     /// Extended-query Execute. Slices borrow from the portal's
     /// alloc-owned storage (stable across `nextEvent` until the portal
@@ -191,7 +191,7 @@ pub const StateError = error{
     /// body parser rejected it).
     BadProtocol,
     /// Allocation failure inside the state machine (statement /
-    /// portal registries, scratch_in growth).
+    /// portal registries, the frame body).
     OutOfMemory,
 } || std.Io.Reader.Error || std.Io.Writer.Error;
 
@@ -209,14 +209,22 @@ pub const ConnState = struct {
     /// Production: `fiber.net.Stream.Writer` for streaming flushes;
     /// tests: `std.Io.Writer.Allocating` (inspect via `.buffered()`).
     out: *std.Io.Writer,
-    /// Body of the *current* input frame. `clearRetainingCapacity`'d
-    /// at the top of every frame; grows to fit the largest body seen.
-    /// Event slices that point here (`startup_complete.params`,
-    /// `query.sql`) are invalidated on the next `nextEvent` call.
-    scratch_in: std.ArrayList(u8) = .empty,
-    /// Reusable scratch for building length-prefixed *output* frame
-    /// bodies before writeFrame ships them to `out`.
+    /// Body of the *current* input frame, its own allocation. Event
+    /// slices that point here (`startup_complete.params`,
+    /// `query.sql`) are invalidated by `releaseBuffers` and by the next
+    /// `nextEvent` call.
+    frame: []u8 = &.{},
+    /// Scratch for building length-prefixed *output* frame bodies
+    /// before writeFrame ships them to `out`: grows to the largest
+    /// row of a statement once and serves every row after it, then is
+    /// given back with the frame (`releaseBuffers`).
     scratch_out: std.Io.Writer.Allocating,
+    /// What the frame and what the session keeps between statements
+    /// are made on: the prepared statements and portals, with their
+    /// SQL and parameter copies. The connection's own until startup
+    /// resolves its database, then that tenant's
+    /// (`useSessionAllocator`), so a frame being read and a bound
+    /// parameter an idle session holds count against its pool.
     alloc: std.mem.Allocator,
     /// Transaction status byte for ReadyForQuery; the SQL handler flips
     /// it on BEGIN/COMMIT/ROLLBACK and statement failure.
@@ -261,8 +269,20 @@ pub const ConnState = struct {
         };
     }
 
+    /// The allocator from here on. What was made on the old one is the
+    /// startup frame, whose params are consumed by now
+    /// (`Handler.onStartup`), and the startup replies' scratch: both
+    /// are given back before the switch.
+    pub fn useSessionAllocator(self: *ConnState, a: std.mem.Allocator) void {
+        std.debug.assert(self.statements.count() == 0);
+        std.debug.assert(self.portals.count() == 0);
+        self.releaseBuffers();
+        self.alloc = a;
+        self.scratch_out = .init(a);
+    }
+
     pub fn deinit(self: *ConnState) void {
-        self.scratch_in.deinit(self.alloc);
+        self.alloc.free(self.frame);
         self.scratch_out.deinit();
         self.dropAllStatements();
         self.dropAllPortals();
@@ -277,7 +297,9 @@ pub const ConnState = struct {
 
     fn freePortal(self: *ConnState, p: *PortalEntry) void {
         self.alloc.free(p.stmt_name);
-        for (p.params) |maybe| if (maybe) |bytes| self.alloc.free(bytes);
+        for (p.params) |maybe| if (maybe) |bytes| {
+            self.alloc.free(bytes);
+        };
         self.alloc.free(p.params);
         self.alloc.free(p.param_wirefmts);
         self.alloc.free(p.result_wirefmts);
@@ -360,7 +382,7 @@ pub const ConnState = struct {
     }
 
     /// Read one startup-class frame ([u32 len][u32 code][body])
-    /// into scratch_in and return the code. Asserts len ≥ 8 (length
+    /// into `frame` and return the code. Asserts len ≥ 8 (length
     /// includes itself + code). On clean EOF before the length,
     /// returns `error.EndOfStream` for the caller to map to a
     /// `.terminate` event.
@@ -368,21 +390,40 @@ pub const ConnState = struct {
         const len = try self.in.takeInt(u32, .big);
         if (len < 8 or len > _proto.max_message_body) return error.BadProtocol;
         const code = try self.in.takeInt(u32, .big);
-        try self.scratch_in.resize(self.alloc, len - 8);
-        try self.in.readSliceAll(self.scratch_in.items);
+        try self.readBody(len - 8);
         return code;
     }
 
-    /// Read one tagged frame ([u8 tag][u32 len][body]) into
-    /// scratch_in and return the tag byte. Length includes itself
-    /// (not the tag); body is `len - 4` bytes. EOF before the header
-    /// returns `error.EndOfStream` for caller to map to `.terminate`.
+    /// Gives the frame and the output scratch back. The driver calls
+    /// it once the event is handled, so a connection idle after a
+    /// 16 MiB row, in or out, holds nothing of it. The scratch is
+    /// left ready for the next frame on the same allocator.
+    pub fn releaseBuffers(self: *ConnState) void {
+        self.alloc.free(self.frame);
+        self.frame = &.{};
+        self.scratch_out.deinit();
+        self.scratch_out = .init(self.alloc);
+    }
+
+    /// `frame` replaced by the next body, exactly its size, and what
+    /// it holds while reading is the tenant's. A frame `nextEvent`
+    /// consumed itself, a Parse or a Bind, is freed here.
+    fn readBody(self: *ConnState, len: usize) StateError!void {
+        self.alloc.free(self.frame);
+        self.frame = &.{};
+        self.frame = try self.alloc.alloc(u8, len);
+        try self.in.readSliceAll(self.frame);
+    }
+
+    /// Read one tagged frame ([u8 tag][u32 len][body]) into `frame`
+    /// and return the tag byte. Length includes itself (not the tag);
+    /// body is `len - 4` bytes. EOF before the header returns
+    /// `error.EndOfStream` for caller to map to `.terminate`.
     fn readTaggedFrame(self: *ConnState) StateError!u8 {
         const tag = try self.in.takeByte();
         const len = try self.in.takeInt(u32, .big);
         if (len < 4 or len > _proto.max_message_body + 4) return error.BadProtocol;
-        try self.scratch_in.resize(self.alloc, len - 4);
-        try self.in.readSliceAll(self.scratch_in.items);
+        try self.readBody(len - 4);
         return tag;
     }
 
@@ -424,7 +465,7 @@ pub const ConnState = struct {
                 return .terminate;
             }
 
-            const params = _proto.parseStartupParams(self.scratch_in.items) catch
+            const params = _proto.parseStartupParams(self.frame) catch
                 return error.BadProtocol;
 
             // AuthenticationOk + a small bundle of ParameterStatus +
@@ -495,7 +536,7 @@ pub const ConnState = struct {
                 return .terminate;
             };
 
-            const body = self.scratch_in.items;
+            const body = self.frame;
             const is_ext_msg = switch (tag) {
                 .parse, .bind, .execute, .describe, .close, .flush => true,
                 else => false,
@@ -589,7 +630,8 @@ pub const ConnState = struct {
         // SQL would otherwise be stale.
         if (self.statements.contains(p.name)) self.dropStatement(p.name);
 
-        const sql_dup = self.alloc.dupe(u8, p.sql) catch return error.OutOfMemory;
+        const sql_dup = self.alloc.dupe(u8, p.sql) catch
+            return error.OutOfMemory;
         errdefer self.alloc.free(sql_dup);
         const oids_dup = self.alloc.dupe(u32, p.param_oids) catch
             return error.OutOfMemory;
@@ -680,9 +722,12 @@ pub const ConnState = struct {
         // a per-param array so handlers don't have to redo the
         // dispatch. 0 → all text; 1 → broadcast that single code.
         // The codes were checked above, so the enum conversion holds.
-        const pwirefmts = self.alloc.alloc(WireFormat, b.params.len) catch
-            return error.OutOfMemory;
+        const pwirefmts = self.alloc.alloc(
+            WireFormat,
+            b.params.len,
+        ) catch return error.OutOfMemory;
         errdefer self.alloc.free(pwirefmts);
+
         if (b.param_formats.len == 0) {
             for (pwirefmts) |*slot| slot.* = .text;
         } else if (b.param_formats.len == 1) {

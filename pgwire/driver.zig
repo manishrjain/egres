@@ -17,6 +17,7 @@
 //!     while (!session.closed()) {
 //!         const state = &session.state;
 //!         const ev = try session.nextEvent();
+//!         defer state.releaseBuffers();
 //!         switch (ev) {
 //!             .startup_complete => |params| try h.onStartup(state, params),
 //!             .query => |sql| {

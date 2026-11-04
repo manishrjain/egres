@@ -42,10 +42,10 @@
 //! pool, as its soft limit, and a tenant holding more than that waits
 //! (`payForMem`) only while the pool is full, read live from what
 //! every tenant holds. Any other time it just runs and the cache
-//! shrinks. A statement reserves its
-//! frame's bytes before the wait, so a burst of large statements
-//! fills the pool as it arrives rather than after each is admitted.
-//! The wait is bounded, since a waiting statement can hold a lock a
+//! shrinks. The frame a statement arrived in is on the tenant's
+//! allocator before the wait, so a burst of large statements fills
+//! the pool as it arrives rather than after each is admitted. The
+//! wait is bounded, since a waiting statement can hold a lock a
 //! running one needs, and ends in a refusal. A single statement past
 //! `query_mem_bytes` is refused at its next yield.
 //!
@@ -331,19 +331,14 @@ pub const Tenant = struct {
         return memPressure() and held > self.mem_soft_limit.load(.monotonic);
     }
 
-    /// Room for a statement that arrived in `hold_bytes`: those are
-    /// held from here, then the wait while the tenant is past its
-    /// soft limit under pressure, at most `mem_wait_ms`; a refusal gives
-    /// them back. Polls: a waiter exists only under pressure, and a
+    /// Room for a statement: the wait while the tenant is past its
+    /// soft limit under pressure, at most `mem_wait_ms`, then a
+    /// refusal. Polls: a waiter exists only under pressure, and a
     /// wake on every release would cost more than a sleep this short.
-    pub fn payForMem(self: *Tenant, hold_bytes: i64) error{MemShare}!void {
-        self.holdMem(hold_bytes);
+    pub fn payForMem(self: *Tenant) error{MemShare}!void {
         var waited: u64 = 0;
         while (self.overMem()) {
-            if (waited >= mem_wait_ms) {
-                self.releaseMem(hold_bytes);
-                return error.MemShare;
-            }
+            if (waited >= mem_wait_ms) return error.MemShare;
             sleepMs(mem_poll_ms);
             waited += mem_poll_ms;
             _ = self.totals.parked_ms.fetchAdd(mem_poll_ms, .monotonic);

@@ -39,6 +39,7 @@ const StubHandler = struct {
         while (!session.closed()) {
             const state = &session.state;
             const ev = try session.nextEvent();
+            defer state.releaseBuffers();
             switch (ev) {
                 .startup_complete => |params| try self.onStartup(state, params),
                 .query => |sql| {
