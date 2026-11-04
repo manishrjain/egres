@@ -596,6 +596,13 @@ fn write(
                 try idx.keys(arloc, cells[idx.column.pos])
             else
                 &.{};
+            // INSERT INTO t (k) VALUES (<70000 chars>) on an indexed k:
+            // refused here, where it is the client's error, not at the
+            // flush that could never write it.
+            for (new) |key| if (key.len > zdb.kv.Key.max_primary_len) {
+                try replyIndexKeyTooLong(state, arloc, idx, table_name);
+                return null;
+            };
             for (old) |key| if (!containsKey(new, key))
                 try keys.append(arloc, .{
                     .idx = idx,
@@ -858,6 +865,22 @@ fn collisionPred(
     else
         .{ .or_ = leaves.items };
     return root;
+}
+
+/// 54000, Postgres's code for its own index row limit: an index key
+/// longer than an SST entry holds (Key.max_primary_len).
+pub fn replyIndexKeyTooLong(
+    state: *pgwire.ConnState,
+    arloc: std.mem.Allocator,
+    idx: *const _table.Index,
+    table_name: String,
+) !void {
+    const msg = try std.fmt.allocPrint(
+        arloc,
+        "index key exceeds the maximum of {d} bytes for index \"{s}\"",
+        .{ zdb.kv.Key.max_primary_len, try idx.nameFor(arloc, table_name) },
+    );
+    try replyErrorCode(state, pgwire.sqlstate.program_limit_exceeded, msg);
 }
 
 /// 21000: INSERT INTO t VALUES (1, 5), (1, 6) ON CONFLICT (id) DO

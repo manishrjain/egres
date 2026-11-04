@@ -445,6 +445,12 @@ pub const Key = struct {
     }
 
     /// The stored form: `[ns][tid][primary]` for an exact key, empty
+    /// The longest primary an SST entry holds: the block entry stores
+    /// key lengths as u16 (table/builder.zig). The SQL layer refuses a
+    /// longer index key at the write; one that reaches the builder
+    /// anyway is logged and dropped.
+    pub const max_primary_len: usize = std.math.maxInt(u16);
+
     /// for `inf` (how a stored range writes an unbounded side). The
     /// other bounds are never stored.
     pub fn marshal(self: Key, allocator: std.mem.Allocator) !String {

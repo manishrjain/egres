@@ -80,6 +80,32 @@ fn buildTestTable(
     return b.finish();
 }
 
+test "builder: a key past max_primary_len is dropped, the rest built" {
+    const alloc = std.testing.allocator;
+    const long = try alloc.alloc(u8, Key.max_primary_len + 1);
+    defer alloc.free(long);
+    @memset(long, 'b');
+
+    var b = Builder.init(alloc, .{ .block_bytes = 4 * 1024 });
+    defer b.deinit();
+    try b.add(.{ .primary = "a" }, 1, "1");
+    try b.add(.{ .primary = long }, 1, "2");
+    try b.add(.{ .primary = "c" }, 1, "3");
+    var tb = try b.finish();
+    defer tb.deinit();
+    const tbl = try openBuffer(alloc, &tb);
+    defer destroyTable(tbl);
+
+    var it = TableIterator.init(alloc, tbl, zero_table_key, .forward);
+    defer it.deinit();
+    try it.seekRange(Key.inf, Key.inf);
+    try std.testing.expectEqualStrings("a", it.itemRef().?.key.primary);
+    try it.next();
+    try std.testing.expectEqualStrings("c", it.itemRef().?.key.primary);
+    try it.next();
+    try std.testing.expect(it.itemRef() == null);
+}
+
 // ---------------------------------------------------------------------------
 // Existing tests (updated for itemRef / blocksAt)
 // ---------------------------------------------------------------------------

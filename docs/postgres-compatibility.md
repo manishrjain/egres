@@ -168,6 +168,7 @@ CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (column);
 | `INCLUDE`, `DESC`, `NULLS FIRST`, `TABLESPACE` | Not&nbsp;yet | |
 | Other access methods (`hash`, `gin`, `gist`, `brin`) | Not&nbsp;yet | |
 | Indexes on `interval` columns | Not&nbsp;yet | As a primary key, a unique column or by `CREATE INDEX`. |
+| Index key size | Yes | An encoded key of up to 65535 bytes; a longer `text` or `bytea` value on an indexed column is `54000` at the write, or at `CREATE INDEX` over it. Postgres's btree stops at 2704 bytes. |
 | Dropping the primary key's index | Not&nbsp;yet | |
 
 ## Data types

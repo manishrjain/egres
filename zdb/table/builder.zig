@@ -111,7 +111,6 @@ const log = std.log.scoped(.table_builder);
 
 pub const Error = error{
     KeyOrderViolation,
-    KeyTooLarge,
     ValueTooLarge,
     TooManyBlocks,
     IntegerOverflow,
@@ -414,7 +413,19 @@ pub const Builder = struct {
         // last_key empty and quietly disarm both the ordering check below
         // and the base-key comparison further down.
         std.debug.assert(key.primary.len > 0);
-        if (key.primary.len > std.math.maxInt(u16)) return error.KeyTooLarge;
+        // The SQL layer refuses such a key at the write, so one here
+        // is a bug. Dropped, since a flush that fails on it would leave
+        // the memtable, and every one after it, frozen for good: the
+        // one entry is lost and said so, the node goes on.
+        if (key.primary.len > Key.max_primary_len) {
+            log.err("table {d}/{d}: dropping a key of {d} bytes, over {d}", .{
+                key.namespace,
+                key.table_id,
+                key.primary.len,
+                Key.max_primary_len,
+            });
+            return;
+        }
 
         var prev_ts: ?u64 = null;
         const ver_hdr = _buffers.BlockVersionReader.SIZE;
@@ -489,9 +500,10 @@ pub const Builder = struct {
             break :blk entry_key.len;
         } else fit_overlap;
 
-        if (overlap > std.math.maxInt(u16)) return error.KeyTooLarge;
+        // Both bounded by the key, which fits a u16.
+        std.debug.assert(overlap <= Key.max_primary_len);
         const diff = entry_key[overlap..];
-        if (diff.len > std.math.maxInt(u16)) return error.KeyTooLarge;
+        std.debug.assert(diff.len <= Key.max_primary_len);
 
         // The entry, a BlockEntry (see the layout notes at the top):
         // the key, the versions' headers newest first with each `off`

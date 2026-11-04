@@ -539,7 +539,10 @@ const IndexBuild = struct {
     /// released — a no-op if held), and reply: 23505 for a duplicate,
     /// else a plain failure. The name is free to retry either way.
     fn fail(self: *IndexBuild, what: String, err: anyerror) !void {
-        logCreateIndexErr(self.name, what, err);
+        // A duplicate or an oversized value is the client's error:
+        // answered below, not logged.
+        if (err != error.DuplicateKey and err != error.KeyTooLong)
+            logCreateIndexErr(self.name, what, err);
         self.takeBarrier();
         removeIndex(
             self.handler,
@@ -555,6 +558,18 @@ const IndexBuild = struct {
                 "could not create unique index: " ++
                     "duplicate key value violates unique constraint",
             );
+        if (err == error.KeyTooLong) {
+            const msg = try std.fmt.allocPrint(
+                self.a,
+                "index key exceeds the maximum of {d} bytes for index \"{s}\"",
+                .{ zdb.kv.Key.max_primary_len, self.name },
+            );
+            return replyErrorCode(
+                self.state,
+                pgwire.sqlstate.program_limit_exceeded,
+                msg,
+            );
+        }
         return replyError(self.state, "create index failed");
     }
 
@@ -590,13 +605,18 @@ const IndexBuild = struct {
     }
 
     /// The keys of one base row for this index, from the row's cell.
+    /// A cell too long for an SST entry fails the build, as its
+    /// INSERT would have been refused with the index in place.
     fn rowKeys(
         self: *IndexBuild,
         at: anytype,
         item: zdb.kv.Item,
     ) ![]const String {
         const cell = at.tbl.parseCol(item, at.idx.column);
-        return at.idx.keys(self.a, cell);
+        const keys = try at.idx.keys(self.a, cell);
+        for (keys) |key| if (key.len > zdb.kv.Key.max_primary_len)
+            return error.KeyTooLong;
+        return keys;
     }
 
     /// Step 6: scan the base table at `read_ts` into v1. Memory ∝

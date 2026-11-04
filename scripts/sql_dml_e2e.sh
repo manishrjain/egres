@@ -989,6 +989,26 @@ expect "connection is usable after the pipeline" "a" \
     x 'SELECT name FROM pt WHERE id = $1 \bind 1 \g'
 expect "DROP the extended-path table" "DROP TABLE" q "DROP TABLE pt;"
 
+# --- index keys: a key must fit an SST entry, 65535 bytes with its tag ----
+KEY_FITS=$(head -c 65534 /dev/zero | tr '\0' 'k')
+KEY_LONG=$(head -c 65535 /dev/zero | tr '\0' 'k')
+q "CREATE TABLE bk (k text PRIMARY KEY, v text);" >/dev/null
+expect "index key at the limit is written" "INSERT 0 1" \
+    qin "INSERT INTO bk VALUES ('$KEY_FITS', 'a');"
+expect "index key past the limit is 54000" \
+    'index key exceeds the maximum of 65535 bytes for index "bk_pkey"' \
+    qin "INSERT INTO bk VALUES ('$KEY_LONG', 'b');"
+expect "UPDATE to a key past the limit is 54000" \
+    'index key exceeds the maximum of 65535 bytes for index "bk_pkey"' \
+    qin "UPDATE bk SET k = '$KEY_LONG';"
+expect "an unindexed column takes the long value" "INSERT 0 1" \
+    qin "INSERT INTO bk VALUES ('x', '$KEY_LONG');"
+expect "CREATE INDEX over the long value is 54000" \
+    'index key exceeds the maximum of 65535 bytes for index "bk_v"' \
+    q "CREATE INDEX bk_v ON bk (v);"
+expect "the rows are intact" "2" v "SELECT count(*) FROM bk;"
+expect "DROP TABLE bk" "DROP TABLE" q "DROP TABLE bk;"
+
 # --- no unexpected server-side errors --------------------------------------
 if grep -qE '^[^ ]+ ERROR ' "$LOG"; then bad "server log has errors"; else ok "server log clean"; fi
 

@@ -110,6 +110,7 @@ pub const sqlstate = struct {
     pub const invalid_savepoint_specification: [5]u8 = .{ '3', 'B', '0', '0', '1' };
     pub const admin_shutdown: [5]u8 = .{ '5', '7', 'P', '0', '1' };
     pub const out_of_memory: [5]u8 = .{ '5', '3', '2', '0', '0' };
+    pub const program_limit_exceeded: [5]u8 = .{ '5', '4', '0', '0', '0' };
 };
 
 /// Severity strings used in ErrorResponse 'S' / 'V' fields. FATAL is
