@@ -3,3 +3,4 @@
 /.lein-*
 /checkouts/
 /runs/
+/lazyfs/

@@ -15,5 +15,6 @@ command -v dot >/dev/null || {
 
 zig build -Doptimize=ReleaseSafe egres
 cd tests/jepsen
+case " $* " in *" --lazyfs "*) ./lazyfs.sh ;; esac
 "$lein" test
 exec "$lein" run test --nodes 127.0.0.1 --concurrency 8 "$@"

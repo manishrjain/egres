@@ -143,10 +143,18 @@
   (when (:indirection? opts)
     (throw (ex-info "Indirection reads through a JOIN, which Egres does not run"
                     {})))
+  (when (and (:lazyfs? opts) (not= :kill (:nemesis opts)))
+    (throw (ex-info "lazyfs loses unsynced writes at a kill; use --nemesis kill"
+                    {})))
   (let [binary (.getCanonicalPath (io/file (:binary opts)))
         _ (when-not (.canExecute (io/file binary))
             (throw (ex-info "Build Egres in ReleaseSafe first"
                             {:binary binary})))
+        lazyfs-binary (.getCanonicalPath (io/file (:lazyfs-binary opts)))
+        _ (when (and (:lazyfs? opts)
+                     (not (.canExecute (io/file lazyfs-binary))))
+            (throw (ex-info "Build lazyfs first: tests/jepsen/lazyfs.sh"
+                            {:lazyfs-binary lazyfs-binary})))
         workload ((workloads (:workload opts)) opts)
         ;; Elle's workloads track the highest key for the final reads;
         ;; internal has its own keys and no final reads.
@@ -167,8 +175,10 @@
     (merge tests/noop-test opts
            {:name (str "egres-" (name (:workload opts)) "-"
                        (str/join "+" (map name (:key-types opts))) "-"
-                       (:query-mode opts) "-" (name fault))
+                       (:query-mode opts) "-" (name fault)
+                       (when (:lazyfs? opts) "-lazyfs"))
             :binary binary
+            :lazyfs-binary lazyfs-binary
             :fault-mode fault
             :final-reads? final-reads?
             :ssh {:dummy? true}
@@ -234,7 +244,13 @@
     :default :none :parse-fn keyword
     :validate [#{:none :kill :pause} "none, kill, or pause"]]
    [nil "--fault-duration SECONDS" "Time a process stays dead or paused"
-    :default 1 :parse-fn parse-long :validate [pos? "Must be positive"]]])
+    :default 1 :parse-fn parse-long :validate [pos? "Must be positive"]]
+   [nil "--[no-]lazyfs"
+    (str "Keep the server's data on lazyfs and lose its unsynced writes"
+         " at each kill, as a power cut would; needs --nemesis kill")
+    :id :lazyfs? :default false]
+   [nil "--lazyfs-binary PATH" "lazyfs, built by lazyfs.sh"
+    :default "lazyfs/lazyfs/build/lazyfs"]])
 
 (def cli-opts
   (cli/merge-opt-specs sql/cli-opts egres-opts))

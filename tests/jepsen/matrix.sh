@@ -9,6 +9,7 @@ command -v "$lein" >/dev/null
 command -v dot >/dev/null
 zig build -Doptimize=ReleaseSafe egres
 cd tests/jepsen
+./lazyfs.sh
 "$lein" test
 mkdir -p runs
 out=$(mktemp -d "$PWD/runs/matrix.XXXXXXXX")
@@ -43,10 +44,10 @@ for mode in simple extended; do
 done
 run_case "extended-scan-none" \
     --query-mode extended --key-types secondary --no-secondary-index
-for keys in primary secondary primary,secondary; do
-    run_case "extended-${keys/,/+}-kill" \
-        --query-mode extended --key-types "$keys" --nemesis kill
-done
+# A SIGKILL keeps the kernel's page cache, so the whole WAL tail
+# survives the crash and is replayed: one such case per workload.
+run_case "extended-primary+secondary-kill" \
+    --query-mode extended --nemesis kill
 run_case "extended-primary-pause" \
     --query-mode extended --key-types primary --nemesis pause \
     --fault-duration 8
@@ -59,6 +60,16 @@ for workload in rw internal; do
         --workload "$workload" --query-mode extended
     run_case "$workload-extended-kill" \
         --workload "$workload" --query-mode extended --nemesis kill
+done
+# On lazyfs a kill also loses every write the server had not synced,
+# as a power cut would. The harsher crash gets the key-type mixes.
+for keys in primary secondary primary,secondary; do
+    run_case "extended-${keys/,/+}-kill-lazyfs" \
+        --query-mode extended --key-types "$keys" --nemesis kill --lazyfs
+done
+for workload in rw internal; do
+    run_case "$workload-extended-kill-lazyfs" \
+        --workload "$workload" --query-mode extended --nemesis kill --lazyfs
 done
 echo "Matrix summary: $out/summary.tsv"
 exit "$failed"

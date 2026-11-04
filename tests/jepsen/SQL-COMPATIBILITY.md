@@ -17,7 +17,8 @@ PostgreSQL suite does. What differs from a run against PostgreSQL:
   so they never run.
 - The `internal-sim` workload is not offered: its generated schemas
   declare `TEXT COLLATE unicode` columns.
-- Nemeses are kill and pause of the one local process; upstream also
+- Nemeses are kill and pause of the one local process, the kill with
+  or without lazyfs losing the unsynced writes; upstream also
   partitions, skews clocks and changes membership.
 - Errors are matched by SQLSTATE, below, where upstream matches the
   message.

@@ -7,6 +7,7 @@
             [jepsen.checker :as checker]
             [jepsen.egres :as egres]
             [jepsen.egres.client :as client]
+            [jepsen.egres.db :as local]
             [jepsen.generator :as gen]
             [jepsen.generator.context :as context]
             [jepsen.history :as history])
@@ -193,7 +194,8 @@
     (is (= #{:update-insert-update :on-conflict :copy-on-write}
            (set (:upsert-types options))))
     (is (some #{:decimal} (:encodings options)))
-    (is (= 100 (:mop-delay options)))))
+    (is (= 100 (:mop-delay options)))
+    (is (false? (:lazyfs? options)))))
 
 (deftest unsupported-workloads-and-indirection-are-refused
   (is (= #{:append :rw :internal} (set (keys egres/workloads))))
@@ -201,3 +203,27 @@
                         (egres/egres-test {:nodes ["127.0.0.1"]
                                            :concurrency 1
                                            :indirection? true}))))
+
+(deftest lazyfs-only-runs-under-kills
+  (doseq [nemesis [:none :pause]]
+    (is (thrown-with-msg? ExceptionInfo #"--nemesis kill"
+                          (egres/egres-test {:nodes ["127.0.0.1"]
+                                             :concurrency 1
+                                             :lazyfs? true
+                                             :nemesis nemesis})))))
+
+(deftest lazyfs-config-and-mount-check
+  (let [paths (local/lazyfs-paths (java.io.File. "/srv/t/server"))
+        config (local/lazyfs-config paths)]
+    (is (= "/srv/t/server/lazyfs/mnt" (str (:mount paths))))
+    (is (re-find #"(?m)^fifo_path=\"/srv/t/server/lazyfs/fifo\"$" config))
+    (is (re-find #"(?m)^fifo_path_completed=\"/srv/t/server/lazyfs/completed\"$"
+                 config))
+    (is (re-find #"(?m)^apply_eviction=false$" config))
+    (is (re-find #"(?m)^logfile=\"/srv/t/server/lazyfs/lazyfs.log\"$" config))
+    (let [mounts (str "/dev/sda1 / ext4 rw 0 0\n"
+                      "lazyfs /srv/t/server/lazyfs/mnt fuse.lazyfs rw 0 0\n")]
+      (is (true? (local/mounted? mounts (:mount paths))))
+      (is (false? (local/mounted? mounts (:root paths))))
+      (is (false? (local/mounted? "/dev/sda1 / ext4 rw 0 0\n"
+                                  (:mount paths)))))))

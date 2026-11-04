@@ -41,6 +41,11 @@ secondary-license notice; the full license texts are in
 | next.jdbc 1.3.1093 | EPL-1.0 |
 | PostgreSQL JDBC 42.7.11 | BSD-2-Clause |
 
+`--lazyfs` runs [lazyfs](https://github.com/dsrhaslab/lazyfs) 0.3.0,
+MIT, as a separate process that `lazyfs.sh` builds from its own
+checkout; nothing of it is linked into or distributed with the
+harness.
+
 `lein jar` produces a source JAR with these notes, the NOTICE and the
 license texts, and no dependency classes; `lein run` launches the
 harness. A source distribution keeps the file notices and license

@@ -17,6 +17,10 @@ every key; what differs from a run against PostgreSQL is in
 - Graphviz (`dot`), which Elle uses to render dependency graphs.
 - Three free local TCP ports: SQL at 13210, Raft at 13211, admin at
   13212. `--port` moves the first; the next two follow it.
+- For `--lazyfs`: FUSE (`/dev/fuse` and a setuid `fusermount3`, as the
+  `fuse3` package installs them) and, to build lazyfs, git, g++, cmake
+  and `libfuse3-dev`. `lazyfs.sh` clones and builds the pinned version
+  under `tests/jepsen/lazyfs`, which is ignored by version control.
 
 ## Running
 
@@ -26,20 +30,22 @@ From the repository root:
 tests/jepsen/run.sh --time-limit 60 --rate 200
 tests/jepsen/run.sh --query-mode extended --key-types secondary
 tests/jepsen/run.sh --nemesis kill --time-limit 120 --rate 200
+tests/jepsen/run.sh --nemesis kill --lazyfs
 tests/jepsen/run.sh --workload rw --query-mode extended --nemesis pause
 tests/jepsen/run.sh --workload internal --query-mode extended
 tests/jepsen/matrix.sh
 ```
 
-`run.sh` builds Egres in ReleaseSafe, runs the harness's unit tests
-(`lein test`), then one Jepsen test with 8 clients. `matrix.sh` runs
-these cases in sequence, each with 16 clients, rate 300 and `DURATION`
-seconds (60): append over both query modes and the three key-type
-mixes, append on an unindexed secondary key, append with kills on each
-key-type mix, append with 8-second pauses, and rw and internal with and
-without kills. It continues after a
-failed case, writes logs and a TSV summary under `runs/`, and exits
-nonzero if any case fails. Set `LEIN` to use another Leiningen
+`run.sh` builds Egres in ReleaseSafe, and lazyfs when `--lazyfs` is
+given, runs the harness's unit tests (`lein test`), then one Jepsen
+test with 8 clients. `matrix.sh` runs these cases in sequence, each
+with 16 clients, rate 300 and `DURATION` seconds (60): append over
+both query modes and the three key-type mixes, append on an unindexed
+secondary key, append with 8-second pauses, rw and internal without
+faults, each workload with kills, and with kills on lazyfs append on
+each key-type mix, rw and internal. It continues after a failed case,
+writes logs and a TSV summary under `runs/`, and exits nonzero if any
+case fails. Set `LEIN` to use another Leiningen
 executable. `.github/workflows/jepsen.yml` runs the matrix nightly on
 a Linux runner and keeps the logs and the store as the job's artifact.
 
@@ -86,6 +92,11 @@ matter most:
 - `--nemesis kill|pause`: every `--nemesis-interval` seconds (5),
   SIGKILL and restart the server on the same data directory, or
   SIGSTOP it, for `--fault-duration` seconds (1).
+- `--lazyfs`: keep the server's data on [lazyfs][lazyfs], a FUSE
+  filesystem with its own page cache that writes to the backing
+  directory only on fsync, and clear that cache after each kill. A
+  write the kernel's page cache would have kept across a SIGKILL is
+  lost, as a power cut loses it. Needs `--nemesis kill`.
 - `--isolation repeatable-read`: the level asked of every transaction.
   Egres runs snapshot isolation whatever is asked, so the model Elle
   checks is `--expected-consistency-model snapshot-isolation`.
@@ -113,6 +124,8 @@ Jepsen writes each run under `store/<test>/<timestamp>/`, with
 - `history.edn`, `history.txt`: the recorded operations.
 - `elle/`: anomalies and dependency graphs.
 - `server/server.log`, `server/wal/`, `server/sst/`: the Egres process.
+  With `--lazyfs`, the data is under `server/lazyfs/root/` once
+  unmounted, next to lazyfs's config and logs.
 
 `lein run test` exits 0 for valid, 1 for invalid, 2 for inconclusive
 and 255 for a crashed harness. To re-analyze a run or browse the store:
@@ -125,3 +138,5 @@ lein run serve
 
 Runs are ignored by version control and never removed by the harness;
 WAL files can be large.
+
+[lazyfs]: https://github.com/dsrhaslab/lazyfs

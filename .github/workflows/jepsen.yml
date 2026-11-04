@@ -48,11 +48,21 @@ jobs:
           path: ~/.m2/repository
           key: m2-${{ hashFiles('tests/jepsen/project.clj') }}
 
-      # Elle renders anomaly graphs through dot.
-      - name: Install Graphviz
+      # Elle renders anomaly graphs through dot; lazyfs builds against
+      # libfuse3 and mounts through fuse3's setuid fusermount3.
+      - name: Install Graphviz and FUSE
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q graphviz
+          sudo apt-get install -y -q graphviz fuse3 libfuse3-dev
+
+      # The lazyfs checkout and build, keyed on the script that pins
+      # its version; lazyfs.sh skips the clone and makes nothing anew.
+      - uses: actions/cache@v6
+        with:
+          path: tests/jepsen/lazyfs
+          key: >-
+            lazyfs-${{ runner.os }}-${{
+            hashFiles('tests/jepsen/lazyfs.sh') }}
 
       - name: Matrix
         env:
@@ -76,4 +86,5 @@ jobs:
             !tests/jepsen/store/**/latest/**
             !tests/jepsen/store/**/server/wal/**
             !tests/jepsen/store/**/server/sst/**
+            !tests/jepsen/store/**/server/lazyfs/root/**
           if-no-files-found: ignore
