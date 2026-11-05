@@ -119,6 +119,31 @@ pub fn LocalQueue(comptime lock: LockMode) type {
             return f;
         }
 
+        /// Remove and return the fiber `i` slots behind the front, or null
+        /// when `i` is past the end. The front fiber moves into its slot
+        /// and the front is popped, so this is O(1) and the live range
+        /// stays contiguous; the queue's order is no longer FIFO, which
+        /// is the point: a seeded scheduler (`InitOptions.shuffle_seed`,
+        /// the simulation) draws `i` to explore orderings production
+        /// would not produce.
+        pub fn popAt(self: *Self, i: usize) ?*Fiber {
+            self.acquire();
+            defer self.release();
+            const size = self.size.load(.monotonic);
+            if (i >= size) return null;
+            const idx = (self.head + i) & self.mask;
+            const f = self.fibers[idx] orelse std.debug.panic(
+                "LocalQueue.popAt: NULL slot[{d}] dispatched; size={d}",
+                .{ idx, size },
+            );
+            self.fibers[idx] = self.fibers[self.head];
+            self.fibers[self.head] = null;
+            self.head = (self.head + 1) & self.mask;
+            self.size.store(size - 1, .monotonic);
+            f.assertDQ();
+            return f;
+        }
+
         /// Steal fibers from the FRONT of this (victim) queue into `out`,
         /// returning the count moved. `dest_sz` is the THIEF's current
         /// ready-ring size: we take `ceil((size - dest_sz) / 2)` — half the

@@ -44,6 +44,9 @@ pub const Config = struct {
     /// this cutoff get their own AE to avoid shipping huge duplicate prefixes.
     lockstep_cutoff: u32 = 32,
     enable_prevote: bool = true,
+    /// Seed of the node's PRNG (election jitter, announce ids). 0 draws
+    /// one from the clock at boot; a simulation sets it so a run replays.
+    seed: u64 = 0,
 
     pub fn validate(self: Config) !void {
         if (self.election_timeout_min_ticks == 0) return error.InvalidConfig;
@@ -349,7 +352,11 @@ pub const Node = struct {
         config: Config,
     ) !*Node {
         try config.validate();
-        const seed = @as(u64, @intCast(std.Io.Timestamp.now(utils.context.g().io, .real).nanoseconds)) ^ config.id;
+        const entropy: u64 = if (config.seed != 0)
+            config.seed
+        else
+            @intCast(utils.timestampNow(.realtime, .nanos));
+        const seed = entropy ^ config.id;
         var prng = std.Random.DefaultPrng.init(seed);
         // Random per-boot base for announce ids: a restarted announcer must
         // not mint ids colliding with its pre-restart announces still in

@@ -127,7 +127,9 @@ pub const SkipList = struct {
             .arena = arena,
             .head = head,
             .max_height_seen = Atomic(u8).init(1),
-            .rng = std.Random.DefaultPrng.init(@intCast(std.Io.Timestamp.now(utils.context.g().io, .real).nanoseconds)),
+            // Fixed seed: Heights only shape lookup cost, so
+            // every memtable drawing the same sequence costs nothing.
+            .rng = std.Random.DefaultPrng.init(0x5eed_5eed_5eed_5eed),
             .ref_count = Atomic(u32).init(1),
             .node_count = Atomic(usize).init(0),
             .used_bytes = Atomic(usize).init(0),

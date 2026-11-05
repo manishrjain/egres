@@ -50,6 +50,30 @@ test "LocalQueue: grow with a wrapped live range keeps FIFO" {
     try std.testing.expect(q.pop() == null);
 }
 
+test "LocalQueue: popAt takes the chosen slot and keeps the rest" {
+    const alloc = std.testing.allocator;
+    var q = try Queue.init(alloc, 4);
+    defer q.deinit();
+    const fs = try makeFibers(alloc, 6);
+    defer alloc.free(fs);
+
+    // Wrap the live range first so the slot arithmetic is exercised.
+    for (0..3) |i| try q.push(&fs[i]);
+    _ = q.pop().?;
+    _ = q.pop().?;
+    for (3..6) |i| try q.push(&fs[i]); // live: f2 f3 f4 f5, wrapped
+
+    try std.testing.expect(q.popAt(4) == null); // past the end
+    // The front moves into the vacated slot: f2 f3 f4 f5 -> f3 f2 f5.
+    try std.testing.expectEqual(&fs[4], q.popAt(2).?);
+    try std.testing.expectEqual(@as(usize, 3), q.len());
+    try std.testing.expectEqual(&fs[3], q.popAt(0).?); // the front itself
+    try std.testing.expectEqual(&fs[5], q.popAt(1).?); // the last: f2 f5
+    try std.testing.expectEqual(&fs[2], q.pop().?); // what remains
+    try std.testing.expect(q.pop() == null);
+    try std.testing.expect(q.popAt(0) == null);
+}
+
 test "LocalQueue: stealInto (empty thief) takes ceil(half) from the front" {
     const alloc = std.testing.allocator;
     var q = try Queue.init(alloc, 4);

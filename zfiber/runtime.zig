@@ -143,6 +143,9 @@ pub const Worker = struct {
     is_thief: bool = false,
     /// xorshift64 state for steal-victim randomization; seeded in `run`.
     rng_state: u64 = 1,
+    /// Set from `InitOptions.shuffle_seed`: `nextFiber` draws from this
+    /// instead of popping the front. Null in production.
+    shuffle: ?std.Random.DefaultPrng = null,
     /// TSC reading when this worker last finished a fiber step; the
     /// pre-park poll runs only within a millisecond of it.
     last_work_ticks: u64 = 0,
@@ -280,8 +283,27 @@ pub const Worker = struct {
     /// a worker keeping itself locally busy (the old per-N-dispatch global
     /// poll is gone with the queue it served).
     fn nextFiber(self: *Worker) ?*Fiber {
+        if (self.shuffle) |*prng| return self.pickShuffled(prng);
         if (self.ready[@intFromEnum(Priority.high)].pop()) |f| return f;
         return self.ready[@intFromEnum(Priority.normal)].pop();
+    }
+
+    /// The seeded pick (`InitOptions.shuffle_seed`): one draw over every
+    /// ready fiber in both rings. Only on a lone worker: nothing steals
+    /// from its rings, and a push only lengthens one, so the lengths
+    /// read without the lock are exact and the drawn slot is there.
+    fn pickShuffled(self: *Worker, prng: *std.Random.DefaultPrng) ?*Fiber {
+        std.debug.assert(runtime().workers.len == 1);
+
+        const high = &self.ready[@intFromEnum(Priority.high)];
+        const normal = &self.ready[@intFromEnum(Priority.normal)];
+        const high_len = high.len();
+        const total = high_len + normal.len();
+        if (total == 0) return null;
+
+        const i = prng.random().uintLessThan(usize, total);
+        if (i < high_len) return high.popAt(i) orelse unreachable;
+        return normal.popAt(i - high_len) orelse unreachable;
     }
 
     /// Pre-park recheck of our own rings, BOTH under their locks so a
@@ -920,6 +942,14 @@ pub const InitOptions = struct {
     /// See `Runtime.steal_lone` / `Runtime.prepark_poll_us`.
     steal_lone: bool = false,
     prepark_poll_us: u64 = 20,
+
+    /// Pick the next fiber at random from the ready rings, seeded, instead
+    /// of in FIFO order: one draw over both rings, so priority is a hint
+    /// the pick ignores. Runs on one worker whatever `num_workers` says:
+    /// a pick is per worker, and the point is an order that replays from
+    /// the seed. A stress mode for the test suite (`zig build test --
+    /// --shuffle-seed N`), and the pick the simulation builds on.
+    shuffle_seed: ?u64 = null,
 };
 
 /// Resolve how many workers serve the `.raft` lane, as a fraction of the
@@ -1052,8 +1082,12 @@ pub const Runtime = struct {
     }
 
     pub fn init(self: *Runtime, allocator: std.mem.Allocator, opts: InitOptions) !void {
+        // A seeded pick is per worker and must replay from the seed
+        // alone, so the shuffle runs on one worker whatever was asked.
         // num_workers == 0 means "auto" → the CPU core count.
-        const n = if (opts.num_workers == 0)
+        const n = if (opts.shuffle_seed != null)
+            1
+        else if (opts.num_workers == 0)
             (std.Thread.getCpuCount() catch 1)
         else
             opts.num_workers;
@@ -1119,6 +1153,8 @@ pub const Runtime = struct {
                 @intFromEnum(Lane.default);
             initialized += 1;
         }
+        if (opts.shuffle_seed) |seed|
+            self.workers[0].shuffle = std.Random.DefaultPrng.init(seed);
 
         // Seed the process-wide coarse clock so `coarseMs` is valid the
         // instant init returns, before any worker ticks it.
