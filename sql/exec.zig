@@ -75,10 +75,12 @@ pub const Selection = std.StaticBitSet(row_cap);
 /// into `bytes` — capacity-pinned while non-empty, growing only to
 /// admit ONE oversized row into an EMPTY batch — and its value per
 /// `ValueMode`: copied next to the key, borrowed against a pin the
-/// source holds for the batch's lifetime, or dropped. `appendRefs`
-/// places whole rows that live elsewhere (the statement arena), the
-/// caller's promise. Sources fill it and set the bits; filters clear
-/// bits; consumers walk `selected()` (ascending).
+/// source holds for the batch's lifetime, or dropped. Copied and
+/// borrowed bytes alike count against `byte_cap`: a borrow holds its
+/// block as a copy would hold the bytes. `appendRefs` places whole
+/// rows that live elsewhere (the statement arena), the caller's
+/// promise. Sources fill it and set the bits; filters clear bits;
+/// consumers walk `selected()` (ascending).
 pub const Batch = struct {
     allocator: std.mem.Allocator,
     /// Reserved to row_cap once; never grows past it.
@@ -94,6 +96,8 @@ pub const Batch = struct {
     /// the first refusal and stash that row (rows are sequential, so a
     /// smaller one is never offered in its place). Cleared by `reset`.
     no_space: bool = false,
+    /// Value bytes held by borrow, outside `bytes`. Cleared by `reset`.
+    borrowed: usize = 0,
     /// Rows a count-only source counted instead of appending (see
     /// plan.Options.count_only). Cleared by `reset`.
     counted: u64 = 0,
@@ -119,6 +123,7 @@ pub const Batch = struct {
         utils.clearRetainCap(&self.bytes);
         self.sel = Selection.initEmpty();
         self.no_space = false;
+        self.borrowed = 0;
         self.counted = 0;
     }
 
@@ -147,21 +152,25 @@ pub const Batch = struct {
     /// Place `item` — its key copied, its value per `mode` — and select
     /// it. false = no room — the caller keeps the row for the next
     /// fill, and `full` is true from here on. A row larger than the
-    /// whole byte capacity is admitted only into an EMPTY batch: nothing
-    /// slices into `bytes` then, so growing it is safe.
+    /// whole byte cap is admitted only into an EMPTY batch: `SELECT b
+    /// FROM rec` over 15 MiB rows is one row per fill, sent and
+    /// unpinned before the next is pinned, and nothing slices into
+    /// `bytes` then, so growing it for a copy is safe.
     pub fn append(self: *Batch, item: Item, mode: ValueMode) !bool {
         if (self.full()) return false;
 
         const src = item.newest();
-        const vlen = if (mode == .copy) src.value.len else 0;
-        const need = item.key.primary.len + vlen;
-        if (self.bytes.items.len + need > self.bytes.capacity) {
-            if (self.numRows() > 0) {
-                self.no_space = true;
-                return false;
-            }
+        const copied = item.key.primary.len +
+            if (mode == .copy) src.value.len else 0;
+        const borrowed = if (mode == .borrow) src.value.len else 0;
+        const held = self.bytes.items.len + self.borrowed;
+        if (held + copied + borrowed > byte_cap and self.numRows() > 0) {
+            self.no_space = true;
+            return false;
+        }
+        if (self.bytes.items.len + copied > self.bytes.capacity) {
             std.debug.assert(self.bytes.items.len == 0);
-            try self.bytes.ensureTotalCapacity(self.allocator, need);
+            try self.bytes.ensureTotalCapacity(self.allocator, copied);
         }
 
         const kstart = self.bytes.items.len;
@@ -178,6 +187,7 @@ pub const Batch = struct {
             .borrow => value = src.value,
             .none => {},
         }
+        self.borrowed += borrowed;
 
         self.sel.set(self.numRows());
         self.rows.appendAssumeCapacity(.{

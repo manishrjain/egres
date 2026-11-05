@@ -2,13 +2,15 @@
 # Copyright 2026 Manish R Jain
 # SPDX-License-Identifier: Apache-2.0
 
-# End-to-end test of statement admission under a memory budget. Two
-# server starts, since the memory flags are fixed at startup:
+# End-to-end test of memory bounds under a budget. Three server
+# starts, since the memory flags are fixed at startup:
 #   1. a burst of large INSERTs against a small statement pool: every
 #      client ends with a row written or out of memory, the server's
 #      peak resident size stays bounded, and it serves afterwards;
 #   2. a pool smaller than one frame: the INSERT is refused after the
-#      wait, deterministically, and a small one goes through.
+#      wait, deterministically, and a small one goes through;
+#   3. a scan of wide rows to a client that reads nothing: the server
+#      holds one batch of the result, not all of it.
 # Wipes $DATA (default /data/egres) — that dir is throw-away.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -37,10 +39,13 @@ v() { psql "$E" -X -tA -c "$1"; } # tuples-only, unaligned (bare value)
 # A statement too long for an argv entry goes in on stdin.
 qin() { psql "$E" -X -f - <<<"$1"; }
 
-# start_server <memory flags>. Ready = listener up AND election won,
-# then one more second so the governor has sized the statement pool.
+# start_server <memory flags> [flag...]. Ready = listener up AND
+# election won, then one more second so the governor has sized the
+# statement pool.
 start_server() {
-    ./zig-out/bin/egres --raft="id=1" --memory="$1" \
+    local memory=$1
+    shift
+    ./zig-out/bin/egres --raft="id=1" --memory="$memory" "$@" \
         --store="dir_path=$DATA/sst" --wal="dir=$DATA/wal" >"$LOG" 2>&1 &
     SERVER_PID=$!
     for _ in $(seq 1 50); do
@@ -125,6 +130,52 @@ expect "its row is absent" "0" v "SELECT count(*) FROM small;"
 expect "a small INSERT after the refusal is written" "INSERT 0 1" \
     q "INSERT INTO small VALUES (2, '$(head -c 1024 /dev/zero | tr '\0' 'y')');"
 expect "the connection is usable" "1" v "SELECT count(*) FROM small;"
+
+stop_server
+
+# --- 3. a scan of wide rows to a client that reads nothing ----------------
+# 64 rows of 2 MiB, flushed to SSTs as they come (4 MiB memtables,
+# flushed one at a time). A scan borrows each row's bytes from its
+# SST block, pinned until the batch is sent, so a client that reads
+# nothing stalls the scan at one batch, and the server's resident
+# size grows by a batch, not by the 128 MiB result.
+rm -rf "$DATA" && mkdir -p "$DATA"
+start_server "total_bytes=2GiB" \
+    --zdb="table_bytes=4MiB;flush_min_memtables=1"
+q "CREATE TABLE wide (id int4, b text);" >/dev/null
+ROW=$(head -c 2097152 /dev/zero | tr '\0' 'w')
+for i in $(seq 1 64); do
+    qin "INSERT INTO wide VALUES ($i, '$ROW');" >/dev/null
+done
+sleep 3 # the last memtables flush
+rss_kb() { awk '/VmRSS/ { print $2 }' "/proc/$SERVER_PID/status"; }
+before=$(rss_kb)
+# A raw pgwire client: StartupMessage (35 bytes, protocol 3.0, user
+# and database egres), then the Query, and nothing read back.
+exec 3<>/dev/tcp/127.0.0.1/3210
+printf '\x00\x00\x00\x23\x00\x03\x00\x00' >&3
+printf 'user\x00egres\x00database\x00egres\x00\x00' >&3
+printf 'Q\x00\x00\x00\x18SELECT b FROM wide;\x00' >&3
+peak=0
+for _ in $(seq 1 25); do
+    sleep 0.2
+    now=$(rss_kb)
+    [ "$now" -gt "$peak" ] && peak=$now
+done
+grown=$(((peak - before) / 1024))
+echo "scan: RSS before ${before} KiB, peak ${peak} KiB, grown ${grown} MiB"
+# One batch is one 2 MiB row plus the reply scratch; the socket takes
+# a few more. Without the bound the whole table is pinned first.
+if [ "$grown" -lt 64 ]; then ok "a stalled scan holds one batch"
+else bad "a stalled scan grew the server by ${grown} MiB"; fi
+# The client reads after all: the whole result arrives, then the
+# Terminate sent behind the query closes the connection.
+printf 'X\x00\x00\x00\x04' >&3
+drained=$(cat <&3 | wc -c)
+exec 3>&-
+if [ "$drained" -gt $((64 * 2097152)) ]; then ok "the whole result was sent"
+else bad "only ${drained} bytes of the result arrived"; fi
+expect "the table reads after the scan" "64" v "SELECT count(*) FROM wide;"
 
 # --- no unexpected server-side errors --------------------------------------
 if grep -qE '^[^ ]+ ERROR ' "$LOG"; then bad "server log has errors"

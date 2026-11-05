@@ -2787,37 +2787,63 @@ test "cursor: pin_values holds handed-out values until releasePins" {
                 try std.testing.expectEqual(@as(u8, 'w'), v[1023]);
             }
         }
+        /// The bytes of the blocks the cursor's pins hold.
+        fn pinned(cur: *const Forest.Cursor) usize {
+            var bytes: usize = 0;
+            for (cur.pins.items) |pin| bytes += switch (pin) {
+                .block => |b| b.byteSize(),
+                .skiplist => 0,
+            };
+            return bytes;
+        }
+        /// What the tenant holds, as the meter counts it.
+        fn held() usize {
+            const t = fiber.ctx().tenant;
+            return @intCast(t.mem_held.load(.monotonic));
+        }
     };
+    // The tenant pays for its pinned blocks, and for nothing else in
+    // this walk: the key buffers are the cursor's own. A tenant of
+    // its own, since the shared one is charged by every other test.
+    var tenant = fiber.Tenant.init(33, fiber.meter.default_limit, 0);
+    fiber.ctx().tenant = &tenant;
+    defer fiber.ctx().tenant = &fiber.meter.shared;
+    const held0 = Walk.held();
 
-    // Memtable-backed: every value lives in one arena — one pin.
+    // Memtable-backed: every value lives in one arena — one pin, free.
     {
         var cur = try f.openCursor(alloc, ns1_table0, .all, pinning);
         defer cur.deinit();
         var vals: [n_rows]String = undefined;
         try Walk.take(&cur, &vals);
         try std.testing.expectEqual(@as(usize, 1), cur.pins.items.len);
+        try std.testing.expectEqual(held0, Walk.held());
         try Walk.check(&vals, 0);
     }
 
     try roar.flush(f, alloc, 2);
 
     // SST-backed: the first half spans blocks the table iterator has
-    // moved past by the time the walk pauses — the pins keep them.
+    // moved past by the time the walk pauses — the pins keep them, and
+    // the statement holds their bytes.
     var cur = try f.openCursor(alloc, ns1_table0, .all, pinning);
     defer cur.deinit();
     var first: [n_rows / 2]String = undefined;
     try Walk.take(&cur, &first);
     try std.testing.expect(cur.pins.items.len >= 2);
     try Walk.check(&first, 0);
+    try std.testing.expect(Walk.pinned(&cur) >= first.len * 1024);
+    try std.testing.expectEqual(held0 + Walk.pinned(&cur), Walk.held());
 
     // Release: only the parked item's storage stays held, and that item
     // (the last one handed out) still reads.
     try cur.releasePins();
     try std.testing.expectEqual(@as(usize, 1), cur.pins.items.len);
     try Walk.check(first[first.len - 1 ..], first.len - 1);
+    try std.testing.expectEqual(held0 + Walk.pinned(&cur), Walk.held());
 
     // The rest pins afresh; once the walk is over nothing is parked, so
-    // a release leaves nothing held.
+    // a release leaves nothing held, and the statement owes nothing.
     var rest: [n_rows / 2]String = undefined;
     try Walk.take(&cur, &rest);
     try Walk.check(&rest, n_rows / 2);
@@ -2825,6 +2851,7 @@ test "cursor: pin_values holds handed-out values until releasePins" {
     try std.testing.expect((try cur.next()) == null);
     try cur.releasePins();
     try std.testing.expectEqual(@as(usize, 0), cur.pins.items.len);
+    try std.testing.expectEqual(held0, Walk.held());
 }
 
 /// Ten one-key L3 SSTs k01..k10 in (namespace 42, table 0), value = the

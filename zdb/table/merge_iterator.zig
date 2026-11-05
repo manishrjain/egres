@@ -10,6 +10,7 @@ const KeyRange = @import("../kv.zig").KeyRange;
 const Version = @import("../kv.zig").Version;
 const _skl = @import("../skl/skiplist.zig");
 const utils = @import("utils");
+const fiber = @import("zfiber");
 
 pub const Error = _table.Error;
 
@@ -32,9 +33,18 @@ pub const Pin = union(enum) {
     block: *_cache.Value,
     skiplist: *_skl.SkipList,
 
+    /// A pinned block is memory the tenant holds, counted as the
+    /// batch's own buffer is, on the tenant and not the statement:
+    /// `SELECT b FROM rec` stalled on its client holds one batch of
+    /// blocks, and the meter sees them. Every pinner pays, so two
+    /// statements on one block count it twice. A skiplist arena lives
+    /// as long as its memtable, pinned or not, so it is not charged.
     pub fn acquire(self: Pin) Pin {
         switch (self) {
-            .block => |b| _ = b.incrRef(),
+            .block => |b| {
+                _ = b.incrRef();
+                fiber.ctx().tenant.holdMem(@intCast(b.byteSize()));
+            },
             .skiplist => |sl| sl.acquire(),
         }
         return self;
@@ -42,7 +52,10 @@ pub const Pin = union(enum) {
 
     pub fn release(self: Pin) void {
         switch (self) {
-            .block => |b| b.decrRef(),
+            .block => |b| {
+                fiber.ctx().tenant.releaseMem(@intCast(b.byteSize()));
+                b.decrRef();
+            },
             .skiplist => |sl| sl.release(),
         }
     }

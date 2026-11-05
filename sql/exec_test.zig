@@ -370,6 +370,16 @@ test "sql.exec: Batch row cap, byte cap, growth only when empty" {
     try testing.expectEqual(@as([*]const u8, &big), kept.ptr);
     try testing.expectEqual(big.len, kept.len);
 
+    // Borrowed bytes count against the cap as copied ones do: the
+    // same number of 1 KiB rows fit, with only their keys in `bytes`.
+    b.reset();
+    n = 0;
+    while (try b.append(tinyItem(&keys[n], &big), .borrow)) n += 1;
+    try testing.expectEqual(exec.byte_cap / (8 + big.len), n);
+    try testing.expectEqual(n * 8, b.bytes.items.len);
+    try testing.expectEqual(n * big.len, b.borrowed);
+    try testing.expect(b.full());
+
     // One oversized row is admitted into an EMPTY batch by growing.
     b.reset();
     const huge = try testing.allocator.alloc(u8, exec.byte_cap + 1);
@@ -379,6 +389,13 @@ test "sql.exec: Batch row cap, byte cap, growth only when empty" {
     try testing.expectEqual(@as(usize, 1), b.numRows());
     try testing.expect(b.bytes.capacity > cap0);
     try testing.expectEqualSlices(u8, huge, b.rows.items[0].newest().value);
+
+    // Borrowed, it is admitted alone too, and the next row is refused.
+    b.reset();
+    try testing.expect(try b.append(tinyItem(&keys[0], huge), .borrow));
+    try testing.expectEqual(@as(usize, 1), b.numRows());
+    try testing.expect(!try b.append(tinyItem(&keys[1], "v"), .borrow));
+    try testing.expect(b.full());
 }
 
 test "sql.exec: BitmapNode and_/or_/egids algebra" {
@@ -500,29 +517,81 @@ test "sql.exec: seq_scan: borrowed values outlive the blocks the walk left" {
     var b = try Batch.init(testing.allocator);
     defer b.deinit();
 
-    // 400 rows of 1 KiB across several 16 KiB SST blocks, all in ONE
-    // batch: only keys land in `bytes`; values are borrows into blocks
-    // the cursor pinned — and every one still reads after the walk
-    // moved past its block.
+    // 400 rows of 1 KiB across several 16 KiB SST blocks: only keys
+    // land in `bytes`; values are borrows into blocks the cursor
+    // pinned — and every one still reads after the walk moved past
+    // its block. The borrows count against the byte cap, so the rows
+    // come in two fills, the first as many as the cap holds.
     var node = RowNode{ .seq_scan = .{} };
     defer node.deinit();
     try testing.expect(try node.next(&ctx, &b));
-    try testing.expectEqual(@as(usize, 400), b.numRows());
-    try testing.expectEqual(@as(usize, 400 * 8), b.bytes.items.len);
+    const per_row = 8 + b.rows.items[0].newest().value.len;
+    try testing.expectEqual(exec.byte_cap / per_row, b.numRows());
+    try testing.expectEqual(b.numRows() * 8, b.bytes.items.len);
     const pins = &node.seq_scan.cursor.?.pins;
     try testing.expect(pins.items.len >= 2);
-    var it = b.selected();
-    while (it.next()) |r| {
-        try testing.expect(!withinBytes(&b, r.newest().value));
-        const egid = sql.key.decodeEgid(r.key.primary).?;
-        const a_val = fx.tbl.parseCol(r, fx.col("a"));
-        try testing.expectEqual(Value{ .int4 = @intCast(egid) }, a_val);
-        const b_val = fx.tbl.parseCol(r, fx.col("b"));
-        try testing.expectEqual(@as(usize, 1024), b_val.text.len);
-        try testing.expectEqual(@as(u8, 'w'), b_val.text[1023]);
+    var seen: u64 = 0;
+    var fills: usize = 1;
+    while (true) {
+        var it = b.selected();
+        while (it.next()) |r| {
+            try testing.expect(!withinBytes(&b, r.newest().value));
+            seen += 1;
+            try testing.expectEqual(seen, sql.key.decodeEgid(r.key.primary).?);
+            const a_val = fx.tbl.parseCol(r, fx.col("a"));
+            try testing.expectEqual(Value{ .int4 = @intCast(seen) }, a_val);
+            const b_val = fx.tbl.parseCol(r, fx.col("b"));
+            try testing.expectEqual(@as(usize, 1024), b_val.text.len);
+            try testing.expectEqual(@as(u8, 'w'), b_val.text[1023]);
+        }
+        // The next fill lets the previous rows go.
+        if (!try node.next(&ctx, &b)) break;
+        fills += 1;
     }
-    // The next fill lets them go; the walk is over.
-    try testing.expect(!try node.next(&ctx, &b));
+    try testing.expectEqual(@as(u64, 400), seen);
+    try testing.expectEqual(@as(usize, 2), fills);
+    try testing.expectEqual(@as(usize, 0), pins.items.len);
+}
+
+/// Three rows whose values alone are past the batch's byte cap.
+fn hugeRows(a: std.mem.Allocator, tbl: *const Table) anyerror![]const Item {
+    const huge = try a.alloc(u8, exec.byte_cap + 1024);
+    @memset(huge, 'h');
+    const items = try a.alloc(Item, 3);
+    for (items, 1..) |*it, egid| {
+        it.* = try row(a, tbl, egid, @intCast(egid), huge);
+    }
+    return items;
+}
+
+test "sql.exec: seq_scan: a row past the byte cap is a fill of its own" {
+    var fx = try Fixture.setupOnDisk(&hugeRows);
+    defer fx.teardown();
+    var tx = fx.txn();
+    defer tx.deinit();
+    var ctx = fx.ctx(&tx, false);
+    var b = try Batch.init(testing.allocator);
+    defer b.deinit();
+
+    // `SELECT b FROM rec` over rows wider than the cap: each fill
+    // holds one row, borrowed, and its block is let go before the
+    // next is pinned, so a scan holds one row's block at a time.
+    var node = RowNode{ .seq_scan = .{} };
+    defer node.deinit();
+    var fills: u64 = 0;
+    while (try node.next(&ctx, &b)) {
+        fills += 1;
+        try testing.expectEqual(@as(usize, 1), b.numRows());
+        try testing.expectEqual(exec.byte_cap, b.bytes.capacity);
+        var it = b.selected();
+        const r = it.next().?;
+        try testing.expectEqual(fills, sql.key.decodeEgid(r.key.primary).?);
+        const b_val = fx.tbl.parseCol(r, fx.col("b"));
+        try testing.expectEqual(exec.byte_cap + 1024, b_val.text.len);
+        try testing.expectEqual(@as(u8, 'h'), b_val.text[b_val.text.len - 1]);
+    }
+    try testing.expectEqual(@as(u64, 3), fills);
+    const pins = &node.seq_scan.cursor.?.pins;
     try testing.expectEqual(@as(usize, 0), pins.items.len);
 }
 
