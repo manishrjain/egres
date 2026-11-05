@@ -365,6 +365,8 @@ fn burn(ms: i64) void {
 }
 
 test "cpu: the worker loop charges each step to the fiber's tenant" {
+    // Skipped under `--sim-seed`: cpu is not accounted under the simulation.
+    if (fiber.isSim()) return error.SkipZigTest;
     var t = cpuTenant(20, 32 * vcpu);
     const ctx = fiber.ctx();
     ctx.tenant = &t;
@@ -388,6 +390,8 @@ test "cpu: the worker loop charges each step to the fiber's tenant" {
 }
 
 test "cpu: maybeYield parks a tenant in debt until its rate covers it" {
+    // Skipped under `--sim-seed`: cpu is not accounted under the simulation.
+    if (fiber.isSim()) return error.SkipZigTest;
     // A tenth of a core: 100 ms of cpu a second, a burst of 10 ms.
     var t = cpuTenant(21, 100);
     const ctx = fiber.ctx();

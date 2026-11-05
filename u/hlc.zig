@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 const std = @import("std");
-const context = @import("context.zig");
+const _coarse = @import("coarse_clock.zig");
 
 // Hybrid Logical Clock.
 //
@@ -49,7 +49,10 @@ pub const Clock = struct {
     /// advances the physical seconds by 1 instead. In practice overflow never
     /// happens on real workloads, but the branch keeps monotonicity airtight.
     pub fn next(self: *Clock) HLC {
-        const wall_sec: u32 = @intCast(std.Io.Timestamp.now(context.g().io, .real).toSeconds());
+        // The coarse clock: at most ~1 ms stale, which seconds absorb,
+        // and the simulation's virtual clock under a sim.
+        const wall_sec: u32 =
+            @intCast(@divFloor(_coarse.ms(), std.time.ms_per_s));
         while (true) {
             const cur_u = self.last.load(.monotonic);
             const cur = HLC.fromU64(cur_u);

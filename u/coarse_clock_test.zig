@@ -14,6 +14,7 @@ test "CoarseClock: ms() advances during a parked fiber's sleep" {
     // current. Under heavy parallel load the tick can lag, making
     // `coarseMs` deltas under-report by 10+ ms even when the sleep
     // ran fine. We sidestep that here by reading a fresh clock.
+    // Under the simulation both the sleep and this read are virtual.
     const before_ms = utils.timestampNow(.monotonic, .millis);
     fiber.sleepMs(30);
     const after_ms = utils.timestampNow(.monotonic, .millis);

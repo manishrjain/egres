@@ -27,6 +27,13 @@ pub const ConfChangeType = _diskwal.ConfChangeType;
 
 pub const PeerRole = zen.RoleEnum;
 
+/// Wall seconds from the coarse clock: at most ~1 ms stale, which a
+/// second absorbs, and the simulation's virtual clock under a sim. Every
+/// clock read the node acts on goes through here.
+fn coarseSeconds() u32 {
+    return @intCast(@divFloor(utils.coarse_clock.ms(), std.time.ms_per_s));
+}
+
 pub const Config = struct {
     id: NodeId,
     cluster_id: u64 = 0,
@@ -44,9 +51,6 @@ pub const Config = struct {
     /// this cutoff get their own AE to avoid shipping huge duplicate prefixes.
     lockstep_cutoff: u32 = 32,
     enable_prevote: bool = true,
-    /// Seed of the node's PRNG (election jitter, announce ids). 0 draws
-    /// one from the clock at boot; a simulation sets it so a run replays.
-    seed: u64 = 0,
 
     pub fn validate(self: Config) !void {
         if (self.election_timeout_min_ticks == 0) return error.InvalidConfig;
@@ -352,11 +356,10 @@ pub const Node = struct {
         config: Config,
     ) !*Node {
         try config.validate();
-        const entropy: u64 = if (config.seed != 0)
-            config.seed
-        else
-            @intCast(utils.timestampNow(.realtime, .nanos));
-        const seed = entropy ^ config.id;
+        // Per boot: the election jitter must differ between nodes and
+        // the announce base between boots. Under a sim the draw comes
+        // from the run's seed, so a replay elects the same.
+        const seed = fiber.random().int(u64);
         var prng = std.Random.DefaultPrng.init(seed);
         // Random per-boot base for announce ids: a restarted announcer must
         // not mint ids colliding with its pre-restart announces still in
@@ -406,7 +409,7 @@ pub const Node = struct {
 
         // Seed the HLC clock with the current wall-clock second so peek()
         // returns a sensible value even before the first `next()` call.
-        utils.hlc.g().seed(.{ .seconds = @intCast(std.Io.Timestamp.now(utils.context.g().io, .real).toSeconds()), .logical = 0 });
+        utils.hlc.g().seed(.{ .seconds = coarseSeconds(), .logical = 0 });
 
         // Restore persisted state from WAL if present.
         if (node.log.lastIndex() > 0) {
@@ -2095,7 +2098,7 @@ pub const Node = struct {
             if (!self.isLeader()) continue;
 
             const last_ts = utils.hlc.HLC.fromU64(self.log.lastTimestamp());
-            const wall_sec: u32 = @intCast(std.Io.Timestamp.now(utils.context.g().io, .real).toSeconds());
+            const wall_sec: u32 = coarseSeconds();
             if (wall_sec <= last_ts.seconds) continue;
 
             self.proposeAndWaitForApply(&.{}, .data) catch |err| {

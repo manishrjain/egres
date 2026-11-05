@@ -47,8 +47,8 @@ here because the code does not make it obvious.
   no atomics outside zfiber, no `std.time`, no `std.posix` I/O. A wall
   timestamp is `utils.timestampNow`; every other clock read, timeouts,
   ageing, elapsed time, is `utils.coarseMs()` or a clock handed in.
-  Randomness is a PRNG handed in or seeded from config, never drawn
-  from the clock.
+  Randomness is `fiber.random()` or a PRNG with a fixed seed, never
+  drawn from the clock.
 - No new process-wide singletons. State an engine owns lives on the
   Engine; state a node owns lives on the Node.
 - A dependency with a real and a fake is a runtime interface (`ptr` plus

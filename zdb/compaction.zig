@@ -541,10 +541,10 @@ fn pickJob(self: *Tree, held: Lock.Shared, src: usize) ?CompactCandidate {
     };
 }
 
-/// A random index below `n`.
+/// A random index below `n`. From the worker's PRNG, so under a sim the
+/// jobs planned differ between seeds and replay within one.
 fn randomIndex(n: usize) usize {
-    const rng_impl: std.Random.IoSource = .{ .io = utils.context.g().io };
-    return rng_impl.interface().uintLessThan(usize, n);
+    return fiber.random().uintLessThan(usize, n);
 }
 
 /// The tables a `merge_down` of level `src` takes: a first table and

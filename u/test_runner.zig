@@ -236,10 +236,12 @@ const Args = struct {
     /// them, e.g. to verify dump cadence and the `--wd-kill-s` exit.
     run_hang: bool = false,
     parallel: u6 = default_parallel,
-    /// `--shuffle-seed`: one worker, seeded random pick from the ready
-    /// rings (`fiber.InitOptions.shuffle_seed`), so the suite runs in an
-    /// order production never produces, the same one for the same seed.
-    shuffle_seed: ?u64 = null,
+    /// `--sim-seed`: the deterministic simulation (`fiber.InitOptions.sim`):
+    /// one worker, seeded pick, virtual time, offload ops inline. The
+    /// summary prints the dispatch trace hash; two runs of one seed over
+    /// tests without real I/O print the same one (scripts/sim_check.sh).
+    sim_seed: ?u64 = null,
+    sim_sched: fiber.sim.Sched = .random,
     /// Watchdog tunables. `wd_stuck_tick_s` is one knob serving two
     /// purposes — dump threshold AND tick interval — so cadence is
     /// always one-dump-per-window. `wd_kill_s = 0` disables the kill.
@@ -370,7 +372,10 @@ const help_text =
     \\                      exercise the process-level watchdog. Default run
     \\                      gets killed at --wd-kill-s.
     \\  --parallel <N>      Concurrent test fibers. 0 (default) = max(2, cpu_count/2).
-    \\  --shuffle-seed <N>  One worker, ready fibers picked at random by seed N.
+    \\  --sim-seed <N>      Deterministic simulation: one worker, seeded pick,
+    \\                      virtual time. Prints the dispatch trace hash.
+    \\  --sim-sched <S>     The sim's pick: random, priority_random,
+    \\                      priority_fifo.
     \\  --verbose           Print "STARTING <name>" before each test (debug wedges).
     \\  --workers           Print the per-worker CPU / wake-path dump after the summary.
     \\  --wd-stuck-tick-s <N> Watchdog: dump threshold AND tick interval, seconds (default 20).
@@ -411,8 +416,18 @@ fn parseArgs(alloc: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--parallel") and i + 1 < argv.len) {
             args.parallel = try std.fmt.parseInt(u6, argv[i + 1], 10);
             i += 1;
-        } else if (std.mem.eql(u8, a, "--shuffle-seed") and i + 1 < argv.len) {
-            args.shuffle_seed = try std.fmt.parseInt(u64, argv[i + 1], 10);
+        } else if (std.mem.eql(u8, a, "--sim-seed") and i + 1 < argv.len) {
+            args.sim_seed = try std.fmt.parseInt(u64, argv[i + 1], 10);
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--sim-sched") and i + 1 < argv.len) {
+            const Sched = fiber.sim.Sched;
+            args.sim_sched = std.meta.stringToEnum(Sched, argv[i + 1]) orelse {
+                std.debug.print(
+                    "--sim-sched: random, priority_random, priority_fifo\n",
+                    .{},
+                );
+                std.process.exit(2);
+            };
             i += 1;
         } else if (std.mem.eql(u8, a, "--guard")) {
             args.guard = true;
@@ -1228,12 +1243,12 @@ pub fn main(init: std.process.Init) !void {
     // the io.sleep test's 100 sleepers) spread out; the `--parallel`
     // knob bounds how many test *bodies* dispatch at once (see
     // fiberDriver), not the worker pool.
-    // A seeded pick runs on one worker; the runtime makes it so.
+    // The sim runs on one worker; the runtime makes it so.
     const fiber_workers: usize =
         std.Thread.getCpuCount() catch @as(usize, args.parallel);
-    if (args.shuffle_seed) |seed| std.debug.print(
-        "[shuffle] seed={d}: one worker, seeded random pick\n",
-        .{seed},
+    if (args.sim_seed) |seed| std.debug.print(
+        "[sim] seed={d} sched={s}: one worker, virtual time\n",
+        .{ seed, @tagName(args.sim_sched) },
     );
 
     // `--guard`: page-isolate the runtime allocator so a dangling/overflow write
@@ -1253,7 +1268,10 @@ pub fn main(init: std.process.Init) !void {
         .num_workers = fiber_workers,
         .raft_workers = 0,
         .pin_workers = false,
-        .shuffle_seed = args.shuffle_seed,
+        .sim = if (args.sim_seed) |seed| .{
+            .seed = seed,
+            .sched = args.sim_sched,
+        } else null,
     });
     defer fiber_rt.deinit();
 
@@ -1277,6 +1295,30 @@ pub fn main(init: std.process.Init) !void {
 
         _ = try fiber.spawn(.{}, fiberDriver, .{&fctx});
         fiber_rt.run();
+    }
+
+    // The simulation's fingerprint, and a deadlock is a failed run even
+    // when every test that got to run passed.
+    if (fiber_rt.simState()) |sim| {
+        out.print(
+            "sim: seed={d} sched={s} dispatches={d} trace={x:0>16}" ++
+                " virtual_ms={d} outcome={s}\n",
+            .{
+                sim.opts.seed,                 @tagName(sim.opts.sched),
+                sim.dispatches,                sim.traceHash(),
+                sim.now() - sim.opts.epoch_ms, @tagName(sim.outcome),
+            },
+        ) catch {};
+        if (sim.outcome != .stopped) {
+            out.flush() catch {};
+            var dump: std.Io.Writer.Allocating = .init(alloc);
+            defer dump.deinit();
+            fiber.dumpFibers(&fiber_rt, &dump.writer) catch {};
+            std.debug.print("sim: {s}; parked fibers:\n{s}", .{
+                @tagName(sim.outcome), dump.written(),
+            });
+            std.process.exit(3);
+        }
     }
 
     const total_ms = @divTrunc(nowNs() - t0_all, std.time.ns_per_ms);

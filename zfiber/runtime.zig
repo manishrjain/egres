@@ -34,6 +34,7 @@ const _spinlock = @import("spinlock.zig");
 const _queue = @import("queue.zig");
 const _fsops = @import("fsops.zig");
 const _context = @import("utils").context;
+const _sim = @import("sim.zig");
 
 /// Flush a busy worker's io_uring SQ once this many SQEs have queued, so reads
 /// issued by running fibers dispatch promptly instead of waiting for the ~1 ms
@@ -121,6 +122,10 @@ pub const Worker = struct {
     loop: xev.Loop,
     deadlines: Deadlines,
     current_fiber: ?*Fiber = null,
+    /// The randomness fibers on this worker draw (`fiber.random`): from
+    /// the OS in production, from the sim's seed under a sim, so a
+    /// replay draws the same. Only this worker's thread touches it.
+    prng: std.Random.DefaultPrng,
 
     /// Track the total cpu time spent processing fibers on this worker. Helps
     /// identify if the work is getting distributed evenly across workers.
@@ -143,9 +148,6 @@ pub const Worker = struct {
     is_thief: bool = false,
     /// xorshift64 state for steal-victim randomization; seeded in `run`.
     rng_state: u64 = 1,
-    /// Set from `InitOptions.shuffle_seed`: `nextFiber` draws from this
-    /// instead of popping the front. Null in production.
-    shuffle: ?std.Random.DefaultPrng = null,
     /// TSC reading when this worker last finished a fiber step; the
     /// pre-park poll runs only within a millisecond of it.
     last_work_ticks: u64 = 0,
@@ -178,11 +180,13 @@ pub const Worker = struct {
     /// arms a CPU-clock timer per worker with it. 0 elsewhere.
     tid: i32 = 0,
 
+    /// `prng_seed` seeds `prng` (`Runtime.prngSeed`).
     pub fn init(
         w: *Worker,
         id: u8,
         allocator: std.mem.Allocator,
         io_pool: ?*xev.ThreadPool,
+        prng_seed: u64,
     ) !void {
         // Construct via a struct literal so every field with a declared
         // default actually gets it.
@@ -192,6 +196,7 @@ pub const Worker = struct {
             .wake_async = undefined,
             .deadlines = undefined,
             .ready = undefined,
+            .prng = std.Random.DefaultPrng.init(prng_seed),
         };
         errdefer w.loop.deinit();
         w.wake_async = try xev.Async.init();
@@ -283,27 +288,8 @@ pub const Worker = struct {
     /// a worker keeping itself locally busy (the old per-N-dispatch global
     /// poll is gone with the queue it served).
     fn nextFiber(self: *Worker) ?*Fiber {
-        if (self.shuffle) |*prng| return self.pickShuffled(prng);
         if (self.ready[@intFromEnum(Priority.high)].pop()) |f| return f;
         return self.ready[@intFromEnum(Priority.normal)].pop();
-    }
-
-    /// The seeded pick (`InitOptions.shuffle_seed`): one draw over every
-    /// ready fiber in both rings. Only on a lone worker: nothing steals
-    /// from its rings, and a push only lengthens one, so the lengths
-    /// read without the lock are exact and the drawn slot is there.
-    fn pickShuffled(self: *Worker, prng: *std.Random.DefaultPrng) ?*Fiber {
-        std.debug.assert(runtime().workers.len == 1);
-
-        const high = &self.ready[@intFromEnum(Priority.high)];
-        const normal = &self.ready[@intFromEnum(Priority.normal)];
-        const high_len = high.len();
-        const total = high_len + normal.len();
-        if (total == 0) return null;
-
-        const i = prng.random().uintLessThan(usize, total);
-        if (i < high_len) return high.popAt(i) orelse unreachable;
-        return normal.popAt(i - high_len) orelse unreachable;
     }
 
     /// Pre-park recheck of our own rings, BOTH under their locks so a
@@ -317,7 +303,7 @@ pub const Worker = struct {
     /// synchronization the deleted global queue used to provide. Both
     /// priorities now arrive by direct ring push (normal via `injectNormal`,
     /// high via `routeReady`), so both need it.
-    fn hasReady(self: *Worker) bool {
+    pub fn hasReady(self: *Worker) bool {
         for (&self.ready) |*q| {
             if (q.lenAcquire() > 0) return true;
         }
@@ -400,11 +386,11 @@ pub const Worker = struct {
     }
 
     /// This worker's bit offset within its lane's idle bitmap.
-    fn laneOffset(self: *const Worker) u8 {
+    pub fn laneOffset(self: *const Worker) u8 {
         return self.id - runtime().lane_ranges[self.lane_idx].start;
     }
 
-    fn markIdle(self: *Worker) void {
+    pub fn markIdle(self: *Worker) void {
         runtime().idle[self.lane_idx].markIdle(self.laneOffset());
     }
 
@@ -579,7 +565,7 @@ pub const Worker = struct {
     /// charging CPU time, so the per-fiber charge can't touch a fiber a joiner
     /// (or the detached-free) already reclaimed. A non-finished fiber is
     /// rescheduled / parked here and returns false.
-    fn runFiber(self: *Worker, f: *Fiber) bool {
+    pub fn runFiber(self: *Worker, f: *Fiber) bool {
         // Catch a clobbered/garbage dispatch BEFORE the step jumps in, on a
         // valid (the dispatching) stack rather than as a silent SIGSEGV. Always
         // on — one u64 compare per dispatch is negligible next to the switch.
@@ -653,6 +639,21 @@ pub const Worker = struct {
     /// `Ctx.maybeYield` so a long step pays per batch, not when it
     /// finally parks. Returns the reading.
     pub fn chargeCpu(self: *Worker, f: *Fiber) u64 {
+        if (runtime().simState()) |sim| {
+            // Virtual cpu: the step costs what the sim says, so the meter
+            // still sees cpu and two runs of one seed see the same.
+            // (`ticksTo` is 0 on this thread; `Sim.run` never seeds its
+            // factor.)
+            const cost = sim.stepCost();
+            self.charged_ticks += cost;
+            f.ctx.tenant.charge(
+                .cpu,
+                f.ctx.class,
+                @intCast(cost),
+                _coarse.ms(),
+            );
+            return self.charged_ticks;
+        }
         const now = readTicks();
         const ticks = now -| self.charged_ticks;
         self.charged_ticks = now;
@@ -863,7 +864,7 @@ pub const Worker = struct {
     }
 };
 
-fn wakeAsyncCallback(
+pub fn wakeAsyncCallback(
     _: ?*Worker,
     _: *xev.Loop,
     _: *xev.Completion,
@@ -943,13 +944,12 @@ pub const InitOptions = struct {
     steal_lone: bool = false,
     prepark_poll_us: u64 = 20,
 
-    /// Pick the next fiber at random from the ready rings, seeded, instead
-    /// of in FIFO order: one draw over both rings, so priority is a hint
-    /// the pick ignores. Runs on one worker whatever `num_workers` says:
-    /// a pick is per worker, and the point is an order that replays from
-    /// the seed. A stress mode for the test suite (`zig build test --
-    /// --shuffle-seed N`), and the pick the simulation builds on.
-    shuffle_seed: ?u64 = null,
+    /// Deterministic simulation (sim.zig): one worker, a seeded pick over
+    /// both rings, a virtual clock that jumps to the next deadline when
+    /// nothing is runnable, blocking offload ops run inline. Forces
+    /// `num_workers = 1`, `raft_workers = 0`, `pin_workers = false`.
+    /// `Runtime.simState` reports the run.
+    sim: ?_sim.Options = null,
 };
 
 /// Resolve how many workers serve the `.raft` lane, as a fraction of the
@@ -1027,6 +1027,12 @@ pub const Runtime = struct {
     steal_lone: std.atomic.Value(bool) = .init(false),
     prepark_poll_us: std.atomic.Value(u64) = .init(20),
 
+    /// The simulation driving worker 0 (`InitOptions.sim`), else null.
+    sim: ?_sim.Sim = null,
+    /// Next `Fiber.seq`. With the simulation's one worker it is the spawn
+    /// order, which is what the dispatch trace needs.
+    spawn_seq: std.atomic.Value(u64) = .init(0),
+
     /// Contiguous worker-id range each lane owns. A `len == 0` lane
     /// falls back to `.default` (see `effectiveLaneIdx`).
     lane_ranges: [Lane.count]LaneRange = undefined,
@@ -1082,10 +1088,11 @@ pub const Runtime = struct {
     }
 
     pub fn init(self: *Runtime, allocator: std.mem.Allocator, opts: InitOptions) !void {
-        // A seeded pick is per worker and must replay from the seed
-        // alone, so the shuffle runs on one worker whatever was asked.
+        const sim_mode = opts.sim != null;
+        // The simulation is one worker whatever was asked: its pick
+        // is per worker and must replay from the seed alone.
         // num_workers == 0 means "auto" → the CPU core count.
-        const n = if (opts.shuffle_seed != null)
+        const n = if (sim_mode)
             1
         else if (opts.num_workers == 0)
             (std.Thread.getCpuCount() catch 1)
@@ -1093,7 +1100,10 @@ pub const Runtime = struct {
             opts.num_workers;
         std.debug.assert(n >= 1);
         std.debug.assert(n <= std.math.maxInt(u8));
-        const raft_workers = raftWorkerCount(n, opts.raft_workers);
+        const raft_workers = raftWorkerCount(
+            n,
+            if (sim_mode) 0 else opts.raft_workers,
+        );
         std.debug.assert(raft_workers < n); // default lane (the fallback) is never empty
 
         // Pay the 1 ms calibration cost up front so the first fiber
@@ -1106,7 +1116,9 @@ pub const Runtime = struct {
         self.fibers_sl = .{};
         self.stopping = .init(false);
         self.steal_enabled = opts.steal;
-        self.pin_workers = opts.pin_workers;
+        self.pin_workers = opts.pin_workers and !sim_mode;
+        self.sim = null;
+        self.spawn_seq = .init(0);
         self.steal_lone = .init(opts.steal_lone);
         self.prepark_poll_us = .init(opts.prepark_poll_us);
         self.idle = .{ .{}, .{} };
@@ -1138,6 +1150,15 @@ pub const Runtime = struct {
         const io_pool: ?*xev.ThreadPool =
             if (needs_io_pool) &self.io_pool else null;
 
+        if (opts.sim) |sim_opts| self.sim = try _sim.Sim.init(sim_opts);
+        errdefer if (self.sim) |*s| s.deinit();
+
+        const sim: ?*_sim.Sim = if (self.sim) |*s| s else null;
+        // Before the clock is seeded below: the seed is the sim's epoch,
+        // or the real time would stand until virtual time caught up.
+        if (sim) |s| _coarse.virtual_ms = &s.now_ms;
+        errdefer _coarse.virtual_ms = null;
+
         self.workers = try allocator.alloc(Worker, n);
         errdefer allocator.free(self.workers);
 
@@ -1146,23 +1167,24 @@ pub const Runtime = struct {
             for (self.workers[0..initialized]) |*w| w.deinit();
         }
         for (self.workers, 0..) |*w, i| {
-            try Worker.init(w, @intCast(i), allocator, io_pool);
+            const id: u8 = @intCast(i);
+            try Worker.init(w, id, allocator, io_pool, prngSeed(id, sim));
             w.lane_idx = if (i < raft_count)
                 @intFromEnum(Lane.raft)
             else
                 @intFromEnum(Lane.default);
             initialized += 1;
         }
-        if (opts.shuffle_seed) |seed|
-            self.workers[0].shuffle = std.Random.DefaultPrng.init(seed);
-
         // Seed the process-wide coarse clock so `coarseMs` is valid the
         // instant init returns, before any worker ticks it.
         _coarse.update();
 
         // Blocking-I/O offload pool (fsync + fs metadata). Started before we
-        // publish the singleton; no jobs arrive until fibers run.
-        try _fsops.start(allocator, opts.io_threads);
+        // publish the singleton; no jobs arrive until fibers run. The
+        // simulation runs those ops inline on its one worker instead.
+        if (sim_mode) _fsops.startInline() else {
+            try _fsops.start(allocator, opts.io_threads);
+        }
         errdefer _fsops.stop();
 
         // Publish as the process singleton. There is exactly one runtime
@@ -1174,6 +1196,8 @@ pub const Runtime = struct {
         // Stop the offload pool first: join every pool thread so none is
         // mid-`wake()` into the runtime state we're about to free.
         _fsops.stop();
+        _coarse.virtual_ms = null;
+        if (self.sim) |*s| s.deinit();
         // Same for the file-I/O pool: its threads complete into the
         // worker loops freed just below, so join them first.
         self.io_pool.shutdown();
@@ -1327,6 +1351,10 @@ pub const Runtime = struct {
     /// runs worker 0 on the calling thread, joins the peer threads
     /// after worker 0 returns.
     pub fn run(self: *Runtime) void {
+        if (self.sim) |*s| {
+            s.run(&self.workers[0]);
+            return;
+        }
         for (self.workers[1..]) |*w| {
             w.thread = std.Thread.spawn(.{}, Worker.runMain, .{w}) catch |err| {
                 std.debug.panic("worker thread spawn failed: {}", .{err});
@@ -1339,8 +1367,22 @@ pub const Runtime = struct {
         }
     }
 
-    /// Coarse monotonic ms. One atomic load — safe from any worker
-    /// thread, cheap on every call.
+    /// The simulation's state when running under `InitOptions.sim`:
+    /// its outcome, dispatch count, virtual clock and trace hash.
+    pub fn simState(self: *Runtime) ?*_sim.Sim {
+        return if (self.sim) |*s| s else null;
+    }
+
+    /// A worker's `prng` seed: from the run under a sim, apart from the
+    /// sim's own `prng` that picks the schedule, so an application draw
+    /// never moves the pick; from the OS otherwise.
+    fn prngSeed(id: u8, sim: ?*_sim.Sim) u64 {
+        if (sim) |s| return s.opts.seed ^ (@as(u64, id) + 1) << 32;
+        var bytes: [8]u8 = undefined;
+        _context.g().io.random(&bytes);
+        return std.mem.readInt(u64, &bytes, .little);
+    }
+
     pub fn stats(self: *Runtime) Stats {
         self.fibers_sl.lock();
         defer self.fibers_sl.unlock();
@@ -1453,6 +1495,7 @@ fn spawn_(
     }
 
     try rt.appendFiber(f);
+    f.seq = rt.spawn_seq.fetchAdd(1, .monotonic);
     f.state.store(@bitCast(State{ .tag = .ready, .awaken = false }), .release);
     routeReady(rt, f, placed);
     return f;
@@ -1599,6 +1642,21 @@ pub fn stop() void {
 pub noinline fn currentWorkerOrNull() ?*Worker {
     asm volatile ("" ::: .{ .memory = true });
     return Worker.current_do_not_use_directly;
+}
+
+/// Whether the runtime is the simulation (`InitOptions.sim`): one
+/// worker, virtual time, virtual cpu, no xev timers for deadlines.
+/// What a struct asks instead of being told.
+pub fn isSim() bool {
+    return runtime().simState() != null;
+}
+
+/// The current worker's randomness: OS-seeded in production, seeded
+/// from the run under a sim, so a replay draws the same numbers. Draw
+/// at once and let it go: the handle is the worker's state, and a
+/// fiber that parks may wake on another worker. Fibers only.
+pub fn random() std.Random {
+    return currentWorker().prng.random();
 }
 
 pub fn currentWorker() *Worker {

@@ -72,6 +72,16 @@ const Pool = struct {
 
 var pool: Pool = .{};
 
+/// The simulation (`startInline`): `run` calls the function on the
+/// calling worker thread and returns, no pool, no park. One worker
+/// means nothing else could run meanwhile anyway, and the order of
+/// completion becomes the order of the calls.
+var inline_mode: bool = false;
+
+pub fn startInline() void {
+    inline_mode = true;
+}
+
 /// Start the offload pool with `num_threads` worker threads. Called by
 /// `Runtime.init`. `num_threads == 0` is treated as 1.
 pub fn start(allocator: std.mem.Allocator, num_threads: usize) !void {
@@ -104,6 +114,7 @@ pub fn start(allocator: std.mem.Allocator, num_threads: usize) !void {
 /// by `Runtime.deinit` BEFORE the workers/queues are torn down, so no pool
 /// thread is mid-`wake()` into freed runtime state.
 pub fn stop() void {
+    inline_mode = false;
     if (pool.threads.len == 0) return;
     pool.mu.lockUncancelable(io());
     pool.stopping = true;
@@ -157,6 +168,8 @@ fn ReturnOf(comptime func: anytype) type {
 /// fiber context (it parks). `func` runs on a plain OS thread, so it must
 /// NOT touch fiber-runtime state (no `park`/`yield`/`currentFiber`).
 pub fn run(comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) ReturnOf(func) {
+    if (inline_mode) return @call(.auto, func, args);
+
     const Args = @TypeOf(args);
     const Ret = ReturnOf(func);
     const Frame = struct {

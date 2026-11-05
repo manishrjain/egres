@@ -110,6 +110,8 @@ test "Runtime: CPU accounting per fiber" {
 }
 
 test "Runtime: TSC accounting times a fibonacci workload" {
+    // Skipped under `--sim-seed`: cpu is not accounted under the simulation.
+    if (fiber.isSim()) return error.SkipZigTest;
     // Naive recursive fibonacci — does meaningful CPU work even in
     // Debug mode (~500K recursive calls for fib(28)) without slowing
     // down the test suite. fib(28) = 317_811.

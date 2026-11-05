@@ -107,9 +107,11 @@ pub const Cfg = struct {
 
 /// `total_bytes` as a budget: itself, or 90% of what the host or the
 /// cgroup allows when zero. The tenth is for the WAL's page cache, the
-/// kernel and thread stacks.
+/// kernel and thread stacks. A simulated run sets it: the box's memory
+/// would make the pool, and so every refusal, differ between boxes.
 pub fn resolveTotal(total_bytes: u64) u64 {
     if (total_bytes > 0) return total_bytes;
+    std.debug.assert(!fiber.isSim());
     return utils.host.memory().bytes / 10 * 9;
 }
 
@@ -215,7 +217,9 @@ pub const Governor = struct {
             }
         }
         const live = utils.context.counting().live_bytes.load(.monotonic);
-        if (self.ticks % ratio_every_ticks == 0)
+        // Resident bytes are the kernel's, not the schedule's: a replay
+        // keeps the ratio's default so the pool is the same each run.
+        if (!fiber.isSim() and self.ticks % ratio_every_ticks == 0)
             self.ratio.measure(live, self.total / 4);
         self.ticks +%= 1;
         self.ratio.update();

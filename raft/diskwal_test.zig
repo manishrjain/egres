@@ -12,10 +12,17 @@ const zbuf = @import("zbuf").zbuf;
 const zen = raft.buffers;
 const u = raft.utils;
 
+/// Named from the OS's random bytes, not the clock: under the
+/// simulation every test in one virtual ms reads the same time.
 fn makeTempWalDir(alloc: std.mem.Allocator) ![]u8 {
     var path_buf: [160]u8 = undefined;
-    const ts = utils.timestampNow(.realtime, .nanos);
-    const path = try std.fmt.bufPrint(&path_buf, "/tmp/egres-diskwal-{d}", .{ts});
+    var tag: [8]u8 = undefined;
+    utils.context.g().io.random(&tag);
+    const path = try std.fmt.bufPrint(
+        &path_buf,
+        "/tmp/egres-diskwal-{x}",
+        .{std.mem.readInt(u64, &tag, .little)},
+    );
     try vfs.createDirPath(path);
     return alloc.dupe(u8, path);
 }
@@ -1405,7 +1412,10 @@ test "diskwal findIndexOlderThan age-only branch" {
     var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
     defer ds.deinit();
 
-    const now_secs: u32 = @intCast(std.Io.Timestamp.now(utils.context.g().io, .real).toSeconds());
+    // The clock the WAL ages against: the coarse clock, virtual
+    // under the simulation.
+    const now_secs: u32 =
+        @intCast(@divFloor(utils.coarseMs(), std.time.ms_per_s));
     // Slot 1: 100 s ago. Slot 2: 50 s ago. Slot 3: 10 s ago.
     const ages = [_]u32{ 100, 50, 10 };
     for (ages, 1..) |age, i| {
@@ -1440,7 +1450,10 @@ test "diskwal findIndexOlderThan returns larger of bytes and age" {
     var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
     defer ds.deinit();
 
-    const now_secs: u32 = @intCast(std.Io.Timestamp.now(utils.context.g().io, .real).toSeconds());
+    // The clock the WAL ages against: the coarse clock, virtual
+    // under the simulation.
+    const now_secs: u32 =
+        @intCast(@divFloor(utils.coarseMs(), std.time.ms_per_s));
     // 5 entries, 1 KiB each. Slot 1 is the oldest (100 s). Slots 2–5 are fresh.
     const payload = try alloc.alloc(u8, 1024);
     defer alloc.free(payload);

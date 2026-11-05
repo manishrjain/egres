@@ -1034,7 +1034,10 @@ pub const DiskWAL = struct {
         const head = self.wal_store.lastIndex();
         if (head == 0) return null;
 
-        const now_secs: u32 = @intCast(std.Io.Timestamp.now(utils.context.g().io, .real).toSeconds());
+        const now_secs: u32 = @intCast(@divFloor(
+            utils.coarse_clock.ms(),
+            std.time.ms_per_s,
+        ));
         var bytes_acc: u64 = 0;
 
         var fi: usize = self.wal_store.files.items.len;

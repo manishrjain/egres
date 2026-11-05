@@ -53,6 +53,12 @@ const context = @import("context.zig");
 pub const ClockKind = enum { monotonic, realtime };
 pub const TimeUnit = enum { secs, millis, micros, nanos };
 
+/// The simulation's clock when one runs (`zfiber/sim.zig` installs
+/// it): every time read in the process, this file's `update` included,
+/// is then virtual, so a replay of one seed sees the same timestamps.
+/// Null in production.
+pub var virtual_ms: ?*const std.atomic.Value(i64) = null;
+
 /// The current time on `kind`'s clock, in `unit`, via `std.Io.Timestamp.now`
 /// on the process io (`context.g().io`) — the same time source the rest of
 /// the codebase uses. `context.g()` asserts the process context was
@@ -64,6 +70,17 @@ pub const TimeUnit = enum { secs, millis, micros, nanos };
 /// registration or per timeline mark; the hot-path CPU accounting in
 /// `Worker.run` sticks to `rdtsc`.
 pub fn timestampNow(comptime kind: ClockKind, comptime unit: TimeUnit) i64 {
+    if (virtual_ms) |v| {
+        // One virtual clock serves both kinds: a monotonic reader only
+        // takes differences, and both move by the same ms.
+        const virt = v.load(.acquire);
+        return switch (unit) {
+            .secs => @divFloor(virt, std.time.ms_per_s),
+            .millis => virt,
+            .micros => virt * std.time.us_per_ms,
+            .nanos => virt * std.time.ns_per_ms,
+        };
+    }
     // std.Io.Clock spells monotonic as `.awake` (Linux CLOCK_MONOTONIC,
     // macOS CLOCK_UPTIME_RAW); `.real` is wall-clock Unix time.
     const ts = std.Io.Timestamp.now(context.g().io, switch (kind) {
@@ -87,10 +104,11 @@ pub fn timestampNow(comptime kind: ClockKind, comptime unit: TimeUnit) i64 {
 var cached_ms: std.atomic.Value(i64) align(std.atomic.cache_line) = .init(0);
 
 /// Publish the current wall-clock millisecond if it's newer than the
-/// cached value. Called by every worker, gated to ~once/ms. The
-/// `last < now` check makes all but the first writer each ms a plain
-/// load (no store, no invalidation); the surviving CAS is best
-/// effort — if a peer won the boundary, ours no-ops harmlessly.
+/// cached value. Called by every worker, gated to ~once/ms, and by the
+/// simulation's loop at every pass. The `last < now` check makes all
+/// but the first writer each ms a plain load (no store, no
+/// invalidation); the surviving CAS is best effort — if a peer won the
+/// boundary, ours no-ops harmlessly.
 pub fn update() void {
     const now = timestampNow(.realtime, .millis);
     const last = cached_ms.load(.monotonic);

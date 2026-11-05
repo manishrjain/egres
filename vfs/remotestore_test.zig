@@ -5,6 +5,7 @@ const std = @import("std");
 const testing = std.testing;
 const utils = @import("utils");
 const vfs = @import("vfs");
+const fiber = @import("zfiber");
 
 fn tmpPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![:0]u8 {
     return tmp.dir.realPathFileAlloc(utils.context.g().io, ".", alloc);
@@ -65,6 +66,9 @@ test "remotestore: file backend put/get/exists/delete round-trip" {
 }
 
 test "remotestore: file probeRead times an O_DIRECT ranged read" {
+    // The probe times a real read; virtual time does not move across
+    // one, so the timings are 0 under the simulation.
+    if (fiber.isSim()) return error.SkipZigTest;
     const alloc = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

@@ -327,6 +327,9 @@ fn tenantAt(id: u64, pages_per_s: i64) fiber.Tenant {
 // ── 11. Read bandwidth enforcement ──────────────────────────────────
 
 test "read bandwidth enforcement" {
+    // Skipped under `--sim-seed`: paces against real time, which the
+    // simulation does not keep.
+    if (fiber.isSim()) return error.SkipZigTest;
     const path = "/tmp/vfs_test_bw_read_rate";
     const file_size = 1024 * page_size; // 4 MB
     const data = try testing.allocator.alloc(u8, file_size);
@@ -369,6 +372,9 @@ test "read bandwidth enforcement" {
 // ── 12. Write bandwidth enforcement ─────────────────────────────────
 
 test "write bandwidth enforcement" {
+    // Skipped under `--sim-seed`: paces against real time, which the
+    // simulation does not keep.
+    if (fiber.isSim()) return error.SkipZigTest;
     const path = "/tmp/vfs_test_bw_write_rate";
 
     // Create the file first.

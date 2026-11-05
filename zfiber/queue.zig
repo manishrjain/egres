@@ -123,9 +123,8 @@ pub fn LocalQueue(comptime lock: LockMode) type {
         /// when `i` is past the end. The front fiber moves into its slot
         /// and the front is popped, so this is O(1) and the live range
         /// stays contiguous; the queue's order is no longer FIFO, which
-        /// is the point: a seeded scheduler (`InitOptions.shuffle_seed`,
-        /// the simulation) draws `i` to explore orderings production
-        /// would not produce.
+        /// is the point: the simulation's seeded pick (`InitOptions.sim`)
+        /// draws `i` to explore orderings production would not produce.
         pub fn popAt(self: *Self, i: usize) ?*Fiber {
             self.acquire();
             defer self.release();

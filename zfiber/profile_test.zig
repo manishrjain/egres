@@ -59,6 +59,9 @@ fn startWhenFree(alloc: std.mem.Allocator, opts: fiber.profile.Options) !void {
 test "profile: samples a CPU-bound fiber, leaf frames inside it" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos)
         return error.SkipZigTest;
+    // `burn` spins until the clock moves, which virtual time never does
+    // under a fiber that holds the worker.
+    if (fiber.isSim()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     try startWhenFree(alloc, .{ .hz = 500, .secs = 2 });
     try std.testing.expect(fiber.profile.running());

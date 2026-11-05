@@ -32,6 +32,9 @@ const _ctx = @import("ctx.zig");
 
 pub const Worker = _rt.Worker;
 pub const Runtime = _rt.Runtime;
+pub const InitOptions = _rt.InitOptions;
+// Deterministic simulation mode: `InitOptions.sim`, `Runtime.simState`.
+pub const sim = @import("sim.zig");
 pub const Deadlines = _rt.Deadlines;
 pub const Timeout = _rt.Timeout;
 pub const Stats = _rt.Stats;
@@ -43,6 +46,7 @@ pub const park = _rt.park;
 pub const wake = _rt.wake;
 pub const stop = _rt.stop;
 pub const runtime = _rt.runtime;
+pub const isSim = _rt.isSim;
 pub const currentWorker = _rt.currentWorker;
 pub const currentWorkerOrNull = _rt.currentWorkerOrNull;
 pub const currentFiber = _rt.currentFiber;
@@ -129,6 +133,9 @@ pub const SemaphoreMap = @import("semaphore_map.zig").SemaphoreMap;
 // `sleepMs` lives in deadlines.zig — it parks on the per-worker Deadlines array
 // and PANICS on a spurious wake (resumed before its own deadline fired).
 pub const sleepMs = @import("deadlines.zig").sleepMs;
+
+// The current worker's randomness, for any fiber that needs a draw.
+pub const random = _rt.random;
 
 // From fs.zig — file I/O that cooperatively parks (zio.File/Dir-compatible).
 pub const fs = @import("fs.zig");

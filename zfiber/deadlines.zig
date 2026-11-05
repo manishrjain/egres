@@ -124,6 +124,13 @@ pub const Deadlines = struct {
         self.timer.deinit();
     }
 
+    /// Earliest pending deadline, or null if none.
+    pub fn minDeadline(self: *Deadlines) ?i64 {
+        self.sl.lock();
+        defer self.sl.unlock();
+        return self.minDeadlineLocked();
+    }
+
     /// Earliest pending deadline, or null if none. Caller holds `sl`.
     fn minDeadlineLocked(self: *const Deadlines) ?i64 {
         var m: ?i64 = null;
@@ -272,6 +279,9 @@ pub const Deadlines = struct {
     /// never left uncovered. No-op when the active node already covers the
     /// head, or when there are no timeouts.
     fn armForHead(self: *Deadlines, current_ms: i64) void {
+        // The sim loop drains by its own clock (`Sim.run`): no timer.
+        if (_rt.isSim()) return;
+
         self.sl.lock();
         const head = self.minDeadlineLocked();
         self.sl.unlock();

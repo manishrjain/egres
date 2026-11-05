@@ -23,3 +23,11 @@ const fiber = @import("zfiber");
 test "HANG: hangs for 6 minutes (watchdog smoke test)" {
     fiber.sleepMs(6 * 60 * 1000);
 }
+
+// Under the simulation (`--sim-seed`) this is not a hang: a parked
+// fiber nothing can wake, with no deadline and no I/O in flight, is
+// declared a deadlock and the run exits 3 (scripts/sim_check.sh checks
+// it). `sleepMs` above would not do: virtual time jumps over it.
+test "HANG: parks forever (simulation deadlock smoke test)" {
+    fiber.park();
+}

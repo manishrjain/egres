@@ -7,6 +7,8 @@ const utils = @import("utils");
 
 /// Fresh monotonic ms — same source `Deadlines.register` / `onTimer`
 /// use. Direct vDSO read; no cache lag under load.
+/// A fresh read, not the coarse clock's loop-tick lag. Virtual under
+/// the simulation, as the deadlines are.
 fn nowMs() i64 {
     return utils.timestampNow(.monotonic, .millis);
 }

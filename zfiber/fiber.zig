@@ -372,6 +372,10 @@ pub const Fiber = struct {
     /// runtime's `appendFiber` / `removeFiber` so swap-remove can find
     /// the fiber in O(1). `maxInt` while not registered.
     registry_index: usize,
+    /// Spawn order on the runtime, set by `spawn_`: the fiber's identity
+    /// in the simulation's dispatch trace, where a pointer would differ
+    /// between two runs of one seed.
+    seq: u64,
 
     /// This fiber's OWN deadline timeout (see `Timeout`). Reused across every
     /// timed op — `sleepMs`, watermark timed waits, and future timed I/O. Lives
@@ -504,6 +508,7 @@ pub const Fiber = struct {
             .waker_prev = null,
             .waker_next = null,
             .registry_index = std.math.maxInt(usize),
+            .seq = 0,
             // Owned timeout: ctx is this (stable) fiber; `on_fire` is a tripwire
             // until a timed op arms the real one via `deadlines.armSelf`.
             .timeout = .{ .on_fire = &timeoutUnarmed, .on_fire_ctx = self },
