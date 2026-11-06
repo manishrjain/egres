@@ -557,14 +557,15 @@ const Change = struct {
 /// change's pre keys diffed against its post keys, per index: a key
 /// only in the pre is removed, only in the post added, in both left
 /// alone — so an insert adds every key, a delete removes every key,
-/// and an update moves the keys its SET changed. Then the unique keys
-/// are locked, each row gets its egid (a fresh one without a pre) and
-/// is put — the post marshalled, or a tombstone — and the index
-/// entries are written. Nothing is buffered before the last lock: a
-/// Restart re-runs the statement. `uniques` are the indexes an ON
-/// CONFLICT resolved against, for the probe; empty otherwise.
-/// `returning` keeps each written row in its change's `returned`. Returns
-/// the rows written; null = replied.
+/// and an update moves the keys its SET changed. Each row gets its egid
+/// first (a fresh one without a pre), since a key may carry it. Then
+/// the unique keys are locked, each row is put — the post marshalled,
+/// or a tombstone — and the index entries are written. Nothing is
+/// buffered before the last lock: a Restart re-runs the statement,
+/// and the egids it took are left as a gap, as a rollback leaves them.
+/// `uniques` are the indexes an ON CONFLICT resolved against, for the
+/// probe; empty otherwise. `returning` keeps each written row in its
+/// change's `returned`. Returns the rows written; null = replied.
 fn write(
     self: *Handler,
     state: *pgwire.ConnState,
@@ -580,20 +581,35 @@ fn write(
     const tx = ctx.tx;
 
     var keys: std.ArrayList(IndexKey) = .empty;
-    for (changes, 0..) |change, ri| {
+    for (changes, 0..) |*change, ri| {
         if (ri % _exec.row_cap == 0) try fiber.ctx().maybeYield();
 
+        if (change.pre) |item| {
+            change.egid = _key.decodeEgid(item.key.primary).?;
+        } else if (change.post != null) {
+            change.egid = self.allocEgid(table_key) catch |err| {
+                log.err("write '{s}': alloc egid: {s}", .{
+                    table_name, @errorName(err),
+                });
+                try replyError(state, "row id allocation failed");
+                return null;
+            };
+        }
         for (tbl.indexes) |*idx| {
             // A building index gets no entries from DML: nothing reads
             // it yet, and its build merges in every row written
             // meanwhile (index_ddl.zig).
             if (idx.isBuilding()) continue;
             const old: []const String = if (change.pre) |item|
-                try idx.keys(arloc, tbl.parseCol(item, idx.column))
+                try idx.keys(
+                    arloc,
+                    tbl.parseCol(item, idx.column),
+                    change.egid,
+                )
             else
                 &.{};
             const new: []const String = if (change.post) |cells|
-                try idx.keys(arloc, cells[idx.column.pos])
+                try idx.keys(arloc, cells[idx.column.pos], change.egid)
             else
                 &.{};
             // INSERT INTO t (k) VALUES (<70000 chars>) on an indexed k:
@@ -628,17 +644,6 @@ fn write(
     for (changes) |*change| {
         if (change.pre == null and change.post == null) continue;
         count += 1;
-        if (change.pre) |item| {
-            change.egid = _key.decodeEgid(item.key.primary).?;
-        } else {
-            change.egid = self.allocEgid(table_key) catch |err| {
-                log.err("write '{s}': alloc egid: {s}", .{
-                    table_name, @errorName(err),
-                });
-                try replyError(state, "row id allocation failed");
-                return null;
-            };
-        }
         const ekey = _key.encodeEgid(change.egid);
         if (change.post) |cells| {
             const bytes = try _row.marshalRow(arloc, &tbl.ps, cells, &buf);
@@ -773,7 +778,8 @@ fn resolveConflicts(
     // change may collide on several indexes, and DO NOTHING drops it.
     for (hits) |item| for (uniques) |unique| {
         const cell = tbl.parseCol(item, unique.idx.column);
-        for (try unique.idx.keys(arloc, cell)) |key| {
+        const egid = _key.decodeEgid(item.key.primary).?;
+        for (try unique.idx.keys(arloc, cell, egid)) |key| {
             const ci = unique.change_by_key.get(key) orelse continue;
             changes[ci].pre = item;
         }
@@ -841,7 +847,9 @@ fn collisionPred(
     for (changes, 0..) |*change, ci| for (uniques) |*unique| {
         const cells = change.post orelse continue;
         const cell = cells[unique.idx.column.pos];
-        for (try unique.idx.keys(arloc, cell)) |key| {
+        // Conflict detection runs before write() allocates egids.
+        // Non-NULL values produce probe keys; NULLs cannot conflict.
+        for (try unique.idx.keys(arloc, cell, null)) |key| {
             const slot = try unique.change_by_key.getOrPut(arloc, key);
             if (slot.found_existing) switch (action) {
                 .nothing => {
@@ -1625,10 +1633,9 @@ fn replyExprErr(state: *pgwire.ConnState, err: _expr.EvalError) !void {
 // (Materialize), then index keys (IndexKey.lessThan).
 
 /// One index mutation: the entry `key` of `idx` for the statement's
-/// row at `row` (whose egid INSERT knows only at write time), added or
-/// removed. Sorted by (index table, key) — the lock order — the
-/// entries for one unique key sit together, which is how
-/// applyIndexKeys decides what the whole statement does to it.
+/// row at `row`, added or removed. Sorted by (index table, key) — the
+/// lock order — the entries for one unique key sit together, which is
+/// how applyIndexKeys decides what the whole statement does to it.
 const IndexKey = struct {
     idx: *const _table.Index,
     key: String,
@@ -1658,7 +1665,8 @@ fn containsKey(keys: []const String, key: String) bool {
 /// Sort the statement's index mutations into lock order and lock every
 /// unique key, all before any write (lockRows may Restart). Non-unique
 /// entries are sorted with the rest but never locked: posting deltas
-/// commute. false = an error was replied.
+/// commute. Nor is a unique index's NULL key: it carries its row's
+/// egid, so no other row can take it. false = an error was replied.
 fn sortAndLockIndexKeys(
     state: *pgwire.ConnState,
     tx: *_txn.Txn,
@@ -1673,7 +1681,7 @@ fn sortAndLockIndexKeys(
     var hashes: std.ArrayList(u64) = .empty;
     defer hashes.deinit(tx.allocator);
     for (keys) |ik| {
-        if (!ik.idx.unique) continue;
+        if (!ik.idx.unique or _key.isNullKey(ik.key)) continue;
         const h = tx.rowHash(ik.idx.index_table_id, ik.key);
         try hashes.append(tx.allocator, h);
     }
@@ -1689,7 +1697,8 @@ fn sortAndLockIndexKeys(
 /// key gets ONE write, decided from its group of equal entries, i.e.
 /// from what the whole statement does to it: more than one add is two
 /// rows given the same value → 23505; no add is a tombstone; one add
-/// with no remove probes the index, found → 23505, else puts; one add
+/// with no remove probes the index, found → 23505, else puts — but a
+/// NULL key, its row's alone, is put unprobed; one add
 /// with a remove is a move between two of this statement's rows — the
 /// put alone, no probe, since the committed occupant is the row moving
 /// away, its pre-image locked and newest. The probed puts are written
@@ -1729,7 +1738,7 @@ fn applyIndexKeys(
             try tx.put(table_id, first.key, "", .{ .kind = .deleted });
             continue;
         }
-        if (group.removes == 0) {
+        if (group.removes == 0 and !_key.isNullKey(first.key)) {
             try probes.append(tx.allocator, first);
             continue;
         }
@@ -1844,8 +1853,8 @@ fn replyUniqueViolation(state: *pgwire.ConnState) !bool {
 }
 
 /// NULL into a NOT NULL column (the PRIMARY KEY included), by INSERT
-/// or UPDATE: 23502, in Postgres's wording. A unique index takes NULL
-/// as "no entry" (NULLS DISTINCT); only the constraint refuses it.
+/// or UPDATE: 23502, in Postgres's wording. A unique index keys each
+/// NULL row apart (NULLS DISTINCT); only the constraint refuses it.
 fn replyNullViolation(
     state: *pgwire.ConnState,
     a: std.mem.Allocator,

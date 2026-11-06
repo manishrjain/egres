@@ -255,8 +255,7 @@ fn bitmapFor(
 }
 
 /// `col IS NULL` from an index: the posting under the NULL tag key. A
-/// unique index holds no NULL entries, so only a posting bitmap can
-/// answer it.
+/// unique index falls back to a table scan for this predicate.
 fn nullLookup(
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,

@@ -20,6 +20,16 @@ from primary key to egid, then egid to row. In exchange, every index has the
 same shape, index key -> egid(s), which are 64-bit ints and can be efficiently
 encoded. Each index is a table in zdb with its own set of LSM trees.
 
+NULL has an index key too, sorted after every value. A non-unique index keeps
+all NULL rows under one key; a unique index gives each NULL row a key of its
+own (the NULL tag followed by the egid), since NULLs never collide. So every
+index holds every row, and walking an index in key order is `ORDER BY` on its
+column.
+
+After upgrading, drop and recreate unique indexes on nullable columns that
+were built without NULL entries before querying their tables. Existing data
+directories are not automatically migrated.
+
 Egres exposes egid SQLite style. `SELECT egid, col1, col2 FROM table`. `...
 WHERE egid = N` would avoid the index key -> rowid lookup, though that's an
 optimization. In the [benchmarks](../benchmarks.md), point reads via *select*
