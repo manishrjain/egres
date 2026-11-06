@@ -84,6 +84,7 @@ pub const sqlstate = struct {
     pub const wrong_object_type: [5]u8 = .{ '4', '2', '8', '0', '9' };
     pub const undefined_object: [5]u8 = .{ '4', '2', '7', '0', '4' };
     pub const undefined_column: [5]u8 = .{ '4', '2', '7', '0', '3' };
+    pub const duplicate_column: [5]u8 = .{ '4', '2', '7', '0', '1' };
     pub const undefined_function: [5]u8 = .{ '4', '2', '8', '8', '3' };
     pub const datatype_mismatch: [5]u8 = .{ '4', '2', '8', '0', '4' };
     pub const invalid_catalog_name: [5]u8 = .{ '3', 'D', '0', '0', '0' };
