@@ -387,7 +387,7 @@ test "sql.plan: IN, BETWEEN, IS NOT DISTINCT FROM and IS TRUE read an index" {
     try expectScan(&not_true);
 }
 
-test "sql.plan: IS NULL reads a posting index, never a unique one" {
+test "sql.plan: IS NULL reads an index's NULL keys" {
     var fx = try Fixture.init();
     defer fx.deinit();
     const a = fx.arena.allocator();
@@ -397,10 +397,33 @@ test "sql.plan: IS NULL reads a posting index, never a unique one" {
     const null_key = try sql.key.encodeIndexKey(a, .null_value, null);
     try expectLookup(try bitmapOf(&on_b), b_index_id, false, null_key);
 
-    // Unique NULL entries are not used for this predicate yet.
-    var on_a = try fx.planFor("a IS NULL", stream);
-    defer on_a.deinit();
-    try expectScan(&on_a);
+    // Nullable unique columns use the range of per-row NULL keys.
+    fx.tbl.indexes[1].unique = true;
+    fx.tbl.indexes[2].unique = true;
+    const cases = [_]struct { where: String, index_table_id: u32 }{
+        .{ .where = "a IS NULL", .index_table_id = pkey_index_id },
+        .{ .where = "b IS NULL", .index_table_id = b_index_id },
+        .{
+            .where = "b IS NOT DISTINCT FROM NULL",
+            .index_table_id = b_index_id,
+        },
+        .{ .where = "d IS UNKNOWN", .index_table_id = d_index_id },
+    };
+    for (cases) |case| {
+        var indexed = try fx.planFor(case.where, stream);
+        defer indexed.deinit();
+        try expectRange(
+            try bitmapOf(&indexed),
+            case.index_table_id,
+            true,
+            sql.key.values_end,
+            sql.key.keys_end,
+        );
+
+        var older = try fx.planFor(case.where, .{ .read_ts = built_ts - 1 });
+        defer older.deinit();
+        try expectScan(&older);
+    }
 
     var not_null = try fx.planFor("b IS NOT NULL", stream);
     defer not_null.deinit();
