@@ -879,6 +879,24 @@ test "ext: Bind with format=2 (invalid) errors and skips until Sync" {
     try testing.expect(saw_error);
     try testing.expect(!saw_bind_complete);
     try testing.expect(!s.ext_failed);
+    try testing.expect(std.mem.indexOf(u8, out, "C22023\x00") != null);
+}
+
+test "startup: unsupported protocol version answers 0A000" {
+    const a = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+
+    // Startup frame: length 9, version 3.1 (not 3.0), param terminator.
+    const input = [_]u8{ 0, 0, 0, 9, 0, 3, 0, 1, 0 };
+    var rdr = std.Io.Reader.fixed(&input);
+    var s = conn_state.ConnState.init(a, &rdr, &aw.writer, .{});
+    defer s.deinit();
+
+    try testing.expect(try s.nextEvent() == .terminate);
+    try testing.expect(
+        std.mem.indexOf(u8, aw.writer.buffered(), "C0A000\x00") != null,
+    );
 }
 
 /// Run `frames` (already tagged+length-prefixed) through a fresh

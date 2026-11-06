@@ -458,9 +458,10 @@ pub const ConnState = struct {
             }
             if (code != _types.protocol_version_3) {
                 // Unknown version — send a fatal error and close.
-                try self.emitFatal("unsupported frontend protocol", .{
-                    'X', 'X', '0', '0', '0',
-                });
+                try self.emitFatal(
+                    "unsupported frontend protocol",
+                    _types.sqlstate.feature_not_supported,
+                );
                 self.phase = .closed;
                 return .terminate;
             }
@@ -682,14 +683,14 @@ pub const ConnState = struct {
         for (b.param_formats) |f| if (f != 0 and f != 1) {
             try self.extError(
                 "invalid parameter format code (must be 0 or 1)",
-                _types.sqlstate.internal_error,
+                _types.sqlstate.invalid_parameter_value,
             );
             return;
         };
         for (b.result_formats) |f| if (f != 0 and f != 1) {
             try self.extError(
                 "invalid result format code (must be 0 or 1)",
-                _types.sqlstate.internal_error,
+                _types.sqlstate.invalid_parameter_value,
             );
             return;
         };
