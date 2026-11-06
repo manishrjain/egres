@@ -558,9 +558,19 @@ pub fn orderValues(x: Value, y: Value) std.math.Order {
         .bytea => std.mem.order(u8, x.bytea, y.bytea),
         .uuid => std.mem.order(u8, &x.uuid, &y.uuid),
         .interval => std.math.order(intervalMicros(x.interval), intervalMicros(y.interval)),
+        .float4 => |f| orderFloats(f, y.float4),
+        .float8 => |f| orderFloats(f, y.float8),
         .numeric => |d| Numeric.order(d, y.numeric),
         inline else => |v, tag| std.math.order(v, @field(y, @tagName(tag))),
     };
+}
+
+/// Postgres float order: NaN is equal to itself and above every number,
+/// as key.zig encodes it; std.math.order traps on a NaN instead.
+pub fn orderFloats(a: f64, b: f64) std.math.Order {
+    if (std.math.isNan(a)) return if (std.math.isNan(b)) .eq else .gt;
+    if (std.math.isNan(b)) return .lt;
+    return std.math.order(a, b);
 }
 
 /// An interval's length in microseconds for ordering: Postgres's

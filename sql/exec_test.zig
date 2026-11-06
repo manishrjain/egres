@@ -950,6 +950,18 @@ test "sql.exec: orderKeys: direction, NULLs, and the first key that differs" {
         lt,
         ord(&.{asc}, &.{.{ .int8 = 2 }}, &.{.{ .float8 = 2.5 }}),
     );
+    // NaN sorts above every number, equal to itself, and before NULL.
+    const nan = Value{ .float8 = std.math.nan(f64) };
+    const inf = Value{ .float8 = std.math.inf(f64) };
+    try testing.expectEqual(gt, ord(&.{asc}, &.{nan}, &.{inf}));
+    try testing.expectEqual(lt, ord(&.{asc}, &.{inf}, &.{nan}));
+    try testing.expectEqual(eq, ord(&.{asc}, &.{nan}, &.{nan}));
+    try testing.expectEqual(lt, ord(&.{desc}, &.{nan}, &.{inf}));
+    try testing.expectEqual(lt, ord(&.{asc}, &.{nan}, &.{nul}));
+    try testing.expectEqual(
+        gt,
+        ord(&.{asc}, &.{.{ .float4 = std.math.nan(f32) }}, &.{inf}),
+    );
 }
 
 test "sql.exec: fetch over an index walk: key order, pending ops merged" {

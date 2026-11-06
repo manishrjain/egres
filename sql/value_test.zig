@@ -469,3 +469,25 @@ test "sql.value: bytea is hex in text, raw in binary" {
     try value.valueToBinary(&aw.writer, null, .{ .bytea = &.{ 0, 0xFF } });
     try testing.expectEqualSlices(u8, &.{ 0, 0xFF }, aw.written());
 }
+
+test "sql.value: orderValues puts NaN above every float and equal to itself" {
+    const nan = value.Value{ .float8 = std.math.nan(f64) };
+    const nan4 = value.Value{ .float4 = std.math.nan(f32) };
+    const inf = value.Value{ .float8 = std.math.inf(f64) };
+    const eq = std.math.Order.eq;
+    const lt = std.math.Order.lt;
+    const gt = std.math.Order.gt;
+
+    try testing.expectEqual(eq, value.orderValues(nan, nan));
+    try testing.expectEqual(gt, value.orderValues(nan, inf));
+    try testing.expectEqual(lt, value.orderValues(inf, nan));
+    try testing.expectEqual(eq, value.orderValues(nan4, nan4));
+    try testing.expectEqual(
+        gt,
+        value.orderValues(nan4, .{ .float4 = std.math.inf(f32) }),
+    );
+    try testing.expectEqual(
+        eq,
+        value.orderValues(.{ .float8 = 0 }, .{ .float8 = -0.0 }),
+    );
+}
