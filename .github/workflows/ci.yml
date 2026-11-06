@@ -51,9 +51,10 @@ jobs:
         run: ./scripts/prepush.sh
 
   # The end-to-end scripts (scripts/e2e.sh): a real server driven over
-  # pgwire by psql. A job of its own, beside the tests, so a red check
-  # says which kind failed, and not in prepush.sh, which gates a local
-  # push.
+  # pgwire by psql, then on Linux the Postgres conformance replay
+  # (scripts/sqllogic_e2e.sh). A job of its own, beside the tests, so a
+  # red check says which kind failed, and not in prepush.sh, which
+  # gates a local push.
   e2e:
     strategy:
       fail-fast: false
@@ -104,6 +105,18 @@ jobs:
         env:
           DATA: ${{ runner.temp }}/e2e
         run: ./scripts/e2e.sh
+
+      # Postgres conformance (tests/sqllogic): Postgres's regress files
+      # replayed from recorded .pgout files, so no Postgres server is
+      # needed, only psycopg, which the script installs into a venv.
+      # Linux only: pure-Python psycopg loads the system libpq, which
+      # the client package above brings; brew's keg-only libpq is not
+      # on the Mac's library path.
+      - name: sqllogic
+        if: runner.os == 'Linux'
+        env:
+          DATA: ${{ runner.temp }}/sqllogic
+        run: ./scripts/sqllogic_e2e.sh
 
       # The scripts write the server's output to this one path; a
       # panic or a hang is only readable from it.
