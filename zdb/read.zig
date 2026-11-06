@@ -577,7 +577,8 @@ pub const MultiGet = struct {
     ) !void {
         const arloc = self.arena.allocator();
         try node.versions.appendSlice(arloc, wanted.versions.slice());
-        for (pins) |pin| try node.pins.append(arloc, pin.acquire());
+        try node.pins.ensureUnusedCapacity(arloc, pins.len);
+        for (pins) |pin| node.pins.appendAssumeCapacity(pin.acquire());
     }
 };
 
@@ -915,7 +916,10 @@ pub const Cursor = struct {
         for (merge.currentPins()) |pin| {
             const covered = self.pins.items.len > 0 and
                 std.meta.eql(self.pins.getLast(), pin);
-            if (!covered) try self.pins.append(self.allocator, pin.acquire());
+            if (!covered) {
+                try self.pins.ensureUnusedCapacity(self.allocator, 1);
+                self.pins.appendAssumeCapacity(pin.acquire());
+            }
         }
     }
 
@@ -928,7 +932,8 @@ pub const Cursor = struct {
         utils.clearRetainCap(&self.pins);
         if (self.opts.pin_values and self.next_pending) {
             for (self.merge.?.currentPins()) |pin| {
-                try self.pins.append(self.allocator, pin.acquire());
+                try self.pins.ensureUnusedCapacity(self.allocator, 1);
+                self.pins.appendAssumeCapacity(pin.acquire());
             }
         }
     }

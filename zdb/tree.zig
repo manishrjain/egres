@@ -584,7 +584,15 @@ pub const Tree = struct {
             if (!transferred) for (iters.items) |*it| it.deinit();
         }
 
-        try iters.appendSlice(allocator, extras);
+        // On failure, extras still own refs but aren't in iters for
+        // errdefer to release. This call consumes them even on error.
+        iters.appendSlice(allocator, extras) catch |err| {
+            for (extras) |source| {
+                var it = source;
+                it.deinit();
+            }
+            return err;
+        };
 
         // The range's bounds are this tree's keys, or open: a table
         // edge (`Key.tableLeft`/`tableRight`) is a key of its table, and

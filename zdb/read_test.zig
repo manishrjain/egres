@@ -770,3 +770,128 @@ test "cursor: reverse walks pending, memtables, L0 and L1 descending" {
     }, unbounded, all[2..7]);
     try expectReverse(&fx, pending, .all, 3, all[0..3]);
 }
+
+test "multiget: allocation failure releases pending writes" {
+    const alloc = std.testing.allocator;
+    var fx: Fixture = undefined;
+    try fx.setup(alloc);
+    defer fx.teardown();
+    const pending = try zdb.skl.SkipList.initCapacity(alloc, 0);
+    defer {
+        // Release leaked refs after measuring, so the failing test is safe
+        // to repeat. The remaining owner ref stands in for the transaction.
+        while (pending.ref_count.load(.acquire) > 1) pending.release();
+        pending.release();
+    }
+    const keys = [_]String{ "a", "b", "c", "d" };
+    for (keys) |key| {
+        try pending.putItem(.{
+            .key = Fixture.key(key),
+            .versions = .{ .one = .{
+                .ts = 10,
+                .meta = .{},
+                .value = "pending row",
+            } },
+        });
+    }
+
+    // With these four keys, the fifth allocation grows the pin array.
+    var failing = std.testing.FailingAllocator.init(alloc, .{
+        .fail_index = 4,
+        .resize_fail_index = 0,
+    });
+    if (fx.f.multiGet(failing.allocator(), table_key, &keys, .{
+        .read_ts = 10,
+        .pending = pending,
+    })) |result| {
+        var mg = result;
+        mg.deinit();
+        return error.TestExpectedOutOfMemory;
+    } else |err| {
+        try std.testing.expectEqual(error.OutOfMemory, err);
+    }
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(u32, 1), pending.ref_count.load(.acquire));
+}
+
+test "cursor: allocation failure releases a pending value pin" {
+    const alloc = std.testing.allocator;
+    var fx: Fixture = undefined;
+    try fx.setup(alloc);
+    defer fx.teardown();
+    const pending = try zdb.skl.SkipList.initCapacity(alloc, 0);
+    defer {
+        // Recover leaked refs after the assertion for repeatable runs.
+        while (pending.ref_count.load(.acquire) > 1) pending.release();
+        pending.release();
+    }
+    try pending.putItem(.{
+        .key = Fixture.key("a"),
+        .versions = .{ .one = .{
+            .ts = 10,
+            .meta = .{},
+            .value = "pending row",
+        } },
+    });
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{
+        .fail_index = 0,
+    });
+    {
+        var cursor = try fx.f.openCursor(alloc, table_key, .{}, .{
+            .read_ts = 10,
+            .pending = pending,
+            .pin_values = true,
+        });
+        defer cursor.deinit();
+        // Keep the arena's backing allocator; fail only pin-list growth.
+        cursor.allocator = failing.allocator();
+        try std.testing.expectError(error.OutOfMemory, cursor.next());
+    }
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(u32, 1), pending.ref_count.load(.acquire));
+}
+
+test "cursor: allocation failure releases sources during merge handoff" {
+    const alloc = std.testing.allocator;
+    var fx: Fixture = undefined;
+    try fx.setup(alloc);
+    defer fx.teardown();
+    const pending = try zdb.skl.SkipList.initCapacity(alloc, 0);
+    const sources = [_]*zdb.skl.SkipList{ pending, fx.f.memtables.current };
+    defer {
+        // Recover leaked refs after the assertion for repeatable runs.
+        for (sources) |source| {
+            while (source.ref_count.load(.acquire) > 1) source.release();
+        }
+        pending.release();
+    }
+    try pending.putItem(.{
+        .key = Fixture.key("a"),
+        .versions = .{ .one = .{
+            .ts = 10,
+            .meta = .{},
+            .value = "pending row",
+        } },
+    });
+
+    // The second backing allocation grows openMerge's iterator list.
+    var failing = std.testing.FailingAllocator.init(alloc, .{
+        .fail_index = 1,
+        .resize_fail_index = 0,
+    });
+    {
+        var cursor = try fx.f.openCursor(
+            failing.allocator(),
+            table_key,
+            .{},
+            .{ .read_ts = 10, .pending = pending, .pin_values = false },
+        );
+        defer cursor.deinit();
+        try std.testing.expectError(error.OutOfMemory, cursor.next());
+    }
+    try std.testing.expect(failing.has_induced_failure);
+    for (sources) |source| {
+        try std.testing.expectEqual(@as(u32, 1), source.ref_count.load(.acquire));
+    }
+}
