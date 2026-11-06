@@ -879,6 +879,105 @@ test "ext: Bind with format=2 (invalid) errors and skips until Sync" {
     try testing.expect(saw_error);
     try testing.expect(!saw_bind_complete);
     try testing.expect(!s.ext_failed);
+    try testing.expect(std.mem.indexOf(u8, out, "C22023\x00") != null);
+}
+
+test "startup: unsupported protocol version answers 0A000" {
+    const a = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+
+    // Startup frame: length 9, version 3.1 (not 3.0), param terminator.
+    const input = [_]u8{ 0, 0, 0, 9, 0, 3, 0, 1, 0 };
+    var rdr = std.Io.Reader.fixed(&input);
+    var s = conn_state.ConnState.init(a, &rdr, &aw.writer, .{});
+    defer s.deinit();
+
+    try testing.expect(try s.nextEvent() == .terminate);
+    try testing.expect(
+        std.mem.indexOf(u8, aw.writer.buffered(), "C0A000\x00") != null,
+    );
+}
+
+/// Run `frames` (already tagged+length-prefixed) through a fresh
+/// connection and check its first ErrorResponse while the buffer is alive.
+fn expectFirstErrorCode(
+    a: std.mem.Allocator,
+    frames: String,
+    want: String,
+) !void {
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(a);
+    try input.appendSlice(a, &hexToBytes(startup_golden_hex));
+    try input.appendSlice(a, frames);
+
+    var rdr = std.Io.Reader.fixed(input.items);
+    var s = try primedConnState(a, &rdr, &aw);
+    defer s.deinit();
+    _ = try s.nextEvent();
+
+    const out = aw.writer.buffered();
+    var off: usize = 0;
+    while (off < out.len) {
+        const r = try proto.decodeMessage(out[off..]);
+        if (r.msg.tag == 'E') {
+            const at = std.mem.indexOf(u8, r.msg.body, "\x00C") orelse
+                return error.NoCodeField;
+            return testing.expectEqualStrings(
+                want,
+                r.msg.body[at + 2 .. at + 7],
+            );
+        }
+        off += r.consumed;
+    }
+    return error.NoErrorResponse;
+}
+
+test "ext: unknown portal/statement and malformed frame carry their SQLSTATE" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { tag: u8, body: String, want: String }{
+        // Execute: portal="" never bound.
+        .{ .tag = 'E', .body = "\x00\x00\x00\x00\x00", .want = "34000" },
+        // Describe: kind='S' name="nope".
+        .{ .tag = 'D', .body = "Snope\x00", .want = "26000" },
+        // Describe: kind byte that is neither 'S' nor 'P'.
+        .{ .tag = 'D', .body = "X\x00", .want = "08P01" },
+    };
+    for (cases) |c| {
+        var frames: std.ArrayList(u8) = .empty;
+        defer frames.deinit(a);
+        try frame(a, &frames, c.tag, c.body);
+        try expectFirstErrorCode(
+            a,
+            frames.items,
+            c.want,
+        );
+    }
+}
+
+test "ext: Bind with negative param length other than -1 is malformed" {
+    const a = std.testing.allocator;
+
+    // Bind: portal="", stmt="", 0 pfmt, 1 param with length -2, 0 rfmt.
+    var bind_body: std.ArrayList(u8) = .empty;
+    defer bind_body.deinit(a);
+    try bind_body.append(a, 0);
+    try bind_body.append(a, 0);
+    try bind_body.appendSlice(a, &[_]u8{ 0, 0 });
+    try bind_body.appendSlice(a, &[_]u8{ 0, 1 });
+    try bind_body.appendSlice(a, &[_]u8{ 0xFF, 0xFF, 0xFF, 0xFE });
+    try bind_body.appendSlice(a, &[_]u8{ 0, 0 });
+
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(a);
+    try frame(a, &frames, 'B', bind_body.items);
+    try expectFirstErrorCode(
+        a,
+        frames.items,
+        "08P01",
+    );
 }
 
 test "ext: Describe(statement) emits ParameterDescription" {
