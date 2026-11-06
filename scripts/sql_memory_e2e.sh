@@ -18,6 +18,7 @@ cd "$(dirname "$0")/.."
 DATA="${DATA:-/data/egres}"
 LOG=/tmp/zdb/server.log
 E="host=127.0.0.1 port=3210 dbname=egres sslmode=disable"
+OS=$(uname -s)
 
 pass=0
 fail=0
@@ -45,10 +46,29 @@ qin() { psql "$E" -X -f - <<<"$1"; }
 start_server() {
     local memory=$1
     shift
-    ./zig-out/bin/egres --raft="id=1" --memory="$memory" "$@" \
-        --store="dir_path=$DATA/sst" --wal="dir=$DATA/wal" >"$LOG" 2>&1 &
-    SERVER_PID=$!
+    local command=(./zig-out/bin/egres --raft="id=1" --memory="$memory"
+        "$@" --store="dir_path=$DATA/sst" --wal="dir=$DATA/wal")
+    SERVER_PID=
+    if [ "$OS" = Darwin ]; then
+        # time collects the child's kernel peak RSS when it exits. The
+        # shell publishes its pid before exec so shutdown targets egres.
+        : >"$DATA/server.pid"
+        /usr/bin/time -l -o "$DATA/rusage" /bin/sh -c '
+            echo $$ >"$1"
+            shift
+            exec "$@"
+        ' sh "$DATA/server.pid" "${command[@]}" >"$LOG" 2>&1 &
+        SERVER_WAIT_PID=$!
+    else
+        "${command[@]}" >"$LOG" 2>&1 &
+        SERVER_PID=$!
+        SERVER_WAIT_PID=$SERVER_PID
+    fi
     for _ in $(seq 1 50); do
+        if [ "$OS" = Darwin ] && [ -z "$SERVER_PID" ] &&
+            [ -s "$DATA/server.pid" ]; then
+            SERVER_PID=$(cat "$DATA/server.pid")
+        fi
         if grep -q "sql listener started" "$LOG" 2>/dev/null &&
             grep -q "become-leader" "$LOG" 2>/dev/null; then
             sleep 1
@@ -61,14 +81,17 @@ start_server() {
 }
 
 stop_server() {
-    kill -TERM "$SERVER_PID" 2>/dev/null || true
-    wait "$SERVER_PID" 2>/dev/null || true
+    if [ -n "$SERVER_PID" ]; then
+        kill -TERM "$SERVER_PID" 2>/dev/null || true
+    fi
+    wait "$SERVER_WAIT_PID" 2>/dev/null || true
+    SERVER_PID=
 }
 
-# The server's peak resident size so far, in KiB.
-peak_rss_kb() { awk '/VmHWM/ { print $2 }' "/proc/$SERVER_PID/status"; }
+# Both BSD and Linux ps report RSS in KiB.
+rss_kb() { ps -o rss= -p "$SERVER_PID"; }
 
-zig build
+zig build -Doptimize=ReleaseSafe
 rm -rf "$DATA" && mkdir -p "$DATA" /tmp/zdb
 trap stop_server EXIT
 
@@ -88,8 +111,15 @@ for i in $(seq 1 $clients); do
 done
 # By pid: a bare `wait` would also wait for the server.
 for pid in "${pids[@]}"; do wait "$pid" || true; done
-written=$(grep -l "INSERT 0 1" "$OUT"/* | wc -l)
-refused=$(grep -l "past its memory limit" "$OUT"/* | wc -l)
+written=0
+refused=0
+for i in $(seq 1 $clients); do
+    if grep -q "INSERT 0 1" "$OUT/$i"; then
+        written=$((written + 1))
+    elif grep -q "past its memory limit" "$OUT/$i"; then
+        refused=$((refused + 1))
+    fi
+done
 echo "burst: $written written, $refused refused"
 if [ $((written + refused)) -eq $clients ]; then
     ok "every client ended with a row written or out of memory"
@@ -103,10 +133,23 @@ else bad "server died during the burst"; fi
 # bound: without admission none would be turned away.
 if [ "$refused" -ge 1 ]; then ok "the full pool turned clients away"
 else bad "no client was refused: nothing waited for the pool"; fi
-expect "rows written are readable" "$written" v "SELECT count(*) FROM burst;"
+if [ "$(v 'SELECT count(*) FROM burst;')" -eq "$written" ]; then
+    ok "rows written are readable"
+else
+    bad "rows written are readable: expected $written"
+fi
 expect "a small statement runs after the burst" "INSERT 0 1" \
     q "INSERT INTO burst VALUES (0, 's');"
-peak=$(peak_rss_kb)
+# Darwin's ru_maxrss is bytes; Linux's VmHWM is KiB. Neither relies
+# on polling, so short-lived allocations count toward the ceiling.
+if [ "$OS" = Darwin ]; then
+    stop_server
+    peak=$(awk '/maximum resident set size/ { print $1 / 1024 }' \
+        "$DATA/rusage")
+else
+    peak=$(awk '/VmHWM/ { print $2 }' "/proc/$SERVER_PID/status")
+    stop_server
+fi
 echo "burst: peak RSS ${peak} KiB"
 # A coarse ceiling: about 860 MB measured in Debug, most of it the 16
 # frames the connections read before admission and the process's own
@@ -114,7 +157,6 @@ echo "burst: peak RSS ${peak} KiB"
 # are resident at once as well.
 if [ "$peak" -lt 1572864 ]; then ok "peak RSS under 1.5 GiB"
 else bad "peak RSS ${peak} KiB, over 1.5 GiB"; fi
-stop_server
 
 # --- 2. a pool smaller than one frame: refused, then recovers -------------
 # 0.1% of 512 MiB is about half a MiB: an 8 MiB frame is past the
@@ -148,7 +190,6 @@ for i in $(seq 1 64); do
     qin "INSERT INTO wide VALUES ($i, '$ROW');" >/dev/null
 done
 sleep 3 # the last memtables flush
-rss_kb() { awk '/VmRSS/ { print $2 }' "/proc/$SERVER_PID/status"; }
 before=$(rss_kb)
 # A raw pgwire client: StartupMessage (35 bytes, protocol 3.0, user
 # and database egres), then the Query, and nothing read back.
