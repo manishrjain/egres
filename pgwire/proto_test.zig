@@ -900,8 +900,12 @@ test "startup: unsupported protocol version answers 0A000" {
 }
 
 /// Run `frames` (already tagged+length-prefixed) through a fresh
-/// connection and return the SQLSTATE of its first ErrorResponse.
-fn firstErrorCode(a: std.mem.Allocator, frames: String) !String {
+/// connection and check its first ErrorResponse while the buffer is alive.
+fn expectFirstErrorCode(
+    a: std.mem.Allocator,
+    frames: String,
+    want: String,
+) !void {
     var aw: std.Io.Writer.Allocating = .init(a);
     defer aw.deinit();
     var input: std.ArrayList(u8) = .empty;
@@ -921,7 +925,10 @@ fn firstErrorCode(a: std.mem.Allocator, frames: String) !String {
         if (r.msg.tag == 'E') {
             const at = std.mem.indexOf(u8, r.msg.body, "\x00C") orelse
                 return error.NoCodeField;
-            return r.msg.body[at + 2 .. at + 7];
+            return testing.expectEqualStrings(
+                want,
+                r.msg.body[at + 2 .. at + 7],
+            );
         }
         off += r.consumed;
     }
@@ -942,9 +949,10 @@ test "ext: unknown portal/statement and malformed frame carry their SQLSTATE" {
         var frames: std.ArrayList(u8) = .empty;
         defer frames.deinit(a);
         try frame(a, &frames, c.tag, c.body);
-        try testing.expectEqualStrings(
+        try expectFirstErrorCode(
+            a,
+            frames.items,
             c.want,
-            try firstErrorCode(a, frames.items),
         );
     }
 }
@@ -965,9 +973,10 @@ test "ext: Bind with negative param length other than -1 is malformed" {
     var frames: std.ArrayList(u8) = .empty;
     defer frames.deinit(a);
     try frame(a, &frames, 'B', bind_body.items);
-    try testing.expectEqualStrings(
+    try expectFirstErrorCode(
+        a,
+        frames.items,
         "08P01",
-        try firstErrorCode(a, frames.items),
     );
 }
 
