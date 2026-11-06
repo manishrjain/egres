@@ -142,16 +142,20 @@ pub const Index = struct {
     /// The index keys one cell contributes: none for NULL under a
     /// unique index (NULLS DISTINCT), else exactly one — the cell's
     /// memcomparable encoding; NULL under a non-unique index keys on
-    /// the tag_null byte. A slice rather than one key on purpose: a
-    /// later index kind (trigram, full text, a cell covering) returns
-    /// many from this same call, and every maintenance loop already
-    /// runs over the slice. Unencodable is unreachable: DDL refuses
-    /// interval columns for every index.
+    /// the tag_null byte. `egid` is the row the cell belongs to, null
+    /// for a value with no row behind it (an ON CONFLICT probe). A
+    /// slice rather than one key on purpose: a later index kind
+    /// (trigram, full text, a cell covering) returns many from this
+    /// same call, and every maintenance loop already runs over the
+    /// slice. Unencodable is unreachable: DDL refuses interval columns
+    /// for every index.
     pub fn keys(
         self: *const Index,
         arloc: std.mem.Allocator,
         cell: _value.Value,
+        egid: ?u64,
     ) error{OutOfMemory}![]const _value.String {
+        _ = egid;
         if (self.unique and cell == .null_value) return &.{};
         const one = try arloc.alloc(_value.String, 1);
         one[0] = _key.encodeIndexKey(arloc, cell, null) catch |err|
