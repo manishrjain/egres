@@ -1,0 +1,6 @@
+# Divergences egres means, hand-written, one per line:
+# <index>\t<first line>\t<reason>.
+# Known decisions: numeric keeps 38 digits (i128), results past 38
+# digits round, and literals past numeric's range become float8. Today
+# they surface only as unsupported numeric(210,10) DDL (see skips), so
+# nothing here yet.

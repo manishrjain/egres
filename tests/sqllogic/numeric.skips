@@ -1,0 +1,384 @@
+# Records egres does not support yet, with its error:
+# <index>\t<first line>\t<error>. Written by
+# run.py --write-skips; do not edit.
+1	CREATE TABLE num_data (id int4, val numeric(210,10))	0A000 NUMERIC precision 210 must be between 1 and 38
+2	CREATE TABLE num_exp_add (id1 int4, id2 int4, expected numeric(210,10))	0A000 NUMERIC precision 210 must be between 1 and 38
+3	CREATE TABLE num_exp_sub (id1 int4, id2 int4, expected numeric(210,10))	0A000 NUMERIC precision 210 must be between 1 and 38
+4	CREATE TABLE num_exp_div (id1 int4, id2 int4, expected numeric(210,10))	0A000 NUMERIC precision 210 must be between 1 and 38
+5	CREATE TABLE num_exp_mul (id1 int4, id2 int4, expected numeric(210,10))	0A000 NUMERIC precision 210 must be between 1 and 38
+6	CREATE TABLE num_exp_sqrt (id int4, expected numeric(210,10))	0A000 NUMERIC precision 210 must be between 1 and 38
+7	CREATE TABLE num_exp_ln (id int4, expected numeric(210,10))	0A000 NUMERIC precision 210 must be between 1 and 38
+8	CREATE TABLE num_exp_log10 (id int4, expected numeric(210,10))	0A000 NUMERIC precision 210 must be between 1 and 38
+9	CREATE TABLE num_exp_power_10_ln (id int4, expected numeric(210,10))	0A000 NUMERIC precision 210 must be between 1 and 38
+10	CREATE TABLE num_result (id1 int4, id2 int4, result numeric(210,10))	0A000 NUMERIC precision 210 must be between 1 and 38
+473	CREATE UNIQUE INDEX num_exp_add_idx ON num_exp_add (id1, id2)	0A000 only single-column indexes are supported
+474	CREATE UNIQUE INDEX num_exp_sub_idx ON num_exp_sub (id1, id2)	0A000 only single-column indexes are supported
+475	CREATE UNIQUE INDEX num_exp_div_idx ON num_exp_div (id1, id2)	0A000 only single-column indexes are supported
+476	CREATE UNIQUE INDEX num_exp_mul_idx ON num_exp_mul (id1, id2)	0A000 only single-column indexes are supported
+481	VACUUM ANALYZE num_exp_add	XX000 unsupported statement
+482	VACUUM ANALYZE num_exp_sub	XX000 unsupported statement
+483	VACUUM ANALYZE num_exp_div	XX000 unsupported statement
+484	VACUUM ANALYZE num_exp_mul	XX000 unsupported statement
+485	VACUUM ANALYZE num_exp_sqrt	XX000 unsupported statement
+486	VACUUM ANALYZE num_exp_ln	XX000 unsupported statement
+487	VACUUM ANALYZE num_exp_log10	XX000 unsupported statement
+488	VACUUM ANALYZE num_exp_power_10_ln	XX000 unsupported statement
+490	INSERT INTO num_result SELECT t1.id, t2.id, t1.val + t2.val	0A000 only INSERT ... VALUES is supported
+491	SELECT t1.id1, t1.id2, t1.result, t2.expected	0A000 SELECT must read exactly one table
+493	INSERT INTO num_result SELECT t1.id, t2.id, round(t1.val + t2.val, 10)	0A000 only INSERT ... VALUES is supported
+494	SELECT t1.id1, t1.id2, t1.result, round(t2.expected, 10) as expected	0A000 SELECT must read exactly one table
+496	INSERT INTO num_result SELECT t1.id, t2.id, t1.val - t2.val	0A000 only INSERT ... VALUES is supported
+497	SELECT t1.id1, t1.id2, t1.result, t2.expected	0A000 SELECT must read exactly one table
+499	INSERT INTO num_result SELECT t1.id, t2.id, round(t1.val - t2.val, 40)	0A000 only INSERT ... VALUES is supported
+500	SELECT t1.id1, t1.id2, t1.result, round(t2.expected, 40)	0A000 SELECT must read exactly one table
+502	INSERT INTO num_result SELECT t1.id, t2.id, t1.val * t2.val	0A000 only INSERT ... VALUES is supported
+503	SELECT t1.id1, t1.id2, t1.result, t2.expected	0A000 SELECT must read exactly one table
+505	INSERT INTO num_result SELECT t1.id, t2.id, round(t1.val * t2.val, 30)	0A000 only INSERT ... VALUES is supported
+506	SELECT t1.id1, t1.id2, t1.result, round(t2.expected, 30) as expected	0A000 SELECT must read exactly one table
+508	INSERT INTO num_result SELECT t1.id, t2.id, t1.val / t2.val	0A000 only INSERT ... VALUES is supported
+509	SELECT t1.id1, t1.id2, t1.result, t2.expected	0A000 SELECT must read exactly one table
+511	INSERT INTO num_result SELECT t1.id, t2.id, round(t1.val / t2.val, 80)	0A000 only INSERT ... VALUES is supported
+512	SELECT t1.id1, t1.id2, t1.result, round(t2.expected, 80) as expected	0A000 SELECT must read exactly one table
+514	INSERT INTO num_result SELECT id, 0, SQRT(ABS(val))	0A000 only INSERT ... VALUES is supported
+515	SELECT t1.id1, t1.result, t2.expected	0A000 SELECT must read exactly one table
+517	INSERT INTO num_result SELECT id, 0, LN(ABS(val))	0A000 only INSERT ... VALUES is supported
+518	SELECT t1.id1, t1.result, t2.expected	0A000 SELECT must read exactly one table
+520	INSERT INTO num_result SELECT id, 0, LOG(numeric '10', ABS(val))	0A000 only INSERT ... VALUES is supported
+521	SELECT t1.id1, t1.result, t2.expected	0A000 SELECT must read exactly one table
+523	INSERT INTO num_result SELECT id, 0, POWER(numeric '10', LN(ABS(round(val,200))))	0A000 only INSERT ... VALUES is supported
+524	SELECT t1.id1, t1.result, t2.expected	0A000 SELECT must read exactly one table
+525	WITH v(x) AS	0A000 SELECT must read exactly one table
+526	WITH v(x) AS	0A000 SELECT must read exactly one table
+529	SELECT 'nan'::numeric / '0'	0A000 only constants are supported without a FROM
+533	SELECT 'nan'::numeric % '0'	0A000 only constants are supported without a FROM
+537	SELECT div('nan'::numeric, '0')	0A000 only constants are supported without a FROM
+539	WITH v(x) AS	0A000 function numeric_inc() is not supported
+540	WITH v(x) AS	42P01 table does not exist
+541	WITH v(x) AS	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
+542	WITH v(x) AS	42P01 table does not exist
+545	WITH v(x) AS	0A000 function log() is not supported
+549	WITH v(x) AS	0A000 SELECT must read exactly one table
+557	WITH v(x) AS	0A000 SELECT must read exactly one table
+560	SELECT power('-1'::numeric, 'inf')	0A000 only constants are supported without a FROM
+561	SELECT power('-2'::numeric, '3')	0A000 only constants are supported without a FROM
+563	SELECT power('-2'::numeric, '-1')	0A000 only constants are supported without a FROM
+565	SELECT power('-2'::numeric, 'inf')	0A000 only constants are supported without a FROM
+566	SELECT power('-2'::numeric, '-inf')	0A000 only constants are supported without a FROM
+567	SELECT power('inf'::numeric, '-2')	0A000 only constants are supported without a FROM
+568	SELECT power('inf'::numeric, '-inf')	0A000 only constants are supported without a FROM
+569	SELECT power('-inf'::numeric, '2')	0A000 only constants are supported without a FROM
+570	SELECT power('-inf'::numeric, '3')	0A000 only constants are supported without a FROM
+572	SELECT power('-inf'::numeric, '-2')	0A000 only constants are supported without a FROM
+573	SELECT power('-inf'::numeric, '-3')	0A000 only constants are supported without a FROM
+574	SELECT power('-inf'::numeric, '0')	0A000 only constants are supported without a FROM
+575	SELECT power('-inf'::numeric, 'inf')	0A000 only constants are supported without a FROM
+576	SELECT power('-inf'::numeric, '-inf')	0A000 only constants are supported without a FROM
+577	SELECT AVG(val) FROM num_data	0A000 only count(*) is supported among aggregates
+578	SELECT MAX(val) FROM num_data	0A000 only count(*) is supported among aggregates
+579	SELECT MIN(val) FROM num_data	0A000 only count(*) is supported among aggregates
+580	SELECT STDDEV(val) FROM num_data	0A000 function stddev() is not supported
+581	SELECT VARIANCE(val) FROM num_data	0A000 function variance() is not supported
+591	INSERT INTO fract_only VALUES (9, 'NaN')	22P02 invalid value for column type
+608	SELECT 'NaN'::float8::numeric	0A000 only constants are supported without a FROM
+609	SELECT 'Infinity'::float8::numeric	0A000 only constants are supported without a FROM
+610	SELECT '-Infinity'::float8::numeric	0A000 only constants are supported without a FROM
+611	SELECT 'NaN'::numeric::float8	0A000 only constants are supported without a FROM
+612	SELECT 'Infinity'::numeric::float8	0A000 only constants are supported without a FROM
+613	SELECT '-Infinity'::numeric::float8	0A000 only constants are supported without a FROM
+614	SELECT 'NaN'::float4::numeric	0A000 only constants are supported without a FROM
+615	SELECT 'Infinity'::float4::numeric	0A000 only constants are supported without a FROM
+616	SELECT '-Infinity'::float4::numeric	0A000 only constants are supported without a FROM
+617	SELECT 'NaN'::numeric::float4	0A000 only constants are supported without a FROM
+618	SELECT 'Infinity'::numeric::float4	0A000 only constants are supported without a FROM
+619	SELECT '-Infinity'::numeric::float4	0A000 only constants are supported without a FROM
+620	SELECT '42'::int2::numeric	0A000 only constants are supported without a FROM
+640	SELECT i as pow,	0A000 only table sources are supported
+641	SELECT round(4.4e131071, -131071) = 4e131071	0A000 only constants are supported without a FROM
+642	SELECT round(4.5e131071, -131071) = 5e131071	0A000 only constants are supported without a FROM
+643	SELECT round(4.5e131071, -131072)	0A000 only constants are supported without a FROM
+645	SELECT round(5.5e131071, -131073)	0A000 only constants are supported without a FROM
+646	SELECT round(5.5e131071, -1000000)	0A000 only constants are supported without a FROM
+647	SELECT round(5e-16383, 1000000) = 5e-16383	0A000 only constants are supported without a FROM
+648	SELECT round(5e-16383, 16383) = 5e-16383	0A000 only constants are supported without a FROM
+649	SELECT round(5e-16383, 16382) = 1e-16382	0A000 only constants are supported without a FROM
+650	SELECT round(5e-16383, 16381) = 0	0A000 only constants are supported without a FROM
+651	SELECT trunc(9.9e131071, -131071) = 9e131071	0A000 only constants are supported without a FROM
+652	SELECT trunc(9.9e131071, -131072)	0A000 only constants are supported without a FROM
+653	SELECT trunc(9.9e131071, -131073)	0A000 only constants are supported without a FROM
+654	SELECT trunc(9.9e131071, -1000000)	0A000 only constants are supported without a FROM
+655	SELECT trunc(5e-16383, 1000000) = 5e-16383	0A000 only constants are supported without a FROM
+656	SELECT trunc(5e-16383, 16383) = 5e-16383	0A000 only constants are supported without a FROM
+657	SELECT trunc(5e-16383, 16382) = 0	0A000 only constants are supported without a FROM
+669	COPY width_bucket_test (operand_num) FROM stdin	XX000 unsupported statement
+670	UPDATE width_bucket_test SET operand_f8 = operand_num::float8	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
+671	SELECT	0A000 function width_bucket() is not supported
+674	SELECT width_bucket('Infinity'::numeric, 1, 10, 10),	0A000 only constants are supported without a FROM
+677	SELECT width_bucket('Infinity'::float8, 1, 10, 10),	0A000 only constants are supported without a FROM
+679	SELECT x, width_bucket(x::float8, 10, 100, 9) as flt,	0A000 only table sources are supported
+680	SELECT x, width_bucket(x::float8, 100, 10, 9) as flt,	0A000 only table sources are supported
+681	SELECT width_bucket(0, -1e100::numeric, 1, 10)	0A000 only constants are supported without a FROM
+682	SELECT width_bucket(0, -1e100::float8, 1, 10)	0A000 only constants are supported without a FROM
+683	SELECT width_bucket(1, 1e100::numeric, 0, 10)	0A000 only constants are supported without a FROM
+684	SELECT width_bucket(1, 1e100::float8, 0, 10)	0A000 only constants are supported without a FROM
+685	SELECT oper, low, high, cnt, width_bucket(oper, low, high, cnt)	0A000 SELECT must read exactly one table
+688	SELECT to_char(val, '9G999G999G999G999G999')	0A000 function to_char() is not supported
+689	SELECT to_char(val, '9G999G999G999G999G999D999G999G999G999G999')	0A000 function to_char() is not supported
+690	SELECT to_char(val, '9999999999999999.999999999999999PR')	0A000 function to_char() is not supported
+691	SELECT to_char(val, '9999999999999999.999999999999999S')	0A000 function to_char() is not supported
+692	SELECT to_char(val, 'MI9999999999999999.999999999999999') FROM num_data	0A000 function to_char() is not supported
+693	SELECT to_char(val, 'FMS9999999999999999.999999999999999') FROM num_data	0A000 function to_char() is not supported
+694	SELECT to_char(val, 'FM9999999999999999.999999999999999THPR') FROM num_data	0A000 function to_char() is not supported
+695	SELECT to_char(val, 'SG9999999999999999.999999999999999th') FROM num_data	0A000 function to_char() is not supported
+696	SELECT to_char(val, '0999999999999999.999999999999999') FROM num_data	0A000 function to_char() is not supported
+697	SELECT to_char(val, 'S0999999999999999.999999999999999') FROM num_data	0A000 function to_char() is not supported
+698	SELECT to_char(val, 'FM0999999999999999.999999999999999') FROM num_data	0A000 function to_char() is not supported
+699	SELECT to_char(val, 'FM9999999999999999.099999999999999') FROM num_data	0A000 function to_char() is not supported
+700	SELECT to_char(val, 'FM9999999999990999.990999999999999') FROM num_data	0A000 function to_char() is not supported
+701	SELECT to_char(val, 'FM0999999999999999.999909999999999') FROM num_data	0A000 function to_char() is not supported
+702	SELECT to_char(val, 'FM9999999990999999.099999999999999') FROM num_data	0A000 function to_char() is not supported
+703	SELECT to_char(val, 'L9999999999999999.099999999999999') FROM num_data	0A000 function to_char() is not supported
+704	SELECT to_char(val, 'FM9999999999999999.99999999999999') FROM num_data	0A000 function to_char() is not supported
+705	SELECT to_char(val, 'S 9 9 9 9 9 9 9 9 9 9 9 9 9 9 9 9 . 9 9 9 9 9 9 9 9 9 9 9 9 9 9 9 9 9') FROM num_data	0A000 function to_char() is not supported
+706	SELECT to_char(val, 'FMS 9 9 9 9 9 9 9 9 9 9 9 9 9 9 9 9 . 9 9 9 9 9 9 9 9 9 9 9 9 9 9 9 9 9') FROM num_data	0A000 function to_char() is not supported
+707	SELECT to_char(val, E'99999 "text" 9999 "9999" 999 "\\"text between quote marks\\"" 9999') FROM num_data	0A000 function to_char() is not supported
+708	SELECT to_char(val, '999999SG9999999999') FROM num_data	0A000 function to_char() is not supported
+709	SELECT to_char(val, 'FM9999999999999999.999999999999999') FROM num_data	0A000 function to_char() is not supported
+710	SELECT to_char(val, '9.999EEEE') FROM num_data	0A000 function to_char() is not supported
+711	SELECT to_char(val, 'FMRN') FROM num_data	0A000 function to_char() is not supported
+712	WITH v(val) AS	0A000 function to_char() is not supported
+713	WITH v(exp) AS	0A000 function to_char() is not supported
+714	WITH v(val) AS	0A000 function to_char() is not supported
+715	WITH v(val) AS	0A000 function to_char() is not supported
+716	SELECT to_char('100'::numeric, 'FM999.9')	0A000 only constants are supported without a FROM
+717	SELECT to_char('100'::numeric, 'FM999.')	0A000 only constants are supported without a FROM
+718	SELECT to_char('100'::numeric, 'FM999')	0A000 only constants are supported without a FROM
+719	SELECT to_char('12345678901'::float8, 'FM9999999999D9999900000000000000000')	0A000 only constants are supported without a FROM
+720	SELECT to_char('100'::numeric, 'rn')	0A000 only constants are supported without a FROM
+721	SELECT to_char('1234'::numeric, 'rn')	0A000 only constants are supported without a FROM
+722	SELECT to_char('1235'::float4, 'rn')	0A000 only constants are supported without a FROM
+723	SELECT to_char('1236'::float8, 'rn')	0A000 only constants are supported without a FROM
+724	SELECT to_char('1237'::float8, 'fmrn')	0A000 only constants are supported without a FROM
+725	SELECT to_char('100e9'::numeric, 'RN')	0A000 only constants are supported without a FROM
+726	SELECT to_char('100e9'::float4, 'RN')	0A000 only constants are supported without a FROM
+727	SELECT to_char('100e9'::float8, 'RN')	0A000 only constants are supported without a FROM
+728	SELECT to_char(1234.56::numeric, '99999V99')	0A000 only constants are supported without a FROM
+729	SELECT to_char(1234.56::float4, '99999V99')	0A000 only constants are supported without a FROM
+730	SELECT to_char(1234.56::float8, '99999V99')	0A000 only constants are supported without a FROM
+731	SELECT to_char('100'::numeric, 'foo999')	0A000 only constants are supported without a FROM
+732	SELECT to_char('100'::numeric, 'f\oo999')	0A000 only constants are supported without a FROM
+733	SELECT to_char('100'::numeric, 'f\\oo999')	0A000 only constants are supported without a FROM
+734	SELECT to_char('100'::numeric, 'f\"oo999')	0A000 only constants are supported without a FROM
+735	SELECT to_char('100'::numeric, 'f\\"oo999')	0A000 only constants are supported without a FROM
+736	SELECT to_char('100'::numeric, 'f"ool"999')	0A000 only constants are supported without a FROM
+737	SELECT to_char('100'::numeric, 'f"\ool"999')	0A000 only constants are supported without a FROM
+738	SELECT to_char('100'::numeric, 'f"\\ool"999')	0A000 only constants are supported without a FROM
+739	SELECT to_char('100'::numeric, 'f"ool\"999')	0A000 only constants are supported without a FROM
+740	SELECT to_char('100'::numeric, 'f"ool\\"999')	0A000 only constants are supported without a FROM
+742	SELECT to_number('-34,338,492', '99G999G999')	0A000 only constants are supported without a FROM
+743	SELECT to_number('-34,338,492.654,878', '99G999G999D999G999')	0A000 only constants are supported without a FROM
+744	SELECT to_number('<564646.654564>', '999999.999999PR')	0A000 only constants are supported without a FROM
+745	SELECT to_number('0.00001-', '9.999999S')	0A000 only constants are supported without a FROM
+746	SELECT to_number('5.01-', 'FM9.999999S')	0A000 only constants are supported without a FROM
+747	SELECT to_number('5.01-', 'FM9.999999MI')	0A000 only constants are supported without a FROM
+748	SELECT to_number('5 4 4 4 4 8 . 7 8', '9 9 9 9 9 9 . 9 9')	0A000 only constants are supported without a FROM
+749	SELECT to_number('.01', 'FM9.99')	0A000 only constants are supported without a FROM
+750	SELECT to_number('.0', '99999999.99999999')	0A000 only constants are supported without a FROM
+751	SELECT to_number('0', '99.99')	0A000 only constants are supported without a FROM
+752	SELECT to_number('.-01', 'S99.99')	0A000 only constants are supported without a FROM
+753	SELECT to_number('.01-', '99.99S')	0A000 only constants are supported without a FROM
+754	SELECT to_number(' . 0 1-', ' 9 9 . 9 9 S')	0A000 only constants are supported without a FROM
+755	SELECT to_number('34,50','999,99')	0A000 only constants are supported without a FROM
+756	SELECT to_number('123,000','999G')	0A000 only constants are supported without a FROM
+757	SELECT to_number('123456','999G999')	0A000 only constants are supported without a FROM
+758	SELECT to_number('$1234.56','L9,999.99')	0A000 only constants are supported without a FROM
+759	SELECT to_number('$1234.56','L99,999.99')	0A000 only constants are supported without a FROM
+760	SELECT to_number('$1,234.56','L99,999.99')	0A000 only constants are supported without a FROM
+761	SELECT to_number('1234.56','L99,999.99')	0A000 only constants are supported without a FROM
+762	SELECT to_number('1,234.56','L99,999.99')	0A000 only constants are supported without a FROM
+763	SELECT to_number('42nd', '99th')	0A000 only constants are supported without a FROM
+764	SELECT to_number('123456', '99999V99')	0A000 only constants are supported without a FROM
+765	WITH rows AS	0A000 function bool_and() is not supported
+766	SELECT to_number('CvIiI', 'rn')	0A000 only constants are supported without a FROM
+767	SELECT to_number('MMXX ', 'RN')	0A000 only constants are supported without a FROM
+768	SELECT to_number(' XIV', ' RN')	0A000 only constants are supported without a FROM
+769	SELECT to_number(' XIV ', ' RN')	0A000 only constants are supported without a FROM
+770	SELECT to_number('M CC', 'RN')	0A000 only constants are supported without a FROM
+795	INSERT INTO num_input_test(n1) VALUES ('NaN ')	22P02 invalid value for column type
+796	INSERT INTO num_input_test(n1) VALUES (' nan')	22P02 invalid value for column type
+797	INSERT INTO num_input_test(n1) VALUES (' inf ')	22P02 invalid value for column type
+798	INSERT INTO num_input_test(n1) VALUES (' +inf ')	22P02 invalid value for column type
+799	INSERT INTO num_input_test(n1) VALUES (' -inf ')	22P02 invalid value for column type
+800	INSERT INTO num_input_test(n1) VALUES (' Infinity ')	22P02 invalid value for column type
+801	INSERT INTO num_input_test(n1) VALUES (' +inFinity ')	22P02 invalid value for column type
+802	INSERT INTO num_input_test(n1) VALUES (' -INFINITY ')	22P02 invalid value for column type
+803	INSERT INTO num_input_test(n1) VALUES ('12_000_000_000')	22P02 invalid value for column type
+804	INSERT INTO num_input_test(n1) VALUES ('12_000.123_456')	22P02 invalid value for column type
+805	INSERT INTO num_input_test(n1) VALUES ('23_000_000_000e-1_0')	22P02 invalid value for column type
+806	INSERT INTO num_input_test(n1) VALUES ('.000_000_000_123e1_0')	22P02 invalid value for column type
+807	INSERT INTO num_input_test(n1) VALUES ('.000_000_000_123e+1_1')	22P02 invalid value for column type
+808	INSERT INTO num_input_test(n1) VALUES ('0b10001110111100111100001001010')	22P02 invalid value for column type
+809	INSERT INTO num_input_test(n1) VALUES (' -0B_1010_1011_0101_0100_1010_1001_1000_1100_1110_1011_0001_1111_0000_1010_1101_0010 ')	22P02 invalid value for column type
+810	INSERT INTO num_input_test(n1) VALUES (' +0o112402761777 ')	22P02 invalid value for column type
+811	INSERT INTO num_input_test(n1) VALUES ('-0O0012_5524_5230_6334_3167_0261')	22P02 invalid value for column type
+812	INSERT INTO num_input_test(n1) VALUES ('-0x0000000000000000000000000deadbeef')	22P02 invalid value for column type
+813	INSERT INTO num_input_test(n1) VALUES (' 0X_30b1_F33a_6DF0_bD4E_64DF_9BdA_7D15 ')	22P02 invalid value for column type
+842	SELECT pg_input_is_valid('34.5', 'numeric')	0A000 only constants are supported without a FROM
+843	SELECT pg_input_is_valid('34xyz', 'numeric')	0A000 only constants are supported without a FROM
+844	SELECT pg_input_is_valid('1e400000', 'numeric')	0A000 only constants are supported without a FROM
+845	SELECT * FROM pg_input_error_info('1e400000', 'numeric')	0A000 only table sources are supported
+846	SELECT pg_input_is_valid('1234.567', 'numeric(8,4)')	0A000 only constants are supported without a FROM
+847	SELECT pg_input_is_valid('1234.567', 'numeric(7,4)')	0A000 only constants are supported without a FROM
+848	SELECT * FROM pg_input_error_info('1234.567', 'numeric(7,4)')	0A000 only table sources are supported
+849	SELECT * FROM pg_input_error_info('0x1234.567', 'numeric')	0A000 only table sources are supported
+850	CREATE TABLE num_typemod_test (	0A000 NUMERIC scale -6 must be between 0 and precision 3
+860	SELECT scale(millions), * FROM num_typemod_test ORDER BY millions	0A000 function scale() is not supported
+867	select 4790999999999999999999999999999999999999999999999999999999999999999999999999999999999999 * 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999	0A000 only constants are supported without a FROM
+868	select 4789999999999999999999999999999999999999999999999999999999999999999999999999999999999999 * 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999	0A000 only constants are supported without a FROM
+869	select 4770999999999999999999999999999999999999999999999999999999999999999999999999999999999999 * 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999	0A000 only constants are supported without a FROM
+870	select 4769999999999999999999999999999999999999999999999999999999999999999999999999999999999999 * 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999	0A000 only constants are supported without a FROM
+871	select trim_scale((0.1 - 2e-16383) * (0.1 - 3e-16383))	0A000 only constants are supported without a FROM
+872	select 999999999999999999999::numeric/1000000000000000000000	0A000 only constants are supported without a FROM
+873	select div(999999999999999999999::numeric,1000000000000000000000)	0A000 only constants are supported without a FROM
+874	select mod(999999999999999999999::numeric,1000000000000000000000)	0A000 only constants are supported without a FROM
+875	select div(-9999999999999999999999::numeric,1000000000000000000000)	0A000 only constants are supported without a FROM
+876	select mod(-9999999999999999999999::numeric,1000000000000000000000)	0A000 only constants are supported without a FROM
+877	select div(-9999999999999999999999::numeric,1000000000000000000000)*1000000000000000000000 + mod(-9999999999999999999999::numeric,1000000000000000000000)	0A000 only constants are supported without a FROM
+878	select mod (70.0,70)	0A000 only constants are supported without a FROM
+879	select div (70.0,70)	0A000 only constants are supported without a FROM
+880	select 70.0 / 70	0A000 only constants are supported without a FROM
+881	select 12345678901234567890 % 123	0A000 only constants are supported without a FROM
+882	select 12345678901234567890 / 123	0A000 only constants are supported without a FROM
+883	select div(12345678901234567890, 123)	0A000 only constants are supported without a FROM
+884	select div(12345678901234567890, 123) * 123 + 12345678901234567890 % 123	0A000 only constants are supported without a FROM
+885	select 8e9000 - div(8e18000 - 1, 9e9000 - 1) * 9	0A000 only constants are supported without a FROM
+886	select 7328412092 - div(53705623790171816464 - 1, 7328412092)	0A000 only constants are supported without a FROM
+887	select div(539913372912345678, 539913372912345678)	0A000 only constants are supported without a FROM
+888	select sqrt(1.000000000000003::numeric)	0A000 only constants are supported without a FROM
+889	select sqrt(1.000000000000004::numeric)	0A000 only constants are supported without a FROM
+890	select sqrt(96627521408608.56340355805::numeric)	0A000 only constants are supported without a FROM
+891	select sqrt(96627521408608.56340355806::numeric)	0A000 only constants are supported without a FROM
+892	select sqrt(515549506212297735.073688290367::numeric)	0A000 only constants are supported without a FROM
+893	select sqrt(515549506212297735.073688290368::numeric)	0A000 only constants are supported without a FROM
+894	select sqrt(8015491789940783531003294973900306::numeric)	0A000 only constants are supported without a FROM
+895	select sqrt(8015491789940783531003294973900307::numeric)	0A000 only constants are supported without a FROM
+896	select 10.0 ^ -2147483648 as rounds_to_zero	0A000 only constants are supported without a FROM
+897	select 10.0 ^ -2147483647 as rounds_to_zero	0A000 only constants are supported without a FROM
+900	select 3.789 ^ 21.0000000000000000	0A000 only constants are supported without a FROM
+901	select 3.789 ^ 35.0000000000000000	0A000 only constants are supported without a FROM
+902	select 1.2 ^ 345	0A000 only constants are supported without a FROM
+903	select 0.12 ^ (-20)	0A000 only constants are supported without a FROM
+904	select 1.000000000123 ^ (-2147483648)	0A000 only constants are supported without a FROM
+905	select coalesce(nullif(0.9999999999 ^ 23300000000000, 0), 0) as rounds_to_zero	0A000 only constants are supported without a FROM
+906	select round(((1 - 1.500012345678e-1000) ^ 1.45e1003) * 1e1000)	0A000 only constants are supported without a FROM
+907	select 0.12 ^ (-25)	0A000 only constants are supported without a FROM
+908	select 0.5678 ^ (-85)	0A000 only constants are supported without a FROM
+909	select coalesce(nullif(0.9999999999 ^ 70000000000000, 0), 0) as underflows	0A000 only constants are supported without a FROM
+910	select (-1.0) ^ 2147483646	0A000 only constants are supported without a FROM
+911	select (-1.0) ^ 2147483647	0A000 only constants are supported without a FROM
+912	select (-1.0) ^ 2147483648	0A000 only constants are supported without a FROM
+913	select (-1.0) ^ 1000000000000000	0A000 only constants are supported without a FROM
+914	select (-1.0) ^ 1000000000000001	0A000 only constants are supported without a FROM
+915	select n, 10.0 ^ n as "10^n", (10.0 ^ n) * (10.0 ^ (-n)) = 1 as ok	0A000 only table sources are supported
+916	select 0.0 ^ 0.0	0A000 only constants are supported without a FROM
+917	select (-12.34) ^ 0.0	0A000 only constants are supported without a FROM
+918	select 12.34 ^ 0.0	0A000 only constants are supported without a FROM
+919	select 0.0 ^ 12.34	0A000 only constants are supported without a FROM
+920	select 'NaN'::numeric ^ 'NaN'::numeric	0A000 only constants are supported without a FROM
+921	select 'NaN'::numeric ^ 0	0A000 only constants are supported without a FROM
+922	select 'NaN'::numeric ^ 1	0A000 only constants are supported without a FROM
+923	select 0 ^ 'NaN'::numeric	0A000 only constants are supported without a FROM
+924	select 1 ^ 'NaN'::numeric	0A000 only constants are supported without a FROM
+927	select 32.1 ^ 9.8	0A000 only constants are supported without a FROM
+928	select 32.1 ^ (-9.8)	0A000 only constants are supported without a FROM
+929	select 12.3 ^ 45.6	0A000 only constants are supported without a FROM
+930	select 12.3 ^ (-45.6)	0A000 only constants are supported without a FROM
+931	select 1.234 ^ 5678	0A000 only constants are supported without a FROM
+932	select exp(0.0)	0A000 only constants are supported without a FROM
+933	select exp(1.0)	0A000 only constants are supported without a FROM
+934	select exp(1.0::numeric(71,70))	0A000 only constants are supported without a FROM
+935	select exp('nan'::numeric)	0A000 only constants are supported without a FROM
+936	select exp('inf'::numeric)	0A000 only constants are supported without a FROM
+937	select exp('-inf'::numeric)	0A000 only constants are supported without a FROM
+938	select coalesce(nullif(exp(-5000::numeric), 0), 0) as rounds_to_zero	0A000 only constants are supported without a FROM
+939	select coalesce(nullif(exp(-10000::numeric), 0), 0) as underflows	0A000 only constants are supported without a FROM
+940	select exp(32.999)	0A000 only constants are supported without a FROM
+941	select exp(-32.999)	0A000 only constants are supported without a FROM
+942	select exp(123.456)	0A000 only constants are supported without a FROM
+943	select exp(-123.456)	0A000 only constants are supported without a FROM
+944	select exp(1234.5678)	0A000 only constants are supported without a FROM
+945	select * from generate_series(0.0::numeric, 4.0::numeric)	0A000 only table sources are supported
+946	select * from generate_series(0.1::numeric, 4.0::numeric, 1.3::numeric)	0A000 only table sources are supported
+947	select * from generate_series(4.0::numeric, -1.5::numeric, -2.2::numeric)	0A000 only table sources are supported
+955	select (i / (10::numeric ^ 131071))::numeric(1,0)	0A000 only table sources are supported
+956	select * from generate_series(1::numeric, 3::numeric) i, generate_series(i,3) j	0A000 SELECT must read exactly one table
+957	select * from generate_series(1::numeric, 3::numeric) i, generate_series(1,i) j	0A000 SELECT must read exactly one table
+958	select * from generate_series(1::numeric, 3::numeric) i, generate_series(1,5,i) j	0A000 SELECT must read exactly one table
+961	select ln(1.2345678e-28)	0A000 only constants are supported without a FROM
+962	select ln(0.0456789)	0A000 only constants are supported without a FROM
+963	select ln(0.349873948359354029493948309745709580730482050975)	0A000 only constants are supported without a FROM
+964	select ln(0.99949452)	0A000 only constants are supported without a FROM
+965	select ln(1.00049687395)	0A000 only constants are supported without a FROM
+966	select ln(1234.567890123456789)	0A000 only constants are supported without a FROM
+967	select ln(5.80397490724e5)	0A000 only constants are supported without a FROM
+968	select ln(9.342536355e34)	0A000 only constants are supported without a FROM
+971	select log(1.234567e-89)	0A000 only constants are supported without a FROM
+972	select log(3.4634998359873254962349856073435545)	0A000 only constants are supported without a FROM
+973	select log(9.999999999999999999)	0A000 only constants are supported without a FROM
+974	select log(10.00000000000000000)	0A000 only constants are supported without a FROM
+975	select log(10.00000000000000001)	0A000 only constants are supported without a FROM
+976	select log(590489.45235237)	0A000 only constants are supported without a FROM
+983	select log(1.23e-89, 6.4689e45)	0A000 only constants are supported without a FROM
+984	select log(0.99923, 4.58934e34)	0A000 only constants are supported without a FROM
+985	select log(1.000016, 8.452010e18)	0A000 only constants are supported without a FROM
+986	select log(3.1954752e47, 9.4792021e-73)	0A000 only constants are supported without a FROM
+987	select scale(numeric 'NaN')	0A000 only constants are supported without a FROM
+988	select scale(numeric 'inf')	0A000 only constants are supported without a FROM
+989	select scale(NULL::numeric)	0A000 only constants are supported without a FROM
+990	select scale(1.12)	0A000 only constants are supported without a FROM
+991	select scale(0)	0A000 only constants are supported without a FROM
+992	select scale(0.00)	0A000 only constants are supported without a FROM
+993	select scale(1.12345)	0A000 only constants are supported without a FROM
+994	select scale(110123.12475871856128)	0A000 only constants are supported without a FROM
+995	select scale(-1123.12471856128)	0A000 only constants are supported without a FROM
+996	select scale(-13.000000000000000)	0A000 only constants are supported without a FROM
+997	select min_scale(numeric 'NaN') is NULL	0A000 only constants are supported without a FROM
+998	select min_scale(numeric 'inf') is NULL	0A000 only constants are supported without a FROM
+999	select min_scale(0)	0A000 only constants are supported without a FROM
+1000	select min_scale(0.00)	0A000 only constants are supported without a FROM
+1001	select min_scale(1.0)	0A000 only constants are supported without a FROM
+1002	select min_scale(1.1)	0A000 only constants are supported without a FROM
+1003	select min_scale(1.12)	0A000 only constants are supported without a FROM
+1004	select min_scale(1.123)	0A000 only constants are supported without a FROM
+1005	select min_scale(1.1234)	0A000 only constants are supported without a FROM
+1006	select min_scale(1.12345)	0A000 only constants are supported without a FROM
+1007	select min_scale(1.1000)	0A000 only constants are supported without a FROM
+1008	select min_scale(1e100)	0A000 only constants are supported without a FROM
+1009	select trim_scale(numeric 'NaN')	0A000 only constants are supported without a FROM
+1010	select trim_scale(numeric 'inf')	0A000 only constants are supported without a FROM
+1011	select trim_scale(1.120)	0A000 only constants are supported without a FROM
+1012	select trim_scale(0)	0A000 only constants are supported without a FROM
+1013	select trim_scale(0.00)	0A000 only constants are supported without a FROM
+1014	select trim_scale(1.1234500)	0A000 only constants are supported without a FROM
+1015	select trim_scale(110123.12475871856128000)	0A000 only constants are supported without a FROM
+1016	select trim_scale(-1123.124718561280000000)	0A000 only constants are supported without a FROM
+1017	select trim_scale(-13.00000000000000000000)	0A000 only constants are supported without a FROM
+1018	select trim_scale(1e100)	0A000 only constants are supported without a FROM
+1019	SELECT SUM(9999::numeric) FROM generate_series(1, 100000)	0A000 only table sources are supported
+1020	SELECT SUM((-9999)::numeric) FROM generate_series(1, 100000)	0A000 only table sources are supported
+1023	INSERT INTO num_variance VALUES (3e-500)	22003 value is out of range for column type
+1024	INSERT INTO num_variance VALUES (-3e-500)	22003 value is out of range for column type
+1025	INSERT INTO num_variance VALUES (4e-500 - 1e-16383)	0A000 unsupported value or column type
+1026	INSERT INTO num_variance VALUES (-4e-500 + 1e-16383)	0A000 unsupported value or column type
+1027	SELECT trim_scale(variance(a) * 1e1000) FROM num_variance	0A000 function trim_scale() is not supported
+1029	ALTER TABLE num_variance SET (parallel_workers = 4)	XX000 unsupported statement
+1035	INSERT INTO num_variance SELECT 9e131071 + x FROM generate_series(1, 5) x	0A000 only INSERT ... VALUES is supported
+1036	SELECT variance(a) FROM num_variance	0A000 function variance() is not supported
+1038	ALTER TABLE num_variance SET (parallel_workers = 4)	XX000 unsupported statement
+1044	SELECT a, b, gcd(a, b), gcd(a, -b), gcd(-b, a), gcd(-b, -a)	0A000 only table sources are supported
+1045	SELECT a,b, lcm(a, b), lcm(a, -b), lcm(-b, a), lcm(-b, -a)	0A000 only table sources are supported
+1047	SELECT factorial(4)	0A000 only constants are supported without a FROM
+1048	SELECT factorial(15)	0A000 only constants are supported without a FROM
+1050	SELECT factorial(0)	0A000 only constants are supported without a FROM
+1052	SELECT pg_lsn(23783416::numeric)	0A000 only constants are supported without a FROM
+1053	SELECT pg_lsn(0::numeric)	0A000 only constants are supported without a FROM
+1054	SELECT pg_lsn(18446744073709551615::numeric)	0A000 only constants are supported without a FROM

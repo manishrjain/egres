@@ -1,0 +1,38 @@
+# Records egres does not support yet, with its error:
+# <index>\t<first line>\t<error>. Written by
+# run.py --write-skips; do not edit.
+2	INSERT INTO INT4_TBL(f1) VALUES	22P02 invalid value for column type
+3	VACUUM INT4_TBL	XX000 unsupported statement
+13	SELECT pg_input_is_valid('34', 'int4')	0A000 only constants are supported without a FROM
+14	SELECT pg_input_is_valid('asdf', 'int4')	0A000 only constants are supported without a FROM
+15	SELECT pg_input_is_valid('1000000000000', 'int4')	0A000 only constants are supported without a FROM
+16	SELECT * FROM pg_input_error_info('1000000000000', 'int4')	0A000 only table sources are supported
+29	SELECT i.* FROM INT4_TBL i WHERE (i.f1 % int2 '2') = int2 '1'	42883 operator does not exist for these operand types
+30	SELECT i.* FROM INT4_TBL i WHERE (i.f1 % int4 '2') = int2 '0'	42883 operator does not exist for these operand types
+32	SELECT i.f1, i.f1 * int2 '2' AS x FROM INT4_TBL i	42883 operator does not exist for these operand types
+34	SELECT i.f1, i.f1 * int4 '2' AS x FROM INT4_TBL i	42883 operator does not exist for these operand types
+36	SELECT i.f1, i.f1 + int2 '2' AS x FROM INT4_TBL i	42883 operator does not exist for these operand types
+38	SELECT i.f1, i.f1 + int4 '2' AS x FROM INT4_TBL i	42883 operator does not exist for these operand types
+40	SELECT i.f1, i.f1 - int2 '2' AS x FROM INT4_TBL i	42883 operator does not exist for these operand types
+42	SELECT i.f1, i.f1 - int4 '2' AS x FROM INT4_TBL i	42883 operator does not exist for these operand types
+43	SELECT i.f1, i.f1 / int2 '2' AS x FROM INT4_TBL i	42883 operator does not exist for these operand types
+44	SELECT i.f1, i.f1 / int4 '2' AS x FROM INT4_TBL i	42883 operator does not exist for these operand types
+45	SELECT -2+3 AS one	0A000 only constants are supported without a FROM
+46	SELECT 4-2 AS two	0A000 only constants are supported without a FROM
+47	SELECT 2- -1 AS three	0A000 only constants are supported without a FROM
+48	SELECT 2 - -2 AS four	0A000 only constants are supported without a FROM
+49	SELECT int2 '2' * int2 '2' = int2 '16' / int2 '4' AS true	0A000 only constants are supported without a FROM
+50	SELECT int4 '2' * int2 '2' = int2 '16' / int4 '4' AS true	0A000 only constants are supported without a FROM
+51	SELECT int2 '2' * int4 '2' = int4 '16' / int2 '4' AS true	0A000 only constants are supported without a FROM
+52	SELECT int4 '1000' < int4 '999' AS false	0A000 only constants are supported without a FROM
+53	SELECT 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 AS ten	0A000 only constants are supported without a FROM
+54	SELECT 2 + 2 / 2 AS three	0A000 only constants are supported without a FROM
+55	SELECT (2 + 2) / 2 AS two	0A000 only constants are supported without a FROM
+56	SELECT (-1::int4<<31)::text	0A000 only constants are supported without a FROM
+57	SELECT ((-1::int4<<31)+1)::text	0A000 only constants are supported without a FROM
+60	SELECT (-2147483648)::int4 % (-1)::int4	0A000 only constants are supported without a FROM
+63	SELECT (-2147483648)::int4 % (-1)::int2	0A000 only constants are supported without a FROM
+64	SELECT x, x::int4 AS int4_value	0A000 only table sources are supported
+65	SELECT x, x::int4 AS int4_value	0A000 only table sources are supported
+66	SELECT a, b, gcd(a, b), gcd(a, -b), gcd(b, a), gcd(-b, a)	0A000 only table sources are supported
+69	SELECT a, b, lcm(a, b), lcm(a, -b), lcm(b, a), lcm(-b, a)	0A000 only table sources are supported
