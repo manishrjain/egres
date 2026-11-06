@@ -942,7 +942,10 @@ test "ext: unknown portal/statement and malformed frame carry their SQLSTATE" {
         var frames: std.ArrayList(u8) = .empty;
         defer frames.deinit(a);
         try frame(a, &frames, c.tag, c.body);
-        try testing.expectEqualStrings(c.want, try firstErrorCode(a, frames.items));
+        try testing.expectEqualStrings(
+            c.want,
+            try firstErrorCode(a, frames.items),
+        );
     }
 }
 
@@ -962,7 +965,10 @@ test "ext: Bind with negative param length other than -1 is malformed" {
     var frames: std.ArrayList(u8) = .empty;
     defer frames.deinit(a);
     try frame(a, &frames, 'B', bind_body.items);
-    try testing.expectEqualStrings("08P01", try firstErrorCode(a, frames.items));
+    try testing.expectEqualStrings(
+        "08P01",
+        try firstErrorCode(a, frames.items),
+    );
 }
 
 test "ext: Describe(statement) emits ParameterDescription" {
