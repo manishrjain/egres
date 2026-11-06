@@ -67,7 +67,11 @@ pub fn createDatabase(
     else
         eng.forest.buildNsCreate(arena.allocator(), .next, name);
     const created = built catch |err| switch (err) {
-        error.NameExists => return replyError(state, "database already exists"),
+        error.NameExists => return replyErrorCode(
+            state,
+            pgwire.sqlstate.duplicate_database,
+            "database already exists",
+        ),
         else => |e| {
             log.err("create database '{s}': {s}", .{ name, @errorName(e) });
             return replyError(state, "create database failed");
@@ -90,7 +94,11 @@ pub fn dropDatabase(self: *Handler, state: *pgwire.ConnState, name: String) !voi
     if (std.mem.eql(u8, name, default_database))
         return replyError(state, "cannot drop the default database");
     const ns = eng.forest.manifest.lookupNamespace(name) orelse
-        return replyError(state, "database does not exist");
+        return replyErrorCode(
+            state,
+            pgwire.sqlstate.invalid_catalog_name,
+            "database does not exist",
+        );
 
     // Set `dropped` first, then take and release every table lock
     // exclusive, ONE AT A TIME: each take waits for the statements

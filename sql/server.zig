@@ -938,7 +938,11 @@ pub const Handler = struct {
             .deallocate => |name| try self.deallocate(state, name),
             .show_var => |show| try self.showVar(state, show),
             .invalid => |msg| try replyErrorCode(state, pgwire.sqlstate.feature_not_supported, msg),
-            .unsupported => try replyError(state, "unsupported statement"),
+            .unsupported => try replyErrorCode(
+                state,
+                pgwire.sqlstate.feature_not_supported,
+                "unsupported statement",
+            ),
         }
     }
 
