@@ -27,10 +27,11 @@
 
 const std = @import("std");
 const _rt = @import("runtime.zig");
-const context = @import("utils").context;
+const utils = @import("utils");
+const context = utils.context;
 
 inline fn nowNs() i128 {
-    return std.Io.Timestamp.now(context.g().io, .real).nanoseconds;
+    return utils.timestampNow(.monotonic, .nanos);
 }
 
 pub const Bench = struct {

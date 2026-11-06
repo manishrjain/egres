@@ -687,7 +687,7 @@ test "table binary fuse large keyset contains sampled keys" {
     const t = try openBuffer(alloc, &tb);
     defer destroyTable(t);
 
-    const seed: u64 = @intCast(std.Io.Timestamp.now(utils.context.g().io, .real).nanoseconds);
+    const seed: u64 = @intCast(utils.timestampNow(.realtime, .nanos));
     var prng = std.Random.DefaultPrng.init(seed);
     const rnd = prng.random();
 

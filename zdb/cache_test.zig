@@ -692,15 +692,14 @@ test "Cache lookups of missing keys stay fast through put and evict churn" {
     try std.testing.expect(c.totalCost() <= 1 << 20);
     try std.testing.expect(c.count() > 1000);
 
-    const io = utils.context.g().io;
-    const t0 = std.Io.Timestamp.now(io, .real).nanoseconds;
+    const t0 = utils.timestampNow(.monotonic, .nanos);
     for (0..100_000) |i| {
         try std.testing.expectEqual(
             @as(?*Value, null),
             c.get(1_000_000 + i, .reuse),
         );
     }
-    const t1 = std.Io.Timestamp.now(io, .real).nanoseconds;
+    const t1 = utils.timestampNow(.monotonic, .nanos);
     const ms = @divTrunc(t1 - t0, 1_000_000);
     // Microseconds of work in all; a full-table probe per miss would
     // take seconds. Generous for a loaded test box.

@@ -14,7 +14,7 @@ const log = std.log.scoped(.zdb_client);
 /// process io clock is the supported monotonic source. `std.Io.Clock` spells
 /// monotonic `.awake`. Used for latency histograms and phase elapsed timing.
 inline fn nowNs() i128 {
-    return std.Io.Timestamp.now(utils.context.g().io, .awake).nanoseconds;
+    return utils.timestampNow(.monotonic, .nanos);
 }
 
 /// Flag-registered config. `phase` is a string ("load" / "run" / "both")

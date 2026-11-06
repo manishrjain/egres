@@ -14,7 +14,7 @@ const u = raft.utils;
 
 fn makeTempWalDir(alloc: std.mem.Allocator) ![]u8 {
     var path_buf: [160]u8 = undefined;
-    const ts = std.Io.Timestamp.now(utils.context.g().io, .real).nanoseconds;
+    const ts = utils.timestampNow(.realtime, .nanos);
     const path = try std.fmt.bufPrint(&path_buf, "/tmp/egres-diskwal-{d}", .{ts});
     try vfs.createDirPath(path);
     return alloc.dupe(u8, path);

@@ -286,7 +286,7 @@ fn benchLoad(b: *Bench, batch_size: u32, mode: Compress) !void {
     var tmp: ?std.testing.TmpDir = null;
     defer if (tmp) |*t| t.cleanup();
     const dir = if (utils.context.g().env("EGRES_BENCH_DIR")) |root| blk: {
-        const ts = std.Io.Timestamp.now(io, .real).nanoseconds;
+        const ts = utils.timestampNow(.realtime, .nanos);
         const path = try std.fmt.allocPrint(
             b.alloc,
             "{s}/diskwal-bench-{d}",
@@ -352,9 +352,9 @@ fn benchLoad(b: *Bench, batch_size: u32, mode: Compress) !void {
     var i: u64 = 0;
     while (i < b.n) : (i += 1) {
         for (0..writes_per_op) |_| {
-            const t0 = std.Io.Timestamp.now(io, .awake).nanoseconds;
+            const t0 = utils.timestampNow(.monotonic, .nanos);
             try load.write();
-            const t1 = std.Io.Timestamp.now(io, .awake).nanoseconds;
+            const t1 = utils.timestampNow(.monotonic, .nanos);
             lat_ns.appendAssumeCapacity(@intCast(t1 - t0));
             b.addBytes(raw_bytes);
         }

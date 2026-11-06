@@ -33,7 +33,7 @@ const Wal = struct {
 
     fn open(alloc: std.mem.Allocator) !Wal {
         var path_buf: [96]u8 = undefined;
-        const ts = std.Io.Timestamp.now(utils.context.g().io, .real).nanoseconds;
+        const ts = utils.timestampNow(.realtime, .nanos);
         const path = try std.fmt.bufPrint(
             &path_buf,
             dir_root ++ "/egres-diskwal-bench-{d}",
@@ -178,13 +178,12 @@ test "BENCH: diskwal sustained 21 x 400 B across a rotation" {
     defer gpa.free(lat);
     const built = try w.buildBatches(batches, 21, payload);
     defer w.freeBatches(built);
-    const io = utils.context.g().io;
     b.resetTimer();
     for (lat, built) |*l, batch| {
-        const t0 = std.Io.Timestamp.now(io, .real).nanoseconds;
+        const t0 = utils.timestampNow(.monotonic, .nanos);
         try w.log.addEntries(batch);
         try w.log.sync();
-        l.* = @intCast(std.Io.Timestamp.now(io, .real).nanoseconds - t0);
+        l.* = @intCast(utils.timestampNow(.monotonic, .nanos) - t0);
     }
     b.stopTimer();
     std.mem.sort(u64, lat, {}, std.sort.asc(u64));

@@ -283,10 +283,12 @@ test "skiplist grows beyond 64 MiB up to 256 MiB and validates full iteration" {
     _ = tmp_arena.reset(.{ .retain_with_limit = target_capacity });
     defer tmp_arena.deinit();
 
-    var value_prng = std.Random.DefaultPrng.init(@intCast(std.Io.Timestamp.now(u.context.g().io, .real).nanoseconds));
+    var value_prng = std.Random.DefaultPrng.init(
+        @intCast(u.timestampNow(.realtime, .nanos)),
+    );
     var value_rand = value_prng.random();
 
-    const insert_start_ns = std.Io.Timestamp.now(u.context.g().io, .real).nanoseconds;
+    const insert_start_ns = u.timestampNow(.monotonic, .nanos);
     var inserted: usize = 0;
     var ts: u64 = 1;
     while (sl.memoryCapacity() < target_capacity) : (inserted += 1) {
@@ -305,7 +307,8 @@ test "skiplist grows beyond 64 MiB up to 256 MiB and validates full iteration" {
             );
         }
     }
-    const insert_elapsed_ns: i128 = std.Io.Timestamp.now(u.context.g().io, .real).nanoseconds - insert_start_ns;
+    const insert_elapsed_ns =
+        u.timestampNow(.monotonic, .nanos) - insert_start_ns;
 
     try testing.expect(sl.memoryCapacity() >= target_capacity);
     try testing.expectEqual(inserted, sl.numNodes());
@@ -315,7 +318,7 @@ test "skiplist grows beyond 64 MiB up to 256 MiB and validates full iteration" {
         .{ inserted, @divTrunc(insert_elapsed_ns, std.time.ns_per_ms) },
     );
 
-    const verify_start_ns = std.Io.Timestamp.now(u.context.g().io, .real).nanoseconds;
+    const verify_start_ns = u.timestampNow(.monotonic, .nanos);
     var it = try sl.iterator(testing.allocator);
     defer it.deinit();
 
@@ -332,7 +335,8 @@ test "skiplist grows beyond 64 MiB up to 256 MiB and validates full iteration" {
         try it.next();
     }
     try testing.expect(it.itemRef() == null);
-    const verify_elapsed_ns: i128 = std.Io.Timestamp.now(u.context.g().io, .real).nanoseconds - verify_start_ns;
+    const verify_elapsed_ns =
+        u.timestampNow(.monotonic, .nanos) - verify_start_ns;
     u.testPrint(
         "[zdb.skl] verification complete keys={d} verify_elapsed_ms={d}\n",
         .{ inserted, @divTrunc(verify_elapsed_ns, std.time.ns_per_ms) },
