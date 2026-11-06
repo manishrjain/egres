@@ -511,3 +511,82 @@ test "sql.expr: the function table's string, number and NULL forms" {
     try testing.expectError(error.NoSuchOperator, fx.bind("b = left(b, b)"));
     try testing.expectError(error.TypeMismatch, fx.bind("a = lower(b)"));
 }
+
+test "sql.expr: NaN equals itself and orders above every number" {
+    const nan = Value{ .float8 = std.math.nan(f64) };
+    const nan4 = Value{ .float4 = std.math.nan(f32) };
+    const inf = Value{ .float8 = std.math.inf(f64) };
+    const ninf = Value{ .float8 = -std.math.inf(f64) };
+    const eq = std.math.Order.eq;
+    const lt = std.math.Order.lt;
+    const gt = std.math.Order.gt;
+
+    try testing.expectEqual(eq, expr.compare(nan, nan));
+    try testing.expectEqual(gt, expr.compare(nan, inf));
+    try testing.expectEqual(lt, expr.compare(inf, nan));
+    try testing.expectEqual(lt, expr.compare(ninf, nan));
+    try testing.expectEqual(gt, expr.compare(nan, .{ .int8 = 1 << 40 }));
+    try testing.expectEqual(lt, expr.compare(.{ .float4 = 1 }, nan));
+    // Both float widths carry the same order.
+    try testing.expectEqual(eq, expr.compare(nan4, nan4));
+    try testing.expectEqual(
+        gt,
+        expr.compare(nan4, .{ .float4 = std.math.inf(f32) }),
+    );
+    // Zeros stay equal, as in PG.
+    try testing.expectEqual(
+        eq,
+        expr.compare(.{ .float8 = 0 }, .{ .float8 = -0.0 }),
+    );
+}
+
+test "sql.expr: NaN from arithmetic, NULLIF, GREATEST and LEAST" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const arloc = arena.allocator();
+    var fx = try Fixture.init(arloc);
+    defer fx.tbl.deinit();
+    const nan_row = try fx.item(9, &.{
+        .{ .int4 = 1 },
+        .{ .text = "n" },
+        .{ .float8 = std.math.nan(f64) },
+        .{ .int2 = 0 },
+        .{ .int8 = 0 },
+        .{ .float4 = std.math.nan(f32) },
+    });
+    const inf_row = try fx.item(10, &.{
+        .{ .int4 = 1 },
+        .{ .text = "i" },
+        .{ .float8 = std.math.inf(f64) },
+        .{ .int2 = 0 },
+        .{ .int8 = 0 },
+        .{ .float4 = std.math.inf(f32) },
+    });
+
+    // NaN = NaN, so NULLIF is NULL; a finite argument is not equal.
+    try expectEval(&fx, nan_row, .null_value, "c = nullif(c, c)");
+    try expectEval(&fx, nan_row, .null_value, "f = nullif(f, f)");
+    try testing.expect(std.math.isNan(
+        (try fx.eval("c = nullif(c, 1)", nan_row)).float8,
+    ));
+    // NaN is the greatest number, whichever side it sits on.
+    try testing.expect(std.math.isNan(
+        (try fx.eval("c = greatest(c, 1)", nan_row)).float8,
+    ));
+    try testing.expect(std.math.isNan(
+        (try fx.eval("c = greatest(1, c)", nan_row)).float8,
+    ));
+    try expectEval(&fx, nan_row, .{ .float8 = 1 }, "c = least(c, 1)");
+    try expectEval(&fx, nan_row, .{ .float8 = 1 }, "c = least(1, c)");
+    try testing.expect(std.math.isNan(
+        (try fx.eval("f = greatest(f, 1)", nan_row)).float4,
+    ));
+
+    // Infinity - Infinity computes a NaN, which the comparisons must take.
+    try testing.expect(std.math.isNan(
+        (try fx.eval("c = c - c", inf_row)).float8,
+    ));
+    try testing.expect(std.math.isNan(
+        (try fx.eval("c = greatest(c - c, 1)", inf_row)).float8,
+    ));
+}

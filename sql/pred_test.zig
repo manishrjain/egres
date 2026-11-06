@@ -378,3 +378,37 @@ test "sql.pred: expressions on either side compute per row" {
     const pb = try pred.bind(a, tbl, bad.select.where.?, .{});
     try testing.expectError(error.DivisionByZero, pb.eval(fx.row(r1)));
 }
+
+test "sql.pred: NaN is equal to itself and above every number" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try Fixture.init(a);
+    defer fx.tbl.deinit();
+    const r = try fx.item(1, &.{ .{ .int4 = 1 }, .{ .text = "x" } });
+
+    const nan = try a.create(sql.expr.Node);
+    nan.* = .{ .value = .{ .float8 = std.math.nan(f64) } };
+    const inf = try a.create(sql.expr.Node);
+    inf.* = .{ .value = .{ .float8 = std.math.inf(f64) } };
+    const one = try a.create(sql.expr.Node);
+    one.* = .{ .value = .{ .float8 = 1 } };
+
+    const eq_self = Pred{ .cmp = .{ .lhs = nan, .op = .eq, .rhs = nan } };
+    const ne_self = Pred{ .cmp = .{ .lhs = nan, .op = .ne, .rhs = nan } };
+    const same_self = Pred{ .cmp = .{ .lhs = nan, .op = .same, .rhs = nan } };
+    const gt_inf = Pred{ .cmp = .{ .lhs = nan, .op = .gt, .rhs = inf } };
+    const lt_inf = Pred{ .cmp = .{ .lhs = nan, .op = .lt, .rhs = inf } };
+    const differs_one = Pred{
+        .cmp = .{ .lhs = nan, .op = .differs, .rhs = one },
+    };
+
+    const T: ?bool = true;
+    const F: ?bool = false;
+    try testing.expectEqual(T, try eq_self.eval(fx.row(r)));
+    try testing.expectEqual(F, try ne_self.eval(fx.row(r)));
+    try testing.expectEqual(T, try same_self.eval(fx.row(r)));
+    try testing.expectEqual(T, try gt_inf.eval(fx.row(r)));
+    try testing.expectEqual(F, try lt_inf.eval(fx.row(r)));
+    try testing.expectEqual(T, try differs_one.eval(fx.row(r)));
+}

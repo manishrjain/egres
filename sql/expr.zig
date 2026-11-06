@@ -499,11 +499,12 @@ pub fn compare(x: Value, y: Value) std.math.Order {
 }
 
 /// Two scalars of one kind: text bytewise, numbers as floats when
-/// either is one, exactly otherwise.
+/// either is one, exactly otherwise. A float NaN is the largest number
+/// and equal to itself, as in PG (value.orderFloats).
 pub fn orderScalars(x: Scalar, y: Scalar) std.math.Order {
     if (x == .text) return std.mem.order(u8, x.text, y.text);
     if (x == .float or y == .float)
-        return std.math.order(toFloat(x), toFloat(y));
+        return _value.orderFloats(toFloat(x), toFloat(y));
     if (x == .int and y == .int) return std.math.order(x.int, y.int);
     return Numeric.order(toNumeric(x), toNumeric(y));
 }
