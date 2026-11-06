@@ -622,6 +622,20 @@ q "DELETE FROM uu WHERE id = 3;" >/dev/null
 if q "INSERT INTO uu VALUES (4, 'c@x');" | grep -q "INSERT 0 1"; then
     ok "DELETE frees the unique value"
 else bad "unique value still taken after DELETE"; fi
+# Concurrent NULLs: each NULL row keys apart, under no key lock, so
+# the second inserter never waits on the first's open txn.
+send 1 "BEGIN;"
+send 1 "INSERT INTO uu VALUES (5, NULL);"
+sync_session 1
+send 2 "INSERT INTO uu VALUES (6, NULL);"
+if sync_session 2; then
+    ok "concurrent NULL inserts under a unique index do not block"
+fi
+send 1 "COMMIT;"
+sync_session 1
+if [ "$(v "SELECT count(*) FROM uu WHERE email IS NULL;")" = "2" ]; then
+    ok "both NULL rows committed under the unique index"
+else bad "NULL rows missing under the unique index"; fi
 
 # Old snapshot, writer: S1's txn predates a unique index S2 builds. An
 # INSERT of a value the build indexed must see the backfilled entries,

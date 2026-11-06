@@ -15,7 +15,7 @@
 //! order over the values. Row cells are native-LE (row.zig) and not
 //! order-preserving, so index keys get their own codec. Every key
 //! leads with a tag byte (see `tag_value`/`tag_null`): it gives NULL
-//! its own address — a posting distinct from every real value,
+//! its own address, distinct from every real value,
 //! including '' — and sorts it after all real values (Postgres's
 //! NULLS LAST). Keys are single-column: raw text/bytea bytes need no
 //! terminator or escaping — memcmp IS the collation. (Composite keys
@@ -68,19 +68,37 @@ pub const U64 = packed struct(u64) {
 
 /// Tag byte leading every index key. Comparison hits it first: all
 /// real values share `tag_value` and order on their encoding exactly
-/// as before, while NULL's lone `tag_null` byte sorts after every
-/// real value — NULLS LAST.
+/// as before, while NULL's `tag_null` sorts after every real value —
+/// NULLS LAST. A non-unique index keys NULL on the lone tag byte; a
+/// unique one keys each NULL row apart (encodeUniqueNullKey).
 const tag_value: u8 = 0x00;
 const tag_null: u8 = 0x01;
 
 /// The index-key bounds of "every non-NULL value": every value key
-/// starts with tag_value, and NULL's key is the one byte that sorts
-/// after them all. A range with no bound on one side ends at these.
+/// starts with tag_value, and the NULL tag sorts after them all.
+/// A range with no bound on one side ends at these.
 pub const values_from: String = &.{tag_value};
 pub const values_end: String = &.{tag_null};
 /// The bound past every key, NULL's included: [values_from, keys_end)
-/// is the whole index in its order, values ascending then NULL.
-pub const keys_end: String = &.{ tag_null, 0 };
+/// is the whole index in its order, values ascending then NULL, and
+/// [values_end, keys_end) its NULL keys alone.
+pub const keys_end: String = &.{tag_null + 1};
+
+/// NULL rows need index entries for ordered scans. Keying each on
+/// [tag_null] ++ its egid keeps NULLs distinct without omitting rows.
+/// The tag sorts after every value; the egid orders NULL rows.
+pub fn encodeUniqueNullKey(a: std.mem.Allocator, egid: u64) ![]u8 {
+    const key = try a.alloc(u8, 1 + 8);
+    key[0] = tag_null;
+    key[1..9].* = encodeEgid(egid);
+    return key;
+}
+
+/// Whether an index key is a NULL's: [tag_null], or [tag_null][egid]
+/// under a unique index.
+pub fn isNullKey(key: String) bool {
+    return key.len > 0 and key[0] == tag_null;
+}
 
 /// The memcomparable index-key encoding of `v`: [tag_value] ++ value
 /// encoding, or the single [tag_null] byte for NULL. With `buf` the

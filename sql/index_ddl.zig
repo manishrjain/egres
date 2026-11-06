@@ -308,8 +308,8 @@ pub const RowIndexKeys = struct {
         return self.v1.count();
     }
 
-    /// First scan: the row's keys as of read_ts. No keys (a NULL
-    /// under a unique index) means no entry.
+    /// First scan: the row's keys as of read_ts. No keys means no
+    /// entry.
     pub fn setV1(self: *RowIndexKeys, egid: u64, keys: []const String) !void {
         if (keys.len == 0) return;
         try self.v1.put(self.a, egid, keys);
@@ -604,16 +604,17 @@ const IndexBuild = struct {
         return error.IndexMissing;
     }
 
-    /// The keys of one base row for this index, from the row's cell.
-    /// A cell too long for an SST entry fails the build, as its
+    /// The keys of base row `egid` for this index, from the row's
+    /// cell. A cell too long for an SST entry fails the build, as its
     /// INSERT would have been refused with the index in place.
     fn rowKeys(
         self: *IndexBuild,
         at: anytype,
         item: zdb.kv.Item,
+        egid: u64,
     ) ![]const String {
         const cell = at.tbl.parseCol(item, at.idx.column);
-        const keys = try at.idx.keys(self.a, cell);
+        const keys = try at.idx.keys(self.a, cell, egid);
         for (keys) |key| if (key.len > zdb.kv.Key.max_primary_len)
             return error.KeyTooLong;
         return keys;
@@ -639,7 +640,7 @@ const IndexBuild = struct {
             if (seen % _exec.row_cap == 0) try fiber.ctx().maybeYield();
             const egid = _key.decodeEgid(item.key.primary) orelse
                 continue; // not row-shaped: nothing to index
-            try rows.setV1(egid, try self.rowKeys(at, item));
+            try rows.setV1(egid, try self.rowKeys(at, item, egid));
         }
         log.info(
             "backfill index={d}: scanned rows={d}",
@@ -677,7 +678,7 @@ const IndexBuild = struct {
             const keys: []const String = if (item.newest().meta.isDeleted())
                 &.{}
             else
-                try self.rowKeys(at, item);
+                try self.rowKeys(at, item, egid);
             try rows.setV2(egid, keys);
         }
 

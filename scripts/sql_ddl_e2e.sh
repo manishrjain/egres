@@ -366,6 +366,15 @@ expect "two NULLs under a unique index" "INSERT 0 2" \
     psql "$E" -X -c "INSERT INTO uq VALUES (4,NULL,40),(5,NULL,50);"
 expect "NULL into the PK column" "not-null" \
     psql "$E" -X -c "INSERT INTO uq VALUES (NULL,'z@x',60);"
+# A rebuild over the two NULLs: each keys apart, so no duplicate, and
+# both are read back through the index.
+expect "DROP before a rebuild over NULLs" "DROP INDEX" \
+    psql "$E" -X -c "DROP INDEX uq_email;"
+expect "unique build over two NULLs" "CREATE INDEX" \
+    psql "$E" -X -c "CREATE UNIQUE INDEX uq_email ON uq (email);"
+expect "the build indexed both NULLs" "^1 2 4 5 $" \
+    sh -c "psql \"$E\" -X -tA -c 'SELECT id FROM uq ORDER BY email;' |
+        tr '\n' ' '"
 expect "DROP a user unique index" "DROP INDEX" \
     psql "$E" -X -c "DROP INDEX uq_email;"
 expect "dropped unique index no longer enforces" "INSERT 0 1" \

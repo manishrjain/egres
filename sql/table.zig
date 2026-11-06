@@ -139,21 +139,30 @@ pub const Index = struct {
         return indexName(alloc, table, self.column.name, shape);
     }
 
-    /// The index keys one cell contributes: none for NULL under a
-    /// unique index (NULLS DISTINCT), else exactly one — the cell's
-    /// memcomparable encoding; NULL under a non-unique index keys on
-    /// the tag_null byte. A slice rather than one key on purpose: a
-    /// later index kind (trigram, full text, a cell covering) returns
-    /// many from this same call, and every maintenance loop already
-    /// runs over the slice. Unencodable is unreachable: DDL refuses
-    /// interval columns for every index.
+    /// The index keys one cell contributes: one, the cell's
+    /// memcomparable encoding. NULL keys on the tag_null byte under a
+    /// non-unique index, and on that byte plus `egid` under a unique
+    /// one, so NULL rows never collide (NULLS DISTINCT) and the index
+    /// still holds every row. `egid` is the row the cell belongs to;
+    /// null for a value with no row behind it (an ON CONFLICT probe),
+    /// whose NULL then has no key. A slice rather than one key on
+    /// purpose: a later index kind (trigram, full text, a cell
+    /// covering) returns many from this same call, and every
+    /// maintenance loop already runs over the slice. Unencodable is
+    /// unreachable: DDL refuses interval columns for every index.
     pub fn keys(
         self: *const Index,
         arloc: std.mem.Allocator,
         cell: _value.Value,
+        egid: ?u64,
     ) error{OutOfMemory}![]const _value.String {
-        if (self.unique and cell == .null_value) return &.{};
+        const unique_null = self.unique and cell == .null_value;
+        if (unique_null and egid == null) return &.{};
         const one = try arloc.alloc(_value.String, 1);
+        if (unique_null) {
+            one[0] = try _key.encodeUniqueNullKey(arloc, egid.?);
+            return one;
+        }
         one[0] = _key.encodeIndexKey(arloc, cell, null) catch |err|
             switch (err) {
                 error.Unencodable => unreachable,

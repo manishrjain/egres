@@ -160,16 +160,23 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
     try testing.expectEqual(&t.columns[0], t.indexes[0].column);
     try testing.expect(t.indexes[0].column.pkey_position != null);
 
-    // Index.keys: a value yields its one encoded key; NULL yields none
-    // under a unique index (NULLS DISTINCT).
-    const one = try t.indexes[0].keys(alloc, .{ .int4 = 7 });
+    // Index.keys: a value yields its one encoded key; NULL under a
+    // unique index yields its row's own key (NULLS DISTINCT), and none
+    // when there is no row (an ON CONFLICT probe).
+    const one = try t.indexes[0].keys(alloc, .{ .int4 = 7 }, 1);
     defer alloc.free(one); // after the key it holds (defers run in reverse)
     defer alloc.free(one[0]);
     try testing.expectEqual(@as(usize, 1), one.len);
     const want = try sql.key.encodeIndexKey(alloc, .{ .int4 = 7 }, null);
     defer alloc.free(want);
     try testing.expectEqualSlices(u8, want, one[0]);
-    const none = try t.indexes[0].keys(alloc, .null_value);
+    const own = try t.indexes[0].keys(alloc, .null_value, 6);
+    defer alloc.free(own);
+    defer alloc.free(own[0]);
+    const own_key = try sql.key.encodeUniqueNullKey(alloc, 6);
+    defer alloc.free(own_key);
+    try testing.expectEqualSlices(u8, own_key, own[0]);
+    const none = try t.indexes[0].keys(alloc, .null_value, null);
     try testing.expectEqual(@as(usize, 0), none.len);
     // A non-unique index keys NULL on the NULL tag byte.
     const posting = sql.table.Index{
@@ -178,7 +185,7 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
         .valid_ts = 0,
         .column = &t.columns[1],
     };
-    const tag = try posting.keys(alloc, .null_value);
+    const tag = try posting.keys(alloc, .null_value, 1);
     defer alloc.free(tag);
     defer alloc.free(tag[0]);
     const null_key = try sql.key.encodeIndexKey(alloc, .null_value, null);

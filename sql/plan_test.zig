@@ -397,7 +397,7 @@ test "sql.plan: IS NULL reads a posting index, never a unique one" {
     const null_key = try sql.key.encodeIndexKey(a, .null_value, null);
     try expectLookup(try bitmapOf(&on_b), b_index_id, false, null_key);
 
-    // A unique index holds no NULL entries.
+    // Unique NULL entries are not used for this predicate yet.
     var on_a = try fx.planFor("a IS NULL", stream);
     defer on_a.deinit();
     try expectScan(&on_a);
@@ -705,4 +705,27 @@ test "sql.plan: ORDER BY on an indexed column walks the index in key order" {
     });
     defer early.deinit();
     _ = try expectSorted(&early);
+}
+
+test "sql.plan: ORDER BY walks a unique index through its NULL keys" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    // b behind a unique index, nullable: its NULL rows have keys too,
+    // so the whole walk is every row (#23).
+    fx.tbl.indexes[1].unique = true;
+    const from = sql.key.values_from;
+    const keys_end = sql.key.keys_end;
+
+    var asc = try fx.planFor("", .{
+        .read_ts = read_ts,
+        .order_by = &.{try fx.sortKey("b", false, false)},
+    });
+    defer asc.deinit();
+    try expectWalk(&asc, b_index_id, true, from, keys_end, .forward);
+    var desc = try fx.planFor("", .{
+        .read_ts = read_ts,
+        .order_by = &.{try fx.sortKey("b", true, true)},
+    });
+    defer desc.deinit();
+    try expectWalk(&desc, b_index_id, true, from, keys_end, .reverse);
 }

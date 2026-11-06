@@ -151,6 +151,28 @@ test "sql.key: NULL keys on its tag byte, after every real value" {
     try testing.expectEqual(1, nk.len);
 }
 
+test "sql.key: a unique index's NULL keys sort after values, by egid" {
+    const a = testing.allocator;
+    const top = try enc(.{ .int8 = std.math.maxInt(i64) });
+    defer a.free(top);
+    const n1 = try key.encodeUniqueNullKey(a, 1);
+    defer a.free(n1);
+    const n2 = try key.encodeUniqueNullKey(a, 256);
+    defer a.free(n2);
+    const last = try key.encodeUniqueNullKey(a, std.math.maxInt(u64));
+    defer a.free(last);
+
+    // Every value < values_end <= NULL keys, in egid order < keys_end.
+    try testing.expect(std.mem.lessThan(u8, top, key.values_end));
+    try testing.expect(!std.mem.lessThan(u8, n1, key.values_end));
+    try testing.expect(std.mem.lessThan(u8, n1, n2));
+    try testing.expect(std.mem.lessThan(u8, n2, last));
+    try testing.expect(std.mem.lessThan(u8, last, key.keys_end));
+
+    try testing.expect(key.isNullKey(n1));
+    try testing.expect(!key.isNullKey(top));
+}
+
 test "sql.key: interval is unencodable and leaves the buffer clean" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
