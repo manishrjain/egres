@@ -1717,7 +1717,6 @@ pub const AdminServer = struct {
         const nr = self.engine.forest.buildNsCreate(
             arena.allocator(),
             .{ .given = req.ns },
-            "",
         ) catch |err| {
             log.err("ns create failed: {s}", .{@errorName(err)});
             try proto.writeErr(stream, @errorName(err));

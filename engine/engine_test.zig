@@ -68,6 +68,13 @@ test "mutations: flat multi-table round-trip" {
     }
 }
 
+// ---------------------------------------------------------------------------
+// A DDL manifest entry carrying rows, driven through the state machine's
+// apply hook on a bare forest: the path every node takes for a commit.
+// The apply path never touches the raft node or the snapshot options, so
+// neither is set.
+// ---------------------------------------------------------------------------
+
 const raft = @import("raft");
 const utils = @import("utils");
 const flags = @import("flags");
@@ -133,7 +140,6 @@ const ApplyFixture = struct {
         const created = try self.forest.buildNsCreate(
             self.arena.allocator(),
             .{ .given = ns },
-            "",
         );
         try self.apply(2, 20, created.change);
     }
@@ -288,6 +294,27 @@ const ApplyFixture = struct {
         return try self.arena.allocator().dupe(u8, found.newest().value);
     }
 
+    /// The change creating one rows table, with `kvs` as its rows.
+    fn createTable(
+        self: *ApplyFixture,
+        kvs: []zen.KeyValueStruct,
+    ) !zdb.manifest.ManifestChange {
+        const changes = try self.arena.allocator().alloc(
+            zdb.manifest.TreeChange,
+            1,
+        );
+        changes[0] = zdb.manifest.newTableChange(.rows);
+        const created = try self.forest.buildTables(
+            self.arena.allocator(),
+            ns,
+            changes,
+            .create_tree,
+        );
+        var mc = created.change;
+        mc.rows = .{ .namespace = ns, .kvs = kvs };
+        return mc;
+    }
+
     /// A catalog-table key in `in_ns`, marshaled for the wire.
     fn key(self: *ApplyFixture, in_ns: u64, primary: String) !String {
         return (Key{
@@ -296,7 +323,199 @@ const ApplyFixture = struct {
             .primary = primary,
         }).marshal(self.arena.allocator());
     }
+    /// The value of `primary` in table 1 at `read_ts`, or null.
+    fn read(self: *ApplyFixture, primary: String, read_ts: u64) !?[]u8 {
+        const found = try self.forest.get(testing.allocator, .{
+            .key = .{ .namespace = ns, .table_id = 1, .primary = primary },
+            .read_ts = read_ts,
+        }) orelse return null;
+        defer found.free(testing.allocator);
+        return try self.arena.allocator().dupe(u8, found.newest().value);
+    }
 };
+
+const first_user: zdb.kv.TableKey = .{
+    .namespace = ns,
+    .table_id = zdb.manifest.first_table_id,
+};
+
+test "ddl rows: a create entry installs its tree and writes its rows" {
+    var fx: ApplyFixture = undefined;
+    try fx.setup(0);
+    defer fx.teardown();
+
+    var kvs = [_]zen.KeyValueStruct{
+        .{ .key = try fx.key(ns, "col-1"), .value = "v1" },
+    };
+    try fx.apply(3, 30, try fx.createTable(&kvs));
+
+    try testing.expect(fx.forest.hasTable(first_user));
+    // Rows take the entry's commit timestamp.
+    try testing.expectEqualStrings("v1", (try fx.read("col-1", 30)).?);
+    try testing.expectEqual(null, try fx.read("col-1", 29));
+}
+
+test "ddl rows: a drop entry writes its tombstones and removes its tree" {
+    var fx: ApplyFixture = undefined;
+    try fx.setup(0);
+    defer fx.teardown();
+
+    var put = [_]zen.KeyValueStruct{
+        .{ .key = try fx.key(ns, "col-1"), .value = "v1" },
+    };
+    try fx.apply(3, 30, try fx.createTable(&put));
+
+    var tomb = [_]zen.KeyValueStruct{.{
+        .key = try fx.key(ns, "col-1"),
+        .meta = (Meta{ .kind = .deleted }).toByte(),
+    }};
+    var mc = try fx.forest.buildTableDrop(
+        fx.arena.allocator(),
+        ns,
+        &.{first_user.table_id},
+    );
+    mc.rows = .{ .namespace = ns, .kvs = &tomb };
+    try fx.apply(4, 40, mc);
+
+    try testing.expect(!fx.forest.hasTable(first_user));
+    try testing.expectEqual(null, try fx.read("col-1", 40));
+    try testing.expectEqualStrings("v1", (try fx.read("col-1", 39)).?);
+}
+
+test "ddl rows: a row in another namespace is skipped" {
+    var fx: ApplyFixture = undefined;
+    try fx.setup(0);
+    defer fx.teardown();
+
+    var kvs = [_]zen.KeyValueStruct{
+        .{ .key = try fx.key(ns, "kept"), .value = "a" },
+        .{ .key = try fx.key(ns + 1, "stray"), .value = "b" },
+    };
+    try fx.apply(3, 30, try fx.createTable(&kvs));
+
+    try testing.expectEqualStrings("a", (try fx.read("kept", 30)).?);
+    const stray = try fx.forest.get(testing.allocator, .{ .key = .{
+        .namespace = ns + 1,
+        .table_id = 1,
+        .primary = "stray",
+    } });
+    try testing.expectEqual(null, stray);
+}
+
+test "ddl rows: applying an entry twice changes nothing" {
+    var fx: ApplyFixture = undefined;
+    try fx.setup(0);
+    defer fx.teardown();
+
+    var kvs = [_]zen.KeyValueStruct{
+        .{ .key = try fx.key(ns, "col-1"), .value = "v1" },
+    };
+    const mc = try fx.createTable(&kvs);
+    try fx.apply(3, 30, mc);
+    try fx.apply(3, 30, mc);
+
+    try testing.expect(fx.forest.hasTable(first_user));
+    try testing.expectEqualStrings("v1", (try fx.read("col-1", 30)).?);
+    try testing.expectEqual(
+        zdb.manifest.first_table_id + 1,
+        try fx.forest.manifest.nextTableId(ns),
+    );
+}
+
+test "ddl rows: below oldest_memtable_index the trees apply, the rows not" {
+    var fx: ApplyFixture = undefined;
+    // Recovery says rows up to index 99 are already in SSTs.
+    try fx.setup(100);
+    defer fx.teardown();
+
+    var kvs = [_]zen.KeyValueStruct{
+        .{ .key = try fx.key(ns, "col-1"), .value = "v1" },
+    };
+    try fx.apply(3, 30, try fx.createTable(&kvs));
+
+    try testing.expect(fx.forest.hasTable(first_user));
+    try testing.expectEqual(null, try fx.read("col-1", 30));
+}
+
+test "ddl rows: a snapshot of the manifest keeps the tree, not the rows" {
+    var fx: ApplyFixture = undefined;
+    try fx.setup(0);
+    defer fx.teardown();
+
+    var kvs = [_]zen.KeyValueStruct{
+        .{ .key = try fx.key(ns, "col-1"), .value = "v1" },
+    };
+    const mc = try fx.createTable(&kvs);
+
+    // The snapshot draft's path: Manifest.apply, then serialize.
+    var draft = zdb.manifest.Manifest.init(testing.allocator);
+    defer draft.deinit();
+    const sys = zdb.manifest.namespace_system_table_ids;
+    var sys_trees: [sys.len]zdb.manifest.TreeChange = undefined;
+    for (sys, &sys_trees) |table_id, *tc|
+        tc.* = zdb.manifest.createTreeChange(
+            zdb.kv.makeTreeId(table_id, 0),
+            ns,
+            "",
+            "",
+            .posting_index,
+        );
+    try draft.apply(2, .{
+        .tree_changes = &sys_trees,
+        .sstable_changes = &.{},
+        .cmd = .create_ns,
+        .memtable_id = 0,
+    });
+    try draft.apply(3, mc);
+    const bytes = try draft.serialize(testing.allocator);
+    defer testing.allocator.free(bytes);
+
+    var restored = zdb.manifest.Manifest.init(testing.allocator);
+    defer restored.deinit();
+    try restored.restoreFrom(bytes);
+    try testing.expect(restored.treeKind(.{
+        .namespace = ns,
+        .tree_id = zdb.kv.makeTreeId(first_user.table_id, 0),
+    }) != null);
+    try testing.expectEqual(
+        zdb.manifest.first_table_id + 1,
+        try restored.nextTableId(ns),
+    );
+    const parsed = try zen.parseMessageWithTail(bytes);
+    try testing.expect(parsed.ManifestChange.rows() == null);
+}
+
+test "startup: a database without the system namespace is refused" {
+    var fx: ApplyFixture = undefined;
+    try fx.setup(0);
+    defer fx.teardown();
+    const check = engine.Engine.checkSystemNamespace;
+    const a = fx.arena.allocator();
+
+    // No database yet: a fresh node, or one still catching up.
+    try check(fx.forest);
+
+    // A database and no system namespace: an older build wrote it.
+    const db = try fx.forest.buildNsCreate(a, .next);
+    try fx.apply(3, 30, db.change);
+    try testing.expectError(error.OldDataDirectory, check(fx.forest));
+
+    // Genesis's namespace 1, with only its names tree.
+    var trees = [_]zdb.manifest.TreeChange{zdb.manifest.createTreeChange(
+        zdb.kv.makeTreeId(zdb.manifest.names_table_id, 0),
+        zdb.manifest.system_namespace,
+        "",
+        "",
+        .posting_index,
+    )};
+    try fx.apply(4, 40, .{
+        .cmd = .create_ns,
+        .tree_changes = &trees,
+        .sstable_changes = &.{},
+        .memtable_id = 0,
+    });
+    try check(fx.forest);
+}
 
 test "branch: a restart keeps the rows a namespace branch copied" {
     var fx: ApplyFixture = undefined;
@@ -324,11 +543,7 @@ test "branch: a restart keeps the rows a namespace branch copied" {
 
     // 8: CREATE DATABASE ... TEMPLATE: the row is copied from frozen
     // memtable 4 into memtable 7, under the new namespace.
-    const branched = try fx.forest.buildNsBranch(
-        fx.arena.allocator(),
-        ns,
-        "",
-    );
+    const branched = try fx.forest.buildNsBranch(fx.arena.allocator(), ns);
     try fx.apply(8, 80, branched.change);
     const copy: zdb.kv.TableKey = .{
         .namespace = branched.namespace,

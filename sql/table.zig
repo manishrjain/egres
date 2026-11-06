@@ -3,7 +3,7 @@
 
 //! Reconstructing a user table's schema from its catalog rows.
 //!
-//! CREATE TABLE writes one catalog row per column (server.writeCatalogRows);
+//! CREATE TABLE writes one catalog row per column (ddl.catalogRowKvs);
 //! this reads them back so INSERT/SELECT can encode/decode the table's rows.
 //! The catalog tree (catalog.table_id) holds every table's columns keyed
 //! (table_id, column_id) big-endian, so the 4-byte table_id prefix scans

@@ -51,12 +51,8 @@ pub const Op = schema.EnumDef(&.{
 // range. `tree_id` is namespace-local and packs (table_id << 32) | split_id, so
 // the tree's SQL table is derived from it (Key.treeTableId) and never
 // stored separately. `namespace_id` + `tree_id` together are the tree's global
-// identity (Key.TreeKey).
-//
-// `name` names the object a CREATE introduces: the namespace's name on an
-// ns_create (its tree_id-0 change, live and in snapshots), a table's name on
-// a create_tree (future). Empty everywhere else (splits, drops, legacy admin
-// namespaces).
+// identity (Key.TreeKey). Names are not here: database, table and index
+// names are rows the SQL layer owns (table 3 of a namespace).
 /// What a tree's primary keys are. The builder picks the SST filter by
 /// it: an `egid` tree's keys are 8-byte big-endian row ids, kept exactly
 /// in a roaring bitmap; a `bytes` tree's keys go through a hash into a
@@ -81,7 +77,6 @@ pub const TreeChange = schema.Table(&.{
     .{ .id = 3, .name = "tree_id", .ty = schema.U64 },
     .{ .id = 4, .name = "left_key", .ty = schema.Bytes },
     .{ .id = 5, .name = "right_key", .ty = schema.Bytes },
-    .{ .id = 6, .name = "name", .ty = schema.Bytes },
     // create only: fixed for the tree's life, inherited by a split.
     .{ .id = 7, .name = "kind", .ty = TreeKind },
     // branch_table only: the table whose trees this table lists again.
@@ -116,13 +111,11 @@ pub const SSTableChange = schema.Table(&.{
 
 // Per-namespace manifest state, persisted ONLY inside a snapshot (a
 // serialized Manifest): the next-free table_id high-water-mark (so a
-// re-elected leader never re-issues an id even after a DROP) and the
-// database name (SQL CREATE DATABASE; empty for unnamed legacy namespaces).
-// Live (non-snapshot) ManifestChanges leave `namespaces` empty.
+// re-elected leader never re-issues an id even after a DROP). Live
+// (non-snapshot) ManifestChanges leave `namespaces` empty.
 pub const Namespace = schema.Table(&.{
     .{ .id = 1, .name = "id", .ty = schema.U64 },
     .{ .id = 2, .name = "next_table_id", .ty = schema.U32 },
-    .{ .id = 3, .name = "name", .ty = schema.Bytes },
 });
 
 // Which kind of change a ManifestChange carries. `none` (0) is the zero value
@@ -145,12 +138,12 @@ pub const Command = schema.EnumDef(&.{
     // CREATE DATABASE dst TEMPLATE src: dst gets every tree of
     // `branch_from` listing the same SST files (shared, refcounted) and
     // the versions still in memtables, as of the entry. `tree_changes`
-    // holds dst's tree-0 change alone, for its id and name; the rest is
-    // derived from the manifest at apply, the same on every node
+    // holds dst's tree-0 change alone, for its id; the rest is derived
+    // from the manifest at apply, the same on every node
     // (Manifest.applyBranch).
     .{ .name = "branch_ns", .tag = 10 },
     // CREATE TABLE dst AS TABLE src: one create change per new table
-    // (the base table and each of its indexes), carrying its name and
+    // (the base table and each of its indexes), carrying its
     // `from_table_id`; each lists every tree of its source under its
     // own id, the files shared, and takes the source's versions still
     // in memtables, as of the entry (Manifest.applyTableBranch).
@@ -169,6 +162,14 @@ pub const ManifestChange = schema.Table(&.{
     .{ .id = 6, .name = "next_ns_id", .ty = schema.U64 },
     // branch_ns only: the namespace copied.
     .{ .id = 7, .name = "branch_from", .ty = schema.U64 },
+    // Rows a DDL entry writes with its tree change, so the two commit
+    // as one: catalog and name rows. Only create_ns, drop_ns,
+    // create_tree, drop_tree, branch_ns and branch_table carry them.
+    // `rows.namespace` is the entry's trees' namespace or the system
+    // namespace; rows take the entry's commit timestamp, as a .data
+    // entry's do. Manifest.apply and the snapshot draft ignore them:
+    // rows reach a snapshot as SSTs.
+    .{ .id = 8, .name = "rows", .ty = Mutations },
 });
 
 /// A single key-value write. `key` is a marshaled zdb key

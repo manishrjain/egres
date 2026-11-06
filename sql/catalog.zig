@@ -18,9 +18,9 @@
 //! catalog's OWN schema cannot live in a catalog (that is circular), so
 //! `logical_schema` is a const compiled into the binary.
 //!
-//! Out of scope here: table-name ↔ table_id and database metadata (a separate
-//! registry, pg_class's job). On disk the `type` column is the Type enum
-//! ordinal, so reordering Type is a catalog-format change.
+//! Out of scope here: table-name ↔ table_id and database names (table 3,
+//! see names.zig). On disk the `type` column is the Type enum ordinal, so
+//! reordering Type is a catalog-format change.
 //!
 //! Table 2 is a second system catalog: the INDEX registry (pg_index's job).
 //! One row per index, keyed (base_table_id, index_table_id) big-endian, so a
@@ -40,9 +40,9 @@ const LogicalColumn = _schema.LogicalColumn;
 const LogicalSchema = _schema.LogicalSchema;
 
 /// Every namespace reserves table_id 1 for its column catalog and table_id 2
-/// for its index catalog (0 is the raw-KV default table; tids 3–15 stay
-/// reserved for future system tables; user tables start at zdb's
-/// first_table_id, 16).
+/// for its index catalog (0 is the raw-KV default table; 3 holds names,
+/// see names.zig; tids 4–15 stay reserved for future system tables; user
+/// tables start at zdb's first_table_id, 16).
 pub const table_id: u32 = 1;
 pub const index_table_id: u32 = 2;
 

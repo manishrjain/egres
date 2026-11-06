@@ -499,10 +499,10 @@ test "forest: drop_ns removes every table and forgets the id counter" {
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
-    // Namespace 7 with five tables: the default + column + index catalogs
-    // (installed by ns_create), a system tree at a reserved table_id, and an
-    // allocated, named user table.
-    const nc = (try f.buildNsCreate(alloc, .{ .given = 7 }, "seven")).change;
+    // Namespace 7 with six tables: the default, column and index catalogs
+    // and names (installed by ns_create), a system tree at a reserved
+    // table_id, and an allocated, named user table.
+    const nc = (try f.buildNsCreate(alloc, .{ .given = 7 })).change;
     defer alloc.free(nc.tree_changes);
     try f.applyTrees(1, nc);
     try std.testing.expect(f.hasNamespace(7));
@@ -514,47 +514,43 @@ test "forest: drop_ns removes every table and forgets the id counter" {
         .namespace = 7,
         .table_id = _manifest.index_catalog_table_id,
     }));
-    try std.testing.expectEqual(
-        @as(?u64, 7),
-        f.manifest.lookupNamespace("seven"),
-    );
+    try std.testing.expect(f.hasTable(.{
+        .namespace = 7,
+        .table_id = _manifest.names_table_id,
+    }));
 
     const sys = try buildCreateTree(f, alloc, .{
         .namespace = 7,
-        .table_id = 3,
+        .table_id = 5,
     }, .posting_index);
     defer alloc.free(sys.tree_changes);
     try f.applyTrees(1, sys);
 
     var ct_tc = [_]_manifest.TreeChange{
-        _manifest.newTableChange("users", .posting_index),
+        _manifest.newTableChange(.posting_index),
     };
     const ct = try f.buildTables(alloc, 7, &ct_tc, .create_tree);
     defer alloc.free(ct.table_ids);
     try f.applyTrees(1, ct.change);
     try std.testing.expectEqual(_manifest.first_table_id, ct.table_ids[0]);
-    try std.testing.expectEqual(
-        @as(?u32, ct.table_ids[0]),
-        f.manifest.lookupTable(7, "users"),
-    );
+    try std.testing.expect(f.hasTable(.{
+        .namespace = 7,
+        .table_id = ct.table_ids[0],
+    }));
 
-    // Drop the namespace: one delete per tree across all five tables.
+    // Drop the namespace: one delete per tree across all six tables.
     const dc = try f.buildNsDrop(alloc, 7);
     defer alloc.free(dc.tree_changes);
-    try std.testing.expectEqual(@as(usize, 5), dc.tree_changes.len);
+    try std.testing.expectEqual(@as(usize, 6), dc.tree_changes.len);
     try std.testing.expectEqual(_manifest.Command.drop_ns, dc.cmd);
     try f.applyTrees(1, dc);
 
     try std.testing.expect(!f.hasNamespace(7));
-    try std.testing.expect(!f.hasTable(.{ .namespace = 7, .table_id = 3 }));
+    try std.testing.expect(!f.hasTable(.{ .namespace = 7, .table_id = 5 }));
     try std.testing.expect(!f.hasTable(.{
         .namespace = 7,
         .table_id = _manifest.catalog_table_id,
     }));
-    // Names — database and table — died with the namespace and are free
-    // for a re-CREATE.
-    try std.testing.expect(f.manifest.lookupNamespace("seven") == null);
-    try std.testing.expect(f.manifest.lookupTable(7, "users") == null);
     try std.testing.expect(!f.hasTable(.{
         .namespace = 7,
         .table_id = ct.table_ids[0],
@@ -571,19 +567,16 @@ test "forest: drop_ns removes every table and forgets the id counter" {
     // floor — the counter was forgotten with the namespace. (Production
     // never reuses a namespace id; the same-id re-create here just
     // exercises idempotence.)
-    const nc2 = (try f.buildNsCreate(alloc, .{ .given = 7 }, "seven")).change;
+    const nc2 = (try f.buildNsCreate(alloc, .{ .given = 7 })).change;
     defer alloc.free(nc2.tree_changes);
     try f.applyTrees(1, nc2);
     var ct2_tc = [_]_manifest.TreeChange{
-        _manifest.newTableChange("users", .posting_index),
+        _manifest.newTableChange(.posting_index),
     };
     const ct2 = try f.buildTables(alloc, 7, &ct2_tc, .create_tree);
     defer alloc.free(ct2.table_ids);
     try std.testing.expectEqual(_manifest.first_table_id, ct2.table_ids[0]);
-    try std.testing.expectEqual(
-        @as(?u64, 7),
-        f.manifest.lookupNamespace("seven"),
-    );
+    try std.testing.expect(f.hasNamespace(7));
 }
 
 test "forest: drop_tree keeps an SST shared with another tree" {
@@ -686,7 +679,7 @@ test "forest: buildTables allocates and never reuses a dropped id" {
     // First user table in namespace 2 gets first_table_id; second gets +1.
     // (Unnamed — id allocation is what's under test here.)
     var r1_tc = [_]_manifest.TreeChange{
-        _manifest.newTableChange("", .posting_index),
+        _manifest.newTableChange(.posting_index),
     };
     const r1 = try f.buildTables(alloc, 2, &r1_tc, .create_tree);
     defer alloc.free(r1.table_ids);
@@ -695,7 +688,7 @@ test "forest: buildTables allocates and never reuses a dropped id" {
     try std.testing.expect(f.hasTable(.{ .namespace = 2, .table_id = first }));
 
     var r2_tc = [_]_manifest.TreeChange{
-        _manifest.newTableChange("", .posting_index),
+        _manifest.newTableChange(.posting_index),
     };
     const r2 = try f.buildTables(alloc, 2, &r2_tc, .create_tree);
     defer alloc.free(r2.table_ids);
@@ -712,7 +705,7 @@ test "forest: buildTables allocates and never reuses a dropped id" {
     }));
 
     var r3_tc = [_]_manifest.TreeChange{
-        _manifest.newTableChange("", .posting_index),
+        _manifest.newTableChange(.posting_index),
     };
     const r3 = try f.buildTables(alloc, 2, &r3_tc, .create_tree);
     defer alloc.free(r3.table_ids);
@@ -738,30 +731,27 @@ test "forest: buildNsCreate allocates global namespace ids" {
     const first = _manifest.first_namespace;
 
     // CREATE DATABASE allocates the next namespace and installs its default table.
-    const r1 = try f.buildNsCreate(alloc, .next, "one");
+    const r1 = try f.buildNsCreate(alloc, .next);
     defer alloc.free(r1.change.tree_changes);
     try std.testing.expectEqual(first, r1.namespace);
     try f.applyTrees(1, r1.change);
     try std.testing.expect(f.hasNamespace(first));
 
-    const r2 = try f.buildNsCreate(alloc, .next, "two");
+    const r2 = try f.buildNsCreate(alloc, .next);
     defer alloc.free(r2.change.tree_changes);
     try std.testing.expectEqual(first + 1, r2.namespace);
     try f.applyTrees(1, r2.change);
     try std.testing.expect(f.hasNamespace(first + 1));
 
-    // Names resolve to their namespaces; a taken name is rejected at build.
-    try std.testing.expectEqual(
-        @as(?u64, first),
-        f.manifest.lookupNamespace("one"),
-    );
-    try std.testing.expectEqual(
-        @as(?u64, first + 1),
-        f.manifest.lookupNamespace("two"),
-    );
+    // A given id that already exists is refused at build.
     try std.testing.expectError(
-        error.NameExists,
-        f.buildNsCreate(alloc, .next, "one"),
+        error.NamespaceAlreadyExists,
+        f.buildNsCreate(alloc, .{ .given = first }),
+    );
+    // So is the system namespace, which has no default table.
+    try std.testing.expectError(
+        error.NamespaceAlreadyExists,
+        f.buildNsCreate(alloc, .{ .given = _manifest.system_namespace }),
     );
 }
 
@@ -828,11 +818,11 @@ test "forest: branch_ns shares the files and forks the memtables as of its ts" {
     // The source: namespace "seven" with a named table, one row flushed
     // to an SST, two still in memtables, one of those after the branch.
     const src: u64 = 7;
-    const nc = (try f.buildNsCreate(alloc, .{ .given = src }, "seven")).change;
+    const nc = (try f.buildNsCreate(alloc, .{ .given = src })).change;
     defer alloc.free(nc.tree_changes);
     try f.applyTrees(1, nc);
     var ct_tc = [_]_manifest.TreeChange{
-        _manifest.newTableChange("users", .rows),
+        _manifest.newTableChange(.rows),
     };
     const ct = try f.buildTables(alloc, src, &ct_tc, .create_tree);
     defer alloc.free(ct.table_ids);
@@ -851,7 +841,7 @@ test "forest: branch_ns shares the files and forks the memtables as of its ts" {
     try f.put(&.{rowItem(src, "c", 40, "c40")});
 
     // Branch at ts 30: a (both versions), b, not c.
-    const br = try f.buildNsBranch(alloc, src, "eight");
+    const br = try f.buildNsBranch(alloc, src);
     defer alloc.free(br.change.tree_changes);
     const dst = br.namespace;
     try std.testing.expectEqual(_manifest.Command.branch_ns, br.change.cmd);
@@ -859,13 +849,11 @@ test "forest: branch_ns shares the files and forks the memtables as of its ts" {
     try f.applyNsBranch(7, 30, br.change);
 
     try std.testing.expect(f.hasNamespace(dst));
+    // The branch takes the source's table-id counter, so it never hands
+    // out an id the source minted.
     try std.testing.expectEqual(
-        @as(?u64, dst),
-        f.manifest.lookupNamespace("eight"),
-    );
-    try std.testing.expectEqual(
-        @as(?u32, ct.table_ids[0]),
-        f.manifest.lookupTable(dst, "users"),
+        ct.table_ids[0] + 1,
+        try f.manifest.nextTableId(dst),
     );
     try std.testing.expect(f.hasTable(.{
         .namespace = dst,
@@ -919,20 +907,16 @@ test "forest: branch_ns shares the files and forks the memtables as of its ts" {
     try std.testing.expect(f.table_cache.contains(shared_sst));
     try expectRow(f, alloc, dst, "a", "a20");
 
-    // The snapshot manifest carries the branch: trees, files and names.
+    // The snapshot manifest carries the branch: trees and files.
     const bytes = try f.manifest.serialize(alloc);
     defer alloc.free(bytes);
     var restored = _manifest.Manifest.init(alloc);
     defer restored.deinit();
     try restored.restoreFrom(bytes);
-    try std.testing.expectEqual(
-        @as(?u64, dst),
-        restored.lookupNamespace("eight"),
-    );
-    try std.testing.expectEqual(
-        @as(?u32, ct.table_ids[0]),
-        restored.lookupTable(dst, "users"),
-    );
+    try std.testing.expect(restored.treeKind(.{
+        .namespace = dst,
+        .tree_id = zdb.kv.makeTreeId(ct.table_ids[0], 0),
+    }) != null);
     try std.testing.expectEqual(
         @as(u32, 1),
         restored.ssts.get(shared_sst).?.refs,
@@ -999,13 +983,13 @@ test "forest: branch_table shares files and forks memtables as of its ts" {
     // flushed to an SST, two still in memtables, one of those after
     // the branch.
     const ns: u64 = 7;
-    const nc = (try f.buildNsCreate(alloc, .{ .given = ns }, "seven")).change;
+    const nc = (try f.buildNsCreate(alloc, .{ .given = ns })).change;
     defer alloc.free(nc.tree_changes);
     try f.applyTrees(1, nc);
     // Both bytes-keyed, so the primaries below are plain strings.
     var ct_tc = [_]_manifest.TreeChange{
-        _manifest.newTableChange("users", .posting_index),
-        _manifest.newTableChange("users_name_idx", .posting_index),
+        _manifest.newTableChange(.posting_index),
+        _manifest.newTableChange(.posting_index),
     };
     const ct = try f.buildTables(alloc, ns, &ct_tc, .create_tree);
     defer alloc.free(ct.table_ids);
@@ -1037,8 +1021,8 @@ test "forest: branch_table shares files and forks memtables as of its ts" {
 
     // Branch at ts 30: a (both versions), b and the index row, not c.
     var br_tc = [_]_manifest.TreeChange{
-        _manifest.newTableChange("users2", .none),
-        _manifest.newTableChange("users2_name_idx", .none),
+        _manifest.newTableChange(.none),
+        _manifest.newTableChange(.none),
     };
     br_tc[0].from_table_id = src.table_id;
     br_tc[1].from_table_id = src_idx.table_id;
@@ -1060,14 +1044,6 @@ test "forest: branch_table shares files and forks memtables as of its ts" {
     };
 
     try std.testing.expect(dst.table_id > src.table_id);
-    try std.testing.expectEqual(
-        @as(?u32, dst.table_id),
-        f.manifest.lookupTable(ns, "users2"),
-    );
-    try std.testing.expectEqual(
-        @as(?u32, dst_idx.table_id),
-        f.manifest.lookupTable(ns, "users2_name_idx"),
-    );
     try std.testing.expect(f.hasTable(dst));
     try std.testing.expect(f.hasTable(dst_idx));
     // The flushed file is listed by both rows trees.
@@ -1123,10 +1099,10 @@ test "forest: branch_table shares files and forks memtables as of its ts" {
     var restored = _manifest.Manifest.init(alloc);
     defer restored.deinit();
     try restored.restoreFrom(bytes);
-    try std.testing.expectEqual(
-        @as(?u32, dst.table_id),
-        restored.lookupTable(ns, "users2"),
-    );
+    try std.testing.expect(restored.treeKind(.{
+        .namespace = ns,
+        .tree_id = zdb.kv.makeTreeId(dst.table_id, 0),
+    }) != null);
     try std.testing.expectEqual(
         @as(u32, 1),
         restored.ssts.get(shared_sst).?.refs,
@@ -1149,9 +1125,9 @@ test "forest: ns_create installs default + catalog trees, idempotent re-apply" {
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
-    const nc = (try f.buildNsCreate(alloc, .{ .given = 9 }, "nine")).change;
+    const nc = (try f.buildNsCreate(alloc, .{ .given = 9 })).change;
     defer alloc.free(nc.tree_changes);
-    try std.testing.expectEqual(@as(usize, 3), nc.tree_changes.len);
+    try std.testing.expectEqual(@as(usize, 4), nc.tree_changes.len);
     try f.applyTrees(1, nc);
     try std.testing.expect(f.hasTable(.{ .namespace = 9, .table_id = 0 }));
     try std.testing.expect(f.hasTable(.{
@@ -1178,7 +1154,7 @@ test "forest: ns_create installs default + catalog trees, idempotent re-apply" {
     }));
 }
 
-test "forest: table names — create registers, duplicate rejects, drop frees" {
+test "forest: a table create re-applies cleanly; a re-create gets a new id" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1195,47 +1171,38 @@ test "forest: table names — create registers, duplicate rejects, drop frees" {
     defer f.close();
 
     var ct_tc = [_]_manifest.TreeChange{
-        _manifest.newTableChange("users", .posting_index),
+        _manifest.newTableChange(.posting_index),
     };
     const ct = try f.buildTables(alloc, 3, &ct_tc, .create_tree);
     defer alloc.free(ct.table_ids);
     try f.applyTrees(1, ct.change);
-    try std.testing.expectEqual(
-        @as(?u32, ct.table_ids[0]),
-        f.manifest.lookupTable(3, "users"),
-    );
-
-    // A taken name is rejected at build; re-applying the create is a no-op.
-    var dup_tc = [_]_manifest.TreeChange{
-        _manifest.newTableChange("users", .posting_index),
+    const t1: zdb.kv.TableKey = .{
+        .namespace = 3,
+        .table_id = ct.table_ids[0],
     };
-    try std.testing.expectError(
-        error.NameExists,
-        f.buildTables(alloc, 3, &dup_tc, .create_tree),
-    );
-    try f.applyTrees(1, ct.change);
-    try std.testing.expectEqual(
-        @as(?u32, ct.table_ids[0]),
-        f.manifest.lookupTable(3, "users"),
-    );
+    try std.testing.expect(f.hasTable(t1));
 
-    // DROP frees the name for a re-CREATE, which gets a fresh id.
+    // Re-applying the create (replay) is a no-op.
+    try f.applyTrees(1, ct.change);
+    try std.testing.expect(f.hasTable(t1));
+
+    // DROP removes it; a re-CREATE gets a fresh id, never the old one.
     const dc = try f.buildTableDrop(alloc, 3, &.{ct.table_ids[0]});
     defer alloc.free(dc.tree_changes);
     try f.applyTrees(1, dc);
-    try std.testing.expect(f.manifest.lookupTable(3, "users") == null);
+    try std.testing.expect(!f.hasTable(t1));
 
     var ct2_tc = [_]_manifest.TreeChange{
-        _manifest.newTableChange("users", .posting_index),
+        _manifest.newTableChange(.posting_index),
     };
     const ct2 = try f.buildTables(alloc, 3, &ct2_tc, .create_tree);
     defer alloc.free(ct2.table_ids);
     try f.applyTrees(1, ct2.change);
     try std.testing.expect(ct2.table_ids[0] > ct.table_ids[0]);
-    try std.testing.expectEqual(
-        @as(?u32, ct2.table_ids[0]),
-        f.manifest.lookupTable(3, "users"),
-    );
+    try std.testing.expect(f.hasTable(.{
+        .namespace = 3,
+        .table_id = ct2.table_ids[0],
+    }));
 }
 
 // ---------------------------------------------------------------------------
@@ -1282,7 +1249,6 @@ test "forest: snapshot manifest round-trip" {
             .namespace = 43,
             .table_id = 0,
         }, .{}, .posting_index);
-        try src.manifest.registerNamespaceName(42, "answers");
 
         // Drop one SST into the ns=42 tree's L1, in the store and the
         // manifest.
@@ -1311,11 +1277,6 @@ test "forest: snapshot manifest round-trip" {
     // Both trees present — same namespace-local tree_id 0, distinct namespaces.
     try std.testing.expectEqual(@as(usize, 2), treeCount(dst));
     try std.testing.expect(dst.hasTree(42, 0));
-    // Database names ride the snapshot.
-    try std.testing.expectEqual(
-        @as(?u64, 42),
-        dst.manifest.lookupNamespace("answers"),
-    );
     try std.testing.expect(dst.hasTree(43, 0));
 
     // Namespace routes wired.

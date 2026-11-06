@@ -30,8 +30,22 @@ const String = _value.String;
 const log = std.log.scoped(.sql);
 const replyError = _server.replyError;
 const replyErrorCode = _server.replyErrorCode;
+const replyNameReadFailed = _server.replyNameReadFailed;
 const replyLockErr = _server.replyLockErr;
-const writeCatalogRows = _ddl.writeCatalogRows;
+const catalogRowKvs = _ddl.catalogRowKvs;
+const replyNameError = _ddl.replyNameError;
+const _names = @import("names.zig");
+
+/// 42P07 for a CREATE INDEX whose name is taken. The holder may be a
+/// `building` index left by a proposal that failed yet committed (see
+/// createIndex), which only DROP INDEX frees, so the hint says so.
+fn replyIndexExists(state: *pgwire.ConnState) !void {
+    try state.sendError(.{
+        .code = pgwire.sqlstate.duplicate_table,
+        .message = "index already exists",
+        .hint = "an index of this name exists; DROP INDEX it to retry",
+    });
+}
 
 /// CREATE [UNIQUE] INDEX — the online-backfill protocol. Blocks the
 /// issuing session until the index is built and valid (the reply
@@ -42,28 +56,28 @@ const writeCatalogRows = _ddl.writeCatalogRows;
 /// skips an index that is being built, and the build never reads
 /// the tree.
 /// In order:
-///  1. create the index tree (raft, applied);
-///  2. reserve the tree against compactions for the whole build —
-///     keeps its bottom level empty, the install condition;
-///  3. take the exclusive table lock as a BARRIER only: drains
+///  1. take the exclusive table lock as a BARRIER only: drains
 ///     statements still holding a pre-index Table (openTable runs
 ///     after dmlTxn, so post-barrier statements load fresh);
-///  4. under it: catalog row (valid_ts = building) + forgetTable —
-///     every later statement loads the catalog afresh, sees the
-///     index and leaves it alone;
+///  2. under it, one raft entry: the index tree and its catalog row
+///     (valid_ts = building), applied; then reserve the tree against
+///     compactions for the whole build — keeps its bottom level
+///     empty, the install condition — and forgetTable, so every
+///     later statement loads the catalog afresh, sees the index and
+///     leaves it alone;
 ///     read_ts = that row's own commit HLC, read back from the row.
 ///     Durable and self-describing: any node could re-run this
 ///     backfill from the catalog row alone;
-///  5. release the barrier — writes flow for the whole scan, every
+///  3. release the barrier — writes flow for the whole scan, every
 ///     row they write landing at commit HLC > read_ts;
-///  6. scan the base table at read_ts: for each row, the keys its
+///  4. scan the base table at read_ts: for each row, the keys its
 ///     cell contributes (v1 in `RowIndexKeys`);
-///  7. install v1 as BOTTOM-level SSTs at ts = read_ts: per key a
+///  5. install v1 as BOTTOM-level SSTs at ts = read_ts: per key a
 ///     bitmap of egids, or for a unique index the one egid (two →
 ///     23505) — built locally, uploaded to the shared store, and
 ///     proposed through raft so every node installs the same files
 ///     in log order;
-///  8. retake the barrier: every statement started after step 3 has
+///  6. retake the barrier: every statement started after step 1 has
 ///     finished and its writes are applied. Scan the base table for
 ///     the rows written after read_ts (skipping tables and versions
 ///     at or below it) into v2, and write the difference between v2
@@ -71,20 +85,20 @@ const writeCatalogRows = _ddl.writeCatalogRows;
 ///     postings; for a unique index a put or tombstone per touched
 ///     key, two rows on one key being 23505. valid_ts = the applied
 ///     ts after that commit;
-///  9. set valid_ts + forgetTable — a statement whose own read_ts
+///  7. set valid_ts + forgetTable — a statement whose own read_ts
 ///     is at or above valid_ts may now use the index; an older
 ///     snapshot scans instead. Forgetting destroys the cached Table,
 ///     which is only safe while no statement holds it (DML holds
 ///     the shared table lock from dmlTxn to txn end); the barrier
 ///     drains them and parks new ones.
-/// A failure after step 4 removes the index again under the barrier
-/// (catalog tombstone + tree drop, `removeIndex`), so the name is
-/// free to retry. A crash before 4 leaves an invisible orphan tree;
-/// after 4 an INVALID index, never read and never written (DROP
-/// INDEX cleans it up). Two rows inserted with one value during a
-/// unique build are both accepted, since neither probes the index;
-/// the build then fails at step 8 and the rows stay for the user to
-/// resolve.
+/// A failure after step 2's entry removes the index again under the
+/// barrier (catalog tombstone + tree drop in one entry,
+/// `removeIndex`), so the name is free to retry. A crash before that
+/// entry commits leaves nothing; after it, an INVALID index, never
+/// read and never written (DROP INDEX cleans it up). Two rows
+/// inserted with one value during a unique build are both accepted,
+/// since neither probes the index; the build then fails at step 6
+/// and the rows stay for the user to resolve.
 pub fn createIndex(
     self: *Handler,
     state: *pgwire.ConnState,
@@ -96,12 +110,14 @@ pub fn createIndex(
     if (!try self.ddlReady(state)) return;
 
     const ns = try self.sessionNamespace(state) orelse return;
-    const base_tid = eng.forest.manifest.lookupTable(ns, ci.table) orelse
-        return replyErrorCode(
-            state,
-            pgwire.sqlstate.undefined_table,
-            "table does not exist",
-        );
+    const read_ts = eng.node.appliedTs();
+    const found = _names.tableId(eng.forest, read_ts, ns, ci.table) catch |err|
+        return replyNameReadFailed(state, ci.table, err);
+    const base_tid = found orelse return replyErrorCode(
+        state,
+        pgwire.sqlstate.undefined_table,
+        "table does not exist",
+    );
     const base_key: zdb.kv.TableKey = .{
         .namespace = ns,
         .table_id = base_tid,
@@ -131,14 +147,12 @@ pub fn createIndex(
     // column limit, which is about a SECOND index on the column.
     const name = ci.name orelse
         try _table.indexName(arloc, ci.table, ci.column, .plain);
-    if (eng.forest.manifest.lookupTable(ns, name) != null) {
+    const existing = _names.tableId(eng.forest, read_ts, ns, name) catch |err|
+        return replyNameReadFailed(state, name, err);
+    if (existing != null) {
         if (ci.if_not_exists)
             return state.sendCommandComplete("CREATE INDEX");
-        return replyErrorCode(
-            state,
-            pgwire.sqlstate.duplicate_table,
-            "index already exists",
-        );
+        return replyIndexExists(state);
     }
     // One index per column, of either kind — dml's `Set.index`
     // invariant.
@@ -153,9 +167,18 @@ pub fn createIndex(
     // `t` (and `col` into it) dangle past forgetTable below; keep
     // what's needed.
     const column_id = col.column_id;
+    _names.checkNew(eng.forest, read_ts, ns, &.{name}) catch |err|
+        switch (err) {
+            error.NameExists => return replyIndexExists(state),
+            else => return replyNameError(
+                state,
+                err,
+                pgwire.sqlstate.duplicate_table,
+                "index already exists",
+            ),
+        };
 
     var changes = [_]zdb.manifest.TreeChange{zdb.manifest.newTableChange(
-        name,
         if (ci.unique) .unique_index else .posting_index,
     )};
     const created = eng.forest.buildTables(
@@ -163,34 +186,15 @@ pub fn createIndex(
         ns,
         &changes,
         .create_tree,
-    ) catch |err| switch (err) {
-        error.NameExists => return replyErrorCode(
-            state,
-            pgwire.sqlstate.duplicate_table,
-            "index already exists",
-        ),
-        else => {
-            logCreateIndexErr(name, "create tree", err);
-            return replyError(state, "create index failed");
-        },
-    };
-    eng.proposeMC(created.change, .apply) catch |err| {
-        logCreateIndexErr(name, "propose tree", err);
+    ) catch |err| {
+        logCreateIndexErr(name, "create tree", err);
         return replyError(state, "create index failed");
     };
     const index_tid = created.table_ids[0];
-
-    const tree_key = zdb.kv.TreeKey{
-        .namespace = ns,
-        .tree_id = zdb.kv.makeTreeId(index_tid, 0),
-    };
-    try eng.reserveTree(tree_key);
-    defer eng.releaseTree(tree_key);
-
     const db = try self.srv.database(ns);
 
     // The barrier: the base table's exclusive lock, taken at steps
-    // 3 and 7 and dropped for the build in between. `fail` retakes it
+    // 1 and 6 and dropped for the build in between. `fail` retakes it
     // when needed, and one deferred dropBarrier covers every exit,
     // held or not.
     const def = _catalog.IndexDef{
@@ -213,12 +217,33 @@ pub fn createIndex(
     build.takeBarrier();
     defer build.dropBarrier();
 
-    // TODO: This can return the timestamp the catalog was written at, so we
-    // don't need to run build.readTs.
-    writeCatalogRows(self, arloc, base_key, &.{}, &.{def}) catch |err| {
-        logCreateIndexErr(name, "catalog row", err);
+    // The index tree, its `building` catalog row and its name row
+    // commit as one entry, so a crash leaves all or none. A failed
+    // proposal's outcome is unknown: the entry can still commit after
+    // a lost leadership, leaving a `building` index that DROP INDEX
+    // removes.
+    const catalog_row = try catalogRowKvs(self, arloc, base_key, &.{}, &.{def});
+    var create_rows = [_]zen.KeyValueStruct{
+        catalog_row[0],
+        try _names.tableNameKv(arloc, ns, name, index_tid),
+    };
+    var mc = created.change;
+    mc.rows = .{ .namespace = ns, .kvs = &create_rows };
+    eng.proposeMC(mc, .apply) catch |err| {
+        logCreateIndexErr(name, "propose", err);
         return replyError(state, "create index failed");
     };
+
+    const tree_key = zdb.kv.TreeKey{
+        .namespace = ns,
+        .tree_id = zdb.kv.makeTreeId(index_tid, 0),
+    };
+    eng.reserveTree(tree_key) catch |err|
+        return build.fail("reserve tree", err);
+    defer eng.releaseTree(tree_key);
+
+    // TODO: This can return the timestamp the catalog was written at, so we
+    // don't need to run build.readTs.
     self.srv.forgetTable(base_key) catch |err|
         return build.fail("forget table", err);
     build.read_ts = build.readTs() catch |err|
@@ -550,6 +575,7 @@ const IndexBuild = struct {
             self.ns,
             self.def.base_table_id,
             self.def.index_table_id,
+            self.name,
         ) catch |rerr| logCreateIndexErr(self.name, "remove", rerr);
         if (err == error.DuplicateKey)
             return replyErrorCode(
@@ -619,7 +645,7 @@ const IndexBuild = struct {
         return keys;
     }
 
-    /// Step 6: scan the base table at `read_ts` into v1. Memory ∝
+    /// Step 4: scan the base table at `read_ts` into v1. Memory ∝
     /// table, accepted for now.
     fn scan(self: *IndexBuild) !RowIndexKeys {
         const eng = self.handler.srv.engine;
@@ -648,7 +674,7 @@ const IndexBuild = struct {
         return rows;
     }
 
-    /// Step 8, under barrier-2: every statement started after
+    /// Step 6, under barrier-2: every statement started after
     /// barrier-1 has finished and its writes are applied. Scan the
     /// base table for the rows written after `read_ts` — tables and
     /// versions at or below it are skipped, so the pass costs what
@@ -697,7 +723,7 @@ const IndexBuild = struct {
         return .{ .namespace = self.ns, .table_id = self.def.base_table_id };
     }
 
-    /// Step 7, outside the barrier: v1 as BOTTOM-level SSTs at ts =
+    /// Step 5, outside the barrier: v1 as BOTTOM-level SSTs at ts =
     /// `read_ts` — built locally, uploaded and announced like every
     /// other SST creator's files (followers download from the shared
     /// store), then proposed through raft so every node applies the
@@ -746,7 +772,7 @@ const IndexBuild = struct {
         );
     }
 
-    /// Step 9: complete from `valid_ts` — the installed entries sit
+    /// Step 7: complete from `valid_ts` — the installed entries sit
     /// at that ts, and every later commit maintains the index itself.
     fn markValid(self: *IndexBuild) !void {
         var vdef = self.def;
@@ -755,13 +781,14 @@ const IndexBuild = struct {
             .namespace = self.ns,
             .table_id = self.def.base_table_id,
         };
-        try writeCatalogRows(
+        const kvs = try catalogRowKvs(
             self.handler,
             self.a,
             base_key,
             &.{},
             &.{vdef},
         );
+        try self.handler.srv.engine.proposeWrites(self.ns, kvs, .apply);
         try self.handler.srv.forgetTable(base_key);
     }
 };
@@ -782,7 +809,13 @@ pub fn dropIndex(
     if (!try self.ddlReady(state)) return;
 
     const ns = try self.sessionNamespace(state) orelse return;
-    const index_tid = eng.forest.manifest.lookupTable(ns, di.name) orelse {
+    const found = _names.tableId(
+        eng.forest,
+        eng.node.appliedTs(),
+        ns,
+        di.name,
+    ) catch |err| return replyNameReadFailed(state, di.name, err);
+    const index_tid = found orelse {
         if (di.missing_ok) return state.sendCommandComplete("DROP INDEX");
         return replyErrorCode(
             state,
@@ -840,7 +873,7 @@ pub fn dropIndex(
     table_lock.lock(@src());
     defer table_lock.unlock();
 
-    removeIndex(self, a, ns, base_tid, index_tid) catch |err| {
+    removeIndex(self, a, ns, base_tid, index_tid, di.name) catch |err| {
         logDropIndexErr(di.name, "remove", err);
         return replyError(state, "drop index failed");
     };
@@ -852,19 +885,21 @@ pub fn dropIndex(
     try state.sendCommandComplete("DROP INDEX");
 }
 
-/// Remove an index: tombstone its catalog row, drop its tree, reload
-/// the base table's schema. Order matters: the catalog row FIRST —
-/// the reverse would leave a live IndexDef pointing at a dead tree
-/// (reads would see silently-empty results), and unlike dropTable's
-/// tolerated catalog garbage, a live IndexDef row would resurrect
-/// the index on the next schema load. The caller holds the base
-/// table's exclusive lock; this must not take it.
+/// Remove an index: tombstone its catalog row and its name row and drop
+/// its tree in one entry, then reload the base table's schema. A drop
+/// entry applies its rows before removing trees, so no node ever holds
+/// a live IndexDef pointing at a dead tree (reads would see
+/// silently-empty results; and unlike dropTable's tolerated catalog
+/// garbage, a live IndexDef row would resurrect the index on the next
+/// schema load). The caller holds the base table's exclusive lock; this
+/// must not take it.
 fn removeIndex(
     self: *Handler,
     a: std.mem.Allocator,
     ns: u64,
     base_tid: u32,
     index_tid: u32,
+    name: String,
 ) !void {
     const eng = self.srv.engine;
     const ck = _catalog.encodeIndexKey(base_tid, index_tid);
@@ -873,14 +908,13 @@ fn removeIndex(
         .table_id = _catalog.index_table_id,
         .primary = &ck,
     }).marshal(a);
-    var kvs = [_]zen.KeyValueStruct{.{
+    var kvs = [_]zen.KeyValueStruct{ .{
         .key = wire_key,
         .value = "",
         .meta = (zdb.kv.Meta{ .kind = .deleted }).toByte(),
-    }};
-    try eng.proposeWrites(ns, &kvs, .apply);
-
-    const mc = try eng.forest.buildTableDrop(a, ns, &.{index_tid});
+    }, try _names.tombstone(a, ns, name) };
+    var mc = try eng.forest.buildTableDrop(a, ns, &.{index_tid});
+    mc.rows = .{ .namespace = ns, .kvs = &kvs };
     try eng.proposeMC(mc, .apply);
     try self.srv.forgetTable(.{ .namespace = ns, .table_id = base_tid });
 }

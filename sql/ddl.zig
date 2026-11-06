@@ -1,9 +1,9 @@
 // Copyright 2026 Manish R Jain
 // SPDX-License-Identifier: Apache-2.0
 
-//! DDL execution: CREATE/DROP DATABASE and TABLE. Each is a
-//! choreography over the forest's manifest (name reservation, tree
-//! creation, catalog rows) replicated through raft — the data plane
+//! DDL execution: CREATE/DROP DATABASE and TABLE. Each builds one
+//! manifest change (name reservation, tree creation) that carries its
+//! catalog rows, replicated through raft as one entry — the data plane
 //! proper lives in dml.zig, and CREATE/DROP INDEX with the online
 //! backfill in index_ddl.zig.
 //!
@@ -20,6 +20,7 @@ const zen = zdb.buffers;
 const _catalog = @import("catalog.zig");
 const _parse = @import("parse.zig");
 const _key = @import("key.zig");
+const _names = @import("names.zig");
 const _row = @import("row.zig");
 const _schema = @import("schema.zig");
 const _table = @import("table.zig");
@@ -31,6 +32,7 @@ const String = _value.String;
 const log = std.log.scoped(.sql);
 const replyError = _server.replyError;
 const replyErrorCode = _server.replyErrorCode;
+const replyNameReadFailed = _server.replyNameReadFailed;
 const replyLockErr = _server.replyLockErr;
 const default_database = _server.default_database;
 
@@ -53,9 +55,29 @@ pub fn createDatabase(
 
     var arena = std.heap.ArenaAllocator.init(eng.allocator);
     defer arena.deinit();
+    const read_ts = eng.node.appliedTs();
+    const sys_ns = zdb.manifest.system_namespace;
+    _names.checkNew(eng.forest, read_ts, sys_ns, &.{name}) catch |err|
+        switch (err) {
+            error.NameExists => return replyError(
+                state,
+                "database already exists",
+            ),
+            else => {
+                log.err("create database '{s}': name check: {s}", .{
+                    name, @errorName(err),
+                });
+                return replyError(state, "create database failed");
+            },
+        };
     var src: ?u64 = null;
     if (cd.source) |src_name| {
-        src = eng.forest.manifest.lookupNamespace(src_name) orelse
+        const found = _names.namespaceId(
+            eng.forest,
+            read_ts,
+            src_name,
+        ) catch |err| return replyNameReadFailed(state, src_name, err);
+        src = found orelse
             return replyErrorCode(
                 state,
                 pgwire.sqlstate.invalid_catalog_name,
@@ -63,17 +85,21 @@ pub fn createDatabase(
             );
     }
     const built = if (src) |s|
-        eng.forest.buildNsBranch(arena.allocator(), s, name)
+        eng.forest.buildNsBranch(arena.allocator(), s)
     else
-        eng.forest.buildNsCreate(arena.allocator(), .next, name);
-    const created = built catch |err| switch (err) {
-        error.NameExists => return replyError(state, "database already exists"),
-        else => |e| {
-            log.err("create database '{s}': {s}", .{ name, @errorName(e) });
-            return replyError(state, "create database failed");
-        },
+        eng.forest.buildNsCreate(arena.allocator(), .next);
+    const created = built catch |err| {
+        log.err("create database '{s}': {s}", .{ name, @errorName(err) });
+        return replyError(state, "create database failed");
     };
-    eng.proposeMC(created.change, .apply) catch |err| {
+    // The database's name row, in the system namespace, commits with
+    // its trees.
+    var mc = created.change;
+    var name_row = [_]zen.KeyValueStruct{
+        try _names.dbNameKv(arena.allocator(), name, created.namespace),
+    };
+    mc.rows = .{ .namespace = sys_ns, .kvs = &name_row };
+    eng.proposeMC(mc, .apply) catch |err| {
         log.err("create database '{s}': propose: {s}", .{ name, @errorName(err) });
         return replyError(state, "create database proposal failed");
     };
@@ -89,8 +115,12 @@ pub fn dropDatabase(self: *Handler, state: *pgwire.ConnState, name: String) !voi
 
     if (std.mem.eql(u8, name, default_database))
         return replyError(state, "cannot drop the default database");
-    const ns = eng.forest.manifest.lookupNamespace(name) orelse
-        return replyError(state, "database does not exist");
+    const found = _names.namespaceId(
+        eng.forest,
+        eng.node.appliedTs(),
+        name,
+    ) catch |err| return replyNameReadFailed(state, name, err);
+    const ns = found orelse return replyError(state, "database does not exist");
 
     // Set `dropped` first, then take and release every table lock
     // exclusive, ONE AT A TIME: each take waits for the statements
@@ -106,6 +136,13 @@ pub fn dropDatabase(self: *Handler, state: *pgwire.ConnState, name: String) !voi
         return replyError(state, "internal error: database state");
     var arena = std.heap.ArenaAllocator.init(eng.allocator);
     defer arena.deinit();
+    // The name row goes with the trees, in one entry; the database's
+    // own table names die with its trees. Built before the flag is
+    // set, so a failure here leaves nothing to undo.
+    const sys_ns = zdb.manifest.system_namespace;
+    var name_row = [_]zen.KeyValueStruct{
+        try _names.tombstone(arena.allocator(), sys_ns, name),
+    };
     db.dropped.store(true, .release);
     const table_locks = db.allTableLocks(arena.allocator()) catch {
         db.dropped.store(false, .release);
@@ -116,11 +153,12 @@ pub fn dropDatabase(self: *Handler, state: *pgwire.ConnState, name: String) !voi
         m.unlock();
     }
 
-    const mc = eng.forest.buildNsDrop(arena.allocator(), ns) catch |err| {
+    var mc = eng.forest.buildNsDrop(arena.allocator(), ns) catch |err| {
         log.err("drop database '{s}': {s}", .{ name, @errorName(err) });
         db.dropped.store(false, .release);
         return replyError(state, "drop database failed");
     };
+    mc.rows = .{ .namespace = sys_ns, .kvs = &name_row };
     eng.proposeMC(mc, .apply) catch |err| {
         log.err("drop database '{s}': propose: {s}", .{ name, @errorName(err) });
         db.dropped.store(false, .release);
@@ -137,7 +175,14 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
     if (!try self.ddlReady(state)) return;
 
     const ns = try self.sessionNamespace(state) orelse return;
-    if (eng.forest.manifest.lookupTable(ns, ct.name) != null) {
+    const read_ts = eng.node.appliedTs();
+    const existing = _names.tableId(
+        eng.forest,
+        read_ts,
+        ns,
+        ct.name,
+    ) catch |err| return replyNameReadFailed(state, ct.name, err);
+    if (existing != null) {
         if (ct.if_not_exists) return state.sendCommandComplete("CREATE TABLE");
         return replyErrorCode(state, pgwire.sqlstate.duplicate_table, "table already exists");
     }
@@ -158,7 +203,10 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
     // The base table's rows tree, then a unique index tree per primary
     // key or UNIQUE column.
     var changes: std.ArrayList(zdb.manifest.TreeChange) = .empty;
-    try changes.append(a, zdb.manifest.newTableChange(ct.name, .rows));
+    try changes.append(a, zdb.manifest.newTableChange(.rows));
+    // Every name the statement introduces, in `changes` order.
+    var new_names: std.ArrayList(String) = .empty;
+    try new_names.append(a, ct.name);
 
     var unique_cols: std.ArrayList(u32) = .empty;
     for (ct.columns, columns, 1..) |c, *lc, id| {
@@ -189,31 +237,31 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
         );
         try changes.append(
             a,
-            zdb.manifest.newTableChange(index_name, .unique_index),
+            zdb.manifest.newTableChange(.unique_index),
         );
+        try new_names.append(a, index_name);
     }
+    _names.checkNew(eng.forest, read_ts, ns, new_names.items) catch |err|
+        return replyNameError(
+            state,
+            err,
+            pgwire.sqlstate.duplicate_table,
+            "table or index name already exists",
+        );
 
     const created = eng.forest.buildTables(
         a,
         ns,
         changes.items,
         .create_tree,
-    ) catch |err| switch (err) {
-        error.NameExists => return replyErrorCode(state, pgwire.sqlstate.duplicate_table, "table or index name already exists"),
-        else => |e| {
-            log.err("create table '{s}': {s}", .{ ct.name, @errorName(e) });
-            return replyError(state, "create table failed");
-        },
+    ) catch |err| {
+        log.err("create table '{s}': {s}", .{ ct.name, @errorName(err) });
+        return replyError(state, "create table failed");
     };
-    eng.proposeMC(created.change, .apply) catch |err| {
-        log.err("create table '{s}': propose: {s}", .{ ct.name, @errorName(err) });
-        return replyError(state, "create table proposal failed");
-    };
-    // Phase 2: the table's column rows (+ the index descriptor rows)
-    // into the namespace's catalogs — one proposal, atomic. A crash
-    // between the two proposals leaves a named, column-less table (DROP
-    // TABLE cleans it up) — acceptable pre-production. An index made
-    // with its table is valid from ts 0: no row precedes it.
+    // The trees and their catalog rows (columns, index descriptors)
+    // go in one entry, so a crash leaves all of the table or none of
+    // it. An index made with its table is valid from ts 0: no row
+    // precedes it.
     const table_id = created.table_ids[0];
     const indexes = try a.alloc(_catalog.IndexDef, unique_cols.items.len);
     for (unique_cols.items, created.table_ids[1..], indexes) |col, tid, *def| {
@@ -224,12 +272,25 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
             .unique = true,
         };
     }
-    writeCatalogRows(self, a, .{
+    var mc = created.change;
+    mc.rows = .{
         .namespace = ns,
-        .table_id = table_id,
-    }, columns, indexes) catch |err| {
-        log.err("create table '{s}': catalog rows: {s}", .{ ct.name, @errorName(err) });
-        return replyError(state, "create table failed writing catalog rows");
+        .kvs = try withNameRows(
+            a,
+            ns,
+            try catalogRowKvs(self, a, .{
+                .namespace = ns,
+                .table_id = table_id,
+            }, columns, indexes),
+            new_names.items,
+            created.table_ids,
+        ),
+    };
+    eng.proposeMC(mc, .apply) catch |err| {
+        log.err("create table '{s}': propose: {s}", .{
+            ct.name, @errorName(err),
+        });
+        return replyError(state, "create table proposal failed");
     };
 
     log.info(
@@ -261,7 +322,14 @@ pub fn createTableAs(
     if (!try self.ddlReady(state)) return;
 
     const ns = try self.sessionNamespace(state) orelse return;
-    if (eng.forest.manifest.lookupTable(ns, cta.name) != null) {
+    const read_ts = eng.node.appliedTs();
+    const existing = _names.tableId(
+        eng.forest,
+        read_ts,
+        ns,
+        cta.name,
+    ) catch |err| return replyNameReadFailed(state, cta.name, err);
+    if (existing != null) {
         if (cta.if_not_exists)
             return state.sendCommandComplete("CREATE TABLE AS");
         return replyErrorCode(
@@ -270,12 +338,17 @@ pub fn createTableAs(
             "table already exists",
         );
     }
-    const src_tid = eng.forest.manifest.lookupTable(ns, cta.source) orelse
-        return replyErrorCode(
-            state,
-            pgwire.sqlstate.undefined_table,
-            "source table does not exist",
-        );
+    const found = _names.tableId(
+        eng.forest,
+        read_ts,
+        ns,
+        cta.source,
+    ) catch |err| return replyNameReadFailed(state, cta.source, err);
+    const src_tid = found orelse return replyErrorCode(
+        state,
+        pgwire.sqlstate.undefined_table,
+        "source table does not exist",
+    );
     const src_key: zdb.kv.TableKey = .{ .namespace = ns, .table_id = src_tid };
     const src = self.srv.openTable(src_key) catch |err| {
         log.err("create table as '{s}': load schema: {s}", .{
@@ -308,10 +381,13 @@ pub fn createTableAs(
     // catalog rows below.
     var changes: std.ArrayList(zdb.manifest.TreeChange) = .empty;
     var src_indexes: std.ArrayList(_table.Index) = .empty;
+    // Every name the statement introduces, in `changes` order.
+    var new_names: std.ArrayList(String) = .empty;
 
-    var base = zdb.manifest.newTableChange(cta.name, .rows);
+    var base = zdb.manifest.newTableChange(.rows);
     base.from_table_id = src_tid;
     try changes.append(arloc, base);
+    try new_names.append(arloc, cta.name);
 
     for (src.indexes) |idx| {
         if (idx.isBuilding())
@@ -321,14 +397,20 @@ pub fn createTableAs(
                 "source table has an index still being built",
             );
 
-        var tc = zdb.manifest.newTableChange(
-            try idx.nameFor(arloc, cta.name),
-            idx.treeKind(),
-        );
+        const index_name = try idx.nameFor(arloc, cta.name);
+        var tc = zdb.manifest.newTableChange(idx.treeKind());
+        try new_names.append(arloc, index_name);
         tc.from_table_id = idx.index_table_id;
         try changes.append(arloc, tc);
         try src_indexes.append(arloc, idx);
     }
+    _names.checkNew(eng.forest, read_ts, ns, new_names.items) catch |err|
+        return replyNameError(
+            state,
+            err,
+            pgwire.sqlstate.duplicate_table,
+            "table or index name already exists",
+        );
 
     const built = eng.forest.buildTables(
         arloc,
@@ -336,28 +418,15 @@ pub fn createTableAs(
         changes.items,
         if (cta.with_data) .branch_table else .create_tree,
     );
-    const created = built catch |err| switch (err) {
-        error.NameExists => return replyErrorCode(
-            state,
-            pgwire.sqlstate.duplicate_table,
-            "table or index name already exists",
-        ),
-        else => |e| {
-            log.err("create table as '{s}': {s}", .{ cta.name, @errorName(e) });
-            return replyError(state, "create table failed");
-        },
+    const created = built catch |err| {
+        log.err("create table as '{s}': {s}", .{ cta.name, @errorName(err) });
+        return replyError(state, "create table failed");
     };
-    eng.proposeMC(created.change, .apply) catch |err| {
-        log.err("create table as '{s}': propose: {s}", .{
-            cta.name, @errorName(err),
-        });
-        return replyError(state, "create table proposal failed");
-    };
-
-    // Phase 2, as createTable: the catalog rows under the new ids. The
-    // column ids stay the source's, so the index descriptors and the
-    // shared rows keep naming the same columns. A branched index is
-    // valid from when its source was; an empty one from the start.
+    // The catalog rows under the new ids ride in the same entry, as in
+    // createTable. The column ids stay the source's, so the index
+    // descriptors and the shared rows keep naming the same columns. A
+    // branched index is valid from when its source was; an empty one
+    // from the start.
     const table_id = created.table_ids[0];
     const indexes = try arloc.alloc(_catalog.IndexDef, src_indexes.items.len);
     for (src_indexes.items, created.table_ids[1..], indexes) |idx, tid, *def| {
@@ -369,14 +438,25 @@ pub fn createTableAs(
             .valid_ts = if (cta.with_data) idx.valid_ts else 0,
         };
     }
-    writeCatalogRows(self, arloc, .{
+    var mc = created.change;
+    mc.rows = .{
         .namespace = ns,
-        .table_id = table_id,
-    }, columns, indexes) catch |err| {
-        log.err("create table as '{s}': catalog rows: {s}", .{
+        .kvs = try withNameRows(
+            arloc,
+            ns,
+            try catalogRowKvs(self, arloc, .{
+                .namespace = ns,
+                .table_id = table_id,
+            }, columns, indexes),
+            new_names.items,
+            created.table_ids,
+        ),
+    };
+    eng.proposeMC(mc, .apply) catch |err| {
+        log.err("create table as '{s}': propose: {s}", .{
             cta.name, @errorName(err),
         });
-        return replyError(state, "create table failed writing catalog rows");
+        return replyError(state, "create table proposal failed");
     };
 
     log.info(
@@ -387,21 +467,19 @@ pub fn createTableAs(
     try state.sendCommandComplete("CREATE TABLE AS");
 }
 
-/// Marshal one catalog row per column plus one per index descriptor and
-/// replicate the batch into the namespace's catalog trees, waiting for
-/// local apply. Column rows land in table 1, index rows in table 2 —
-/// mixed table_ids in one atomic proposal. `columns` carry their minted
-/// ids (createTable assigns them); nothing is derived here.
-pub fn writeCatalogRows(
+/// Marshal one catalog row per column plus one per index descriptor,
+/// for the caller to propose: column rows land in table 1, index rows
+/// in table 2. `columns` carry their minted ids (createTable assigns
+/// them); nothing is derived here. The rows are allocated with `a`.
+pub fn catalogRowKvs(
     self: *Handler,
     a: std.mem.Allocator,
     table_key: zdb.kv.TableKey,
     columns: []const _schema.LogicalColumn,
     indexes: []const _catalog.IndexDef,
-) !void {
+) ![]zen.KeyValueStruct {
     const eng = self.srv.engine;
     const n = columns.len + indexes.len;
-    if (n == 0) return;
 
     const kvs = try a.alloc(zen.KeyValueStruct, n);
     var buf: std.ArrayList(u8) = .empty;
@@ -438,7 +516,7 @@ pub fn writeCatalogRows(
         };
         kvs[i] = .{ .key = try k.marshal(a), .value = try a.dupe(u8, bytes) };
     }
-    try eng.proposeWrites(table_key.namespace, kvs, .apply);
+    return kvs;
 }
 
 pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: _parse.DropTable) !void {
@@ -448,7 +526,13 @@ pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: _parse.DropTable)
     if (!try self.ddlReady(state)) return;
 
     const ns = try self.sessionNamespace(state) orelse return;
-    const table_id = eng.forest.manifest.lookupTable(ns, dt.name) orelse {
+    const found = _names.tableId(
+        eng.forest,
+        eng.node.appliedTs(),
+        ns,
+        dt.name,
+    ) catch |err| return replyNameReadFailed(state, dt.name, err);
+    const table_id = found orelse {
         if (dt.missing_ok) return state.sendCommandComplete("DROP TABLE");
         return replyErrorCode(state, pgwire.sqlstate.undefined_table, "table does not exist");
     };
@@ -484,16 +568,32 @@ pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: _parse.DropTable)
     table_lock.lock(@src());
     defer table_lock.unlock();
 
-    // The table and its index tables drop together, in one atomic change
-    // — order is irrelevant. Their rows in the CATALOG trees stay behind
-    // as unreachable garbage (ids are never reused). TODO: issue
+    // The table and its index tables drop together, with their name
+    // rows, in one atomic change. Their rows in the CATALOG trees stay
+    // behind as unreachable garbage (ids are never reused). TODO: issue
     // tombstones for them.
     try scan.table_ids.append(a, table_id);
     const ids = scan.table_ids.items;
-    const mc = eng.forest.buildTableDrop(a, ns, ids) catch |err| {
+    var mc = eng.forest.buildTableDrop(a, ns, ids) catch |err| {
         log.err("drop table '{s}': {s}", .{ dt.name, @errorName(err) });
         return replyError(state, "drop table failed");
     };
+    // The table's name and its indexes' names: every name row naming
+    // one of `ids`, which holds the indexes and, appended above, the
+    // table itself.
+    const name_rows = _names.tombstonesFor(
+        a,
+        eng.forest,
+        eng.node.appliedTs(),
+        ns,
+        ids,
+    ) catch |err| {
+        log.err("drop table '{s}': name rows: {s}", .{
+            dt.name, @errorName(err),
+        });
+        return replyError(state, "drop table failed");
+    };
+    mc.rows = .{ .namespace = ns, .kvs = name_rows };
     eng.proposeMC(mc, .apply) catch |err| {
         log.err("drop table '{s}': propose: {s}", .{ dt.name, @errorName(err) });
         return replyError(state, "drop table proposal failed");
@@ -505,4 +605,41 @@ pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: _parse.DropTable)
 
     log.info("dropped table '{s}' (ns={d} table_id={d} indexes={d})", .{ dt.name, ns, table_id, scan.table_ids.items.len - 1 });
     try state.sendCommandComplete("DROP TABLE");
+}
+
+/// `catalog` followed by one name row per new table: `new_names[i]`
+/// names `table_ids[i]`, in namespace `ns`.
+fn withNameRows(
+    arloc: std.mem.Allocator,
+    ns: u64,
+    catalog: []zen.KeyValueStruct,
+    new_names: []const String,
+    table_ids: []const u32,
+) ![]zen.KeyValueStruct {
+    std.debug.assert(new_names.len == table_ids.len);
+    const out = try arloc.alloc(
+        zen.KeyValueStruct,
+        catalog.len + new_names.len,
+    );
+    @memcpy(out[0..catalog.len], catalog);
+    for (new_names, table_ids, out[catalog.len..]) |name, id, *row|
+        row.* = try _names.tableNameKv(arloc, ns, name, id);
+    return out;
+}
+
+/// Answer a failed `names.checkNew`: `code` and `taken` for a name in
+/// use; any other error is a failed read.
+pub fn replyNameError(
+    state: *pgwire.ConnState,
+    err: anyerror,
+    code: [5]u8,
+    taken: String,
+) !void {
+    return switch (err) {
+        error.NameExists => replyErrorCode(state, code, taken),
+        else => {
+            log.err("name check: {s}", .{@errorName(err)});
+            return replyError(state, "name check failed");
+        },
+    };
 }

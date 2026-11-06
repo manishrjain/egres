@@ -18,9 +18,11 @@ No actual data is ever copied though. Egres branches database (namespace) via a
 single manifest update, which creates a new `dst` namespace, with new tables and LSM
 trees, referencing the same SSTables from `src`.
 
-The table and index schemas live in reserved tables within the namespace, so
-they are cloned automatically. Unflushed writes sitting in memtables are copied
-under the new namespace so no writes are lost.
+The table and index schemas, and the table and index names, live in reserved
+tables within the namespace, so they are cloned automatically. The new
+database's own name is a row in the system namespace, written by the same
+entry. Unflushed writes sitting in memtables are copied under the new
+namespace so no writes are lost.
 
 <figure class="fig">
   <img src="../figures/branching.svg" width="1000" height="486" alt="Branching a database: one manifest update gives the new namespace app2 its own tables and trees pointing at the same SSTables as app, the unflushed writes are copied under it, and a later write to app2 flushes into files that only app2 references while app is untouched" loading="lazy" />
