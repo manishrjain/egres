@@ -97,6 +97,7 @@ pub const sqlstate = struct {
     pub const division_by_zero: [5]u8 = .{ '2', '2', '0', '1', '2' };
     pub const substring_error: [5]u8 = .{ '2', '2', '0', '1', '1' };
     pub const invalid_sql_statement_name: [5]u8 = .{ '2', '6', '0', '0', '0' };
+    pub const invalid_cursor_name: [5]u8 = .{ '3', '4', '0', '0', '0' };
     pub const invalid_argument_for_power_function: [5]u8 = .{ '2', '2', '0', '1', 'F' };
     pub const not_null_violation: [5]u8 = .{ '2', '3', '5', '0', '2' };
     pub const unique_violation: [5]u8 = .{ '2', '3', '5', '0', '5' };

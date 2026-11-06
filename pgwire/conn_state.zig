@@ -530,7 +530,7 @@ pub const ConnState = struct {
                 }
                 try self.emitFatal(
                     "unknown frontend message",
-                    _types.sqlstate.internal_error,
+                    _types.sqlstate.protocol_violation,
                 );
                 self.phase = .closed;
                 return .terminate;
@@ -584,7 +584,7 @@ pub const ConnState = struct {
                 else => {
                     try self.emitErrorReady(
                         "unsupported message",
-                        _types.sqlstate.internal_error,
+                        _types.sqlstate.protocol_violation,
                     );
                     self.ext_failed = true;
                     continue;
@@ -619,7 +619,7 @@ pub const ConnState = struct {
         const p = _proto.parseParse(body, &oids_storage) catch {
             try self.extError(
                 "malformed Parse message",
-                _types.sqlstate.internal_error,
+                _types.sqlstate.protocol_violation,
             );
             return;
         };
@@ -660,7 +660,7 @@ pub const ConnState = struct {
         ) catch {
             try self.extError(
                 "malformed Bind message",
-                _types.sqlstate.internal_error,
+                _types.sqlstate.protocol_violation,
             );
             return;
         };
@@ -668,7 +668,7 @@ pub const ConnState = struct {
         if (!self.statements.contains(b.statement_name)) {
             try self.extError(
                 "Bind references unknown prepared statement",
-                _types.sqlstate.internal_error,
+                _types.sqlstate.invalid_sql_statement_name,
             );
             return;
         }
@@ -738,7 +738,7 @@ pub const ConnState = struct {
         } else {
             try self.extError(
                 "Bind: param_formats count must be 0, 1, or n_params",
-                _types.sqlstate.internal_error,
+                _types.sqlstate.protocol_violation,
             );
             return;
         }
@@ -770,14 +770,14 @@ pub const ConnState = struct {
         const e = _proto.parseExecute(body) catch {
             try self.extError(
                 "malformed Execute message",
-                _types.sqlstate.internal_error,
+                _types.sqlstate.protocol_violation,
             );
             return null;
         };
         const entry = self.portals.getEntry(e.portal_name) orelse {
             try self.extError(
                 "Execute references unknown portal",
-                _types.sqlstate.internal_error,
+                _types.sqlstate.invalid_cursor_name,
             );
             return null;
         };
@@ -820,7 +820,7 @@ pub const ConnState = struct {
         const d = _proto.parseDescribe(body) catch {
             try self.extError(
                 "malformed Describe message",
-                _types.sqlstate.internal_error,
+                _types.sqlstate.protocol_violation,
             );
             return null;
         };
@@ -829,7 +829,7 @@ pub const ConnState = struct {
                 const stmt = self.statements.get(d.name) orelse {
                     try self.extError(
                         "Describe references unknown statement",
-                        _types.sqlstate.internal_error,
+                        _types.sqlstate.invalid_sql_statement_name,
                     );
                     return null;
                 };
@@ -847,7 +847,7 @@ pub const ConnState = struct {
                 const portal = self.portals.get(d.name) orelse {
                     try self.extError(
                         "Describe references unknown portal",
-                        _types.sqlstate.internal_error,
+                        _types.sqlstate.invalid_cursor_name,
                     );
                     return null;
                 };
@@ -878,7 +878,7 @@ pub const ConnState = struct {
         const c = _proto.parseClose(body) catch {
             try self.extError(
                 "malformed Close message",
-                _types.sqlstate.internal_error,
+                _types.sqlstate.protocol_violation,
             );
             return;
         };

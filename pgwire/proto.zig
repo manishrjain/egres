@@ -335,9 +335,12 @@ pub fn parseBind(
     i = 0;
     while (i < np_n) : (i += 1) {
         const len = try r.takeInt(i32, .big);
-        if (len < 0) {
+        if (len == -1) {
             params_storage[i] = null;
         } else {
+            // Only -1 is the NULL sentinel; any other negative length
+            // is a malformed frame, not a value.
+            if (len < 0) return error.Truncated;
             params_storage[i] = try r.take(@intCast(len));
         }
     }
