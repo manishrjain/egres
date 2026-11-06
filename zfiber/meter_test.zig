@@ -141,6 +141,14 @@ fn plan(vcpus: i64) Limit {
 /// only these tests touch, and bounds cpu and io from above.
 const t0: i64 = 1 << 60;
 
+test "tenants: id 0 is shared, never a throttled map entry" {
+    var ts = Tenants.init(std.testing.allocator, plan(1));
+    defer ts.deinit();
+
+    try expect(try ts.get(0, t0) == &meter.shared);
+    try expectEqual(0, ts.count());
+}
+
 test "tenants: one tenant alone gets the box" {
     meter.capacity = box;
     var ts = Tenants.init(std.testing.allocator, plan(1));

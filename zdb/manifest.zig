@@ -86,9 +86,22 @@ pub const index_catalog_table_id: u32 = 2;
 pub const namespace_system_table_ids =
     [_]u32{ 0, catalog_table_id, index_catalog_table_id };
 
-/// namespaces 1–15 are reserved for future engine use. User databases start
-/// here. nextNamespace floors next_ns_id at this value.
+/// namespaces 1–15 are reserved for engine use and belong to no tenant.
+/// User databases start here. nextNamespace floors next_ns_id at this value.
 pub const first_namespace: u64 = 16;
+
+/// Namespace 1 holds every tenant's roles and the server's own secrets.
+/// It belongs to no tenant and no login reaches it; genesis creates it
+/// with the trees of `auth_table_ids` and nothing else.
+pub const auth_namespace: u64 = 1;
+pub const roles_table_id: u32 = 3;
+pub const secrets_table_id: u32 = 4;
+pub const auth_table_ids = [_]u32{ roles_table_id, secrets_table_id };
+
+/// Tenant `egres`, which genesis creates. Callers with no login yet (SQL
+/// sessions, the admin port) act in it until logins exist.
+pub const default_tenant_id: u64 = 1;
+pub const default_tenant_name: String = "egres";
 
 /// In-memory manifest state. Durability comes from the Raft log + periodic
 /// snapshots — this struct is never persisted to its own file. `serialize`
@@ -134,35 +147,61 @@ pub const Manifest = struct {
     /// manifest state. A namespace with no entry allocates from
     /// `first_table_id`.
     namespaces: std.AutoHashMap(u64, Namespace),
-    /// Reverse index for name → namespace resolution (per-connection hot
-    /// path). Keys borrow the name strings owned by `namespaces`.
+    /// Reverse index for (tenant, name) → namespace resolution
+    /// (per-connection hot path). A key is the tenant id, 8 bytes
+    /// big-endian, then the name, so two tenants can share a name; keys
+    /// borrow `Namespace.name_key`, owned by `namespaces`.
     names: std.StringHashMap(u64),
     /// Next-free namespace id (global). Same allocate-on-leader / advance-on-
     /// apply / snapshot-persist discipline as the per-namespace table_id
     /// counter, one level up.
     next_ns_id: u64 = first_namespace,
+    /// Every tenant by id, snapshot-persisted, added by create_tenant.
+    tenants: std.AutoHashMap(u64, Tenant),
+    /// Tenant name → id. Keys borrow `Tenant.name`.
+    tenant_names: std.StringHashMap(u64),
+    /// Next-free tenant id, on the same discipline as `next_ns_id`. Starts
+    /// at 1: id 0 is no tenant, and the meter's `shared` account.
+    next_tenant_id: u64 = 1,
     mu: Lock = .{},
+
+    pub const Tenant = struct {
+        /// Owned by the map.
+        name: String,
+    };
 
     pub const Namespace = struct {
         /// Next-free user table_id: the only authoritative source of
         /// table_id allocation — bumped on apply of every create
         /// (advanceTableId), reserved by the leader (nextTableId).
         next_table_id: u32 = first_table_id,
-        /// Database name (SQL: CREATE DATABASE), owned by the map. Empty for
-        /// unnamed namespaces (legacy admin KV path) — those never resolve
-        /// by name.
-        name: String = "",
+        /// The tenant that owns the namespace. No default: an entry is
+        /// made only where the namespace is created (`registerNamespace`,
+        /// `applyNsBranch`, `restoreFrom`), which always knows its tenant,
+        /// so an entry can never hold 0 ("no tenant") by omission.
+        /// Namespaces below `first_namespace` get no entry.
+        tenant_id: u64,
+        /// The `names` key: tenant id (8 bytes, big-endian) then the
+        /// database name (SQL: CREATE DATABASE), owned here. Empty for
+        /// unnamed namespaces (admin `ns create`), which never resolve by
+        /// name.
+        name_key: String = "",
         /// SQL table name → table_id for this namespace's tables. Keys are
         /// allocator-owned dupes. Registered on create_tree apply (the
         /// TreeChange carries the name), unregistered on drop_tree apply;
         /// freed wholesale by deinit.
         tables: std.StringHashMapUnmanaged(u32) = .empty,
 
-        /// Free the owned strings (database name + table-name keys) and the
-        /// map. The caller removes `name` from the Manifest.names reverse
-        /// index first — its key borrows the string freed here.
+        /// The database name, without the tenant prefix.
+        pub fn name(self: Namespace) String {
+            return if (self.name_key.len == 0) "" else self.name_key[8..];
+        }
+
+        /// Free the owned strings (name key + table-name keys) and the
+        /// map. The caller removes `name_key` from the Manifest.names
+        /// reverse index first — that key borrows the string freed here.
         pub fn deinit(self: *Namespace, allocator: std.mem.Allocator) void {
-            if (self.name.len > 0) allocator.free(self.name);
+            if (self.name_key.len > 0) allocator.free(self.name_key);
             var it = self.tables.keyIterator();
             while (it.next()) |k| allocator.free(k.*);
             self.tables.deinit(allocator);
@@ -178,7 +217,82 @@ pub const Manifest = struct {
             .to_evict = .empty,
             .namespaces = std.AutoHashMap(u64, Namespace).init(allocator),
             .names = std.StringHashMap(u64).init(allocator),
+            .tenants = std.AutoHashMap(u64, Tenant).init(allocator),
+            .tenant_names = std.StringHashMap(u64).init(allocator),
         };
+    }
+
+    /// Reserve the next tenant id (leader path). A burned id (failed
+    /// propose) is never reused.
+    pub fn nextTenant(self: *Manifest) u64 {
+        self.mu.lock(@src());
+        defer self.mu.unlock();
+        const id = self.next_tenant_id;
+        self.next_tenant_id = id + 1;
+        return id;
+    }
+
+    /// The tenant named `name`, if any.
+    pub fn lookupTenant(self: *Manifest, name: String) ?u64 {
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
+        return self.tenant_names.get(name);
+    }
+
+    pub fn hasTenant(self: *Manifest, id: u64) bool {
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
+        return self.tenants.contains(id);
+    }
+
+    /// The tenant that owns `namespace`; null below `first_namespace` and
+    /// for a namespace the manifest does not know.
+    pub fn tenantOf(self: *Manifest, namespace: u64) ?u64 {
+        if (namespace < first_namespace) return null;
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
+        const ns = self.namespaces.getPtr(namespace) orelse return null;
+        return ns.tenant_id;
+    }
+
+    /// Add a tenant (create_tenant apply path, all nodes) and raise the
+    /// counter past its id. A re-apply of the same tenant changes
+    /// nothing. Returns false, changing nothing, for a change the leader
+    /// should never have built: id 0, an id or a name already held by a
+    /// different tenant.
+    fn addTenant(self: *Manifest, id: u64, name: String) !bool {
+        self.mu.lock(@src());
+        defer self.mu.unlock();
+        if (self.tenants.get(id)) |t| {
+            if (std.mem.eql(u8, t.name, name)) return true; // re-apply
+            log.err("tenant id={d} already named '{s}', not adding '{s}'", .{
+                id, t.name, name,
+            });
+            return false;
+        }
+        if (id == 0 or name.len == 0 or self.tenant_names.contains(name)) {
+            log.err("refusing tenant id={d} name='{s}'", .{ id, name });
+            return false;
+        }
+        const owned = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned);
+        try self.tenants.put(id, .{ .name = owned });
+        errdefer _ = self.tenants.remove(id);
+        try self.tenant_names.put(owned, id);
+        self.next_tenant_id = @max(self.next_tenant_id, id +| 1);
+        return true;
+    }
+
+    /// Whether a namespace create or branch for `namespace` in `tenant_id`
+    /// may apply: a namespace at or above `first_namespace` needs a
+    /// tenant that exists; one below it carries none.
+    fn nsTenantValid(self: *Manifest, namespace: u64, tenant_id: u64) bool {
+        if (namespace < first_namespace) return true;
+        if (tenant_id != 0 and self.hasTenant(tenant_id)) return true;
+        log.err("refusing ns={d}: tenant {d} does not exist", .{
+            namespace, tenant_id,
+        });
+        return false;
     }
 
     /// Reserve the next namespace id (leader path). Floors at
@@ -210,97 +324,131 @@ pub const Manifest = struct {
     /// only a hint until the create_tree commits — a burned id (failed propose)
     /// is never reused because advanceTableId only ever raises the counter.
     pub fn nextTableId(self: *Manifest, namespace: u64) !u32 {
+        // Tables are made only in user databases; the reserved namespaces
+        // have their trees from creation and no counter.
+        if (namespace < first_namespace) return error.ReservedNamespace;
         self.mu.lock(@src());
         defer self.mu.unlock();
 
-        const slot = try self.namespaces.getOrPut(namespace);
-        if (!slot.found_existing) slot.value_ptr.* = .{};
+        // Only a created namespace has a counter; never make one here.
+        const ns = self.namespaces.getPtr(namespace) orelse
+            return error.NamespaceNotFound;
 
         // Hand out the current counter (never below the floor), reserve next.
-        const id = @max(slot.value_ptr.next_table_id, first_table_id);
-        slot.value_ptr.next_table_id = id + 1;
+        const id = @max(ns.next_table_id, first_table_id);
+        ns.next_table_id = id + 1;
         return id;
     }
 
     /// Raise the table's namespace counter past its table_id (apply path,
     /// all nodes). Idempotent; never lowers it (so re-applying or applying
     /// a low system table leaves a higher user counter untouched). Floors
-    /// at first_table_id.
+    /// at first_table_id. A namespace that was never created is logged and
+    /// skipped, not given an entry: the apply loop retries an error forever.
     pub fn advanceTableId(
         self: *Manifest,
         table_key: TableKey,
     ) !void {
+        if (table_key.namespace < first_namespace) return;
         self.mu.lock(@src());
         defer self.mu.unlock();
 
-        const slot = try self.namespaces.getOrPut(table_key.namespace);
-        if (!slot.found_existing) slot.value_ptr.* = .{};
+        const ns = self.namespaces.getPtr(table_key.namespace) orelse {
+            log.err("table_id={d} in ns={d}: namespace not created, skipped", .{
+                table_key.table_id, table_key.namespace,
+            });
+            return;
+        };
 
         // Floor the current counter, then raise it past table_id; never lowers.
-        const floor = @max(slot.value_ptr.next_table_id, first_table_id);
-        slot.value_ptr.next_table_id = @max(floor, table_key.table_id +| 1);
+        const floor = @max(ns.next_table_id, first_table_id);
+        ns.next_table_id = @max(floor, table_key.table_id +| 1);
     }
 
-    /// Record `namespace`'s database name (ns_create apply path, all nodes).
-    /// Idempotent for re-applies; an empty name (legacy unnamed namespace)
-    /// records nothing. A name held by ANOTHER namespace is a build-side bug
-    /// (uniqueness is checked before propose) — logged and skipped, never
-    /// clobbered.
-    pub fn registerNamespaceName(
+    /// Create `namespace`'s entry with its tenant and database name
+    /// (create_ns and branch_ns apply paths, all nodes). Below
+    /// `first_namespace` it records nothing: those namespaces get no
+    /// entry. At or above, the entry is made even for an empty name (admin
+    /// `ns create`), so the tenant is kept. Idempotent for re-applies. An
+    /// entry that already names a different tenant, or a name the tenant
+    /// already gave ANOTHER namespace, is a build-side bug — logged and
+    /// skipped, never clobbered.
+    pub fn registerNamespace(
         self: *Manifest,
         namespace: u64,
+        tenant_id: u64,
         name: String,
     ) !void {
-        if (name.len == 0) return;
+        if (namespace < first_namespace) return;
 
         self.mu.lock(@src());
         defer self.mu.unlock();
 
-        if (self.names.get(name)) |owner| {
-            if (owner != namespace)
-                log.err(
-                    "namespace name '{s}' already owned by ns={d}, not " ++
-                        "renaming ns={d}",
-                    .{ name, owner, namespace },
-                );
+        const slot = try self.namespaces.getOrPut(namespace);
+        if (!slot.found_existing) {
+            slot.value_ptr.* = .{ .tenant_id = tenant_id };
+        } else if (slot.value_ptr.tenant_id != tenant_id) {
+            log.err("ns={d} belongs to tenant {d}, not re-owning it to {d}", .{
+                namespace, slot.value_ptr.tenant_id, tenant_id,
+            });
             return;
         }
-        const slot = try self.namespaces.getOrPut(namespace);
-        if (!slot.found_existing) slot.value_ptr.* = .{};
-        if (slot.value_ptr.name.len > 0) return; // re-apply; name is immutable
+        if (name.len == 0 or slot.value_ptr.name_key.len > 0) return;
 
-        const owned = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(owned);
-        try self.names.put(owned, namespace);
-        slot.value_ptr.name = owned;
+        const key = try nameKey(self.allocator, tenant_id, name);
+        errdefer self.allocator.free(key);
+        if (self.names.get(key)) |owner| {
+            if (owner != namespace)
+                log.err(
+                    "namespace name '{s}' in tenant {d} already owned by " ++
+                        "ns={d}, not renaming ns={d}",
+                    .{ name, tenant_id, owner, namespace },
+                );
+            self.allocator.free(key);
+            return;
+        }
+        try self.names.put(key, namespace);
+        slot.value_ptr.name_key = key;
     }
 
-    /// Resolve a database name to its namespace.
-    pub fn lookupNamespace(self: *Manifest, name: String) ?u64 {
+    /// Resolve a database name in `tenant_id` to its namespace.
+    pub fn lookupNamespace(
+        self: *Manifest,
+        tenant_id: u64,
+        name: String,
+    ) ?u64 {
+        var buf: [8 + 256]u8 = undefined;
+        if (name.len > buf.len - 8) return null;
+        std.mem.writeInt(u64, buf[0..8], tenant_id, .big);
+        @memcpy(buf[8..][0..name.len], name);
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
-        return self.names.get(name);
+        return self.names.get(buf[0 .. 8 + name.len]);
     }
 
     /// Record a table's name (create_tree apply path, all nodes). Idempotent
     /// for re-applies (same name → same table_id). A name held by a DIFFERENT
-    /// table is a build-side bug (uniqueness is checked before propose) —
-    /// logged and skipped, never clobbered. Empty name records nothing
-    /// (system trees, splits).
+    /// table, or a namespace that was never created, is a build-side bug —
+    /// logged and skipped, never clobbered or given an entry. Empty name
+    /// records nothing (system trees, splits).
     pub fn registerTableName(
         self: *Manifest,
         table_key: TableKey,
         name: String,
     ) !void {
-        if (name.len == 0) return;
+        if (name.len == 0 or table_key.namespace < first_namespace) return;
 
         self.mu.lock(@src());
         defer self.mu.unlock();
 
-        const slot = try self.namespaces.getOrPut(table_key.namespace);
-        if (!slot.found_existing) slot.value_ptr.* = .{};
+        const ns = self.namespaces.getPtr(table_key.namespace) orelse {
+            log.err("table '{s}' in ns={d}: namespace not created, skipped", .{
+                name, table_key.namespace,
+            });
+            return;
+        };
 
-        if (slot.value_ptr.tables.get(name)) |owner| {
+        if (ns.tables.get(name)) |owner| {
             if (owner != table_key.table_id)
                 log.err(
                     "table name '{s}' in ns={d} already owned by " ++
@@ -316,11 +464,7 @@ pub const Manifest = struct {
         }
         const owned = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(owned);
-        try slot.value_ptr.tables.put(
-            self.allocator,
-            owned,
-            table_key.table_id,
-        );
+        try ns.tables.put(self.allocator, owned, table_key.table_id);
     }
 
     /// Resolve a table name to its table_id within a namespace (per-query
@@ -363,7 +507,8 @@ pub const Manifest = struct {
         self.mu.lock(@src());
         defer self.mu.unlock();
         if (self.namespaces.fetchRemove(namespace)) |kv| {
-            if (kv.value.name.len > 0) _ = self.names.remove(kv.value.name);
+            if (kv.value.name_key.len > 0)
+                _ = self.names.remove(kv.value.name_key);
             var v = kv.value;
             v.deinit(self.allocator);
         }
@@ -557,6 +702,10 @@ pub const Manifest = struct {
         var nit = self.namespaces.valueIterator();
         while (nit.next()) |n| n.deinit(self.allocator);
         self.namespaces.deinit();
+        self.tenant_names.deinit(); // keys borrow the names freed below
+        var tit = self.tenants.valueIterator();
+        while (tit.next()) |t| self.allocator.free(t.name);
+        self.tenants.deinit();
         self.mu.deinit();
     }
 
@@ -785,9 +934,37 @@ pub const Manifest = struct {
     ///
     /// TODO: We probably should move table names over to the table schema,
     /// and avoid storing them in the MANIFEST.
-    pub fn apply(self: *Manifest, index: u64, mc: ManifestChange) !void {
-        if (mc.cmd == .branch_ns) return self.applyNsBranch(mc);
-        if (mc.cmd == .branch_table) return self.applyTableBranch(mc);
+    ///
+    /// Returns false, changing nothing, for a change that breaks a rule
+    /// the leader checks before proposing (a tenant that is missing, a
+    /// name or id already held): it is logged and skipped rather than
+    /// returned as an error, because the apply loop retries an error
+    /// forever and would stall every node. The forest then installs
+    /// nothing for it either.
+    pub fn apply(self: *Manifest, index: u64, mc: ManifestChange) !bool {
+        switch (mc.cmd) {
+            .branch_ns => return self.applyNsBranch(mc),
+            .branch_table => {
+                try self.applyTableBranch(mc);
+                return true;
+            },
+            .create_tenant => {
+                var all = true;
+                for (mc.tenants) |t| {
+                    const ok = try self.addTenant(t.id, t.name);
+                    if (!ok) all = false;
+                }
+                return all;
+            },
+            .create_ns => for (mc.tree_changes) |tc| {
+                // The tree-0 change carries the namespace's tenant.
+                if (tc.op != .create or treeTableId(tc.tree_id) != 0)
+                    continue;
+                if (!self.nsTenantValid(tc.namespace_id, tc.tenant_id))
+                    return false;
+            },
+            else => {},
+        }
         {
             const held = self.mu.hold(.exclusive, @src());
             defer held.release();
@@ -800,7 +977,14 @@ pub const Manifest = struct {
             .create_ns => for (mc.tree_changes) |tc| {
                 if (tc.op != .create) continue;
                 self.advanceNamespace(tc.namespace_id);
-                try self.registerNamespaceName(tc.namespace_id, tc.name);
+                // Only the tree-0 change names the namespace and its
+                // tenant; the system trees after it carry neither.
+                if (treeTableId(tc.tree_id) != 0) continue;
+                try self.registerNamespace(
+                    tc.namespace_id,
+                    tc.tenant_id,
+                    tc.name,
+                );
             },
             .create_tree => for (mc.tree_changes) |tc| {
                 if (tc.op != .create) continue;
@@ -827,6 +1011,7 @@ pub const Manifest = struct {
             },
             else => {},
         }
+        return true;
     }
 
     /// branch_ns: the target namespace (`mc.tree_changes[0]`, which
@@ -840,11 +1025,12 @@ pub const Manifest = struct {
     /// node's manifest, which every node holds identically at this
     /// index. A target that already has trees was applied before
     /// (replay): nothing changes.
-    fn applyNsBranch(self: *Manifest, mc: ManifestChange) !void {
+    fn applyNsBranch(self: *Manifest, mc: ManifestChange) !bool {
         std.debug.assert(mc.tree_changes.len == 1);
         const target = mc.tree_changes[0];
         const dst = target.namespace_id;
         const src = mc.branch_from;
+        if (!self.nsTenantValid(dst, target.tenant_id)) return false;
         {
             const held = self.mu.hold(.exclusive, @src());
             defer held.release();
@@ -854,7 +1040,7 @@ pub const Manifest = struct {
             defer keys.deinit(self.allocator);
             var it = self.trees.keyIterator();
             while (it.next()) |tk| {
-                if (tk.namespace == dst) return; // This ns was already applied.
+                if (tk.namespace == dst) return true; // already applied
                 if (tk.namespace == src) try keys.append(self.allocator, tk.*);
             }
             for (keys.items) |sk| try self.copyTree(sk, .{
@@ -865,7 +1051,8 @@ pub const Manifest = struct {
             // Names and the counter, under the same hold: the register
             // helpers take the lock themselves.
             const dst_slot = try self.namespaces.getOrPut(dst);
-            if (!dst_slot.found_existing) dst_slot.value_ptr.* = .{};
+            if (!dst_slot.found_existing)
+                dst_slot.value_ptr.* = .{ .tenant_id = target.tenant_id };
 
             if (self.namespaces.getPtr(src)) |src_ns| {
                 dst_slot.value_ptr.next_table_id = src_ns.next_table_id;
@@ -882,7 +1069,8 @@ pub const Manifest = struct {
             }
         }
         self.advanceNamespace(dst);
-        try self.registerNamespaceName(dst, target.name);
+        try self.registerNamespace(dst, target.tenant_id, target.name);
+        return true;
     }
 
     /// branch_table: each change names a new table (its tree-0 change,
@@ -1054,9 +1242,18 @@ pub const Manifest = struct {
             try namespaces.append(a, .{
                 .id = kv.key_ptr.*,
                 .next_table_id = kv.value_ptr.next_table_id,
-                .name = @constCast(kv.value_ptr.name),
+                .name = kv.value_ptr.name(),
+                .tenant_id = kv.value_ptr.tenant_id,
             });
         }
+
+        var tenants: std.ArrayList(_zen.TenantStruct) = .empty;
+        var tnit = self.tenants.iterator();
+        while (tnit.next()) |kv|
+            try tenants.append(a, .{
+                .id = kv.key_ptr.*,
+                .name = kv.value_ptr.name,
+            });
 
         // The arena holds the source changes; marshalRoot copies them into a
         // fresh `allocator`-owned payload, so the arena can be torn down after.
@@ -1065,6 +1262,8 @@ pub const Manifest = struct {
             .sstable_changes = table_changes.items,
             .namespaces = namespaces.items,
             .next_ns_id = self.next_ns_id,
+            .tenants = tenants.items,
+            .next_tenant_id = self.next_tenant_id,
         });
     }
 
@@ -1094,6 +1293,11 @@ pub const Manifest = struct {
             var nit = self.namespaces.valueIterator();
             while (nit.next()) |n| n.deinit(self.allocator);
             self.namespaces.clearRetainingCapacity();
+            self.tenant_names.clearRetainingCapacity();
+            var tnit = self.tenants.valueIterator();
+            while (tnit.next()) |t| self.allocator.free(t.name);
+            self.tenants.clearRetainingCapacity();
+            self.next_tenant_id = 1;
 
             // Order matters: trees must exist before tables can attach to them.
             const tc_len = reader.treeChangesLen();
@@ -1137,13 +1341,27 @@ pub const Manifest = struct {
             i = 0;
             while (i < ns_len) : (i += 1) {
                 const c = try reader.namespacesAt(i);
+                // A snapshot lists only namespaces that were created,
+                // each with its tenant (checked once tenants are back).
                 const slot = try self.namespaces.getOrPut(c.id());
-                if (!slot.found_existing) slot.value_ptr.* = .{};
+                if (!slot.found_existing)
+                    slot.value_ptr.* = .{ .tenant_id = c.tenantId() };
                 slot.value_ptr.next_table_id = c.nextTableId();
             }
 
             self.next_ns_id = @max(reader.nextNsId(), first_namespace);
         }
+
+        // Tenants before namespaces: a namespace names its tenant.
+        const t_len = reader.tenantsLen();
+        var ti: u32 = 0;
+        while (ti < t_len) : (ti += 1) {
+            const t = try reader.tenantsAt(ti);
+            _ = try self.addTenant(t.id(), t.name());
+        }
+        self.mu.lock(@src());
+        self.next_tenant_id = @max(self.next_tenant_id, reader.nextTenantId());
+        self.mu.unlock();
 
         // Names: serialize stamps a table's name onto its tree's change
         // (only user tables carry one; empty is a no-op), and each
@@ -1162,7 +1380,9 @@ pub const Manifest = struct {
         i = 0;
         while (i < ns_len) : (i += 1) {
             const c = try reader.namespacesAt(i);
-            try self.registerNamespaceName(c.id(), c.name());
+            if (c.id() >= first_namespace)
+                std.debug.assert(self.hasTenant(c.tenantId()));
+            try self.registerNamespace(c.id(), c.tenantId(), c.name());
         }
     }
 
@@ -1187,6 +1407,8 @@ pub const SSTableChange = _zen.SSTableChangeStruct;
 pub const TreeChange = _zen.TreeChangeStruct;
 pub const ManifestChange = _zen.ManifestChangeStruct;
 pub const Command = _zen.CommandEnum;
+/// One tenant in a create_tenant change or a snapshot.
+pub const TenantRecord = _zen.TenantStruct;
 
 pub fn createSSTableChange(
     sst_id: u64,
@@ -1266,4 +1488,13 @@ pub fn updateTreeChange(
         .left_key = @constCast(left_key),
         .right_key = @constCast(right_key),
     };
+}
+
+/// The `Manifest.names` key for `name` in `tenant_id`: the tenant id,
+/// 8 bytes big-endian, then the name. Caller owns the result.
+fn nameKey(alloc: std.mem.Allocator, tenant_id: u64, name: String) ![]u8 {
+    const key = try alloc.alloc(u8, 8 + name.len);
+    std.mem.writeInt(u64, key[0..8], tenant_id, .big);
+    @memcpy(key[8..], name);
+    return key;
 }

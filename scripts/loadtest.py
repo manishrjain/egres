@@ -343,8 +343,13 @@ def promote_learners(ports: Ports, nodes: int, timeout: float) -> None:
         run_until_ok(ports, f"conf to_voter {node}\n", f"promote node {node}", timeout)
 
 
+# Namespaces below 16 are reserved and 16 is the `egres` database genesis
+# creates; the benchmark's namespaces start after it (benchmark.zig).
+FIRST_BENCH_NAMESPACE = 17
+
+
 def bootstrap_namespaces(ports: Ports, count: int, timeout: float) -> None:
-    for ns in range(1, count + 1):
+    for ns in range(FIRST_BENCH_NAMESPACE, FIRST_BENCH_NAMESPACE + count):
         run_until_ok(ports, f"ns create {ns}\n", f"create ns {ns}", timeout)
 
 

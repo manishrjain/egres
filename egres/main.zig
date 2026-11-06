@@ -16,6 +16,7 @@ const String = utils.String;
 // build.zig): jemalloc or mimalloc behind one adapter API, exactly one
 // linked per binary. `galloc.kind` names it at comptime.
 const galloc = @import("galloc");
+const _genesis = @import("genesis.zig");
 
 pub const std_options = std.Options{
     // Debug lines (raft prints three per apply batch) are compiled out
@@ -170,65 +171,6 @@ const probe_help =
 ;
 
 const log = std.log.scoped(.egres);
-
-/// The default database, present from a node's very first boot — created by
-/// the WAL's genesis entry (see seedGenesis), never at runtime. The SQL
-/// layer owns the name (sessions with no database fall back to it).
-const default_database = sql.default_database;
-
-/// Seed a fresh WAL with the deterministic genesis prefix: entry 1 creates
-/// the default database at the first user namespace id ('egres' is ns 16 on
-/// every cluster). Every node writes the same bytes — fixed ids, term 0,
-/// fixed timestamp — so raft's log matching holds across fresh nodes, and
-/// the entry is committed by construction (HardState.commit_index covers
-/// it): engine recovery applies it before any election or client traffic.
-/// A restarted or joining node with a non-empty WAL skips this.
-fn seedGenesis(allocator: std.mem.Allocator, wal: *raft.DiskWAL) !void {
-    if (wal.lastIndex() != 0) return;
-
-    // Same trees as forest.buildNsCreate — one per system table,
-    // posting indexes as there; tree 0 (the raw-KV default table)
-    // carries the database name.
-    const sys = zdb.manifest.namespace_system_table_ids;
-    var tc: [sys.len]zdb.manifest.TreeChange = undefined;
-    for (sys, &tc) |table_id, *c|
-        c.* = zdb.manifest.createTreeChange(
-            zdb.kv.makeTreeId(table_id, 0),
-            zdb.manifest.first_namespace,
-            "",
-            "",
-            .posting_index,
-        );
-    tc[0].name = @constCast(default_database);
-    const payload = try zdb.buffers.marshalRoot(allocator, zdb.manifest.ManifestChange{
-        .cmd = .create_ns,
-        .tree_changes = &tc,
-        .sstable_changes = &.{},
-        .memtable_id = 0,
-    });
-    defer allocator.free(payload);
-
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(allocator);
-    var writer = try raft.buffers.LogEntryWriter.initWithBuf(allocator, &buf);
-    defer writer.deinit();
-    try writer.set(.{
-        .index = 1,
-        .term = 0,
-        .timestamp = 1, // fixed; real HLC values are far larger
-        .data = payload,
-        .entry_type = .manifest,
-    });
-    _ = try writer.finishWithTail();
-    const data = try buf.toOwnedSlice(allocator);
-    var entry = try raft.buffers.LogEntryBuffer.initWithTail(allocator, data, .owned);
-    defer entry.deinit();
-
-    try wal.addEntries(&.{entry});
-    try wal.sync();
-    try wal.setHardState(.{ .commit_index = 1 });
-    log.info("seeded genesis: database '{s}' -> ns={d}", .{ default_database, zdb.manifest.first_namespace });
-}
 
 fn deinitWithLog(comptime msg: String, ptr: anytype) void {
     ptr.deinit();
@@ -587,7 +529,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     defer deinitWithLog("wal", &wal);
     // Genesis before the node reads the log: a fresh WAL gets its
     // deterministic bootstrap prefix (default database), pre-committed.
-    try seedGenesis(allocator, &wal);
+    try _genesis.seed(allocator, &wal);
 
     const node = try raft.Node.init(
         allocator,
