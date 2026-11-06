@@ -518,6 +518,67 @@ expect "DESC NULLS LAST sorts" "1 4 3 2 " \
     seq_ "SELECT id FROM obi ORDER BY n DESC NULLS LAST;"
 expect "a WHERE off the key sorts" "3 1 " \
     seq_ "SELECT id FROM obi WHERE id < 4 AND n <= 3 ORDER BY n;"
+# A unique index keys each NULL row apart (#23): the walk over a
+# nullable unique column returns its NULL rows, last by egid, and the
+# build indexes the NULL already there (id 4).
+expect "CREATE UNIQUE INDEX over a NULL" "CREATE INDEX" \
+    q "CREATE UNIQUE INDEX obi_s ON obi (s);"
+expect "unique walk keeps NULL rows" "2 1 3 4 " \
+    seq_ "SELECT id FROM obi ORDER BY s;"
+expect "reverse unique walk: NULLs first" "4 3 1 2 " \
+    seq_ "SELECT id FROM obi ORDER BY s DESC;"
+expect "unique walk with LIMIT" "2 1 " \
+    seq_ "SELECT id FROM obi ORDER BY s LIMIT 2;"
+expect "unique walk over a range skips NULLs" "1 3 " \
+    seq_ "SELECT id FROM obi WHERE s > 'a' ORDER BY s;"
+expect "IS NULL still returns NULL rows" "4 " \
+    seq_ "SELECT id FROM obi WHERE s IS NULL;"
+expect "two NULLs under the unique index" "INSERT 0 2" \
+    q "INSERT INTO obi VALUES (5, 0, NULL), (6, 0, NULL);"
+expect "NULL rows walk in egid order" "2 1 3 4 5 6 " \
+    seq_ "SELECT id FROM obi ORDER BY s;"
+expect "unique pagination crosses into NULLs" "^3 4 5 $" \
+    seq_ "SELECT id FROM obi ORDER BY s LIMIT 3 OFFSET 2;"
+expect "reverse unique pagination crosses out of NULLs" "^4 3 1 $" \
+    seq_ "SELECT id FROM obi ORDER BY s DESC LIMIT 3 OFFSET 2;"
+expect "NULLs do not conflict under DO NOTHING" "7 8 " \
+    txseq_ "BEGIN;
+INSERT INTO obi VALUES (7, 0, NULL), (8, 0, NULL)
+    ON CONFLICT (s) DO NOTHING;
+SELECT id FROM obi WHERE id >= 7 ORDER BY id;
+ROLLBACK;"
+expect "NULLs do not conflict under DO UPDATE" "7 8 " \
+    txseq_ "BEGIN;
+INSERT INTO obi VALUES (7, 0, NULL), (8, 0, NULL)
+    ON CONFLICT (s) DO UPDATE SET n = 1;
+SELECT id FROM obi WHERE id >= 7 ORDER BY id;
+ROLLBACK;"
+expect "a value is still unique" "duplicate key" \
+    q "INSERT INTO obi VALUES (7, 0, 'a');"
+expect "DELETE NULL rows drops their keys" "DELETE 2" \
+    q "DELETE FROM obi WHERE id >= 5;"
+expect "unique walk sees value <-> NULL in this txn" "2 4 3 1 " \
+    txseq_ "BEGIN;
+UPDATE obi SET s = NULL WHERE id = 1;
+UPDATE obi SET s = 'aa' WHERE id = 4;
+SELECT id FROM obi ORDER BY s;
+ROLLBACK;"
+expect "rolled back: the unique walk is unchanged" "2 1 3 4 " \
+    seq_ "SELECT id FROM obi ORDER BY s;"
+expect "UPDATE a value to NULL commits" "UPDATE 1" \
+    q "UPDATE obi SET s = NULL WHERE id = 3;"
+expect "IS NULL sees the moved row" "3 4 " \
+    seq_ "SELECT id FROM obi WHERE s IS NULL;"
+expect "UPDATE NULL back to a value commits" "UPDATE 1" \
+    q "UPDATE obi SET s = 'c' WHERE id = 3;"
+expect "the old NULL key is gone" "2 1 3 4 " \
+    seq_ "SELECT id FROM obi ORDER BY s;"
+stop_server
+start_server
+expect "unique NULL entries survive restart" "^2 1 3 4 $" \
+    seq_ "SELECT id FROM obi ORDER BY s;"
+expect "unique NULL lookup survives restart" "^4 $" \
+    seq_ "SELECT id FROM obi WHERE s IS NULL;"
 expect "DROP the indexed ORDER BY table" "DROP TABLE" q "DROP TABLE obi;"
 
 expect "DELETE 5000 rows" "DELETE 5000" q "DELETE FROM big;"

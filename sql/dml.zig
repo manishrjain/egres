@@ -847,8 +847,8 @@ fn collisionPred(
     for (changes, 0..) |*change, ci| for (uniques) |*unique| {
         const cells = change.post orelse continue;
         const cell = cells[unique.idx.column.pos];
-        // A proposed row has no egid yet, and needs none: only its
-        // values can collide.
+        // Conflict detection runs before write() allocates egids.
+        // Non-NULL values produce probe keys; NULLs cannot conflict.
         for (try unique.idx.keys(arloc, cell, null)) |key| {
             const slot = try unique.change_by_key.getOrPut(arloc, key);
             if (slot.found_existing) switch (action) {
@@ -1665,7 +1665,8 @@ fn containsKey(keys: []const String, key: String) bool {
 /// Sort the statement's index mutations into lock order and lock every
 /// unique key, all before any write (lockRows may Restart). Non-unique
 /// entries are sorted with the rest but never locked: posting deltas
-/// commute. false = an error was replied.
+/// commute. Nor is a unique index's NULL key: it carries its row's
+/// egid, so no other row can take it. false = an error was replied.
 fn sortAndLockIndexKeys(
     state: *pgwire.ConnState,
     tx: *_txn.Txn,
@@ -1680,7 +1681,7 @@ fn sortAndLockIndexKeys(
     var hashes: std.ArrayList(u64) = .empty;
     defer hashes.deinit(tx.allocator);
     for (keys) |ik| {
-        if (!ik.idx.unique) continue;
+        if (!ik.idx.unique or _key.isNullKey(ik.key)) continue;
         const h = tx.rowHash(ik.idx.index_table_id, ik.key);
         try hashes.append(tx.allocator, h);
     }
@@ -1696,7 +1697,8 @@ fn sortAndLockIndexKeys(
 /// key gets ONE write, decided from its group of equal entries, i.e.
 /// from what the whole statement does to it: more than one add is two
 /// rows given the same value → 23505; no add is a tombstone; one add
-/// with no remove probes the index, found → 23505, else puts; one add
+/// with no remove probes the index, found → 23505, else puts — but a
+/// NULL key, its row's alone, is put unprobed; one add
 /// with a remove is a move between two of this statement's rows — the
 /// put alone, no probe, since the committed occupant is the row moving
 /// away, its pre-image locked and newest. The probed puts are written
@@ -1736,7 +1738,7 @@ fn applyIndexKeys(
             try tx.put(table_id, first.key, "", .{ .kind = .deleted });
             continue;
         }
-        if (group.removes == 0) {
+        if (group.removes == 0 and !_key.isNullKey(first.key)) {
             try probes.append(tx.allocator, first);
             continue;
         }
@@ -1851,8 +1853,8 @@ fn replyUniqueViolation(state: *pgwire.ConnState) !bool {
 }
 
 /// NULL into a NOT NULL column (the PRIMARY KEY included), by INSERT
-/// or UPDATE: 23502, in Postgres's wording. A unique index takes NULL
-/// as "no entry" (NULLS DISTINCT); only the constraint refuses it.
+/// or UPDATE: 23502, in Postgres's wording. A unique index keys each
+/// NULL row apart (NULLS DISTINCT); only the constraint refuses it.
 fn replyNullViolation(
     state: *pgwire.ConnState,
     a: std.mem.Allocator,

@@ -308,8 +308,8 @@ pub const RowIndexKeys = struct {
         return self.v1.count();
     }
 
-    /// First scan: the row's keys as of read_ts. No keys (a NULL
-    /// under a unique index) means no entry.
+    /// First scan: the row's keys as of read_ts. No keys means no
+    /// entry.
     pub fn setV1(self: *RowIndexKeys, egid: u64, keys: []const String) !void {
         if (keys.len == 0) return;
         try self.v1.put(self.a, egid, keys);
