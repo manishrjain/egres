@@ -22,6 +22,7 @@ const _coarse = @import("utils").coarse_clock;
 const _fb = @import("fiber.zig");
 const _queue = @import("queue.zig");
 const _rt = @import("runtime.zig");
+const _simdisk = @import("simdisk.zig");
 
 const Fiber = _fb.Fiber;
 const Priority = _fb.Priority;
@@ -62,6 +63,10 @@ pub const Options = struct {
     /// threads. 0 declares at once; a harness that forbids threads
     /// sets it.
     idle_grace_ms: u64 = 50,
+    /// The disk's error rates (`simdisk.Faults`). Zero: the unit suite
+    /// expects a disk that works; a harness that tests the error paths
+    /// sets them.
+    disk_faults: _simdisk.Faults = .{},
 };
 
 /// How a run ended. `running` until `Runtime.run` returns.
@@ -95,18 +100,26 @@ pub const Sim = struct {
     timer: xev.Timer,
     timer_c: xev.Completion = .{},
     timer_fired: bool = false,
+    /// Every file op of the run (`fs.submit` asks `Runtime.simDisk`).
+    disk: _simdisk.SimDisk,
 
-    pub fn init(opts: Options) !Sim {
+    pub fn init(alloc: std.mem.Allocator, opts: Options) !Sim {
+        var timer = try xev.Timer.init();
+        errdefer timer.deinit();
+        var disk = try _simdisk.SimDisk.init(alloc, opts.seed);
+        disk.root.faults = opts.disk_faults;
         return .{
             .opts = opts,
             .prng = std.Random.DefaultPrng.init(opts.seed),
             .now_ms = .init(opts.epoch_ms),
             .trace = std.hash.Wyhash.init(opts.seed),
-            .timer = try xev.Timer.init(),
+            .timer = timer,
+            .disk = disk,
         };
     }
 
     pub fn deinit(self: *Sim) void {
+        self.disk.deinit();
         self.timer.deinit();
     }
 

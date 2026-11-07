@@ -114,6 +114,8 @@ pub const MetaStore = struct {
 
         if (fresh) {
             try state_file.truncate(state_file_size);
+            // O_DSYNC makes the file's bytes durable, not its name.
+            _vfs.syncDir(path);
         }
 
         // Allocate a default-empty Snapshot pointer up front so subsequent

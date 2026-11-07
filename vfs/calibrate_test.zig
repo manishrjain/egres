@@ -6,18 +6,13 @@ const testing = std.testing;
 const vfs = @import("vfs");
 const calibrate = vfs.calibrate;
 
-fn tmpPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![:0]u8 {
-    const utils = @import("utils");
-    return tmp.dir.realPathFileAlloc(utils.context.g().io, ".", alloc);
-}
-
 // The plumbing, not the numbers: a tmp dir on whatever filesystem the
 // tests run on yields both bandwidths, and the scratch dir is gone.
 test "calibrate: runCalibration profiles a directory and cleans up" {
     const alloc = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmpPath(alloc, &tmp);
+    const root = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(root);
 
     const p = try calibrate.runCalibration(alloc, root);

@@ -26,10 +26,6 @@ const ns: u64 = 1;
 const tid: u32 = 0;
 const table_key: zdb.kv.TableKey = .{ .namespace = ns, .table_id = tid };
 
-fn tmpPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![:0]u8 {
-    return tmp.dir.realPathFileAlloc(utils.context.g().io, ".", alloc);
-}
-
 /// A forest with one table (`ns`, `tid`) and a live memtable, plus the
 /// moves that put rows where a test wants them: frozen into an
 /// immutable memtable, flushed to L0, compacted to L1.
@@ -59,7 +55,7 @@ const Fixture = struct {
             .tree_id = undefined,
             .next_index = 0,
         };
-        self.dir = try tmpPath(alloc, &self.tmp);
+        self.dir = try vfs.tmpDirPath(alloc, &self.tmp);
         // A bottom target of one byte makes a push L0's job at any
         // size (`pickJob`), so `compactL0` below pushes into L1.
         self.live = try flags.Live(Config).create(alloc, .{

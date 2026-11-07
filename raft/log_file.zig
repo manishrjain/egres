@@ -425,7 +425,11 @@ pub const LogFile = struct {
     ) !LogFile {
         var name_buf: LogFile.NameBuf = undefined;
         const name = try fname(fid, &name_buf);
-        return createNamed(vfs, alloc, dir_path, name, fid, opts);
+        const lf = try createNamed(vfs, alloc, dir_path, name, fid, opts);
+        // Under its final name: O_DSYNC covers the file's bytes, the
+        // directory's sync its name, before anything is appended.
+        _vfs.syncDir(dir_path);
+        return lf;
     }
 
     /// `createCurrent` under a caller-chosen name: the log file prepared

@@ -35,6 +35,7 @@ const _queue = @import("queue.zig");
 const _fsops = @import("fsops.zig");
 const _context = @import("utils").context;
 const _sim = @import("sim.zig");
+const _simdisk = @import("simdisk.zig");
 
 /// Flush a busy worker's io_uring SQ once this many SQEs have queued, so reads
 /// issued by running fibers dispatch promptly instead of waiting for the ~1 ms
@@ -1150,7 +1151,8 @@ pub const Runtime = struct {
         const io_pool: ?*xev.ThreadPool =
             if (needs_io_pool) &self.io_pool else null;
 
-        if (opts.sim) |sim_opts| self.sim = try _sim.Sim.init(sim_opts);
+        if (opts.sim) |sim_opts|
+            self.sim = try _sim.Sim.init(allocator, sim_opts);
         errdefer if (self.sim) |*s| s.deinit();
 
         const sim: ?*_sim.Sim = if (self.sim) |*s| s else null;
@@ -1649,6 +1651,13 @@ pub noinline fn currentWorkerOrNull() ?*Worker {
 /// What a struct asks instead of being told.
 pub fn isSim() bool {
     return runtime().simState() != null;
+}
+
+/// The simulation's disk, which `fs.submit` runs every file op on
+/// under a sim; null on the real disk.
+pub fn simDisk() ?*_simdisk.SimDisk {
+    const sim = runtime().simState() orelse return null;
+    return &sim.disk;
 }
 
 /// The current worker's randomness: OS-seeded in production, seeded

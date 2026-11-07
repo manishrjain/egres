@@ -97,11 +97,7 @@ const ApplyFixture = struct {
         self.wal = .empty;
         self.tmp = std.testing.tmpDir(.{});
         errdefer self.tmp.cleanup();
-        self.dir_path = try self.tmp.dir.realPathFileAlloc(
-            utils.context.g().io,
-            ".",
-            alloc,
-        );
+        self.dir_path = try zdb.vfs.tmpDirPath(alloc, &self.tmp);
         errdefer alloc.free(self.dir_path);
         self.store = try alloc.create(zdb.vfs.Store);
         errdefer alloc.destroy(self.store);

@@ -49,7 +49,7 @@ test "Sim: the pick replays from the seed and differs across seeds" {
     const seeds = [_]u64{ 7, 7, 8 };
     for (seeds, 0..) |seed, k| {
         var w: fiber.Worker = undefined;
-        var sim = try Sim.init(.{ .seed = seed });
+        var sim = try Sim.init(alloc, .{ .seed = seed });
         defer sim.deinit();
         try loadWorker(&w, alloc, fs);
         defer w.deinit();
@@ -71,7 +71,7 @@ test "Sim: priority and fifo picks keep high before normal" {
     var order: [8]u64 = undefined;
     for ([_]fiber.sim.Sched{ .priority_random, .priority_fifo }) |sched| {
         var w: fiber.Worker = undefined;
-        var sim = try Sim.init(.{ .seed = 3, .sched = sched });
+        var sim = try Sim.init(alloc, .{ .seed = 3, .sched = sched });
         defer sim.deinit();
         try loadWorker(&w, alloc, fs);
         defer w.deinit();
@@ -89,9 +89,9 @@ test "Sim: the trace hashes dispatch order, not addresses" {
     const alloc = std.testing.allocator;
     const fs = try makeFibers(alloc, 4);
     defer alloc.free(fs);
-    var a = try Sim.init(.{ .seed = 1 });
+    var a = try Sim.init(alloc, .{ .seed = 1 });
     defer a.deinit();
-    var b = try Sim.init(.{ .seed = 1 });
+    var b = try Sim.init(alloc, .{ .seed = 1 });
     defer b.deinit();
     for (fs) |*f| a.record(f);
     for (fs) |*f| b.record(f);

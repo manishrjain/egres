@@ -465,6 +465,20 @@ pub fn createDirPath(path: String) !void {
     try fs.submit(.create_dir_path, path);
 }
 
+/// A test's temp directory as an absolute path the VFS knows: it exists
+/// on the real disk, the simulated one learns of it here. Sentinel
+/// slice because realPathFileAlloc allocates len+1.
+pub fn tmpDirPath(
+    alloc: std.mem.Allocator,
+    tmp: *std.testing.TmpDir,
+) ![:0]u8 {
+    const io = utils.context.g().io;
+    const path = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    errdefer alloc.free(path);
+    try createDirPath(path);
+    return path;
+}
+
 /// Recursive delete.
 pub fn deleteTree(path: String) !void {
     try fs.submit(.delete_tree, path);
@@ -476,6 +490,13 @@ pub fn renameFile(old_path: String, new_path: String) !void {
 
 pub fn deleteFile(path: String) !void {
     try fs.submit(.delete_file, path);
+}
+
+/// Set a file's modification time, whole seconds since the Unix epoch.
+/// For a test that ages a file without waiting: the orphan scans judge
+/// by mtime.
+pub fn setMtime(path: String, mtime_s: i64) !void {
+    try fs.submit(.set_mtime, .{ .path = path, .mtime_s = mtime_s });
 }
 
 /// Best-effort directory fsync so newly created filenames are durable.

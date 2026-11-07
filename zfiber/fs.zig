@@ -8,7 +8,7 @@
 //!     `pwrite` submitted to the current worker's libxev loop; the fiber
 //!     parks and the completion callback wakes it. Fully async.
 //!   - **Blocking ops** (`sync`, `set_size`, `open`, and the path ops
-//!     access/rename/delete/mkdir/rmtree/list): libxev can't do these
+//!     access/rename/delete/mkdir/rmtree/list/set_mtime): libxev can't do these
 //!     async, so they run on the `fsops` thread pool — the fiber parks, a
 //!     pool thread runs the syscall and wakes it. The worker thread stays
 //!     free, and the big path-buffer frames run on the pool thread's
@@ -19,8 +19,8 @@
 //!
 //! `vfs` is the typed face over `submit` and its only caller: nothing
 //! above this file calls `std.Io.Dir`, `std.posix` or a raw syscall for
-//! a file, so one function sees every file operation. That is what lets
-//! the simulation's disk replace the real one.
+//! a file, so one function sees every file operation. Under a sim that
+//! function hands every op to `simdisk.zig` instead of the kernel.
 //!
 //! The blocking/instant syscalls go through `std.Io.File`/`std.Io.Dir`
 //! on the pool's blocking `std.Io` (`fsops.io()`) rather than raw
@@ -75,6 +75,7 @@ pub const Op = union(enum) {
     delete_tree: String,
     list: List,
     fs_magic: String,
+    set_mtime: SetMtime,
 
     pub const Tag = std.meta.Tag(Op);
 
@@ -97,41 +98,42 @@ pub const Op = union(enum) {
     };
     pub const Rename = struct { old_path: String, new_path: String };
     pub const List = struct { alloc: Allocator, path: String };
+    /// Whole seconds since the Unix epoch, the scale `Stat.mtime_s` is.
+    pub const SetMtime = struct { path: String, mtime_s: i64 };
 };
 
-/// What `submit(tag, ...)` returns, error set included: the type of the
-/// real implementation, so every backend answers in the same shape.
+/// What `submit(tag, ...)` returns. Any error: the real disk answers
+/// with std's and libxev's names, the simulated one with its own, and
+/// no set borrowed from either library holds both.
 pub fn Result(comptime tag: Op.Tag) type {
     return switch (tag) {
-        .read => ReturnOf(readImpl),
-        .write => ReturnOf(writeImpl),
-        .read_batch => ReturnOf(readBatchImpl),
-        .sync => ReturnOf(syncImpl),
-        .set_size => ReturnOf(setSizeImpl),
-        .stat => ReturnOf(statImpl),
-        .close => ReturnOf(closeImpl),
-        .device => ReturnOf(deviceImpl),
-        .advise_random => ReturnOf(adviseRandomImpl),
-        .no_cache => ReturnOf(noCacheImpl),
-        .open => ReturnOf(openImpl),
-        .access => ReturnOf(accessImpl),
-        .rename => ReturnOf(renameImpl),
-        .delete_file => ReturnOf(deleteFileImpl),
-        .create_dir_path => ReturnOf(createDirPathImpl),
-        .delete_tree => ReturnOf(deleteTreeImpl),
-        .list => ReturnOf(listImpl),
-        .fs_magic => ReturnOf(fsMagicImpl),
+        .read, .write => anyerror!usize,
+        .stat => anyerror!Stat,
+        .device => anyerror!u64,
+        .open => anyerror!File,
+        .list => anyerror![]Entry,
+        .read_batch,
+        .sync,
+        .set_size,
+        .access,
+        .rename,
+        .delete_file,
+        .create_dir_path,
+        .delete_tree,
+        .set_mtime,
+        => anyerror!void,
+        .close, .advise_random, .no_cache => void,
+        .fs_magic => ?i64,
     };
-}
-
-fn ReturnOf(comptime func: anytype) type {
-    return @typeInfo(@TypeOf(func)).@"fn".return_type.?;
 }
 
 /// The one door: runs `tag` with `args` and returns its result. Must be
 /// called on a fiber (the data-plane and blocking ops park). The caller's
 /// slices stay valid across the park: a parked fiber's stack persists.
 pub fn submit(comptime tag: Op.Tag, args: Op.Args(tag)) Result(tag) {
+    if (_rt.simDisk()) |disk| {
+        return disk.apply(tag, args);
+    }
     switch (tag) {
         // Data plane: on this worker's libxev loop, parked on completion.
         .read => return readImpl(args),
@@ -147,6 +149,7 @@ pub fn submit(comptime tag: Op.Tag, args: Op.Args(tag)) Result(tag) {
         .create_dir_path => return _fsops.run(createDirPathImpl, .{args}),
         .delete_tree => return _fsops.run(deleteTreeImpl, .{args}),
         .list => return _fsops.run(listImpl, .{args}),
+        .set_mtime => return _fsops.run(setMtimeImpl, .{args}),
         // No disk I/O: inline.
         .stat => return statImpl(args),
         .close => return closeImpl(args),
@@ -173,7 +176,7 @@ pub const BatchOp = struct {
     file: File,
     buf: []u8,
     offset: u64,
-    result: xev.ReadError!usize = 0,
+    result: anyerror!usize = 0,
 };
 
 /// One directory entry: the name (owned by the caller's allocator) and
@@ -195,7 +198,7 @@ pub fn freeEntries(alloc: Allocator, entries: []const Entry) void {
 
 /// Async via libxev (io_uring submits the op directly; the epoll backend
 /// offloads to libxev's threadpool) — never blocks the worker thread.
-fn readImpl(op: Op.Read) xev.ReadError!usize {
+fn readImpl(op: Op.Read) !usize {
     const w = _rt.currentWorker();
     const f = w.current_fiber.?;
     const xf = xev.File.initFd(op.file.fd);
@@ -214,7 +217,7 @@ fn readImpl(op: Op.Read) xev.ReadError!usize {
     return waiter.result;
 }
 
-fn writeImpl(op: Op.Write) xev.WriteError!usize {
+fn writeImpl(op: Op.Write) !usize {
     const w = _rt.currentWorker();
     const f = w.current_fiber.?;
     const xf = xev.File.initFd(op.file.fd);
@@ -397,7 +400,7 @@ fn setSizeImpl(op: Op.SetSize) !void {
 
 /// The one open. CLOEXEC on every fd: a forked child (none today) must
 /// not inherit a WAL or an O_DIRECT handle.
-fn openImpl(op: Op.Open) std.posix.OpenError!File {
+fn openImpl(op: Op.Open) !File {
     var flags = op.flags;
     if (@hasField(std.posix.O, "CLOEXEC")) flags.CLOEXEC = true;
     const fd = try std.posix.openat(
@@ -457,6 +460,15 @@ fn listImpl(op: Op.List) ![]Entry {
         try out.append(alloc, .{ .name = name, .kind = entry.kind });
     }
     return out.toOwnedSlice(alloc);
+}
+
+/// A test's way to age a file without waiting: the orphan scans judge
+/// by mtime.
+fn setMtimeImpl(op: Op.SetMtime) !void {
+    const ns: i96 = @as(i96, op.mtime_s) * std.time.ns_per_s;
+    return SioDir.cwd().setTimestamps(_fsops.io(), op.path, .{
+        .modify_timestamp = .{ .new = .{ .nanoseconds = ns } },
+    });
 }
 
 // ───────────────────────── Instant (inline) ─────────────────────────

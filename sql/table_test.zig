@@ -20,17 +20,13 @@ const schema = sql.schema;
 const row = sql.row;
 const Type = sql.Type;
 
-fn tmpPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![:0]u8 {
-    return tmp.dir.realPathFileAlloc(utils.context.g().io, ".", alloc);
-}
-
 // Write one catalog row per column into namespace `ns`'s catalog tree, keyed
 // (table_id, column_id) BE, then reconstruct the schema via loadTableSchema.
 test "sql.table: load reconstructs a user table's schema from catalog rows" {
     const alloc = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     const f_live = try flags.Live(Config).create(alloc, .{});
@@ -218,7 +214,7 @@ test "sql.table: load returns UndefinedTable when no catalog rows exist" {
     const alloc = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     const f_live = try flags.Live(Config).create(alloc, .{});

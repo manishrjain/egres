@@ -27,6 +27,33 @@ fn makeTempWalDir(alloc: std.mem.Allocator) ![]u8 {
     return alloc.dupe(u8, path);
 }
 
+/// Until the prepared log file's fill is done. A poll that parks, not
+/// a yield loop: under the simulation the fill's writes take virtual
+/// time, which only moves while nothing is runnable.
+fn awaitReady(next: *const raft.diskwal.NextLog) void {
+    while (!next.isReady()) fiber.sleepMs(1);
+}
+
+/// Raw bytes of a WAL file at `off`, through vfs: a test that corrupts
+/// or inspects one reaches the same disk the WAL wrote, simulated or
+/// real.
+fn writeAt(path: String, off: u64, data: String) !void {
+    const fh = try vfs.g().openFile(std.testing.allocator, path, .{
+        .flags = .{ .writable = true },
+    });
+    defer fh.close();
+    try fh.write(data, off);
+}
+
+fn readAt(path: String, off: u64, buf: []u8) !void {
+    const fh = try vfs.g().openFile(std.testing.allocator, path, .{});
+    defer fh.close();
+    const res = try fh.readAligned(std.testing.allocator, off, buf.len);
+    defer res.free();
+    if (res.data.len != buf.len) return error.ShortRead;
+    @memcpy(buf, res.data);
+}
+
 fn makeLogEntry(
     alloc: std.mem.Allocator,
     index: u64,
@@ -363,6 +390,71 @@ test "diskwal persists hardstate and entries across reopen" {
     }
 }
 
+test "diskwal: a crash keeps every synced entry and the hardstate" {
+    // Only the simulated disk can lose power.
+    const disk = fiber.simDisk() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+
+    {
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
+        defer ds.deinit();
+        try ds.setHardState(.{ .current_term = 7, .voted_for = 2 });
+        try appendEntry(alloc, &ds, 1, 7, "a1");
+        try appendEntry(alloc, &ds, 2, 7, "a2");
+        try ds.sync();
+        // In flight at the power cut: may or may not be on disk.
+        try appendEntry(alloc, &ds, 3, 7, "a3");
+        try appendEntry(alloc, &ds, 4, 7, "a4");
+        disk.crash(wal_dir, .lose_all);
+    }
+
+    var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
+    defer ds2.deinit();
+    try std.testing.expect(ds2.lastIndex() >= 2);
+    try std.testing.expect(ds2.lastIndex() <= 4);
+    try std.testing.expectEqual(@as(?u64, 7), try ds2.term(2));
+    const hs = ds2.hardState();
+    try std.testing.expectEqual(@as(u64, 7), hs.current_term);
+    try std.testing.expectEqual(@as(u64, 2), hs.voted_for);
+}
+
+test "diskwal: the writer retries through disk faults" {
+    // Only the simulated disk fails on purpose.
+    const disk = fiber.simDisk() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+
+    {
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
+        defer ds.deinit();
+        // After the open, which must not fail, and off again before the
+        // close: the writer's retry loop is what is under test.
+        try disk.setFaults(wal_dir, .{
+            .write = 300,
+            .short_write = 300,
+            .sync = 300,
+        });
+        defer disk.setFaults(wal_dir, .{}) catch {};
+        try appendRange(alloc, &ds, 1, 40, 3);
+        try ds.sync();
+        try std.testing.expectEqual(@as(u64, 40), ds.lastIndex());
+    }
+
+    var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
+    defer ds2.deinit();
+    try std.testing.expectEqual(@as(u64, 40), ds2.lastIndex());
+    try std.testing.expectEqual(@as(?u64, 3), try ds2.term(40));
+}
+
 test "diskwal drops malformed trailing wal files on reopen" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
@@ -404,11 +496,7 @@ test "diskwal drops malformed trailing wal files on reopen" {
         // Corrupt the highest file's magic bytes.
         const bad_path = try std.fmt.allocPrint(alloc, "{s}/{d:0>5}.wal", .{ wal_dir, max_fid });
         defer alloc.free(bad_path);
-        const io = utils.context.g().io;
-        var file = try std.Io.Dir.cwd().openFile(io, bad_path, .{ .mode = .read_write });
-        defer file.close(io);
-        var garbage = [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF };
-        _ = try file.writePositionalAll(io, &garbage, 0);
+        try writeAt(bad_path, 0, &[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF });
     }
 
     // Reopen — the malformed current file should be dropped. The previous
@@ -577,15 +665,7 @@ test "diskwal rotated file with a torn header is rebuilt from its records" {
     // outgoing file leaves its header unwritten: zero the first file's.
     const first_path = try std.fmt.allocPrint(alloc, "{s}/00001.wal", .{wal_dir});
     defer alloc.free(first_path);
-    const io = utils.context.g().io;
-    {
-        var file = try std.Io.Dir.cwd().openFile(io, first_path, .{
-            .mode = .read_write,
-        });
-        defer file.close(io);
-        const zeros = [_]u8{0} ** 4096;
-        try file.writePositionalAll(io, &zeros, 0);
-    }
+    try writeAt(first_path, 0, &([_]u8{0} ** 4096));
 
     // Reopen: every entry is there, the first file's from a scan.
     {
@@ -605,10 +685,8 @@ test "diskwal rotated file with a torn header is rebuilt from its records" {
 
     // The scan wrote the header back, so the next open reads it.
     {
-        var file = try std.Io.Dir.cwd().openFile(io, first_path, .{});
-        defer file.close(io);
         var prefix: [zbuf.Frame.hdr_size]u8 = undefined;
-        _ = try file.readPositionalAll(io, &prefix, 0);
+        try readAt(first_path, 0, &prefix);
         try std.testing.expect(!std.mem.allEqual(u8, &prefix, 0));
     }
 }
@@ -645,7 +723,6 @@ test "diskwal rotated file left with its empty header is rebuilt too" {
         .{wal_dir},
     );
     defer alloc.free(first_path);
-    const io = utils.context.g().io;
     {
         const created = raft.diskwal.LogFile{
             .fid = 1,
@@ -660,11 +737,7 @@ test "diskwal rotated file left with its empty header is rebuilt too" {
         var page = [_]u8{0} ** 4096;
         @memcpy(page[0..frame.len], frame);
 
-        var file = try std.Io.Dir.cwd().openFile(io, first_path, .{
-            .mode = .read_write,
-        });
-        defer file.close(io);
-        try file.writePositionalAll(io, &page, 0);
+        try writeAt(first_path, 0, &page);
     }
 
     // Reopen: every entry is there, the first file's from a scan.
@@ -737,7 +810,6 @@ test "diskwal rotated file with no record at all is dropped at open" {
         second_name,
     );
     defer alloc.free(second_path);
-    const io = utils.context.g().io;
     {
         const created = raft.diskwal.LogFile{
             .fid = second_fid,
@@ -753,16 +825,8 @@ test "diskwal rotated file with no record at all is dropped at open" {
         @memcpy(page[0..frame.len], frame);
         const zeros = [_]u8{0} ** 4096;
 
-        var file = try std.Io.Dir.cwd().openFile(io, second_path, .{
-            .mode = .read_write,
-        });
-        defer file.close(io);
-        try file.writePositionalAll(io, &page, 0);
-        try file.writePositionalAll(
-            io,
-            &zeros,
-            raft.diskwal.log_file_offset,
-        );
+        try writeAt(second_path, 0, &page);
+        try writeAt(second_path, raft.diskwal.log_file_offset, &zeros);
     }
 
     // Reopen: the empty file is gone, and the log ends where the gap
@@ -1131,16 +1195,13 @@ test "diskwal CRC corruption truncates at corrupt entry" {
         // The current file is 00001.wal (no rotation happened).
         const current_path = try std.fmt.allocPrint(alloc, "{s}/00001.wal", .{wal_dir});
         defer alloc.free(current_path);
-        const io = utils.context.g().io;
-        var file = try std.Io.Dir.cwd().openFile(io, current_path, .{ .mode = .read_write });
-        defer file.close(io);
 
         // Read past the first two entries to find the 3rd entry's payload.
         const hdr_size: usize = zbuf.Frame.hdr_size;
         var offset: u64 = diskwal.log_file_offset;
         var hdr_buf: [zbuf.Frame.hdr_size]u8 = undefined;
         for (0..2) |_| {
-            _ = try file.readPositionalAll(utils.context.g().io, &hdr_buf, offset);
+            try readAt(current_path, offset, &hdr_buf);
             // u32 length lives at byte 8 of the prefix (after the u64 hash).
             const payload_len = std.mem.readInt(u32, hdr_buf[8..12], .little);
             offset += hdr_size + payload_len;
@@ -1148,9 +1209,9 @@ test "diskwal CRC corruption truncates at corrupt entry" {
         // Now offset points at the 3rd entry. Corrupt a byte in its payload.
         const corrupt_offset = offset + hdr_size + 1; // +1 to hit inside the payload
         var byte: [1]u8 = undefined;
-        _ = try file.readPositionalAll(utils.context.g().io, &byte, corrupt_offset);
+        try readAt(current_path, corrupt_offset, &byte);
         byte[0] ^= 0xFF; // flip all bits
-        _ = try file.writePositionalAll(utils.context.g().io, &byte, corrupt_offset);
+        try writeAt(current_path, corrupt_offset, &byte);
     }
 
     // Reopen — should recover only entries 1 and 2.
@@ -1596,7 +1657,7 @@ test "diskwal prepared log file: renamed in at rotation, a spare at open" {
         defer ds.deinit();
         // Prepare log file 2 as the sync fiber would, and let it finish.
         ds.wal_store.next.prepare();
-        while (!ds.wal_store.next.isReady()) fiber.yield();
+        awaitReady(&ds.wal_store.next);
         try std.testing.expect(try dirHas(wal_dir, "00002.wal.tmp"));
         try std.testing.expect(!try dirHas(wal_dir, "00002.wal"));
 
@@ -1703,7 +1764,7 @@ test "diskwal prepared log file: a late prepare never delays rotation" {
 
     // The prepared file, once ready, comes in under a fresh fid so
     // file order stays time order, and is filled.
-    while (!next.isReady()) fiber.yield();
+    awaitReady(next);
     var late = try next.swapIn();
     defer late.deinit();
     try std.testing.expectEqual(@as(u64, 4), late.fid);
@@ -1733,7 +1794,7 @@ test "diskwal: an unfilled log file rotates once the prepared one is ready" {
     try std.testing.expectEqual(@as(usize, 1), try countWalFiles(wal_dir));
     ds.wal_store.current.filled = false;
     ds.wal_store.next.prepare();
-    while (!ds.wal_store.next.isReady()) fiber.yield();
+    awaitReady(&ds.wal_store.next);
     try appendRange(alloc, &ds, 4, 4, 1);
     try ds.sync();
     try std.testing.expectEqual(@as(usize, 2), try countWalFiles(wal_dir));
@@ -1751,7 +1812,7 @@ fn appendPrepared(
     index: u64,
 ) !void {
     ds.wal_store.next.prepare();
-    while (!ds.wal_store.next.isReady()) fiber.yield();
+    awaitReady(&ds.wal_store.next);
     fillLargePayload(payload, index);
     try appendEntry(alloc, ds, index, 1, payload);
 }
@@ -1799,7 +1860,7 @@ test "diskwal: a trimmed log file is reused, its old records unread" {
         }
         try ds.sync();
         // The prepare after 16 takes the other pooled file.
-        while (!ds.wal_store.next.isReady()) fiber.yield();
+        awaitReady(&ds.wal_store.next);
         try std.testing.expect(try dirHas(wal_dir, "00006.wal"));
         try std.testing.expect(!try dirHas(wal_dir, "00002.wal.tmp"));
         try std.testing.expectEqual(@as(usize, 0), spares.items.len);
@@ -1812,12 +1873,9 @@ test "diskwal: a trimmed log file is reused, its old records unread" {
         const stale_at: u64 = slot.data_offset + frame_len;
         const path = try std.fmt.allocPrint(alloc, "{s}/00006.wal", .{wal_dir});
         defer alloc.free(path);
-        const io = utils.context.g().io;
-        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
-        defer file.close(io);
         const frame = try alloc.alloc(u8, @intCast(frame_len));
         defer alloc.free(frame);
-        _ = try file.readPositionalAll(io, frame, stale_at);
+        try readAt(path, stale_at, frame);
         const stale = try zen.LogEntryReader.parseRoot(
             try zbuf.Frame.read(frame),
         );
@@ -1932,7 +1990,7 @@ test "diskwal: spare log files are taken up again after a restart" {
     // another.
     try appendPrepared(alloc, &ds, payload, 13);
     try ds.sync();
-    while (!next.isReady()) fiber.yield();
+    awaitReady(next);
     try std.testing.expectEqual(@as(usize, 3), try countWalFiles(wal_dir));
     try std.testing.expectEqual(@as(usize, 1), next.spares.items.len);
     try std.testing.expectEqual(@as(u64, 13), ds.lastIndex());

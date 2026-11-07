@@ -59,8 +59,7 @@ fn benchOne(
     // concurrent `zig build bench` invocations don't collide.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const io = utils.context.g().io;
-    const dir = try tmp.dir.realPathFileAlloc(io, ".", b.alloc);
+    const dir = try vfs.tmpDirPath(b.alloc, &tmp);
     defer b.alloc.free(dir);
 
     var dwal = try diskwal.DiskWAL.openPath(dir, b.alloc, .{ .cache_len = 0 });
@@ -282,7 +281,6 @@ fn benchLoad(b: *Bench, batch_size: u32, mode: Compress) !void {
 
     // The WAL goes under EGRES_BENCH_DIR when it is set, so the cells
     // can be pointed at the disk in question; else a temp dir here.
-    const io = utils.context.g().io;
     var tmp: ?std.testing.TmpDir = null;
     defer if (tmp) |*t| t.cleanup();
     const dir = if (utils.context.g().env("EGRES_BENCH_DIR")) |root| blk: {
@@ -296,7 +294,7 @@ fn benchLoad(b: *Bench, batch_size: u32, mode: Compress) !void {
         break :blk path;
     } else blk: {
         tmp = std.testing.tmpDir(.{});
-        break :blk try tmp.?.dir.realPathFileAlloc(io, ".", b.alloc);
+        break :blk try vfs.tmpDirPath(b.alloc, &tmp.?);
     };
     defer b.alloc.free(dir);
     defer if (tmp == null) vfs.deleteTree(dir) catch {};

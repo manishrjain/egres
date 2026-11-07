@@ -42,11 +42,7 @@ const Fixture = struct {
     fn setup(rows: []const zdb.kv.Item) !Fixture {
         var tmp = std.testing.tmpDir(.{});
         errdefer tmp.cleanup();
-        const dir_path = try tmp.dir.realPathFileAlloc(
-            utils.context.g().io,
-            ".",
-            testing.allocator,
-        );
+        const dir_path = try zdb.vfs.tmpDirPath(testing.allocator, &tmp);
         errdefer testing.allocator.free(dir_path);
         const store = try testing.allocator.create(zdb.vfs.Store);
         errdefer testing.allocator.destroy(store);

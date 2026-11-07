@@ -35,6 +35,8 @@ pub const Runtime = _rt.Runtime;
 pub const InitOptions = _rt.InitOptions;
 // Deterministic simulation mode: `InitOptions.sim`, `Runtime.simState`.
 pub const sim = @import("sim.zig");
+pub const simdisk = @import("simdisk.zig");
+pub const simDisk = _rt.simDisk;
 pub const Deadlines = _rt.Deadlines;
 pub const Timeout = _rt.Timeout;
 pub const Stats = _rt.Stats;

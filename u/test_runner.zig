@@ -242,6 +242,8 @@ const Args = struct {
     /// tests without real I/O print the same one (scripts/sim_check.sh).
     sim_seed: ?u64 = null,
     sim_sched: fiber.sim.Sched = .random,
+    /// `--sim-faults`: every disk fault kind at this rate per thousand.
+    sim_faults: u16 = 0,
     /// Watchdog tunables. `wd_stuck_tick_s` is one knob serving two
     /// purposes — dump threshold AND tick interval — so cadence is
     /// always one-dump-per-window. `wd_kill_s = 0` disables the kill.
@@ -376,6 +378,8 @@ const help_text =
     \\                      virtual time. Prints the dispatch trace hash.
     \\  --sim-sched <S>     The sim's pick: random, priority_random,
     \\                      priority_fifo.
+    \\  --sim-faults <N>    Every simulated disk fault at N per thousand
+    \\                      ops; the unit suite expects 0.
     \\  --verbose           Print "STARTING <name>" before each test (debug wedges).
     \\  --workers           Print the per-worker CPU / wake-path dump after the summary.
     \\  --wd-stuck-tick-s <N> Watchdog: dump threshold AND tick interval, seconds (default 20).
@@ -428,6 +432,9 @@ fn parseArgs(alloc: std.mem.Allocator) !Args {
                 );
                 std.process.exit(2);
             };
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--sim-faults") and i + 1 < argv.len) {
+            args.sim_faults = try std.fmt.parseInt(u16, argv[i + 1], 10);
             i += 1;
         } else if (std.mem.eql(u8, a, "--guard")) {
             args.guard = true;
@@ -1247,8 +1254,8 @@ pub fn main(init: std.process.Init) !void {
     const fiber_workers: usize =
         std.Thread.getCpuCount() catch @as(usize, args.parallel);
     if (args.sim_seed) |seed| std.debug.print(
-        "[sim] seed={d} sched={s}: one worker, virtual time\n",
-        .{ seed, @tagName(args.sim_sched) },
+        "[sim] seed={d} sched={s} faults={d}: one worker, virtual time\n",
+        .{ seed, @tagName(args.sim_sched), args.sim_faults },
     );
 
     // `--guard`: page-isolate the runtime allocator so a dangling/overflow write
@@ -1271,6 +1278,7 @@ pub fn main(init: std.process.Init) !void {
         .sim = if (args.sim_seed) |seed| .{
             .seed = seed,
             .sched = args.sim_sched,
+            .disk_faults = fiber.simdisk.Faults.all(args.sim_faults),
         } else null,
     });
     defer fiber_rt.deinit();

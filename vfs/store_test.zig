@@ -7,15 +7,11 @@ const utils = @import("utils");
 const vfs = @import("vfs");
 const fiber = @import("zfiber");
 
-fn tmpPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![:0]u8 {
-    return tmp.dir.realPathFileAlloc(utils.context.g().io, ".", alloc);
-}
-
 test "store: file backend put/get/exists/delete round-trip" {
     const alloc = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmpPath(alloc, &tmp);
+    const root = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(root);
     const depot = try std.fmt.allocPrint(alloc, "{s}/depot", .{root});
     defer alloc.free(depot);
@@ -72,7 +68,7 @@ test "store: file probeRead times an O_DIRECT ranged read" {
     const alloc = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmpPath(alloc, &tmp);
+    const root = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(root);
     const depot = try std.fmt.allocPrint(alloc, "{s}/depot", .{root});
     defer alloc.free(depot);

@@ -90,8 +90,8 @@ pub fn authorization(
     defer if (session_token != null) a.free(token_hdr);
     const canonical = try std.fmt.allocPrint(a, "{s}\n{s}\n{s}\nhost:{s}\n" ++
         "x-amz-content-sha256:{s}\nx-amz-date:{s}\n{s}\n{s}\n{s}", .{
-        method,     path,      query,     host, payload_hash,
-        &amz.stamp, token_hdr, signed,    payload_hash,
+        method,     path,      query,  host,         payload_hash,
+        &amz.stamp, token_hdr, signed, payload_hash,
     });
     defer a.free(canonical);
 

@@ -55,6 +55,11 @@ here because the code does not make it obvious.
   `vtable`, or an enum switch as `vfs.Mode` is), not a comptime type
   parameter.
 - Never hash or order by pointer address.
+- Tests reach files through the VFS as well, fixtures and corruption
+  included: a file written with `std.Io` is invisible to the simulated
+  disk. A test that waits on another fiber polls with `sleepMs` or waits
+  on the primitive, never a `yield` loop: virtual time moves only while
+  nothing is runnable, so a spinner stops the clock.
 
 ## Logs
 

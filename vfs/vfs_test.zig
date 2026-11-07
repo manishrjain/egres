@@ -11,35 +11,17 @@ const bandwidth = vfs.bandwidth;
 const VFS = vfs.VFS;
 const page_size = vfs.page_size;
 
-// 0.16 helpers: thin wrappers around std.Io.Dir that inject the
-// process-wide `io` from `utils.context`. Keeps the per-test call sites
-// readable (no `io` parameter to thread).
-inline fn ioOf() std.Io {
-    return utils.context.g().io;
-}
-fn createFileAbs(path: String) !std.Io.File {
-    return std.Io.Dir.createFileAbsolute(ioOf(), path, .{});
-}
-fn openFileAbs(path: String) !std.Io.File {
-    return std.Io.Dir.openFileAbsolute(ioOf(), path, .{});
-}
-fn deleteFileAbs(path: String) !void {
-    return std.Io.Dir.deleteFileAbsolute(ioOf(), path);
-}
-fn accessAbs(path: String) !void {
-    return std.Io.Dir.accessAbsolute(ioOf(), path, .{});
-}
-inline fn nowMs() i64 {
-    return std.Io.Timestamp.now(ioOf(), .real).toMilliseconds();
-}
-
 // ── Helpers ──────────────────────────────────────────────────────────
+//
+// Every file a test sets up or checks goes through vfs too, so the test
+// reaches the disk the code under test used, simulated or real.
+
+inline fn nowMs() i64 {
+    return utils.timestampNow(.realtime, .millis);
+}
 
 fn writeTempFile(path: String, data: String) !void {
-    const io = ioOf();
-    const file = try createFileAbs(path);
-    defer file.close(io);
-    try file.writeStreamingAll(io, data);
+    try vfs.writeFile(path, data);
 }
 
 // ── 1. Open / close round-trip ───────────────────────────────────────
@@ -47,7 +29,7 @@ fn writeTempFile(path: String, data: String) !void {
 test "open and close" {
     const path = "/tmp/vfs_test_open_close";
     try writeTempFile(path, "hello world");
-    defer deleteFileAbs(path) catch {};
+    defer vfs.deleteFile(path) catch {};
 
     const v = vfs.g().*;
     const handle = try v.openFile(testing.allocator, path, .{ .mode = .direct });
@@ -65,7 +47,7 @@ test "readAligned at aligned offset" {
     var data: [8192]u8 = undefined;
     for (&data, 0..) |*b, i| b.* = @truncate(i);
     try writeTempFile(path, &data);
-    defer deleteFileAbs(path) catch {};
+    defer vfs.deleteFile(path) catch {};
 
     const v = vfs.g().*;
     const handle = try v.openFile(testing.allocator, path, .{ .mode = .direct });
@@ -87,7 +69,7 @@ test "readAligned at unaligned offset" {
     var data: [8192]u8 = undefined;
     for (&data, 0..) |*b, i| b.* = @truncate(i);
     try writeTempFile(path, &data);
-    defer deleteFileAbs(path) catch {};
+    defer vfs.deleteFile(path) catch {};
 
     const v = vfs.g().*;
     const handle = try v.openFile(testing.allocator, path, .{ .mode = .direct });
@@ -109,7 +91,7 @@ test "readAligned alignment math" {
     var data: [8192]u8 = undefined;
     for (&data, 0..) |*b, i| b.* = @truncate(i);
     try writeTempFile(path, &data);
-    defer deleteFileAbs(path) catch {};
+    defer vfs.deleteFile(path) catch {};
 
     const v = vfs.g().*;
     const handle = try v.openFile(testing.allocator, path, .{ .mode = .direct });
@@ -145,11 +127,11 @@ test "readAligned alignment math" {
 // Uses /data/egres/ which the project pins to ext4.
 test "O_DIRECT page-aligned write round-trips intact (content verified)" {
     const dir = "/data/egres";
-    accessAbs(dir) catch return error.SkipZigTest;
+    vfs.access(dir) catch return error.SkipZigTest;
 
     const path = dir ++ "/vfs_test_direct_aligned";
-    defer deleteFileAbs(path) catch {};
-    deleteFileAbs(path) catch {};
+    defer vfs.deleteFile(path) catch {};
+    vfs.deleteFile(path) catch {};
 
     // 16 MB + 1 page — page-aligned length, the size class where SST-write
     // corruption was once suspected. The buffer is page-aligned via
@@ -170,17 +152,11 @@ test "O_DIRECT page-aligned write round-trips intact (content verified)" {
     try wh.write(data, 0);
     wh.close();
 
-    // Read the file back through a plain (non-O_DIRECT) handle so we
+    // Read the file back through a plain (non-O_DIRECT) read so we
     // observe what's actually on disk, not whatever caches we skipped.
-    const io = ioOf();
-    const file = try openFileAbs(path);
-    defer file.close(io);
-    try testing.expectEqual(@as(u64, len), (try file.stat(io)).size);
-
-    const back = try testing.allocator.alloc(u8, len);
+    const back = try vfs.readFile(path, testing.allocator);
     defer testing.allocator.free(back);
-    const n = try file.readPositionalAll(io, back, 0);
-    try testing.expectEqual(len, n);
+    try testing.expectEqual(len, back.len);
 
     // Tail must survive: checksum bytes intact AND match the body.
     const stored_checksum = std.mem.readInt(u32, back[len - 4 ..][0..4], .little);
@@ -196,7 +172,7 @@ test "O_DIRECT fallback on tmpfs" {
     // VFS.openFile must succeed via the fallback path.
     const path = "/tmp/vfs_test_direct_fallback";
     try writeTempFile(path, "fallback test");
-    defer deleteFileAbs(path) catch {};
+    defer vfs.deleteFile(path) catch {};
 
     const v = vfs.g().*;
     const handle = try v.openFile(testing.allocator, path, .{ .mode = .direct });
@@ -219,7 +195,7 @@ test "bandwidth limiter deducts on read" {
     var data: [8192]u8 = undefined;
     @memset(&data, 0xFF);
     try writeTempFile(path, &data);
-    defer deleteFileAbs(path) catch {};
+    defer vfs.deleteFile(path) catch {};
 
     var limiter = bandwidth.Limiter.init(.{ .bytes_per_sec = 1_000_000 });
     var v = VFS.new(&limiter);
@@ -256,7 +232,7 @@ test "read bandwidth enforcement" {
     defer testing.allocator.free(data);
     @memset(data, 0xAB);
     try writeTempFile(path, data);
-    defer deleteFileAbs(path) catch {};
+    defer vfs.deleteFile(path) catch {};
 
     // The file is one second of the tenant's rate: the first read is
     // granted at once and owed, the second waits the debt out.
@@ -303,7 +279,7 @@ test "write bandwidth enforcement" {
     defer testing.allocator.free(data);
     @memset(data, 0xCD);
     try writeTempFile(path, data);
-    defer deleteFileAbs(path) catch {};
+    defer vfs.deleteFile(path) catch {};
 
     // 8192 pages/s at a write cost of 8: the 512-page write costs
     // 4096, half a second of the tenant's rate. The first is granted
@@ -351,19 +327,18 @@ test "write bandwidth enforcement" {
 test "batchRead 512 requests" {
     const alloc = testing.allocator;
     const path = "/tmp/vfs_test_batch_read";
-    defer deleteFileAbs(path) catch {};
+    defer vfs.deleteFile(path) catch {};
 
     // Write a 2 MiB file. Each page filled with a byte derived from page index.
     const num_pages = 512;
     {
-        const io = ioOf();
-        const file = try createFileAbs(path);
-        defer file.close(io);
-        var buf: [page_size]u8 = undefined;
+        const all = try alloc.alloc(u8, num_pages * page_size);
+        defer alloc.free(all);
         for (0..num_pages) |i| {
-            @memset(&buf, @intCast(i % 251)); // distinct fill per page (mod 251 to stay in u8)
-            try file.writeStreamingAll(io, &buf);
+            // Distinct fill per page; mod 251 stays in a u8.
+            @memset(all[i * page_size ..][0..page_size], @intCast(i % 251));
         }
+        try vfs.writeFile(path, all);
     }
 
     const v = vfs.g().*;
@@ -401,7 +376,7 @@ test "batchRead 512 requests" {
 test "openFile: a file charges the limiter of the VFS it opened through" {
     const path = "/tmp/vfs_test_handle_bw";
     try writeTempFile(path, "x");
-    defer deleteFileAbs(path) catch {};
+    defer vfs.deleteFile(path) catch {};
     var limiter = bandwidth.Limiter.init(.{ .bytes_per_sec = 1_000_000 });
     var v = VFS.new(&limiter);
     const handle = try v.openFile(testing.allocator, path, .{});

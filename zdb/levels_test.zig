@@ -50,13 +50,6 @@ fn compact(tree: *Tree, index: u64, snapshot_ts: u64) !void {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Returns the absolute path of a TmpDir (caller frees). Sentinel slice
-/// because realPathFileAlloc allocates len+1; declaring []u8 here would
-/// make the caller's free undercount by 1 (DebugAllocator catches it).
-fn tmpPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![:0]u8 {
-    return tmp.dir.realPathFileAlloc(utils.context.g().io, ".", alloc);
-}
-
 /// Builds a TableBuffer containing the given key/value pairs.
 /// Keys must be in sorted order (caller's responsibility).
 /// Each entry is (key_no_ts, ts, value).
@@ -506,7 +499,7 @@ test "levels: open" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
     var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
@@ -575,7 +568,7 @@ test "levels: pick compact level" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
     var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
@@ -635,7 +628,7 @@ test "levels: compact L0 L1" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
     var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
@@ -716,7 +709,7 @@ test "levels: compact L0 L1 with dest overlap" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
     var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
@@ -813,7 +806,7 @@ test "levels: an L0 push splits into a fiber per L1 range" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
     var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
@@ -893,7 +886,7 @@ test "levels: an L1 merge splits into a fiber per L2 range" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
     var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
@@ -999,7 +992,7 @@ test "levels: compact L1 L2" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
     var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
@@ -1095,7 +1088,7 @@ test "levels: get L0 shadows L1" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
     var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
@@ -1384,7 +1377,7 @@ test "compaction: a push that overlaps nothing below moves its oldest table" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     // Disjoint L0 tables of rows over an empty L1 that is not the
@@ -1423,7 +1416,7 @@ test "compaction: a unique index tree moves like a rows tree" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     // One row key per entry, no roaring chains: nothing a rewrite above
@@ -1447,7 +1440,7 @@ test "compaction: overlapping L0 tables are merged, not moved" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     // The oldest meets nothing in an empty L1 and moves; the next one
@@ -1488,7 +1481,7 @@ test "compaction: a table overlapping nothing below moves down a middle level" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     var fx: TombstoneFixture = undefined;
@@ -1512,7 +1505,7 @@ test "compaction: a push into the bottom level is rewritten, not moved" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     // The bottom rewrite is where the floor's discards happen, so it is
@@ -1553,7 +1546,7 @@ test "compaction: an L0 push that meets nothing in L1 is not held back by a full
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     const cfg = score_cfg;
@@ -1581,7 +1574,7 @@ test "compaction: an L0 push that overlaps L1 waits for room below" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     // L1's first table spans L0's keys, so the push would rewrite it.
@@ -1617,7 +1610,7 @@ test "compaction: an L0 merge with tables to spare runs ahead of L1" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     // Four small L0 tables where a merge takes three: the merge scores
@@ -1663,7 +1656,7 @@ test "compaction: a tree runs an L0 merge beside its L1 job" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     // As above: L0 holds a merge run, L1 is over its target.
@@ -1730,7 +1723,7 @@ test "compaction: a push with few tables scores by L0's bytes" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     // Two L0 tables against a start count of 32: 0.125 by count. They
@@ -1775,7 +1768,7 @@ test "compaction: L0 merges its small tables before a push that is due" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     // A 1 byte target: L0 is due a push whatever it holds. L1 is the
@@ -1831,7 +1824,7 @@ test "compaction: a level below L0 rewrites a run of adjacent tables" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     // Six adjacent L1 tables over one L2 table that spans them all. L2
@@ -1879,7 +1872,7 @@ test "compaction: a push takes L0 tables that add no L1 overlap" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     // Four L0 tables, each spanning the one L1 table: any push rewrites
@@ -1930,7 +1923,7 @@ test "compaction: a posting index's push is rewritten, not moved" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     // Its tables may hold roaring chains only a rewrite rolls up.
@@ -1953,7 +1946,7 @@ test "compaction: bottom level drops a tombstone below the horizon and what it s
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     // max_levels=2 → L0's dest is L1, which IS the bottom level.
@@ -1977,7 +1970,7 @@ test "compaction: a tombstone above the horizon is retained with the state it sh
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     var fx: TombstoneFixture = undefined;
@@ -2014,7 +2007,7 @@ test "compaction: a non-bottom level never drops tombstones" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     // max_levels=4 → L0's dest is L1, and L2/L3 sit below it. An older
@@ -2040,7 +2033,7 @@ test "compaction: a put above the horizon survives a lower tombstone's drop" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     // The key is re-created after being deleted. Sort order is ts descending.
@@ -2074,7 +2067,7 @@ test "compaction: dropping one primary does not disturb its neighbours" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     // "j" and "m" bracket the dropped primary: the skip must end when the
@@ -2111,7 +2104,7 @@ test "compaction: bottom level drops shadowed versions once they reach the horiz
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     // Three plain (no tombstone) versions of "k".
@@ -2148,7 +2141,7 @@ test "compaction: bottom level keeps a shadowed version above the horizon and co
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     var fx: TombstoneFixture = undefined;
@@ -2185,7 +2178,7 @@ test "compaction: a non-bottom level drops what a state below the horizon shadow
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     // max_levels=4 → L0's dest is L1, well above the bottom (L3). k@500
@@ -2214,7 +2207,7 @@ test "compaction: a non-bottom level keeps a shadowed version above the horizon 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     // The shadowing state k@500 is above the horizon (400), so a read at
@@ -2244,7 +2237,7 @@ test "compaction: a delta above the newest state is live, not stale" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     // Newest-first: a delta on top of a full state, with an older state beneath
@@ -2406,7 +2399,7 @@ test "compaction: rollup folds a delta chain onto its in-inputs state" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     const d300 = try encodeDelta(alloc, &.{40}, &.{2});
@@ -2466,7 +2459,7 @@ test "compaction: an L0 to L0 merge does not roll up" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     const d300 = try encodeDelta(alloc, &.{40}, &.{2});
@@ -2512,7 +2505,7 @@ test "compaction: rollup leaves lone states and baseless chains alone" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     const s100 = try encodeState(alloc, &.{ 7, 8 });
@@ -2551,7 +2544,7 @@ test "compaction: a mixed chain aborts the rollup and stays verbatim" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     const d300 = try encodeDelta(alloc, &.{5}, &.{});
@@ -2589,7 +2582,7 @@ test "compaction: an empty fold emits a roaring tombstone" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     const d200 = try encodeDelta(alloc, &.{}, &.{1});
@@ -2629,7 +2622,7 @@ test "compaction: bottom level collapses a rolled chain below the horizon" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     const d200 = try encodeDelta(alloc, &.{5}, &.{});
@@ -2683,7 +2676,7 @@ test "compaction: rollup gates — min_deltas and rollup_enabled" {
     {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        const dir_path = try tmpPath(alloc, &tmp);
+        const dir_path = try vfs.tmpDirPath(alloc, &tmp);
         defer alloc.free(dir_path);
         var fx: TombstoneFixture = undefined;
         try setupTreeWithCfg(
@@ -2709,7 +2702,7 @@ test "compaction: rollup gates — min_deltas and rollup_enabled" {
     {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        const dir_path = try tmpPath(alloc, &tmp);
+        const dir_path = try vfs.tmpDirPath(alloc, &tmp);
         defer alloc.free(dir_path);
         var fx: TombstoneFixture = undefined;
         try setupTreeWithCfg(
@@ -2785,7 +2778,7 @@ test "compaction: shadowed delta chains are never re-rolled" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     const s400 = try encodeState(alloc, &.{ 1, 5 });
@@ -2827,7 +2820,7 @@ test "compaction: read-below rolls a baseless chain onto a deep state" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     const d300 = try encodeDelta(alloc, &.{5}, &.{1});
@@ -2865,7 +2858,7 @@ test "compaction: max_deltas forces read-below even at L1" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     const d300 = try encodeDelta(alloc, &.{5}, &.{});
@@ -2910,7 +2903,7 @@ test "compaction: read-below with no state anywhere folds from empty" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     const d300 = try encodeDelta(alloc, &.{5}, &.{});
@@ -2953,7 +2946,7 @@ test "compaction: read-below declined by triggers or mixed chains" {
     {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        const dir_path = try tmpPath(alloc, &tmp);
+        const dir_path = try vfs.tmpDirPath(alloc, &tmp);
         defer alloc.free(dir_path);
         var fx: TombstoneFixture = undefined;
         try setupTreeMulti(alloc, &fx, dir_path, .{
@@ -2983,7 +2976,7 @@ test "compaction: read-below declined by triggers or mixed chains" {
     {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        const dir_path = try tmpPath(alloc, &tmp);
+        const dir_path = try vfs.tmpDirPath(alloc, &tmp);
         defer alloc.free(dir_path);
         var fx: TombstoneFixture = undefined;
         try setupTreeMulti(alloc, &fx, dir_path, .{
@@ -3011,7 +3004,7 @@ test "compaction: rollup folds a chain terminated by a tombstone" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
+    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
     const d300 = try encodeDelta(alloc, &.{9}, &.{});

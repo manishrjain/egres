@@ -12,10 +12,6 @@ const page = vfs.page_size;
 
 const chunk: u64 = 128 << 10;
 
-fn tmpPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![:0]u8 {
-    return tmp.dir.realPathFileAlloc(utils.context.g().io, ".", alloc);
-}
-
 /// A cache of `slots` chunks: the file header page, one page of slot
 /// records (128 fit), and the slots.
 fn config(path: String, slots: u64) ChunkCache.Config {
@@ -75,7 +71,7 @@ test "chunkcache: put then read, any offset, tail chunk, miss" {
     const alloc = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmpPath(alloc, &tmp);
+    const root = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(root);
     const path = try std.fmt.allocPrint(alloc, "{s}/slots", .{root});
     defer alloc.free(path);
@@ -115,7 +111,7 @@ test "chunkcache: restart restores slots; a bad page drops its chunk" {
     const alloc = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmpPath(alloc, &tmp);
+    const root = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(root);
     const path = try std.fmt.allocPrint(alloc, "{s}/slots", .{root});
     defer alloc.free(path);
@@ -147,15 +143,14 @@ test "chunkcache: restart restores slots; a bad page drops its chunk" {
     // 3, 2, 1 in order, so that chunk is slot 2; its page 17. Four
     // records fit one header page.
     {
-        const io = utils.context.g().io;
-        const f = try std.Io.Dir.openFileAbsolute(io, path, .{
-            .mode = .read_write,
+        const fh = try vfs.g().openFile(alloc, path, .{
+            .flags = .{ .writable = true },
         });
-        defer f.close(io);
+        defer fh.close();
         const data_off = page * 2 + 2 * chunk;
         var junk: [page]u8 = undefined;
         @memset(&junk, 0xee);
-        try f.writePositionalAll(io, &junk, data_off + 17 * page);
+        try fh.write(&junk, data_off + 17 * page);
     }
 
     // Reopen with no chunk size set: the file's wins.
@@ -197,7 +192,7 @@ test "chunkcache: eviction frees slots for new chunks" {
     const alloc = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmpPath(alloc, &tmp);
+    const root = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(root);
     const path = try std.fmt.allocPrint(alloc, "{s}/slots", .{root});
     defer alloc.free(path);
@@ -254,7 +249,7 @@ test "chunkcache: restart restores records across header pages" {
     const alloc = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmpPath(alloc, &tmp);
+    const root = try vfs.tmpDirPath(alloc, &tmp);
     defer alloc.free(root);
     const path = try std.fmt.allocPrint(alloc, "{s}/slots", .{root});
     defer alloc.free(path);

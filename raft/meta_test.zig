@@ -8,6 +8,7 @@
 // detection catches any forgotten frees.
 
 const std = @import("std");
+const fiber = @import("zfiber");
 const raft = @import("raft");
 const vfs = @import("vfs");
 const zen = raft.buffers;
@@ -25,14 +26,20 @@ fn makeTempMetaDir(alloc: std.mem.Allocator) ![]u8 {
 fn readStateBytes(alloc: std.mem.Allocator, dir: []const u8) ![]u8 {
     const path = try std.fs.path.join(alloc, &.{ dir, "state.bin" });
     defer alloc.free(path);
-    const f = try std.fs.cwd().openFile(path, .{});
-    defer f.close();
-    const stat = try f.stat();
-    const buf = try alloc.alloc(u8, stat.size);
-    errdefer alloc.free(buf);
-    const n = try f.readAll(buf);
-    if (n != stat.size) return error.ShortRead;
-    return buf;
+    return vfs.readFile(path, alloc);
+}
+
+/// Flip one byte of the file at `offset`, through vfs: the test reaches
+/// the same disk MetaStore wrote, simulated or real.
+fn flipByte(alloc: std.mem.Allocator, path: []const u8, offset: u64) !void {
+    const fh = try vfs.g().openFile(alloc, path, .{
+        .flags = .{ .writable = true },
+    });
+    defer fh.close();
+    const res = try fh.readAligned(alloc, offset, 1);
+    defer res.free();
+    const b = [_]u8{res.data[0] ^ 0xFF};
+    try fh.write(&b, offset);
 }
 
 /// Flip the first byte of the slot's CRC (offset = slot_idx * 4096).
@@ -40,20 +47,14 @@ fn readStateBytes(alloc: std.mem.Allocator, dir: []const u8) ![]u8 {
 fn corruptSlotCrc(alloc: std.mem.Allocator, dir: []const u8, slot_idx: u32) !void {
     const path = try std.fs.path.join(alloc, &.{ dir, "state.bin" });
     defer alloc.free(path);
-    const f = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-    defer f.close();
-    const offset: u64 = @as(u64, slot_idx) * 4096;
-    var b: [1]u8 = undefined;
-    _ = try f.preadAll(&b, offset);
-    b[0] ^= 0xFF;
-    _ = try f.pwriteAll(&b, offset);
+    try flipByte(alloc, path, @as(u64, slot_idx) * 4096);
 }
 
 test "meta: fresh open creates two valid slots with default HardState" {
     const alloc = std.testing.allocator;
     const dir = try makeTempMetaDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(dir) catch {};
+        vfs.deleteTree(dir) catch {};
         alloc.free(dir);
     }
 
@@ -71,11 +72,69 @@ test "meta: fresh open creates two valid slots with default HardState" {
     try std.testing.expectEqual(@as(u64, 2), ms.next_seq);
 }
 
+test "meta: a crash keeps the last hardstate and snapshot" {
+    // Only the simulated disk can lose power.
+    const disk = fiber.simDisk() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const dir = try makeTempMetaDir(alloc);
+    defer {
+        vfs.deleteTree(dir) catch {};
+        alloc.free(dir);
+    }
+
+    {
+        var ms = try meta.MetaStore.openPath(vfs.g(), dir, alloc);
+        defer ms.deinit();
+        try ms.setHardState(.{ .current_term = 9, .voted_for = 3 });
+        try ms.setSnapshot(.{
+            .index = 5,
+            .term = 1,
+            .data = "abc",
+            .conf_state = null,
+        });
+        disk.crash(dir, .lose_all);
+    }
+
+    var ms2 = try meta.MetaStore.openPath(vfs.g(), dir, alloc);
+    defer ms2.deinit();
+    try std.testing.expectEqual(@as(u64, 9), ms2.hardState().current_term);
+    try std.testing.expectEqual(@as(u64, 3), ms2.hardState().voted_for);
+    try std.testing.expectEqual(@as(u64, 5), ms2.snapshotState().index);
+}
+
+test "meta: a failed write leaves the last hardstate in place" {
+    // Only the simulated disk fails on purpose.
+    const disk = fiber.simDisk() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const dir = try makeTempMetaDir(alloc);
+    defer {
+        vfs.deleteTree(dir) catch {};
+        alloc.free(dir);
+    }
+
+    var ms = try meta.MetaStore.openPath(vfs.g(), dir, alloc);
+    defer ms.deinit();
+    try ms.setHardState(.{ .current_term = 4, .voted_for = 1 });
+
+    try disk.setFaults(dir, .{ .write = 1000 });
+    defer disk.setFaults(dir, .{}) catch {};
+    try std.testing.expectError(
+        error.InputOutput,
+        ms.setHardState(.{ .current_term = 5, .voted_for = 1 }),
+    );
+    try disk.setFaults(dir, .{});
+    try std.testing.expectEqual(@as(u64, 4), ms.hardState().current_term);
+
+    var ms2 = try meta.MetaStore.openPath(vfs.g(), dir, alloc);
+    defer ms2.deinit();
+    try std.testing.expectEqual(@as(u64, 4), ms2.hardState().current_term);
+}
+
 test "meta: setHardState round-trip survives reopen" {
     const alloc = std.testing.allocator;
     const dir = try makeTempMetaDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(dir) catch {};
+        vfs.deleteTree(dir) catch {};
         alloc.free(dir);
     }
 
@@ -103,7 +162,7 @@ test "meta: setHardState alternates slots" {
     const alloc = std.testing.allocator;
     const dir = try makeTempMetaDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(dir) catch {};
+        vfs.deleteTree(dir) catch {};
         alloc.free(dir);
     }
 
@@ -139,7 +198,7 @@ test "meta: torn write to newer slot recovers older value" {
     const alloc = std.testing.allocator;
     const dir = try makeTempMetaDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(dir) catch {};
+        vfs.deleteTree(dir) catch {};
         alloc.free(dir);
     }
 
@@ -174,7 +233,7 @@ test "meta: both slots corrupt returns MetaCorrupt" {
     const alloc = std.testing.allocator;
     const dir = try makeTempMetaDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(dir) catch {};
+        vfs.deleteTree(dir) catch {};
         alloc.free(dir);
     }
 
@@ -195,7 +254,7 @@ test "meta: setSnapshot round-trip survives reopen" {
     const alloc = std.testing.allocator;
     const dir = try makeTempMetaDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(dir) catch {};
+        vfs.deleteTree(dir) catch {};
         alloc.free(dir);
     }
 
@@ -236,7 +295,7 @@ test "meta: stale snapshot.tmp is cleaned on reopen" {
     const alloc = std.testing.allocator;
     const dir = try makeTempMetaDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(dir) catch {};
+        vfs.deleteTree(dir) catch {};
         alloc.free(dir);
     }
 
@@ -249,9 +308,10 @@ test "meta: stale snapshot.tmp is cleaned on reopen" {
     // Plant a garbage snapshot.tmp simulating a crashed setSnapshot.
     const tmp_path = try std.fs.path.join(alloc, &.{ dir, "snapshot.tmp" });
     defer alloc.free(tmp_path);
-    const tmp_file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
-    try tmp_file.writeAll("garbage that doesn't parse as a valid Snapshot");
-    tmp_file.close();
+    try vfs.writeFile(
+        tmp_path,
+        "garbage that doesn't parse as a valid Snapshot",
+    );
 
     // Reopen — should silently delete the stale tmp.
     {
@@ -260,15 +320,14 @@ test "meta: stale snapshot.tmp is cleaned on reopen" {
     }
 
     // tmp should now be gone.
-    const access_err = std.fs.cwd().access(tmp_path, .{});
-    try std.testing.expectError(error.FileNotFound, access_err);
+    try std.testing.expectError(error.FileNotFound, vfs.access(tmp_path));
 }
 
 test "meta: corrupt snapshot.bin returns SnapshotCorrupt" {
     const alloc = std.testing.allocator;
     const dir = try makeTempMetaDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(dir) catch {};
+        vfs.deleteTree(dir) catch {};
         alloc.free(dir);
     }
 
@@ -287,12 +346,7 @@ test "meta: corrupt snapshot.bin returns SnapshotCorrupt" {
     // Flip a byte in the CRC at offset 0 of snapshot.bin.
     const snap_path = try std.fs.path.join(alloc, &.{ dir, "snapshot.bin" });
     defer alloc.free(snap_path);
-    const f = try std.fs.cwd().openFile(snap_path, .{ .mode = .read_write });
-    defer f.close();
-    var b: [1]u8 = undefined;
-    _ = try f.preadAll(&b, 0);
-    b[0] ^= 0xFF;
-    _ = try f.pwriteAll(&b, 0);
+    try flipByte(alloc, snap_path, 0);
 
     try std.testing.expectError(
         meta.Error.SnapshotCorrupt,
