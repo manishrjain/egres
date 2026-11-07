@@ -437,6 +437,12 @@ pub fn statement(alloc: std.mem.Allocator, sql: String) parser.ParseError!Stmt {
     // below never parks (see pgwire.parser).
     const tree = try parser.parse(alloc, sql, null);
     defer tree.deinit();
+    // Only one is run, so the rest would be dropped with the client
+    // told the message succeeded: refuse it before any of it runs.
+    if (tree.count() > 1) return invalid(
+        "several statements in one message are not supported, " ++
+            "send them one at a time",
+    );
     const node = tree.statement(0) orelse return .unsupported;
 
     // CREATE and DROP DATABASE are their own kinds, both carrying the

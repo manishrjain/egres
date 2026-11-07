@@ -19,7 +19,7 @@ A statement Egres recognises but does not run yet returns a Postgres error with 
 
 | Feature | Status | Notes |
 |---|---|---|
-| Simple query protocol | Yes | One statement per message. A message with several statements separated by `;` runs the first one only. |
+| Simple query protocol | Yes | One statement per message. A message with several statements separated by `;` is refused with `0A000` before any of them runs. |
 | Extended query protocol (`Parse`, `Bind`, `Describe`, `Execute`, `Close`, `Sync`, `Flush`) | Yes | Each session caches its parsed statements by SQL text. A statement's `Describe` types a `$n` in a target by what `Parse` declared; undeclared, it takes its operand's type, or text on its own. `ParameterDescription` echoes the declared types and infers none. |
 | `$1`-style parameters | Yes | In `WHERE`, `SET` and `VALUES`, up to `$65535`. |
 | Parameters in text format | Yes | Any column type. |

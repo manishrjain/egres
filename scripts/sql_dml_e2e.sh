@@ -194,6 +194,10 @@ expect "cannot insert egid" "not supported" q "INSERT INTO t (egid, name) VALUES
 # --- error paths -----------------------------------------------------------
 expect "unknown table" "does not exist" q "SELECT * FROM nope;"
 expect "unknown column" "does not exist" q "SELECT bogus FROM t;"
+# psql -c sends both as one Query message: refused whole, neither runs.
+expect "several statements refused" "one at a time" \
+    q "INSERT INTO t (name) VALUES ('x'); INSERT INTO t (name) VALUES ('y');"
+expect "no statement of the refused message ran" "(3 rows)" q "SELECT * FROM t;"
 
 # --- restart: rows persist, egid stays monotonic (no reuse) ----------------
 stop_server
