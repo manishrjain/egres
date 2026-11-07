@@ -242,9 +242,17 @@ fn worker(sh: *Shared, idx: usize) void {
                 const nonce: u8 = @truncate(next(&st));
                 for (&wbuf, 0..) |*x, i| x.* = nonce +% @as(u8, @truncate(i));
                 const off = @as(u64, idx) * io_block;
-                const nw = sh.io_file.write(&wbuf, off) catch |e|
+                const nw = fiber.fs.submit(.write, .{
+                    .file = sh.io_file,
+                    .data = &wbuf,
+                    .offset = off,
+                }) catch |e|
                     std.debug.panic("io write at {d}: {}", .{ off, e });
-                const nr = sh.io_file.read(&rbuf, off) catch |e|
+                const nr = fiber.fs.submit(.read, .{
+                    .file = sh.io_file,
+                    .buf = &rbuf,
+                    .offset = off,
+                }) catch |e|
                     std.debug.panic("io read at {d}: {}", .{ off, e });
                 if (nw != wbuf.len or nr != rbuf.len or !std.mem.eql(u8, &wbuf, &rbuf))
                     std.debug.panic("io round-trip mismatch at {d}: wrote {d} read {d}", .{ off, nw, nr });
@@ -358,11 +366,15 @@ fn driver(sh: *Shared) void {
     // One shared scratch file for the io_uring op (created from a fiber — the
     // create parks on the fsops pool). Set before any worker spawns; closed +
     // unlinked after g.wait() drains them all.
-    sh.io_file = fiber.Dir.cwd().createFile(io_path, .{}) catch |e|
+    sh.io_file = fiber.fs.submit(.open, .{
+        .path = io_path,
+        .flags = .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true },
+        .mode = 0o644,
+    }) catch |e|
         std.debug.panic("create io scratch {s}: {}", .{ io_path, e });
     defer {
-        sh.io_file.close();
-        fiber.Dir.cwd().deleteFile(io_path) catch {};
+        fiber.fs.submit(.close, sh.io_file);
+        fiber.fs.submit(.delete_file, io_path) catch {};
     }
 
     var g: fiber.Group(void) = .init(sh.allocator);

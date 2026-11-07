@@ -28,7 +28,7 @@ fn idFromName(basename: String) u64 {
 /// the index starts. This tool has no manifest to ask.
 fn probeExtent(
     allocator: std.mem.Allocator,
-    store: *vfs.RemoteStore,
+    store: *vfs.Store,
     name: String,
 ) !Table.Extent {
     const trailer_len = zdb.table.index.trailer_len;
@@ -51,7 +51,7 @@ fn probeExtent(
 
 fn verifyOne(
     allocator: std.mem.Allocator,
-    store: *vfs.RemoteStore,
+    store: *vfs.Store,
     base: String,
 ) bool {
     const extent = probeExtent(allocator, store, base) catch |err| {
@@ -145,7 +145,7 @@ pub fn main(init: std.process.Init) !void {
     // VFS still needs a bandwidth controller.
     vfs.VFS.initGlobal(.{ .bytes_per_sec = 500 * 1024 * 1024 });
     // The dir as a store, so tables open the way the server opens them.
-    var store = try vfs.RemoteStore.initFile(allocator, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(allocator, dir_path, vfs.g());
     defer store.deinit();
 
     var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });

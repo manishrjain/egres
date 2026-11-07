@@ -162,7 +162,7 @@ test "forest: open close empty" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     f.close();
@@ -183,7 +183,7 @@ test "forest: create tree and get" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -216,7 +216,7 @@ test "forest: create tree and get" {
 // Helper: build a minimal SST holding one key and put it in the store.
 fn buildAndWriteTable(
     alloc: std.mem.Allocator,
-    store: *vfs.RemoteStore,
+    store: *vfs.Store,
     file_id: u64,
     primary: String,
 ) !_manifest.Extent {
@@ -244,7 +244,7 @@ test "forest: split tree" {
     // splitter has a clean, evenly-sized Lmax to work with.
     const f_live = try flags.Live(Config).create(alloc, .{});
     defer f_live.destroy();
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -315,7 +315,7 @@ test "forest: split tree" {
 // the stored key is table-specific, and write it to disk.
 fn buildAndWriteTableKV(
     alloc: std.mem.Allocator,
-    store: *vfs.RemoteStore,
+    store: *vfs.Store,
     file_id: u64,
     key: Key,
     ts: u64,
@@ -343,7 +343,7 @@ test "forest: two-level routing isolates by table_id" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -426,7 +426,7 @@ test "forest: create_tree + drop_tree round-trip" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -494,7 +494,7 @@ test "forest: drop_ns removes every table and forgets the id counter" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -597,7 +597,7 @@ test "forest: drop_tree keeps an SST shared with another tree" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -676,7 +676,7 @@ test "forest: buildTables allocates and never reuses a dropped id" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -730,7 +730,7 @@ test "forest: buildNsCreate allocates global namespace ids" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -820,7 +820,7 @@ test "forest: branch_ns shares the files and forks the memtables as of its ts" {
 
     const f_live = try flags.Live(Config).create(alloc, .{});
     defer f_live.destroy();
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -990,7 +990,7 @@ test "forest: branch_table shares files and forks memtables as of its ts" {
 
     const f_live = try flags.Live(Config).create(alloc, .{});
     defer f_live.destroy();
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -1144,7 +1144,7 @@ test "forest: ns_create installs default + catalog trees, idempotent re-apply" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -1189,7 +1189,7 @@ test "forest: table names — create registers, duplicate rejects, drop frees" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -1262,7 +1262,7 @@ test "forest: snapshot manifest round-trip" {
 
     // One store for both forests: the source writes the SST, the
     // destination reads it.
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
 
     const bytes = blk: {
@@ -1507,7 +1507,7 @@ test "forest: routes to correct tree" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -1551,7 +1551,7 @@ test "forest: maxKey finds the largest row id (memtable), or null when empty" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -1612,7 +1612,7 @@ test "forest: maxKey counts a tombstoned max key" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -1676,7 +1676,7 @@ test "forest: meta survives put, flush to L0, compaction, and get" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -1786,7 +1786,7 @@ test "forest: a tombstone reads as absent" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -1846,7 +1846,7 @@ test "forest: snapshotTs rejects older reads and only moves forward" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -1898,7 +1898,7 @@ test "forest: a bottom-level compaction discards under the read floor" {
         },
     );
     defer f_live.destroy();
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -2046,7 +2046,7 @@ test "scan: by default emits one version per key and hides deleted keys" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -2076,7 +2076,7 @@ test "scan: num_versions returns extra versions but still stops at a tombstone" 
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -2113,7 +2113,7 @@ test "scan: include_deleted surfaces tombstones and the versions behind them" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -2156,7 +2156,7 @@ test "scan: num_versions caps deleted runs too" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -2190,7 +2190,7 @@ test "scan: num_versions 0 behaves as 1 rather than returning nothing" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -2213,7 +2213,7 @@ test "scan: max_rows bounds emitted items, not versions walked" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -2240,7 +2240,7 @@ test "scan: read_ts reports the world as of that timestamp" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -2283,7 +2283,7 @@ test "scan: min_ts emits only what changed after it" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -2383,7 +2383,7 @@ test "scan: versions above read_ts do not consume num_versions" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -2415,7 +2415,7 @@ test "scan: read_ts at the delete sees the key as gone" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -2441,7 +2441,7 @@ test "scan: rejects a read_ts below snapshotTs" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -2520,7 +2520,7 @@ test "cursor: agrees with scan under every option" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -2556,7 +2556,7 @@ test "cursor: null is sticky and emitted counts hand-outs" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -2602,7 +2602,7 @@ test "cursor: max_rows 0 opens exhausted without the min-read check" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -2654,7 +2654,7 @@ test "cursor: deinit mid-walk releases the sources" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -2687,7 +2687,7 @@ test "cursor: a flush between two next calls does not disturb the walk" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -2747,7 +2747,7 @@ test "cursor: pin_values holds handed-out values until releasePins" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -2904,7 +2904,7 @@ test "cursor: a split applied by another fiber mid-walk loses and repeats nothin
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -2960,7 +2960,7 @@ test "split: a reader holding the old tree keeps its full range until it lets go
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -3003,7 +3003,7 @@ test "cursor: hops across a split like scan does" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -3040,7 +3040,7 @@ test "cursor: reverse hops across a split from the upper tree down" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -3182,7 +3182,7 @@ test "forest: getBitmap folds deltas from memtable, L0, and history" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -3231,7 +3231,7 @@ test "forest: getBitmap tombstone resets, absent key is empty" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -3274,7 +3274,7 @@ test "forest: rollup is read-invariant across flush and compactions" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -3339,7 +3339,7 @@ test "forest: getBitmap rejects non-roaring chains and old reads" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -3390,7 +3390,7 @@ test "forest: index backfill installs bottom states below live deltas" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -3462,7 +3462,7 @@ fn putRow(f: *Forest, primary: String, ts: u64, value: String) !void {
 }
 
 /// Whether `id`'s SST is still in the store.
-fn sstExists(alloc: std.mem.Allocator, store: *vfs.RemoteStore, id: u64) !bool {
+fn sstExists(alloc: std.mem.Allocator, store: *vfs.Store, id: u64) !bool {
     const name = try zdb.sstName(alloc, id);
     defer alloc.free(name);
     return store.exists(name);
@@ -3517,7 +3517,7 @@ test "forest: deleteFiles unlinks compaction inputs at the retire index" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -3637,7 +3637,7 @@ test "table cache: a table loaded for an install survives an evict before it is 
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -3701,7 +3701,7 @@ test "forest: removeOrphans unlinks only unknown files at or before the cutoff" 
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -3817,7 +3817,7 @@ test "forest: evictTables evicts a compacted-away file; its blocks go with the t
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -3928,7 +3928,7 @@ test "forest: one flush covers every waiting memtable" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -3985,7 +3985,7 @@ test "forest: an L0 to L0 merge folds small tables into one and keeps L0's read 
         .{ .l0_merge_min_tables = 4 },
     );
     defer f_live.destroy();
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -4112,7 +4112,7 @@ test "buildFlush takes the oldest memtables up to job_max_bytes" {
         .job_max_bytes = 1,
     });
     defer f_live.destroy();
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -4166,7 +4166,7 @@ test "maxL0TableCountForKeys counts each key's own table" {
         .job_max_bytes = 1,
     });
     defer f_live.destroy();
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();

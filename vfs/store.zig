@@ -1,7 +1,7 @@
 // Copyright 2026 Manish R Jain
 // SPDX-License-Identifier: Apache-2.0
 
-//! RemoteStore — the store that holds every SST, backed by a FileStore
+//! The store that holds every SST, backed by a FileStore
 //! (a directory, local or a shared mount) or an S3Store. The creator
 //! uploads an object BEFORE proposing the manifest change that references
 //! it, so store durability precedes consensus; every node opens the same
@@ -25,7 +25,7 @@ const _lookahead = @import("lookahead.zig");
 
 pub const S3Config = _s3.S3Config;
 
-pub const RemoteStore = union(enum) {
+pub const Store = union(enum) {
     file: FileStore,
     s3: _s3.S3Store,
 
@@ -35,15 +35,15 @@ pub const RemoteStore = union(enum) {
         a: std.mem.Allocator,
         depot: String,
         vfs: *const _vfs.VFS,
-    ) !RemoteStore {
+    ) !Store {
         return .{ .file = try FileStore.init(a, depot, vfs) };
     }
 
-    pub fn initS3(a: std.mem.Allocator, cfg: S3Config) !RemoteStore {
+    pub fn initS3(a: std.mem.Allocator, cfg: S3Config) !Store {
         return .{ .s3 = try _s3.S3Store.init(a, cfg) };
     }
 
-    pub fn deinit(self: *RemoteStore) void {
+    pub fn deinit(self: *Store) void {
         switch (self.*) {
             .file => |*f| f.deinit(),
             .s3 => |*s| s.deinit(),
@@ -52,7 +52,7 @@ pub const RemoteStore = union(enum) {
 
     /// The file backend's depot path; empty for s3. For the callers that
     /// need a local device to probe (the `--io` calibration).
-    pub fn localPath(self: *const RemoteStore) String {
+    pub fn localPath(self: *const Store) String {
         return switch (self.*) {
             .file => |*f| f.depot,
             .s3 => "",
@@ -64,7 +64,7 @@ pub const RemoteStore = union(enum) {
     /// page-aligned and a page multiple — the file backend writes
     /// O_DIRECT and rejects anything else (error.UnalignedPut). SST
     /// buffers satisfy this by construction.
-    pub fn put(self: *RemoteStore, name: String, data: String) !void {
+    pub fn put(self: *Store, name: String, data: String) !void {
         switch (self.*) {
             .file => |*f| try f.put(name, data),
             .s3 => |*s| try s.put(name, data),
@@ -76,21 +76,21 @@ pub const RemoteStore = union(enum) {
     /// directory fsync — done here, once per batch, instead of per put.
     /// s3: no-op, every PUT is durable when the response arrives. Call
     /// after a batch of puts, before proposing changes that reference them.
-    pub fn sync(self: *RemoteStore) !void {
+    pub fn sync(self: *Store) !void {
         switch (self.*) {
             .file => |*f| f.sync(),
             .s3 => {},
         }
     }
 
-    pub fn exists(self: *RemoteStore, name: String) !bool {
+    pub fn exists(self: *Store, name: String) !bool {
         switch (self.*) {
             .file => |*f| return f.exists(name),
             .s3 => |*s| return s.exists(name),
         }
     }
 
-    pub fn delete(self: *RemoteStore, name: String) !void {
+    pub fn delete(self: *Store, name: String) !void {
         switch (self.*) {
             .file => |*f| try f.delete(name),
             .s3 => |*s| try s.delete(name),
@@ -100,7 +100,7 @@ pub const RemoteStore = union(enum) {
     /// Drop the object's chunks from the disk cache: it left the
     /// manifest, so no reader will ask for them again. The object
     /// itself stays until `delete`. Nothing to do for a file store.
-    pub fn forget(self: *RemoteStore, name: String) void {
+    pub fn forget(self: *Store, name: String) void {
         switch (self.*) {
             .file => {},
             .s3 => |*s| s.cache.forget(name),
@@ -110,7 +110,7 @@ pub const RemoteStore = union(enum) {
     /// One object's size and modification time. error.FileNotFound if
     /// absent. For a caller that needs a few objects out of a large
     /// store: `list(.stat)` stats every one.
-    pub fn stat(self: *RemoteStore, name: String) !_vfs.FileStat {
+    pub fn stat(self: *Store, name: String) !_vfs.FileStat {
         switch (self.*) {
             .file => |*f| return f.stat(name),
             .s3 => |*s| return s.stat(name),
@@ -126,7 +126,7 @@ pub const RemoteStore = union(enum) {
     /// and the partial puts inside it are skipped. The s3 backend pages
     /// through ListObjectsV2 under the configured prefix.
     pub fn list(
-        self: *RemoteStore,
+        self: *Store,
         alloc: std.mem.Allocator,
         detail: _vfs.ListDetail,
     ) ![]_vfs.ObjectInfo {
@@ -143,7 +143,7 @@ pub const RemoteStore = union(enum) {
     /// how the file backend opens the file (direct, mmap, ...); s3
     /// ignores it.
     pub fn open(
-        self: *RemoteStore,
+        self: *Store,
         name: String,
         size: u64,
         opts: _vfs.FileOptions,
@@ -163,7 +163,7 @@ pub const RemoteStore = union(enum) {
     /// per-request fixed cost — a network round trip for s3, syscall +
     /// device latency for file. Run by `--probe`, not at startup:
     /// nothing in the server consumes it.
-    pub fn calibrateLookahead(self: *RemoteStore, block_size: u64) !u64 {
+    pub fn calibrateLookahead(self: *Store, block_size: u64) !u64 {
         switch (self.*) {
             .file => |*f| return f.calibrateLookahead(block_size),
             .s3 => |*s| return s.calibrateLookahead(block_size),
@@ -172,7 +172,7 @@ pub const RemoteStore = union(enum) {
 
     /// The disk chunk cache in front of this store's reads; none for a
     /// file store, whose objects are already local.
-    pub fn chunkCache(self: *RemoteStore) ?*_vfs.ChunkCache {
+    pub fn chunkCache(self: *Store) ?*_vfs.ChunkCache {
         switch (self.*) {
             .file => return null,
             .s3 => |*s| return &s.cache,
@@ -316,7 +316,7 @@ pub const FileStore = struct {
         // overwrite it. The write runs at the caller's I/O class: the
         // flush or compaction whose output this is. The NAME's
         // durability (dir entry) is the caller's batch-level barrier:
-        // one RemoteStore.sync after all puts.
+        // one Store.sync after all puts.
         try _vfs.writeAndSync(
             tmp,
             data,
@@ -393,9 +393,9 @@ pub const FileStore = struct {
         const buf = try self.a.alignedAlloc(u8, _vfs.page_alignment, a_len);
         defer self.a.free(buf);
 
-        const f = fiber.File.fromFd(try _vfs.openDirect(path, .{ .mode = .direct }));
-        defer f.close();
-        const fsize = (try f.stat()).size;
+        const file = try _vfs.openDirect(path, .{ .mode = .direct });
+        defer fiber.fs.submit(.close, file);
+        const fsize = (try fiber.fs.submit(.stat, file)).size;
         if (a_off + a_len > fsize) return error.ShortRead;
 
         // The fixed-cost page: hashed from the (already random) offset so
@@ -406,8 +406,15 @@ pub const FileStore = struct {
         if (page_off >= a_off and page_off < a_off + a_len) {
             page_off = ((page_off + a_len) / _vfs.page_size % pages) * _vfs.page_size;
         }
+
         const t0 = utils.timestampNow(.monotonic, .nanos);
-        if (try f.read(buf[0.._vfs.page_size], page_off) != _vfs.page_size) return error.ShortRead;
+        const fixed = try fiber.fs.submit(.read, .{
+            .file = file,
+            .buf = buf[0.._vfs.page_size],
+            .offset = page_off,
+        });
+        if (fixed != _vfs.page_size) return error.ShortRead;
+
         const fixed_ns: u64 =
             @intCast(utils.timestampNow(.monotonic, .nanos) - t0);
         if (!_lookahead.verifyProbeData(page_off, buf[0.._vfs.page_size])) return error.BadProbeData;
@@ -415,7 +422,11 @@ pub const FileStore = struct {
         const t1 = utils.timestampNow(.monotonic, .nanos);
         var got: usize = 0;
         while (got < a_len) {
-            const n = try f.read(buf[got..], a_off + got);
+            const n = try fiber.fs.submit(.read, .{
+                .file = file,
+                .buf = buf[got..],
+                .offset = a_off + got,
+            });
             if (n == 0) return error.ShortRead;
             got += n;
         }

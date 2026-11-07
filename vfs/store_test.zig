@@ -11,7 +11,7 @@ fn tmpPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![:0]u8 {
     return tmp.dir.realPathFileAlloc(utils.context.g().io, ".", alloc);
 }
 
-test "remotestore: file backend put/get/exists/delete round-trip" {
+test "store: file backend put/get/exists/delete round-trip" {
     const alloc = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -20,7 +20,7 @@ test "remotestore: file backend put/get/exists/delete round-trip" {
     const depot = try std.fmt.allocPrint(alloc, "{s}/depot", .{root});
     defer alloc.free(depot);
 
-    var store = try vfs.RemoteStore.initFile(alloc, depot, vfs.g());
+    var store = try vfs.Store.initFile(alloc, depot, vfs.g());
     defer store.deinit();
 
     // Missing object: exists false, open fails.
@@ -65,7 +65,7 @@ test "remotestore: file backend put/get/exists/delete round-trip" {
     try testing.expect(!try store.exists("0001_000000000001.sst"));
 }
 
-test "remotestore: file probeRead times an O_DIRECT ranged read" {
+test "store: file probeRead times an O_DIRECT ranged read" {
     // The probe times a real read; virtual time does not move across
     // one, so the timings are 0 under the simulation.
     if (fiber.isSim()) return error.SkipZigTest;
@@ -77,7 +77,7 @@ test "remotestore: file probeRead times an O_DIRECT ranged read" {
     const depot = try std.fmt.allocPrint(alloc, "{s}/depot", .{root});
     defer alloc.free(depot);
 
-    var store = try vfs.RemoteStore.initFile(alloc, depot, vfs.g());
+    var store = try vfs.Store.initFile(alloc, depot, vfs.g());
     defer store.deinit();
 
     // A small probe-patterned object (position-dependent bytes from 0);

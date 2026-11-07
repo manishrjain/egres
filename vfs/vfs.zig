@@ -5,14 +5,15 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const fiber = @import("zfiber");
+const fs = fiber.fs;
 const utils = @import("utils");
 const String = utils.String;
 pub const bandwidth = @import("bandwidth.zig");
-pub const remotestore = @import("remotestore.zig");
-pub const RemoteStore = remotestore.RemoteStore;
+pub const store = @import("store.zig");
+pub const Store = store.Store;
 pub const ChunkCache = @import("chunkcache.zig").ChunkCache;
 pub const Chunk = @import("chunkcache.zig").Chunk;
-pub const Object = remotestore.Object;
+pub const Object = store.Object;
 pub const sigv4 = @import("sigv4.zig");
 pub const s3 = @import("s3.zig");
 pub const lookahead = @import("lookahead.zig");
@@ -114,12 +115,16 @@ pub const FileHandle = struct {
         const buf = try allocator.alignedAlloc(u8, page_alignment, aligned_size);
         errdefer allocator.free(buf);
 
-        const f = self.file.?;
+        const file = self.file.?;
         self.bw.grant(aligned_size, .read);
         var total_read: usize = 0;
         while (total_read < aligned_size) {
             const rest = buf[total_read..];
-            const n = try f.read(rest, aligned_offset + total_read);
+            const n = try fs.submit(.read, .{
+                .file = file,
+                .buf = rest,
+                .offset = aligned_offset + total_read,
+            });
             total_read += n;
             // A short read is the end of the file: one more at that
             // offset is an EOF error, not zero bytes.
@@ -162,7 +167,7 @@ pub const FileHandle = struct {
         data: String,
         offset: u64,
     ) !void {
-        const f = self.file.?;
+        const file = self.file.?;
 
         // O_DIRECT requires the buffer ADDRESS, LENGTH, and file OFFSET to all
         // be page-aligned. Every direct-mode writer is in-tree and hands us an
@@ -180,7 +185,11 @@ pub const FileHandle = struct {
         self.bw.grant(data.len, .write);
         var written: usize = 0;
         while (written < data.len) {
-            const n = try f.write(data[written..], offset + written);
+            const n = try fs.submit(.write, .{
+                .file = file,
+                .data = data[written..],
+                .offset = offset + written,
+            });
             if (n == 0) return error.WriteFailed;
             written += n;
         }
@@ -191,19 +200,20 @@ pub const FileHandle = struct {
     }
 
     pub fn sync(self: FileHandle) !void {
-        if (self.file) |f| f.sync(.{}) catch {};
+        const file = self.file orelse return;
+        fs.submit(.sync, .{ .file = file, .data_only = false }) catch {};
     }
 
     /// fdatasync, errors propagated: the data and the metadata needed
     /// to read it back are durable on return. The WAL's durability point
     /// (raft/diskwal.zig); a failure here must reach the caller.
     pub fn syncData(self: FileHandle) !void {
-        const f = self.file orelse return;
-        try f.sync(.{ .data_only = true });
+        const file = self.file orelse return;
+        try fs.submit(.sync, .{ .file = file, .data_only = true });
     }
 
     pub fn truncate(self: FileHandle, size: u64) !void {
-        try self.file.?.setSize(size);
+        try fs.submit(.set_size, .{ .file = self.file.?, .length = size });
     }
 
     pub fn close(self: FileHandle) void {
@@ -211,7 +221,7 @@ pub const FileHandle = struct {
             if (self.buf_allocator) |a| a.free(b);
             return; // memory-backed: no file to release
         }
-        if (self.file) |f| f.close();
+        if (self.file) |file| fs.submit(.close, file);
     }
 };
 
@@ -290,10 +300,10 @@ pub const VFS = struct {
         }
 
         // One BatchOp + page-aligned buffer per request, heap-allocated from
-        // the arena (fiber stacks are small). `preadBatch` submits them all
+        // the arena (fiber stacks are small). `read_batch` submits them all
         // in a single libxev submission, whatever files they name, and
         // parks once until every read completes.
-        const ops = try alloc.alloc(fiber.File.BatchOp, requests.len);
+        const ops = try alloc.alloc(fs.BatchOp, requests.len);
         const bufs = try alloc.alloc([]u8, requests.len);
 
         for (requests, 0..) |*req, i| {
@@ -311,7 +321,7 @@ pub const VFS = struct {
             };
         }
 
-        try fiber.fs.preadBatch(alloc, ops);
+        try fs.submit(.read_batch, .{ .alloc = alloc, .ops = ops });
 
         // Fill request .data fields from the aligned read buffers.
         for (requests, 0..) |*req, i| {
@@ -336,12 +346,12 @@ pub const VFS = struct {
     pub fn openFile(self: *const VFS, allocator: std.mem.Allocator, path: String, opts: FileOptions) !FileHandle {
         switch (opts.mode) {
             .default, .direct => {
-                const file = fiber.File.fromFd(try openDirect(path, opts));
-                errdefer file.close();
+                const file = try openDirect(path, opts);
+                errdefer fs.submit(.close, file);
 
                 return .{
                     .file = file,
-                    .file_size = try file.size(),
+                    .file_size = (try fs.submit(.stat, file)).size,
                     .vfs = self,
                     .bw = self.bw,
                     .direct = builtin.os.tag == .linux and opts.mode == .direct,
@@ -350,15 +360,19 @@ pub const VFS = struct {
             .memory => {
                 // Read once into a buffer through a plain fd, closed after:
                 // the handle owns the bytes, not a file.
-                const file = fiber.File.fromFd(try openDirect(path, .{}));
-                defer file.close();
+                const file = try openDirect(path, .{});
+                defer fs.submit(.close, file);
 
-                const file_size = try file.size();
+                const file_size = (try fs.submit(.stat, file)).size;
                 const buf = try allocator.alloc(u8, @intCast(file_size));
                 errdefer allocator.free(buf);
                 var off: usize = 0;
                 while (off < buf.len) {
-                    const n = try file.read(buf[off..], off);
+                    const n = try fs.submit(.read, .{
+                        .file = file,
+                        .buf = buf[off..],
+                        .offset = off,
+                    });
                     if (n == 0) return error.UnexpectedEof;
                     off += n;
                 }
@@ -385,17 +399,16 @@ pub const VFS = struct {
         if (builtin.os.tag == .linux and opts.mode == .direct) open_flags.DIRECT = true;
         if (opts.flags.dsync) open_flags.DSYNC = true;
 
-        // Offload the (potentially disk-blocking) open to the fsops pool via
-        // fiber.fs rather than syscalling on the worker thread. The O_DIRECT
-        // policy + tmpfs fallback stay here; only the syscall moves off-worker.
-        const fd = fiber.fs.openPosix(path, open_flags, 0o644) catch |err| switch (err) {
+        const file = fs.submit(.open, .{
+            .path = path,
+            .flags = open_flags,
+            .mode = 0o644,
+        }) catch |err| switch (err) {
             // tmpfs doesn't support O_DIRECT — fall back to plain open.
             error.BadPathName => return self.createFile(path, .{ .flags = opts.flags }),
             else => return err,
         };
-
-        const file = fiber.File.fromFd(fd);
-        if (opts.mode == .direct) file.noCache();
+        if (opts.mode == .direct) fs.submit(.no_cache, file);
 
         return .{
             .file = file,
@@ -410,9 +423,9 @@ pub const VFS = struct {
 /// The device (`st_dev`) holding the directory `path`: what tells
 /// directories on one disk from those on different ones.
 pub fn deviceOfPath(path: String) !u64 {
-    const file = fiber.File.fromFd(try openDirect(path, .{}));
-    defer file.close();
-    return file.device();
+    const file = try openDirect(path, .{});
+    defer fs.submit(.close, file);
+    return fs.submit(.device, file);
 }
 
 /// Create `path`, write `data` through the accounted FileHandle path,
@@ -440,37 +453,41 @@ pub fn writeAndSync(
 // accounting or O_DIRECT semantics. Production code, tests, and tools all
 // route through these so the project's "always use vfs" rule applies to
 // the whole filesystem surface, not just data-plane I/O. Each one is a
-// `fiber.Dir` op underneath: fiber.fs is the one layer that reaches the
+// `fiber.fs` op underneath: fiber.fs is the one layer that reaches the
 // kernel, and the one the simulation's disk replaces.
 
 pub fn access(path: String) !void {
-    try fiber.Dir.cwd().access(path, .{});
+    try fs.submit(.access, path);
 }
 
 /// Recursive mkdir -p.
 pub fn createDirPath(path: String) !void {
-    try fiber.Dir.cwd().createDirPath(path);
+    try fs.submit(.create_dir_path, path);
 }
 
 /// Recursive delete.
 pub fn deleteTree(path: String) !void {
-    try fiber.Dir.cwd().deleteTree(path);
+    try fs.submit(.delete_tree, path);
 }
 
 pub fn renameFile(old_path: String, new_path: String) !void {
-    try fiber.Dir.cwd().rename(old_path, fiber.Dir.cwd(), new_path);
+    try fs.submit(.rename, .{ .old_path = old_path, .new_path = new_path });
 }
 
 pub fn deleteFile(path: String) !void {
-    try fiber.Dir.cwd().deleteFile(path);
+    try fs.submit(.delete_file, path);
 }
 
 /// Best-effort directory fsync so newly created filenames are durable.
 /// Silently ignores errors (tmpfs, some network mounts don't support dir fsync).
 pub fn syncDir(path: String) void {
-    const dir = fiber.Dir.cwd().openDir(path) catch return;
-    defer dir.close();
-    dir.sync(.{}) catch {};
+    const file = fs.submit(.open, .{
+        .path = path,
+        .flags = .{ .ACCMODE = .RDONLY, .DIRECTORY = true },
+        .mode = 0,
+    }) catch return;
+    defer fs.submit(.close, file);
+    fs.submit(.sync, .{ .file = file, .data_only = false }) catch {};
 }
 
 /// Filesystem magic numbers (statfs `f_type`) that decide how a file is
@@ -486,7 +503,7 @@ pub const fs_magic = struct {
 /// The filesystem magic of `path` (statfs `f_type`), or null when it
 /// cannot be read; the numbers above are what it is compared with.
 pub fn fsMagic(path: String) ?i64 {
-    return fiber.fs.fsMagic(path);
+    return fs.submit(.fs_magic, path);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -501,25 +518,37 @@ pub fn fsMagic(path: String) ?i64 {
 /// file store renames these into place as upload targets, and a rename
 /// must never expose a name whose data could still be lost.
 pub fn writeFile(path: String, data: String) !void {
-    const f = try fiber.Dir.cwd().createFile(path, .{});
-    defer f.close();
+    const file = try fs.submit(.open, .{
+        .path = path,
+        .flags = .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true },
+        .mode = 0o644,
+    });
+    defer fs.submit(.close, file);
     var off: u64 = 0;
     while (off < data.len) {
-        off += try f.write(data[off..], off);
+        off += try fs.submit(.write, .{
+            .file = file,
+            .data = data[off..],
+            .offset = off,
+        });
     }
-    try f.sync(.{});
+    try fs.submit(.sync, .{ .file = file, .data_only = false });
 }
 
 /// Open and read the whole file. Caller owns the returned buffer.
 pub fn readFile(path: String, allocator: std.mem.Allocator) ![]u8 {
-    const f = try fiber.Dir.cwd().openFile(path, .{});
-    defer f.close();
-    const info = try f.stat();
+    const file = try openDirect(path, .{});
+    defer fs.submit(.close, file);
+    const info = try fs.submit(.stat, file);
     const buf = try allocator.alloc(u8, @intCast(info.size));
     errdefer allocator.free(buf);
     var off: u64 = 0;
     while (off < buf.len) {
-        const n = try f.read(buf[off..], off);
+        const n = try fs.submit(.read, .{
+            .file = file,
+            .buf = buf[off..],
+            .offset = off,
+        });
         if (n == 0) break;
         off += n;
     }
@@ -539,9 +568,9 @@ pub const FileStat = struct { size: u64, mtime_s: i64 };
 /// directory: `listFiles(.stat)` stats every entry, this one only what is
 /// asked.
 pub fn fileStat(path: String) !FileStat {
-    const f = try fiber.Dir.cwd().openFile(path, .{});
-    defer f.close();
-    const st = try f.stat();
+    const file = try openDirect(path, .{});
+    defer fs.submit(.close, file);
+    const st = try fs.submit(.stat, file);
     return .{ .size = st.size, .mtime_s = st.mtime_s };
 }
 
@@ -573,15 +602,15 @@ pub fn freeObjectInfos(alloc: std.mem.Allocator, infos: []const ObjectInfo) void
 /// Every regular file directly in `dir`. Anything that is not a regular
 /// file — a subdirectory, a symlink — is skipped, so a depot's `tmp/`
 /// staging directory never shows up. The one way to list a directory
-/// above zfiber: `fiber.Dir.list` is the readdir underneath, and only
+/// above zfiber: `fiber.fs`'s `list` is the readdir underneath, and only
 /// this function calls it. Caller releases the result with
 /// `freeObjectInfos`.
 ///
 /// With `.stat`, an entry that vanishes between the listing and its stat
 /// is dropped, not an error: a concurrent writer is allowed.
 pub fn listFiles(alloc: std.mem.Allocator, dir: String, detail: ListDetail) ![]ObjectInfo {
-    const entries = try fiber.Dir.cwd().list(alloc, dir);
-    defer fiber.freeDirEntries(alloc, entries);
+    const entries = try fs.submit(.list, .{ .alloc = alloc, .path = dir });
+    defer fs.freeEntries(alloc, entries);
 
     var out: std.ArrayList(ObjectInfo) = .empty;
     errdefer freeObjectInfos(alloc, out.toOwnedSlice(alloc) catch &.{});
@@ -613,27 +642,28 @@ pub fn listFiles(alloc: std.mem.Allocator, dir: String, detail: ListDetail) ![]O
 /// so this function's signature stays stable as new flags are added.
 /// Pub for the file store's calibration probe reads, which need O_DIRECT
 /// without a FileHandle's bandwidth accounting.
-pub fn openDirect(path: String, opts: FileOptions) !posix.fd_t {
+pub fn openDirect(path: String, opts: FileOptions) !fiber.File {
     const direct_io = opts.mode == .direct;
     const accmode: posix.ACCMODE = if (opts.flags.writable) .RDWR else .RDONLY;
     var flags: posix.O = .{ .ACCMODE = accmode };
     if (builtin.os.tag == .linux and direct_io) flags.DIRECT = true;
     if (opts.flags.dsync) flags.DSYNC = true;
 
-    // Offload to the fsops pool (see VFS.createFile) instead of a blocking
-    // openat on the fiber's worker thread.
-    const fd = fiber.fs.openPosix(path, flags, 0) catch |err| switch (err) {
+    const file = fs.submit(.open, .{
+        .path = path,
+        .flags = flags,
+        .mode = 0,
+    }) catch |err| switch (err) {
         error.BadPathName => {
             var fb: posix.O = .{ .ACCMODE = accmode };
             if (opts.flags.dsync) fb.DSYNC = true;
-            return fiber.fs.openPosix(path, fb, 0);
+            return fs.submit(.open, .{ .path = path, .flags = fb, .mode = 0 });
         },
         else => return err,
     };
 
-    const file = fiber.File.fromFd(fd);
-    if (direct_io) file.noCache();
-    if (opts.flags.random and !direct_io) file.adviseRandom();
+    if (direct_io) fs.submit(.no_cache, file);
+    if (opts.flags.random and !direct_io) fs.submit(.advise_random, file);
 
-    return fd;
+    return file;
 }

@@ -5,82 +5,150 @@ const std = @import("std");
 const fiber = @import("zfiber");
 const utils = @import("utils");
 
-test "fs.File: write, sync, stat, read back at offsets" {
+const fs = fiber.fs;
+const String = utils.String;
+
+// ── helpers: the ops as this file uses them ──
+
+fn create(path: String) !fiber.File {
+    return fs.submit(.open, .{
+        .path = path,
+        .flags = .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true },
+        .mode = 0o644,
+    });
+}
+
+fn openRead(path: String) !fiber.File {
+    return fs.submit(.open, .{
+        .path = path,
+        .flags = .{ .ACCMODE = .RDONLY },
+        .mode = 0,
+    });
+}
+
+fn close(file: fiber.File) void {
+    fs.submit(.close, file);
+}
+
+fn del(path: String) void {
+    fs.submit(.delete_file, path) catch {};
+}
+
+fn sync(file: fiber.File) !void {
+    return fs.submit(.sync, .{ .file = file, .data_only = false });
+}
+
+fn size(file: fiber.File) !u64 {
+    return (try fs.submit(.stat, file)).size;
+}
+
+fn write(file: fiber.File, data: String, offset: u64) !usize {
+    return fs.submit(.write, .{ .file = file, .data = data, .offset = offset });
+}
+
+fn read(file: fiber.File, buf: []u8, offset: u64) !usize {
+    return fs.submit(.read, .{ .file = file, .buf = buf, .offset = offset });
+}
+
+/// Single ops can be short: loop to the end.
+fn writeAllAt(file: fiber.File, data: String, offset: u64) !void {
+    var off: usize = 0;
+    while (off < data.len) {
+        const n = try write(file, data[off..], offset + off);
+        if (n == 0) return error.WriteFailed;
+        off += n;
+    }
+}
+
+fn readAllAt(file: fiber.File, buf: []u8, offset: u64) !usize {
+    var off: usize = 0;
+    while (off < buf.len) {
+        const n = try read(file, buf[off..], offset + off);
+        if (n == 0) break; // EOF
+        off += n;
+    }
+    return off;
+}
+
+test "fs: write, sync, stat, read back at offsets" {
     const path = "/tmp/fiber_fs_test_rw";
-    fiber.Dir.cwd().deleteFile(path) catch {};
-    var file = try fiber.Dir.cwd().createFile(path, .{});
+    del(path);
+    const file = try create(path);
     defer {
-        file.close();
-        fiber.Dir.cwd().deleteFile(path) catch {};
+        close(file);
+        del(path);
     }
 
     const data = "hello fiber file io";
-    const written = try file.write(data, 0);
+    const written = try write(file, data, 0);
     try std.testing.expectEqual(@as(usize, data.len), written);
 
-    try file.sync(.{});
+    try sync(file);
 
-    const st = try file.stat();
+    const st = try fs.submit(.stat, file);
     try std.testing.expectEqual(@as(u64, data.len), st.size);
 
     var buf: [64]u8 = undefined;
-    const n = try file.read(buf[0..data.len], 0);
+    const n = try read(file, buf[0..data.len], 0);
     try std.testing.expectEqual(@as(usize, data.len), n);
     try std.testing.expectEqualSlices(u8, data, buf[0..n]);
 
     // Positional read mid-file: bytes 6..11 are "fiber".
-    const m = try file.read(buf[0..5], 6);
+    const m = try read(file, buf[0..5], 6);
     try std.testing.expectEqualStrings("fiber", buf[0..m]);
 }
 
-test "fs.File: setSize truncates" {
+test "fs: set_size truncates" {
     const path = "/tmp/fiber_fs_test_trunc";
-    fiber.Dir.cwd().deleteFile(path) catch {};
-    var file = try fiber.Dir.cwd().createFile(path, .{});
+    del(path);
+    const file = try create(path);
     defer {
-        file.close();
-        fiber.Dir.cwd().deleteFile(path) catch {};
+        close(file);
+        del(path);
     }
 
-    _ = try file.write("0123456789", 0);
-    try file.setSize(4);
-    try std.testing.expectEqual(@as(u64, 4), try file.size());
+    _ = try write(file, "0123456789", 0);
+    try fs.submit(.set_size, .{ .file = file, .length = 4 });
+    try std.testing.expectEqual(@as(u64, 4), try size(file));
 }
 
-test "fs.preadBatch reads offsets across two files in one park" {
+test "fs: read_batch reads offsets across two files in one park" {
     const path = "/tmp/fiber_fs_test_batch";
     const path2 = "/tmp/fiber_fs_test_batch2";
-    fiber.Dir.cwd().deleteFile(path) catch {};
-    fiber.Dir.cwd().deleteFile(path2) catch {};
-    var file = try fiber.Dir.cwd().createFile(path, .{});
-    var file2 = try fiber.Dir.cwd().createFile(path2, .{});
+    del(path);
+    del(path2);
+    const file = try create(path);
+    const file2 = try create(path2);
     defer {
-        file.close();
-        file2.close();
-        fiber.Dir.cwd().deleteFile(path) catch {};
-        fiber.Dir.cwd().deleteFile(path2) catch {};
+        close(file);
+        close(file2);
+        del(path);
+        del(path2);
     }
 
     // 256 bytes where byte[i] == i; the second file holds 255 - i.
     var content: [256]u8 = undefined;
     for (&content, 0..) |*b, i| b.* = @intCast(i);
-    _ = try file.write(&content, 0);
-    try file.sync(.{});
+    _ = try write(file, &content, 0);
+    try sync(file);
     for (&content, 0..) |*b, i| b.* = @intCast(255 - i);
-    _ = try file2.write(&content, 0);
-    try file2.sync(.{});
+    _ = try write(file2, &content, 0);
+    try sync(file2);
 
     var b0: [16]u8 = undefined;
     var b1: [16]u8 = undefined;
     var b2: [16]u8 = undefined;
     var b3: [16]u8 = undefined;
-    var ops = [_]fiber.File.BatchOp{
+    var ops = [_]fs.BatchOp{
         .{ .file = file, .buf = &b0, .offset = 0 },
         .{ .file = file, .buf = &b1, .offset = 100 },
         .{ .file = file2, .buf = &b2, .offset = 100 },
         .{ .file = file, .buf = &b3, .offset = 240 },
     };
-    try fiber.fs.preadBatch(std.testing.allocator, &ops);
+    try fs.submit(.read_batch, .{
+        .alloc = std.testing.allocator,
+        .ops = &ops,
+    });
 
     for (ops) |op| try std.testing.expectEqual(@as(usize, 16), try op.result);
     try std.testing.expectEqual(@as(u8, 0), b0[0]);
@@ -89,55 +157,39 @@ test "fs.preadBatch reads offsets across two files in one park" {
     try std.testing.expectEqual(@as(u8, 240), b3[0]);
 }
 
-test "fs.Dir: openFile, access, deleteFile" {
+test "fs: open read-only, access, delete_file" {
     const path = "/tmp/fiber_fs_test_dir";
-    fiber.Dir.cwd().deleteFile(path) catch {};
+    del(path);
 
     {
-        var w = try fiber.Dir.cwd().createFile(path, .{});
-        _ = try w.write("payload", 0);
-        try w.sync(.{});
-        w.close();
+        const w = try create(path);
+        _ = try write(w, "payload", 0);
+        try sync(w);
+        close(w);
     }
 
-    try fiber.Dir.cwd().access(path, .{});
+    try fs.submit(.access, path);
 
-    var r = try fiber.Dir.cwd().openFile(path, .{});
+    const r = try openRead(path);
     var buf: [16]u8 = undefined;
-    const n = try r.read(buf[0..7], 0);
+    const n = try read(r, buf[0..7], 0);
     try std.testing.expectEqualStrings("payload", buf[0..n]);
-    r.close();
+    close(r);
 
-    try fiber.Dir.cwd().deleteFile(path);
-    try std.testing.expectError(error.FileNotFound, fiber.Dir.cwd().access(path, .{}));
+    try fs.submit(.delete_file, path);
+    try std.testing.expectError(
+        error.FileNotFound,
+        fs.submit(.access, path),
+    );
 }
 
-// ── helpers: loop fiber.File.read/write (single ops can be short) ──
-fn writeAllAt(file: fiber.File, data: []const u8, offset: u64) !void {
-    var off: usize = 0;
-    while (off < data.len) {
-        const n = try file.write(data[off..], offset + off);
-        if (n == 0) return error.WriteFailed;
-        off += n;
-    }
-}
-fn readAllAt(file: fiber.File, buf: []u8, offset: u64) !usize {
-    var off: usize = 0;
-    while (off < buf.len) {
-        const n = try file.read(buf[off..], offset + off);
-        if (n == 0) break; // EOF
-        off += n;
-    }
-    return off;
-}
-
-test "fs.File: large patterned write/read round-trip (256 KiB)" {
+test "fs: large patterned write/read round-trip (256 KiB)" {
     const path = "/tmp/fiber_fs_test_large";
-    fiber.Dir.cwd().deleteFile(path) catch {};
-    var file = try fiber.Dir.cwd().createFile(path, .{});
+    del(path);
+    const file = try create(path);
     defer {
-        file.close();
-        fiber.Dir.cwd().deleteFile(path) catch {};
+        close(file);
+        del(path);
     }
 
     const N = 256 * 1024;
@@ -146,8 +198,8 @@ test "fs.File: large patterned write/read round-trip (256 KiB)" {
     for (data, 0..) |*b, i| b.* = @truncate(i *% 2654435761);
 
     try writeAllAt(file, data, 0);
-    try file.sync(.{});
-    try std.testing.expectEqual(@as(u64, N), try file.size());
+    try sync(file);
+    try std.testing.expectEqual(@as(u64, N), try size(file));
 
     const back = try std.testing.allocator.alloc(u8, N);
     defer std.testing.allocator.free(back);
@@ -156,37 +208,37 @@ test "fs.File: large patterned write/read round-trip (256 KiB)" {
     try std.testing.expect(std.mem.eql(u8, data, back));
 }
 
-test "fs.File: data survives sync + close + reopen" {
+test "fs: data survives sync + close + reopen" {
     const path = "/tmp/fiber_fs_test_durable";
-    fiber.Dir.cwd().deleteFile(path) catch {};
-    defer fiber.Dir.cwd().deleteFile(path) catch {};
+    del(path);
+    defer del(path);
 
     {
-        var w = try fiber.Dir.cwd().createFile(path, .{});
+        const w = try create(path);
         try writeAllAt(w, "durable-data", 0);
-        try w.sync(.{});
-        w.close();
+        try sync(w);
+        close(w);
     }
 
-    var r = try fiber.Dir.cwd().openFile(path, .{});
-    defer r.close();
+    const r = try openRead(path);
+    defer close(r);
     var buf: [12]u8 = undefined;
     const n = try readAllAt(r, &buf, 0);
     try std.testing.expectEqualStrings("durable-data", buf[0..n]);
 }
 
-test "fs.File: setSize extends with zero fill" {
+test "fs: set_size extends with zero fill" {
     const path = "/tmp/fiber_fs_test_extend";
-    fiber.Dir.cwd().deleteFile(path) catch {};
-    var file = try fiber.Dir.cwd().createFile(path, .{});
+    del(path);
+    const file = try create(path);
     defer {
-        file.close();
-        fiber.Dir.cwd().deleteFile(path) catch {};
+        close(file);
+        del(path);
     }
 
     try writeAllAt(file, "abc", 0);
-    try file.setSize(10);
-    try std.testing.expectEqual(@as(u64, 10), try file.size());
+    try fs.submit(.set_size, .{ .file = file, .length = 10 });
+    try std.testing.expectEqual(@as(u64, 10), try size(file));
 
     var buf: [10]u8 = undefined;
     const n = try readAllAt(file, &buf, 0);
@@ -195,38 +247,38 @@ test "fs.File: setSize extends with zero fill" {
     for (buf[3..10]) |b| try std.testing.expectEqual(@as(u8, 0), b);
 }
 
-test "fs.Dir: rename moves a file" {
+test "fs: rename moves a file" {
     const old = "/tmp/fiber_fs_test_rn_old";
     const new = "/tmp/fiber_fs_test_rn_new";
-    fiber.Dir.cwd().deleteFile(old) catch {};
-    fiber.Dir.cwd().deleteFile(new) catch {};
+    del(old);
+    del(new);
     defer {
-        fiber.Dir.cwd().deleteFile(old) catch {};
-        fiber.Dir.cwd().deleteFile(new) catch {};
+        del(old);
+        del(new);
     }
 
     {
-        var w = try fiber.Dir.cwd().createFile(old, .{});
+        const w = try create(old);
         try writeAllAt(w, "moved", 0);
-        try w.sync(.{});
-        w.close();
+        try sync(w);
+        close(w);
     }
 
-    try fiber.Dir.cwd().rename(old, fiber.Dir.cwd(), new);
-    try std.testing.expectError(error.FileNotFound, fiber.Dir.cwd().access(old, .{}));
-    try fiber.Dir.cwd().access(new, .{});
+    try fs.submit(.rename, .{ .old_path = old, .new_path = new });
+    try std.testing.expectError(error.FileNotFound, fs.submit(.access, old));
+    try fs.submit(.access, new);
 
-    var r = try fiber.Dir.cwd().openFile(new, .{});
-    defer r.close();
+    const r = try openRead(new);
+    defer close(r);
     var buf: [5]u8 = undefined;
     const n = try readAllAt(r, &buf, 0);
     try std.testing.expectEqualStrings("moved", buf[0..n]);
 }
 
-test "fs.Dir: openFile on a nonexistent path returns FileNotFound" {
+test "fs: open on a nonexistent path returns FileNotFound" {
     const path = "/tmp/fiber_fs_test_missing_xyz";
-    fiber.Dir.cwd().deleteFile(path) catch {};
-    try std.testing.expectError(error.FileNotFound, fiber.Dir.cwd().openFile(path, .{}));
+    del(path);
+    try std.testing.expectError(error.FileNotFound, openRead(path));
 }
 
 test "fs: many fibers run full file lifecycles concurrently" {
@@ -234,28 +286,32 @@ test "fs: many fibers run full file lifecycles concurrently" {
     const Body = struct {
         fn run(id: usize, ok: *bool) void {
             var pbuf: [64]u8 = undefined;
-            const path = std.fmt.bufPrint(&pbuf, "/tmp/fiber_fs_conc_{d}", .{id}) catch return;
-            fiber.Dir.cwd().deleteFile(path) catch {};
+            const path = std.fmt.bufPrint(
+                &pbuf,
+                "/tmp/fiber_fs_conc_{d}",
+                .{id},
+            ) catch return;
+            del(path);
 
-            var file = fiber.Dir.cwd().createFile(path, .{}) catch return;
+            const file = create(path) catch return;
             var data: [1024]u8 = undefined;
             for (&data, 0..) |*b, i| b.* = @truncate(i +% id);
 
             writeAllAt(file, &data, 0) catch {
-                file.close();
+                close(file);
                 return;
             };
-            file.sync(.{}) catch {
-                file.close();
+            sync(file) catch {
+                close(file);
                 return;
             };
             var back: [1024]u8 = undefined;
             const n = readAllAt(file, &back, 0) catch {
-                file.close();
+                close(file);
                 return;
             };
-            file.close();
-            fiber.Dir.cwd().deleteFile(path) catch {};
+            close(file);
+            del(path);
 
             ok.* = (n == data.len and std.mem.eql(u8, &data, &back));
         }
@@ -271,21 +327,21 @@ test "fs: many fibers run full file lifecycles concurrently" {
     for (oks) |ok| try std.testing.expect(ok);
 }
 
-test "fs.Dir: list reports every entry with its kind" {
+test "fs: list reports every entry with its kind" {
     const alloc = std.testing.allocator;
     const root = "/tmp/fiber_fs_test_list";
-    std.Io.Dir.cwd().deleteTree(utils.context.g().io, root) catch {};
-    try std.Io.Dir.cwd().createDirPath(utils.context.g().io, root ++ "/sub");
-    defer std.Io.Dir.cwd().deleteTree(utils.context.g().io, root) catch {};
+    fs.submit(.delete_tree, root) catch {};
+    try fs.submit(.create_dir_path, root ++ "/sub");
+    defer fs.submit(.delete_tree, root) catch {};
 
-    for ([_][]const u8{ root ++ "/a.txt", root ++ "/b.txt" }) |p| {
-        const f = try fiber.Dir.cwd().createFile(p, .{});
-        _ = try f.write("x", 0);
-        f.close();
+    for ([_]String{ root ++ "/a.txt", root ++ "/b.txt" }) |p| {
+        const file = try create(p);
+        _ = try write(file, "x", 0);
+        close(file);
     }
 
-    const entries = try fiber.Dir.cwd().list(alloc, root);
-    defer fiber.freeDirEntries(alloc, entries);
+    const entries = try fs.submit(.list, .{ .alloc = alloc, .path = root });
+    defer fs.freeEntries(alloc, entries);
     try std.testing.expectEqual(@as(usize, 3), entries.len);
 
     var files: usize = 0;
@@ -305,44 +361,48 @@ test "fs.Dir: list reports every entry with its kind" {
     try std.testing.expectEqual(@as(usize, 1), dirs);
 }
 
-test "fs.File: stat reports a fresh file's mtime as now" {
+test "fs: stat reports a fresh file's mtime as now" {
     // The real disk stamps real time; under the simulation `now` is
     // virtual, so the two agree only once the sim disk stamps files.
     if (fiber.isSim()) return error.SkipZigTest;
     const path = "/tmp/fiber_fs_test_mtime";
-    fiber.Dir.cwd().deleteFile(path) catch {};
-    var file = try fiber.Dir.cwd().createFile(path, .{});
+    del(path);
+    const file = try create(path);
     defer {
-        file.close();
-        fiber.Dir.cwd().deleteFile(path) catch {};
+        close(file);
+        del(path);
     }
-    _ = try file.write("now", 0);
+    _ = try write(file, "now", 0);
 
     const now = utils.timestampNow(.realtime, .secs);
-    const st = try file.stat();
+    const st = try fs.submit(.stat, file);
     const skew = @abs(now - st.mtime_s);
     try std.testing.expect(skew < 10);
 }
 
-test "fs.Dir: createDirPath, openDir sync, deleteTree" {
+test "fs: create_dir_path, directory sync, delete_tree" {
     const root = "/tmp/fiber_fs_test_tree";
-    fiber.Dir.cwd().deleteTree(root) catch {};
-    try fiber.Dir.cwd().createDirPath(root ++ "/a/b");
-    try fiber.Dir.cwd().access(root ++ "/a/b", .{});
+    fs.submit(.delete_tree, root) catch {};
+    try fs.submit(.create_dir_path, root ++ "/a/b");
+    try fs.submit(.access, root ++ "/a/b");
 
-    var f = try fiber.Dir.cwd().createFile(root ++ "/a/b/f", .{});
-    _ = try f.write("x", 0);
-    f.close();
+    const file = try create(root ++ "/a/b/f");
+    _ = try write(file, "x", 0);
+    close(file);
 
     // The directory fsync that makes the new name durable.
-    const dir = try fiber.Dir.cwd().openDir(root ++ "/a/b");
-    try dir.sync(.{});
-    _ = try dir.device();
-    dir.close();
+    const dir = try fs.submit(.open, .{
+        .path = root ++ "/a/b",
+        .flags = .{ .ACCMODE = .RDONLY, .DIRECTORY = true },
+        .mode = 0,
+    });
+    try sync(dir);
+    _ = try fs.submit(.device, dir);
+    close(dir);
 
-    try fiber.Dir.cwd().deleteTree(root);
+    try fs.submit(.delete_tree, root);
     try std.testing.expectError(
         error.FileNotFound,
-        fiber.Dir.cwd().access(root, .{}),
+        fs.submit(.access, root),
     );
 }

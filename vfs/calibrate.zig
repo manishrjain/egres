@@ -227,11 +227,11 @@ fn fillProbeFile(a: std.mem.Allocator, path: String) !void {
 /// The file is opened once here: reads and writes are positional,
 /// so every worker shares the descriptor.
 fn throughput(a: std.mem.Allocator, path: String, kind: _vfs.IOKind) !u64 {
-    const f = fiber.File.fromFd(try _vfs.openDirect(path, .{
+    const file = try _vfs.openDirect(path, .{
         .mode = .direct,
         .flags = .{ .writable = kind == .write },
-    }));
-    defer f.close();
+    });
+    defer fiber.fs.submit(.close, file);
 
     var stop = std.atomic.Value(bool).init(false);
     var group = fiber.Group(anyerror!u64).init(a);
@@ -239,7 +239,7 @@ fn throughput(a: std.mem.Allocator, path: String, kind: _vfs.IOKind) !u64 {
     const t0 = utils.timestampNow(.monotonic, .nanos);
     for (0..depth) |i| {
         try group.spawn(.{ .worker_id = @intCast(i) }, worker, .{
-            a, f, kind, &stop,
+            a, file, kind, &stop,
         });
     }
     fiber.sleepMs(250);
@@ -263,7 +263,7 @@ fn throughput(a: std.mem.Allocator, path: String, kind: _vfs.IOKind) !u64 {
 /// bytes moved returned.
 fn worker(
     a: std.mem.Allocator,
-    f: fiber.File,
+    file: fiber.File,
     kind: _vfs.IOKind,
     stop: *std.atomic.Value(bool),
 ) anyerror!u64 {
@@ -285,8 +285,16 @@ fn worker(
         var done: usize = 0;
         while (done < size) {
             const n = switch (kind) {
-                .read => try f.read(buf[done..], off + done),
-                .write => try f.write(buf[done..], off + done),
+                .read => try fiber.fs.submit(.read, .{
+                    .file = file,
+                    .buf = buf[done..],
+                    .offset = off + done,
+                }),
+                .write => try fiber.fs.submit(.write, .{
+                    .file = file,
+                    .data = buf[done..],
+                    .offset = off + done,
+                }),
             };
             if (n == 0) return error.ShortIo;
             done += n;

@@ -83,7 +83,7 @@ pub fn openBuffer(
 /// in a store without a manifest CREATE in hand.
 pub fn probeExtent(
     alloc: std.mem.Allocator,
-    store: *vfs.RemoteStore,
+    store: *vfs.Store,
     name: String,
 ) !Table.Extent {
     const size = (try store.stat(name)).size;

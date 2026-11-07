@@ -244,7 +244,7 @@ const BlockInfo = struct {
 
 pub const TableBuffer = struct {
     allocator: std.mem.Allocator,
-    // Page-aligned so `RemoteStore.put` (O_DIRECT in a file store) can take
+    // Page-aligned so `Store.put` (O_DIRECT in a file store) can take
     // it as is: the buffer ADDRESS as well as its length must be page
     // aligned, and `finish()` already pads the length to a page multiple.
     bytes: []align(vfs.page_size) u8,

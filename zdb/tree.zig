@@ -57,13 +57,13 @@ pub const TableNeed = struct {
 /// needed by another tree (e.g. shared tables after a split).
 pub const TableCache = struct {
     allocator: std.mem.Allocator,
-    store: *vfs.RemoteStore,
+    store: *vfs.Store,
     tables: std.AutoHashMap(u64, *Table),
     mu: fiber.RWMutex(.tracked),
 
     pub fn init(
         allocator: std.mem.Allocator,
-        store: *vfs.RemoteStore,
+        store: *vfs.Store,
     ) TableCache {
         return .{
             .allocator = allocator,

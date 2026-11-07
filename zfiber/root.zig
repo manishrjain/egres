@@ -137,12 +137,10 @@ pub const sleepMs = @import("deadlines.zig").sleepMs;
 // The current worker's randomness, for any fiber that needs a draw.
 pub const random = _rt.random;
 
-// From fs.zig — file I/O that cooperatively parks (zio.File/Dir-compatible).
+// From fs.zig — every file operation, one `fs.submit(op, args)` that
+// parks the fiber. `vfs` is its caller.
 pub const fs = @import("fs.zig");
 pub const File = fs.File;
-pub const Dir = fs.Dir;
-pub const DirEntry = fs.Entry;
-pub const freeDirEntries = fs.freeEntries;
 
 // From fsops.zig — blocking-op offload pool (fsync + fs metadata) that parks
 // the calling fiber and wakes it when a pool thread finishes the syscall.

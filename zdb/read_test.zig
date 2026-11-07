@@ -40,7 +40,7 @@ const Fixture = struct {
     /// The forest reads its options through this; freed after it.
     live: *flags.Live(Config),
     /// The forest's SSTs; freed after it.
-    store: vfs.RemoteStore,
+    store: vfs.Store,
     f: *Forest,
     tree_id: u64,
     /// Stands in for the raft log: every fixture step that would be its
@@ -65,7 +65,7 @@ const Fixture = struct {
         self.live = try flags.Live(Config).create(alloc, .{
             .lmax_target_bytes = 1,
         });
-        self.store = try vfs.RemoteStore.initFile(alloc, self.dir, vfs.g());
+        self.store = try vfs.Store.initFile(alloc, self.dir, vfs.g());
         self.f = try Forest.open(alloc, self.live, &self.store);
         self.tree_id = try createTree(self.f, table_key, .{}, .posting_index);
         // Forest.open leaves an id-0 placeholder memtable that a swap
@@ -367,7 +367,7 @@ test "multiget: rejects a read_ts below snapshotTs" {
 
 fn writeOneKeyTable(
     alloc: std.mem.Allocator,
-    store: *vfs.RemoteStore,
+    store: *vfs.Store,
     file_id: u64,
     k: Key,
     ts: u64,

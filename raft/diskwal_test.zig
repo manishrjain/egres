@@ -151,12 +151,11 @@ fn checkLargePayload(reader: zen.LogEntryReader, index: u64, expected_len: usize
 
 fn countWalFiles(path: String) !usize {
     const alloc = std.testing.allocator;
-    const entries = try fiber.Dir.cwd().list(alloc, path);
-    defer fiber.freeDirEntries(alloc, entries);
+    const infos = try vfs.listFiles(alloc, path, .names);
+    defer vfs.freeObjectInfos(alloc, infos);
     var count: usize = 0;
-    for (entries) |e| {
-        if (e.kind != .file) continue;
-        if (std.mem.endsWith(u8, e.name, ".wal")) count += 1;
+    for (infos) |info| {
+        if (std.mem.endsWith(u8, info.name, ".wal")) count += 1;
     }
     return count;
 }
@@ -391,14 +390,13 @@ test "diskwal drops malformed trailing wal files on reopen" {
 
     // Corrupt the header of the last (current) file by flipping bytes in the magic.
     {
-        const entries = try fiber.Dir.cwd().list(alloc, wal_dir);
-        defer fiber.freeDirEntries(alloc, entries);
+        const infos = try vfs.listFiles(alloc, wal_dir, .names);
+        defer vfs.freeObjectInfos(alloc, infos);
 
         // Find the highest fid file.
         var max_fid: u64 = 0;
-        for (entries) |e| {
-            if (e.kind != .file) continue;
-            const fid = raft.diskwal.wal.parseWalFid(e.name) orelse continue;
+        for (infos) |info| {
+            const fid = raft.diskwal.wal.parseWalFid(info.name) orelse continue;
             if (fid > max_fid) max_fid = fid;
         }
         try std.testing.expect(max_fid > 1);
@@ -1569,10 +1567,10 @@ test "diskwal: no prezero (copy-on-write filesystem setting)" {
 
 fn dirHas(path: String, name: String) !bool {
     const alloc = std.testing.allocator;
-    const entries = try fiber.Dir.cwd().list(alloc, path);
-    defer fiber.freeDirEntries(alloc, entries);
-    for (entries) |e| {
-        if (std.mem.eql(u8, e.name, name)) return true;
+    const infos = try vfs.listFiles(alloc, path, .names);
+    defer vfs.freeObjectInfos(alloc, infos);
+    for (infos) |info| {
+        if (std.mem.eql(u8, info.name, name)) return true;
     }
     return false;
 }

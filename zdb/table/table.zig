@@ -138,7 +138,7 @@ pub const Table = struct {
     /// of the index and trailer, no stat and no trailer round trip.
     pub fn open(
         allocator: std.mem.Allocator,
-        store: *vfs.RemoteStore,
+        store: *vfs.Store,
         file_id: u64,
         extent: Extent,
     ) !*Table {

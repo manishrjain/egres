@@ -576,7 +576,7 @@ pub const Forest = struct {
     /// caller keeps it alive past `close`.
     live: *flags.Live(_config.Config),
     /// Where every SST lives. The caller keeps it alive past `close`.
-    store: *vfs.RemoteStore,
+    store: *vfs.Store,
     manifest: _manifest.Manifest,
     /// One TableTrees per table, keyed by its `{namespace, table_id}` identity.
     /// The TableTreess own the live `*Tree` objects (in their sorted entries);
@@ -644,7 +644,7 @@ pub const Forest = struct {
     pub fn open(
         allocator: std.mem.Allocator,
         live: *flags.Live(_config.Config),
-        store: *vfs.RemoteStore,
+        store: *vfs.Store,
     ) !*Forest {
         var manifest = _manifest.Manifest.init(allocator);
         errdefer manifest.deinit();

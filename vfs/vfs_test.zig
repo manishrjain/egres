@@ -320,13 +320,17 @@ test "write bandwidth enforcement" {
     });
     limiter.metered = true;
 
-    // Open for writing (need a real fd, not O_DIRECT for writes on tmpfs).
-    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY }, 0);
-    defer (std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } }).close(ioOf());
+    // Open for writing without O_DIRECT: tmpfs rejects direct writes.
+    const file = try fiber.fs.submit(.open, .{
+        .path = path,
+        .flags = .{ .ACCMODE = .WRONLY },
+        .mode = 0,
+    });
+    defer fiber.fs.submit(.close, file);
 
     var v = VFS.new(&limiter);
     const fh = vfs.FileHandle{
-        .file = fiber.File.fromFd(fd),
+        .file = file,
         .file_size = file_size,
         .vfs = &v,
         .bw = &limiter,

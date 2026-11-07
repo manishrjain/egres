@@ -37,7 +37,7 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
@@ -225,7 +225,7 @@ test "sql.table: load returns UndefinedTable when no catalog rows exist" {
 
     defer f_live.destroy();
 
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
+    var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
     const f = try Forest.open(alloc, f_live, &store);
     defer f.close();

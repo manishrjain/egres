@@ -518,14 +518,14 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     );
 
     // The remote store every SST lives in.
-    var store: zdb.vfs.RemoteStore = if (store_dir)
-        try zdb.vfs.RemoteStore.initFile(
+    var store: zdb.vfs.Store = if (store_dir)
+        try zdb.vfs.Store.initFile(
             allocator,
             store_cfg.dir_path,
             data_vfs.?,
         )
     else
-        try zdb.vfs.RemoteStore.initS3(allocator, .{
+        try zdb.vfs.Store.initS3(allocator, .{
             .endpoint = store_cfg.s3_endpoint,
             .bucket = store_cfg.s3_bucket,
             .prefix = store_cfg.s3_prefix,

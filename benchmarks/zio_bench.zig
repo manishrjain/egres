@@ -117,10 +117,13 @@ fn ioWorkZio(fd_int: std.posix.fd_t, offsets: []const u64, latencies: []u64) voi
 
 fn ioWorkFiber(fd_int: std.posix.fd_t, offsets: []const u64, latencies: []u64) void {
     var buf: [BLOCK_SIZE]u8 align(4096) = undefined;
-    const file = fiber.File.fromFd(fd_int);
     for (offsets, 0..) |offset, i| {
         const t0 = nowNs();
-        _ = file.read(&buf, offset) catch {};
+        _ = fiber.fs.submit(.read, .{
+            .file = .{ .fd = fd_int },
+            .buf = &buf,
+            .offset = offset,
+        }) catch {};
         const t1 = nowNs();
         latencies[i] = @intCast(t1 - t0);
     }

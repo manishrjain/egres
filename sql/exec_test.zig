@@ -49,7 +49,7 @@ const Fixture = struct {
     live: *flags.Live(Config),
     /// The forest's SSTs; heap-held so its address survives the move out
     /// of setup. Freed after the forest.
-    store: *zdb.vfs.RemoteStore,
+    store: *zdb.vfs.Store,
     db: sql.database.Database,
     arena: std.heap.ArenaAllocator,
     tbl: Table,
@@ -109,9 +109,9 @@ const Fixture = struct {
             testing.allocator,
         );
         errdefer testing.allocator.free(dir_path);
-        const store = try testing.allocator.create(zdb.vfs.RemoteStore);
+        const store = try testing.allocator.create(zdb.vfs.Store);
         errdefer testing.allocator.destroy(store);
-        store.* = try zdb.vfs.RemoteStore.initFile(
+        store.* = try zdb.vfs.Store.initFile(
             testing.allocator,
             dir_path,
             zdb.vfs.g(),

@@ -1,7 +1,7 @@
 // Copyright 2026 Manish R Jain
 // SPDX-License-Identifier: Apache-2.0
 
-//! S3-compatible object store client — the `s3` RemoteStore backend. A
+//! S3-compatible object store client — the `s3` Store backend. A
 //! minimal HTTP/1.1 client over fiber.net with SigV4-signed
 //! PUT/GET/HEAD/DELETE, path-style URLs (`/bucket/prefix/key`), TLS, and
 //! a keep-alive connection pool. HTTP/1.1 carries one response at a
@@ -562,7 +562,7 @@ pub const S3Store = struct {
     /// the result with `_vfs.freeObjectInfos`. Names come back with the
     /// prefix stripped, so they match what `put`/`open` take. ListObjectsV2
     /// carries size and mtime whatever `detail` asks, so `stat` is always
-    /// set; the parameter exists for the shared `RemoteStore.list` shape.
+    /// set; the parameter exists for the shared `Store.list` shape.
     pub fn list(
         self: *S3Store,
         alloc: std.mem.Allocator,

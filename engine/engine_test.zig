@@ -80,7 +80,7 @@ const ApplyFixture = struct {
     tmp: std.testing.TmpDir,
     dir_path: [:0]u8,
     live: *flags.Live(zdb.config.Config),
-    store: *zdb.vfs.RemoteStore,
+    store: *zdb.vfs.Store,
     forest: *Forest,
     impl: engine.StorageImpl,
     arena: std.heap.ArenaAllocator,
@@ -103,9 +103,9 @@ const ApplyFixture = struct {
             alloc,
         );
         errdefer alloc.free(self.dir_path);
-        self.store = try alloc.create(zdb.vfs.RemoteStore);
+        self.store = try alloc.create(zdb.vfs.Store);
         errdefer alloc.destroy(self.store);
-        self.store.* = try zdb.vfs.RemoteStore.initFile(
+        self.store.* = try zdb.vfs.Store.initFile(
             alloc,
             self.dir_path,
             zdb.vfs.g(),
