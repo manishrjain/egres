@@ -183,13 +183,13 @@ fn walkFor(
 /// expression is the residual's. `egid = N` is the one-id set; `col =
 /// v` on a valid index its entry (unique: the one row; non-unique: the
 /// posting bitmap, as `IS NOT DISTINCT FROM v` and `IS TRUE`);
-/// `col IS NULL` on a valid non-unique index the posting under the
-/// NULL tag key. A comparison against NULL can never be true (3VL),
-/// and `never` is false by construction, so both are the EMPTY set. An
-/// AND intersects every indexable child and can drop the rest, so one
-/// indexable child is enough to route it (the dropped terms are the
-/// residual's job); an OR must union EVERY child, so all of them must
-/// be indexable; NOT never is.
+/// `col IS NULL` on a valid index its NULL keys (nullLookup). A
+/// comparison against NULL can never be true (3VL), and `never` is
+/// false by construction, so both are the EMPTY set. An AND intersects
+/// every indexable child and can drop the rest, so one indexable child
+/// is enough to route it (the dropped terms are the residual's job);
+/// an OR must union EVERY child, so all of them must be indexable; NOT
+/// never is.
 fn bitmapFor(
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
@@ -254,8 +254,9 @@ fn bitmapFor(
     }
 }
 
-/// `col IS NULL` from an index: the posting under the NULL tag key. A
-/// unique index falls back to a table scan for this predicate.
+/// `col IS NULL` from an index: the posting under the NULL tag key,
+/// or under a unique index its key per NULL row, all of them in
+/// [values_end, keys_end).
 fn nullLookup(
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
@@ -263,8 +264,15 @@ fn nullLookup(
     read_ts: u64,
 ) Error!?BitmapNode {
     const idx = validIndex(tbl, col, read_ts) orelse return null;
-    if (idx.unique) return null;
-    return try lookup(arloc, idx, .null_value);
+    if (!idx.unique) return try lookup(arloc, idx, .null_value);
+    // A unique index built before NULL keys existed has no entries
+    // for NULL rows; docs/design/indexes.md requires rebuilding it.
+    return .{ .index_range = .{
+        .index_table_id = idx.index_table_id,
+        .lo = _key.values_end,
+        .hi = _key.keys_end,
+        .unique = true,
+    } };
 }
 
 /// The index on `col` that is complete at `read_ts`, if any. An index
