@@ -80,6 +80,31 @@ test "sql.parse: everything else is unsupported; bad SQL is a syntax error" {
     try testing.expectError(error.SyntaxError, parse.statement(alloc, "CREATE DATABASE;"));
 }
 
+test "sql.parse: several statements in one string are refused" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Running only the first would drop the rest unseen.
+    const two = try parse.statement(
+        alloc,
+        "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)",
+    );
+    try testing.expect(two == .invalid);
+    const reason = two.invalid;
+    try testing.expect(std.mem.indexOf(u8, reason, "one at a time") != null);
+    const ddl_dml = try parse.statement(
+        alloc,
+        "CREATE TABLE t (a int4); SELECT 1",
+    );
+    try testing.expect(ddl_dml == .invalid);
+
+    // Extra semicolons are empty statements, not a second one.
+    const one = try parse.statement(alloc, "INSERT INTO t VALUES (1);;");
+    try testing.expect(one == .insert);
+}
+
 test "sql.parse: CREATE TABLE parses columns, types, and the primary key" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
