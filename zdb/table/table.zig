@@ -540,8 +540,8 @@ pub const Table = struct {
     /// small queue until its first hit, and a burst past that budget
     /// would evict its own earlier blocks before their seeks. Blocks
     /// past the cap are left to the seeks, in key order. A no-op for a
-    /// table with no cache key or whose file is mapped or in memory
-    /// (no I/O to batch).
+    /// table with no cache key or whose file is in memory (no I/O to
+    /// batch).
     pub fn prefetchBlocks(
         self: *const Table,
         cache: *_cache.ShardedCache(u128),

@@ -323,3 +323,26 @@ test "fs.File: stat reports a fresh file's mtime as now" {
     const skew = @abs(now - st.mtime_s);
     try std.testing.expect(skew < 10);
 }
+
+test "fs.Dir: createDirPath, openDir sync, deleteTree" {
+    const root = "/tmp/fiber_fs_test_tree";
+    fiber.Dir.cwd().deleteTree(root) catch {};
+    try fiber.Dir.cwd().createDirPath(root ++ "/a/b");
+    try fiber.Dir.cwd().access(root ++ "/a/b", .{});
+
+    var f = try fiber.Dir.cwd().createFile(root ++ "/a/b/f", .{});
+    _ = try f.write("x", 0);
+    f.close();
+
+    // The directory fsync that makes the new name durable.
+    const dir = try fiber.Dir.cwd().openDir(root ++ "/a/b");
+    try dir.sync(.{});
+    _ = try dir.device();
+    dir.close();
+
+    try fiber.Dir.cwd().deleteTree(root);
+    try std.testing.expectError(
+        error.FileNotFound,
+        fiber.Dir.cwd().access(root, .{}),
+    );
+}

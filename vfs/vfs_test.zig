@@ -233,86 +233,6 @@ test "bandwidth limiter deducts on read" {
     try testing.expectEqual(1, limiter.total_read_pages.load(.monotonic));
 }
 
-// ── 7. mmap open/close ──────────────────────────────────────────────
-
-test "mmap open and close" {
-    const path = "/tmp/vfs_test_mmap_open";
-    try writeTempFile(path, "mmap test data");
-    defer deleteFileAbs(path) catch {};
-
-    var v = vfs.g().*;
-    const handle = try v.openFile(testing.allocator, path, .{ .mode = .mmap });
-    defer handle.close();
-
-    try testing.expectEqual(@as(u64, 14), handle.file_size);
-    try testing.expect(handle.mapped != null);
-}
-
-// ── 8. mmap readAligned ─────────────────────────────────────────────
-
-test "mmap readAligned" {
-    const path = "/tmp/vfs_test_mmap_read";
-
-    var data: [8192]u8 = undefined;
-    for (&data, 0..) |*b, i| b.* = @truncate(i);
-    try writeTempFile(path, &data);
-    defer deleteFileAbs(path) catch {};
-
-    var v = vfs.g().*;
-    const handle = try v.openFile(testing.allocator, path, .{ .mode = .mmap });
-    defer handle.close();
-
-    // Aligned offset.
-    const r1 = try handle.readAligned(testing.allocator, 0, 100);
-    defer r1.free();
-    try testing.expectEqualSlices(u8, data[0..100], r1.data);
-
-    // Unaligned offset.
-    const r2 = try handle.readAligned(testing.allocator, 5000, 12);
-    defer r2.free();
-    try testing.expectEqualSlices(u8, data[5000..5012], r2.data);
-}
-
-// ── 9. mmap readAligned returns no buf ──────────────────────────────
-
-test "mmap readAligned no allocation" {
-    const path = "/tmp/vfs_test_mmap_nobuf";
-    try writeTempFile(path, "no alloc test!");
-    defer deleteFileAbs(path) catch {};
-
-    var v = vfs.g().*;
-    const handle = try v.openFile(testing.allocator, path, .{ .mode = .mmap });
-    defer handle.close();
-
-    const r = try handle.readAligned(testing.allocator, 0, 14);
-    defer r.free();
-
-    try testing.expect(r.buf == null);
-    try testing.expectEqualSlices(u8, "no alloc test!", r.data);
-}
-
-// ── 10. mmap bandwidth ─────────────────────────────────────────────
-
-test "mmap enforces bandwidth limiter" {
-    const path = "/tmp/vfs_test_mmap_bw";
-
-    var data: [8192]u8 = undefined;
-    @memset(&data, 0xFF);
-    try writeTempFile(path, &data);
-    defer deleteFileAbs(path) catch {};
-
-    var limiter = bandwidth.Limiter.init(.{ .bytes_per_sec = 1_000_000 });
-    var v = VFS.new(&limiter);
-    const handle = try v.openFile(testing.allocator, path, .{ .mode = .mmap });
-    defer handle.close();
-
-    const r = try handle.readAligned(testing.allocator, 0, 100);
-    defer r.free();
-
-    // mmap reads go through the limiter too.
-    try testing.expectEqual(1, limiter.total_read_pages.load(.monotonic));
-}
-
 /// A tenant at `pages_per_s` on this test fiber's context, so the
 /// metered limiter below charges it rather than the system, which
 /// never waits. The caller resets the context.
@@ -324,7 +244,7 @@ fn tenantAt(id: u64, pages_per_s: i64) fiber.Tenant {
     }, utils.coarseMs());
 }
 
-// ── 11. Read bandwidth enforcement ──────────────────────────────────
+// ── 7. Read bandwidth enforcement ──────────────────────────────────
 
 test "read bandwidth enforcement" {
     // Skipped under `--sim-seed`: paces against real time, which the
@@ -369,7 +289,7 @@ test "read bandwidth enforcement" {
     try testing.expect(elapsed_ms <= 10000);
 }
 
-// ── 12. Write bandwidth enforcement ─────────────────────────────────
+// ── 8. Write bandwidth enforcement ─────────────────────────────────
 
 test "write bandwidth enforcement" {
     // Skipped under `--sim-seed`: paces against real time, which the

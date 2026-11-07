@@ -149,7 +149,7 @@ pub const Error = error{
     InvalidLogHeader,
     WriteFailed,
     CrcMismatch,
-} || std.posix.MMapError || std.posix.MSyncError || std.posix.SyncError ||
+} || std.posix.SyncError ||
     std.Io.Dir.OpenError || std.Io.Dir.CreateDirPathError || std.Io.File.OpenError ||
     std.Io.Dir.DeleteFileError ||
     std.Io.File.StatError || std.Io.File.SetLengthError ||

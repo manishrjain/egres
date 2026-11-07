@@ -196,11 +196,11 @@ pub const Object = union(enum) {
         }
     }
 
-    /// True when reads are memory copies, not I/O: a mapped or
-    /// memory-backed file. Nothing to gain from batching those.
+    /// True when reads are memory copies, not I/O: a memory-backed
+    /// file. Nothing to gain from batching those.
     pub fn isResident(self: *const Object) bool {
         switch (self.*) {
-            .file => |*f| return f.mapped != null or f.owned_buf != null,
+            .file => |*f| return f.owned_buf != null,
             .s3 => return false,
         }
     }

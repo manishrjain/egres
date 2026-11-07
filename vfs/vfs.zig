@@ -18,18 +18,6 @@ pub const s3 = @import("s3.zig");
 pub const lookahead = @import("lookahead.zig");
 pub const calibrate = @import("calibrate.zig");
 
-inline fn fdToFile(fd: posix.fd_t) std.Io.File {
-    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
-}
-
-inline fn fdSize(fd: posix.fd_t) !u64 {
-    return (try fdToFile(fd).stat(utils.context.g().io)).size;
-}
-
-inline fn closeFd(fd: posix.fd_t) void {
-    fdToFile(fd).close(utils.context.g().io);
-}
-
 pub const Flags = struct {
     /// Open for reading and writing instead of read-only.
     writable: bool = false,
@@ -60,7 +48,6 @@ pub const page_alignment = std.mem.Alignment.fromByteUnits(page_size);
 pub const Mode = enum {
     default, // default via filesystem
     direct, // O_DIRECT, aligned reads/writes
-    mmap, // mmap the file, reads are slices into the mapped region
     memory, // read entire file into owned buffer
 };
 
@@ -89,9 +76,6 @@ pub const ReadResult = struct {
 pub const FileHandle = struct {
     file: ?fiber.File = null,
     file_size: u64,
-    /// Aligned to the OS page, not `page_size`: munmap wants the
-    /// former, and on aarch64-macos it is 16 KiB.
-    mapped: ?[]align(std.heap.page_size_min) const u8 = null,
     owned_buf: ?[]u8 = null, // memory mode: entire file read into this buffer
     buf_allocator: ?std.mem.Allocator = null, // for freeing owned_buf on close
     vfs: *const VFS,
@@ -125,25 +109,6 @@ pub const FileHandle = struct {
 
         // Round total size up to page boundary.
         const aligned_size = std.mem.alignForward(usize, prefix + len, page_size);
-
-        if (self.mapped) |mapped| {
-            // MMAP: slice from mapped memory. Fault in pages under bandwidth
-            // control so mmap I/O respects the same rate limits as pread.
-            self.bw.grant(aligned_size, .read);
-            // Touch one byte per page to trigger page faults.
-            var sink: u8 = 0;
-            var pos: usize = 0;
-            while (pos < aligned_size) : (pos += page_size) {
-                sink ^= mapped[aligned_offset + pos];
-            }
-            std.mem.doNotOptimizeAway(sink);
-            return .{
-                .buf = null,
-                .data = mapped[offset .. offset + len],
-                .offset = offset,
-                .allocator = allocator,
-            };
-        }
 
         // Allocate page-aligned buffer for O_DIRECT compatibility.
         const buf = try allocator.alignedAlloc(u8, page_alignment, aligned_size);
@@ -244,9 +209,8 @@ pub const FileHandle = struct {
     pub fn close(self: FileHandle) void {
         if (self.owned_buf) |b| {
             if (self.buf_allocator) |a| a.free(b);
-            return; // memory-backed: no file or mapping to release
+            return; // memory-backed: no file to release
         }
-        if (self.mapped) |m| posix.munmap(m);
         if (self.file) |f| f.close();
     }
 };
@@ -371,47 +335,33 @@ pub const VFS = struct {
 
     pub fn openFile(self: *const VFS, allocator: std.mem.Allocator, path: String, opts: FileOptions) !FileHandle {
         switch (opts.mode) {
-            .mmap => {
-                // mmap mode opens RO+default for the underlying fd; mapped
-                // semantics live above the fd, not in its open flags.
-                const fd = try openDirect(path, .{});
-                errdefer closeFd(fd);
-
-                const file_size = try fdSize(fd);
-                const mapped = try posix.mmap(null, file_size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
-                return .{
-                    .file = fiber.File.fromFd(fd),
-                    .file_size = file_size,
-                    .mapped = mapped,
-                    .vfs = self,
-                    .bw = self.bw,
-                };
-            },
             .default, .direct => {
-                const fd = try openDirect(path, opts);
-                errdefer closeFd(fd);
+                const file = fiber.File.fromFd(try openDirect(path, opts));
+                errdefer file.close();
 
-                const file_size = try fdSize(fd);
                 return .{
-                    .file = fiber.File.fromFd(fd),
-                    .file_size = file_size,
+                    .file = file,
+                    .file_size = try file.size(),
                     .vfs = self,
                     .bw = self.bw,
                     .direct = builtin.os.tag == .linux and opts.mode == .direct,
                 };
             },
             .memory => {
-                // memory mode reads the file once into a buffer; underlying fd is RO+default.
-                const fd = try openDirect(path, .{});
-                defer closeFd(fd); // closed after reading; FileHandle won't own it
+                // Read once into a buffer through a plain fd, closed after:
+                // the handle owns the bytes, not a file.
+                const file = fiber.File.fromFd(try openDirect(path, .{}));
+                defer file.close();
 
-                const io = utils.context.g().io;
-                const file = fdToFile(fd);
-                const file_size = (try file.stat(io)).size;
-                const size: usize = @intCast(file_size);
-                const buf = try allocator.alloc(u8, size);
+                const file_size = try file.size();
+                const buf = try allocator.alloc(u8, @intCast(file_size));
                 errdefer allocator.free(buf);
-                _ = try file.readPositionalAll(io, buf, 0);
+                var off: usize = 0;
+                while (off < buf.len) {
+                    const n = try file.read(buf[off..], off);
+                    if (n == 0) return error.UnexpectedEof;
+                    off += n;
+                }
                 return .{
                     .file_size = file_size,
                     .owned_buf = buf,
@@ -424,7 +374,7 @@ pub const VFS = struct {
     }
 
     pub fn createFile(self: *const VFS, path: String, opts: FileOptions) !FileHandle {
-        if (opts.mode == .mmap or opts.mode == .memory) return error.InvalidMode;
+        if (opts.mode == .memory) return error.InvalidMode;
 
         var open_flags: posix.O = .{ .ACCMODE = .RDWR, .CREAT = true };
         if (opts.flags.truncate) {
@@ -444,12 +394,11 @@ pub const VFS = struct {
             else => return err,
         };
 
-        if (builtin.os.tag == .macos and opts.mode == .direct) {
-            _ = std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1));
-        }
+        const file = fiber.File.fromFd(fd);
+        if (opts.mode == .direct) file.noCache();
 
         return .{
-            .file = fiber.File.fromFd(fd),
+            .file = file,
             .file_size = 0,
             .vfs = self,
             .bw = self.bw,
@@ -458,33 +407,12 @@ pub const VFS = struct {
     }
 };
 
-/// The device (`st_dev`) holding `fd`. `std.Io.File.Stat` leaves it
-/// out, so the system call is made here: statx on Linux, fstat on
-/// macOS.
-fn deviceOf(fd: posix.fd_t) !u64 {
-    switch (builtin.os.tag) {
-        .linux => {
-            const linux = std.os.linux;
-            var stx: linux.Statx = undefined;
-            const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{}, &stx);
-            if (linux.errno(rc) != .SUCCESS) return error.StatFailed;
-            return (@as(u64, stx.dev_major) << 32) | stx.dev_minor;
-        },
-        .macos => {
-            var st: std.c.Stat = undefined;
-            if (std.c.fstat(fd, &st) != 0) return error.StatFailed;
-            return @bitCast(@as(i64, st.dev));
-        },
-        else => return error.Unsupported,
-    }
-}
-
 /// The device (`st_dev`) holding the directory `path`: what tells
 /// directories on one disk from those on different ones.
 pub fn deviceOfPath(path: String) !u64 {
-    const fd = try openDirect(path, .{});
-    defer closeFd(fd);
-    return deviceOf(fd);
+    const file = fiber.File.fromFd(try openDirect(path, .{}));
+    defer file.close();
+    return file.device();
 }
 
 /// Create `path`, write `data` through the accounted FileHandle path,
@@ -511,26 +439,22 @@ pub fn writeAndSync(
 // These are control-plane operations: they don't go through bandwidth
 // accounting or O_DIRECT semantics. Production code, tests, and tools all
 // route through these so the project's "always use vfs" rule applies to
-// the whole filesystem surface, not just data-plane I/O.
-//
-// Where fiber.fs has the op (`fiber.Dir.cwd().deleteFile/rename/access`,
-// …), we wrap it for naming consistency.
-// Where fiber.fs is missing higher-level conveniences (`createDirPath`,
-// `deleteTree`, file iteration), we wrap `std.Io.Dir` with the global
-// `io` from `utils.context`.
+// the whole filesystem surface, not just data-plane I/O. Each one is a
+// `fiber.Dir` op underneath: fiber.fs is the one layer that reaches the
+// kernel, and the one the simulation's disk replaces.
 
 pub fn access(path: String) !void {
     try fiber.Dir.cwd().access(path, .{});
 }
 
-/// Recursive mkdir-p. Wraps std.Io.Dir.createDirPath (fiber.fs doesn't have it).
+/// Recursive mkdir -p.
 pub fn createDirPath(path: String) !void {
-    try std.Io.Dir.cwd().createDirPath(utils.context.g().io, path);
+    try fiber.Dir.cwd().createDirPath(path);
 }
 
-/// Recursive delete. Wraps std.Io.Dir.deleteTree (fiber.fs doesn't have it).
+/// Recursive delete.
 pub fn deleteTree(path: String) !void {
-    try std.Io.Dir.cwd().deleteTree(utils.context.g().io, path);
+    try fiber.Dir.cwd().deleteTree(path);
 }
 
 pub fn renameFile(old_path: String, new_path: String) !void {
@@ -544,10 +468,9 @@ pub fn deleteFile(path: String) !void {
 /// Best-effort directory fsync so newly created filenames are durable.
 /// Silently ignores errors (tmpfs, some network mounts don't support dir fsync).
 pub fn syncDir(path: String) void {
-    const fd = posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0) catch return;
-    const f = fiber.File.fromFd(fd);
-    defer f.close();
-    f.sync(.{}) catch {};
+    const dir = fiber.Dir.cwd().openDir(path) catch return;
+    defer dir.close();
+    dir.sync(.{}) catch {};
 }
 
 /// Filesystem magic numbers (statfs `f_type`) that decide how a file is
@@ -561,35 +484,9 @@ pub const fs_magic = struct {
 };
 
 /// The filesystem magic of `path` (statfs `f_type`), or null when it
-/// cannot be read. Linux only: the magic numbers and the statfs layout
-/// are Linux's; elsewhere the answer is null.
+/// cannot be read; the numbers above are what it is compared with.
 pub fn fsMagic(path: String) ?i64 {
-    if (builtin.os.tag == .linux) return linuxFsMagic(path);
-    return null;
-}
-
-fn linuxFsMagic(path: String) ?i64 {
-    // struct statfs on 64-bit Linux; only f_type is read.
-    const Statfs = extern struct {
-        f_type: i64,
-        f_bsize: i64,
-        f_blocks: u64,
-        f_bfree: u64,
-        f_bavail: u64,
-        f_files: u64,
-        f_ffree: u64,
-        f_fsid: [2]i32,
-        f_namelen: i64,
-        f_frsize: i64,
-        f_flags: i64,
-        f_spare: [4]i64,
-    };
-    comptime std.debug.assert(@sizeOf(Statfs) == 120);
-    const path_z = posix.toPosixPath(path) catch return null;
-    var st: Statfs = undefined;
-    const rc = std.os.linux.syscall2(.statfs, @intFromPtr(&path_z), @intFromPtr(&st));
-    if (std.os.linux.errno(rc) != .SUCCESS) return null;
-    return st.f_type;
+    return fiber.fs.fsMagic(path);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -734,24 +631,9 @@ pub fn openDirect(path: String, opts: FileOptions) !posix.fd_t {
         else => return err,
     };
 
-    if (builtin.os.tag == .macos and direct_io) {
-        // F_NOCACHE: bypass the unified buffer cache. Best effort.
-        _ = std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1));
-    }
-    if (opts.flags.random and !direct_io) adviseRandom(fd);
+    const file = fiber.File.fromFd(fd);
+    if (direct_io) file.noCache();
+    if (opts.flags.random and !direct_io) file.adviseRandom();
 
     return fd;
-}
-
-/// Turns readahead off for `fd` (`Flags.random`); best effort.
-fn adviseRandom(fd: posix.fd_t) void {
-    switch (builtin.os.tag) {
-        .linux => {
-            const linux = std.os.linux;
-            _ = linux.fadvise(fd, 0, 0, linux.POSIX_FADV.RANDOM);
-        },
-        // F_RDAHEAD 0 turns readahead off. Best effort.
-        .macos => _ = std.c.fcntl(fd, std.c.F.RDAHEAD, @as(c_int, 0)),
-        else => {},
-    }
 }

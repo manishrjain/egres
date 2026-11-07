@@ -31,10 +31,6 @@ const _meta = @import("meta.zig");
 // If snapshot index is `idx_s`, keep the first log file whose first entry is <= `idx_s`,
 // and all log files after it. Log files strictly below that can be deleted.
 //
-// --- sync ---
-// mmap generally handles process crash safety well enough for default mode.
-// If hard sync is enabled, call msync/fdatasync after writes.
-
 const _lf = @import("log_file.zig");
 // The log file and its buffer live in log_file.zig; the names the
 // code below and the callers use are re-exported here.
@@ -261,10 +257,8 @@ pub const wal = struct {
         // The header takes the first MiB; a log file needs room past it.
         std.debug.assert(opts.log_file_size >= log_file_offset + (1 << 20));
         const vfs = opts.vfs orelse _vfs.g();
-        const io = utils.context.g().io;
-        const cwd = std.Io.Dir.cwd();
-        cwd.access(io, path, .{}) catch |err| switch (err) {
-            error.FileNotFound => try cwd.createDirPath(io, path),
+        _vfs.access(path) catch |err| switch (err) {
+            error.FileNotFound => try _vfs.createDirPath(path),
             else => return err,
         };
         // Settle `.auto` once, here: every log file created under this
@@ -279,9 +273,6 @@ pub const wal = struct {
         const dir_copy = try alloc.dupe(u8, path);
         errdefer alloc.free(dir_copy);
 
-        var dir = try cwd.openDir(io, path, .{ .iterate = true });
-        defer dir.close(io);
-
         // Discover all log file ids, sorted ascending.
         var found_fids = std.ArrayList(u64).empty;
         defer found_fids.deinit(alloc);
@@ -289,11 +280,10 @@ pub const wal = struct {
         var spare_fids = std.ArrayList(u64).empty;
         defer spare_fids.deinit(alloc);
 
-        var it = dir.iterate();
-        while (try it.next(io)) |entry_dir| {
-            if (entry_dir.kind != .file) continue;
-
-            const name = entry_dir.name;
+        const infos = try _vfs.listFiles(alloc, path, .names);
+        defer _vfs.freeObjectInfos(alloc, infos);
+        for (infos) |info| {
+            const name = info.name;
             if (std.mem.endsWith(u8, name, tmp_suffix)) {
                 // A spare the last run left: the file it had prepared,
                 // or one it kept for reuse.

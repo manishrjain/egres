@@ -7,18 +7,23 @@
 //!     `pwrite` submitted to the current worker's libxev loop; the fiber
 //!     parks and the completion callback wakes it. Fully async.
 //!   - **Blocking ops** (`sync`, `setSize`, the `Dir` path ops open/
-//!     create/access/rename/delete, and `Dir.list`): libxev can't do these
-//!     async, so they
-//!     run on the `fsops` thread pool — the fiber parks, a pool thread runs
-//!     the syscall and wakes it. The worker thread stays free, and the big
-//!     path-buffer frames run on the pool thread's full-size OS stack.
-//!   - **Instant ops** (`close`, `stat`): plain inline syscalls (no disk
-//!     I/O), so a pool round-trip would be pure overhead.
+//!     create/access/rename/delete/mkdir/rmtree, and `Dir.list`): libxev
+//!     can't do these async, so they run on the `fsops` thread pool — the
+//!     fiber parks, a pool thread runs the syscall and wakes it. The
+//!     worker thread stays free, and the big path-buffer frames run on
+//!     the pool thread's full-size OS stack.
+//!   - **Instant ops** (`close`, `stat`, `device`, the readahead and
+//!     cache hints, `fsMagic`): plain inline syscalls (no disk I/O), so a
+//!     pool round-trip would be pure overhead.
 //!
 //! The blocking/instant syscalls go through `std.Io.File`/`std.Io.Dir` on the
 //! pool's blocking `std.Io` (`fsops.io()`) rather than raw `std.os.linux` —
 //! cross-platform, and no errno/path-buffer boilerplate. Only the libxev data
 //! plane is fiber-native.
+//!
+//! Every file operation in the process comes through here: nothing above
+//! calls `std.Io.Dir`, `std.posix` or a raw syscall for a file. That is
+//! what lets the simulation's disk replace this one layer.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -126,6 +131,54 @@ pub const File = struct {
     /// Close releases the fd (instant), so it runs inline.
     pub fn close(self: File) void {
         sioFile(self.fd).close(_fsops.io());
+    }
+
+    /// The device (`st_dev`) holding the file: what tells directories
+    /// on one disk from those on different ones. `std.Io.File.Stat`
+    /// leaves it out, so the system call is made here: statx on Linux,
+    /// fstat on macOS. Inline, as `stat` is.
+    pub fn device(self: File) !u64 {
+        switch (builtin.os.tag) {
+            .linux => {
+                const linux = std.os.linux;
+                var stx: linux.Statx = undefined;
+                const rc = linux.statx(
+                    self.fd,
+                    "",
+                    linux.AT.EMPTY_PATH,
+                    .{},
+                    &stx,
+                );
+                if (linux.errno(rc) != .SUCCESS) return error.StatFailed;
+                return (@as(u64, stx.dev_major) << 32) | stx.dev_minor;
+            },
+            .macos => {
+                var st: std.c.Stat = undefined;
+                if (std.c.fstat(self.fd, &st) != 0) return error.StatFailed;
+                return @bitCast(@as(i64, st.dev));
+            },
+            else => return error.Unsupported,
+        }
+    }
+
+    /// Turns readahead off for the file; best effort.
+    pub fn adviseRandom(self: File) void {
+        switch (builtin.os.tag) {
+            .linux => {
+                const linux = std.os.linux;
+                _ = linux.fadvise(self.fd, 0, 0, linux.POSIX_FADV.RANDOM);
+            },
+            // F_RDAHEAD 0 turns readahead off.
+            .macos => _ = std.c.fcntl(self.fd, std.c.F.RDAHEAD, @as(c_int, 0)),
+            else => {},
+        }
+    }
+
+    /// macOS's stand-in for O_DIRECT: F_NOCACHE bypasses the unified
+    /// buffer cache. Best effort, a no-op elsewhere.
+    pub fn noCache(self: File) void {
+        if (builtin.os.tag == .macos)
+            _ = std.c.fcntl(self.fd, std.c.F.NOCACHE, @as(c_int, 1));
     }
 };
 
@@ -336,6 +389,30 @@ pub const Dir = struct {
         return _fsops.run(openImpl, .{path});
     }
 
+    /// Recursive mkdir -p. Offloaded: directory metadata can block.
+    pub fn createDirPath(self: Dir, path: []const u8) !void {
+        _ = self;
+        return _fsops.run(createDirPathImpl, .{path});
+    }
+
+    /// Recursive delete of `path` and everything under it. Offloaded.
+    pub fn deleteTree(self: Dir, path: []const u8) !void {
+        _ = self;
+        return _fsops.run(deleteTreeImpl, .{path});
+    }
+
+    /// Open the directory `path` read-only as a `File`, for `sync`: a
+    /// directory fsync is what makes a created or renamed name durable.
+    pub fn openDir(self: Dir, path: []const u8) !File {
+        _ = self;
+        const fd = try openPosix(
+            path,
+            .{ .ACCMODE = .RDONLY, .DIRECTORY = true },
+            0,
+        );
+        return File.fromFd(fd);
+    }
+
     /// Every entry of `path`, names duped out of `alloc`. Release the
     /// result with `freeEntries`. Offloaded: libxev has no readdir op, and
     /// the loop blocks once per getdents buffer — on the pool thread that
@@ -385,6 +462,14 @@ fn accessImpl(path: []const u8) !void {
     return SioDir.cwd().access(_fsops.io(), path, .{});
 }
 
+fn createDirPathImpl(path: []const u8) !void {
+    return SioDir.cwd().createDirPath(_fsops.io(), path);
+}
+
+fn deleteTreeImpl(path: []const u8) !void {
+    return SioDir.cwd().deleteTree(_fsops.io(), path);
+}
+
 fn renameImpl(old_path: []const u8, new_path: []const u8) !void {
     return SioDir.cwd().rename(old_path, SioDir.cwd(), new_path, _fsops.io());
 }
@@ -425,4 +510,37 @@ fn openPosixImpl(
     mode: std.posix.mode_t,
 ) std.posix.OpenError!std.posix.fd_t {
     return std.posix.openat(std.posix.AT.FDCWD, path, flags, mode);
+}
+
+/// The filesystem magic of `path` (statfs `f_type`), or null when it
+/// cannot be read. Linux only: the magic numbers and the statfs layout
+/// are Linux's; elsewhere the answer is null. Inline: one call at a
+/// WAL's open.
+pub fn fsMagic(path: []const u8) ?i64 {
+    if (builtin.os.tag != .linux) return null;
+    // struct statfs on 64-bit Linux; only f_type is read.
+    const Statfs = extern struct {
+        f_type: i64,
+        f_bsize: i64,
+        f_blocks: u64,
+        f_bfree: u64,
+        f_bavail: u64,
+        f_files: u64,
+        f_ffree: u64,
+        f_fsid: [2]i32,
+        f_namelen: i64,
+        f_frsize: i64,
+        f_flags: i64,
+        f_spare: [4]i64,
+    };
+    comptime std.debug.assert(@sizeOf(Statfs) == 120);
+    const path_z = std.posix.toPosixPath(path) catch return null;
+    var st: Statfs = undefined;
+    const rc = std.os.linux.syscall2(
+        .statfs,
+        @intFromPtr(&path_z),
+        @intFromPtr(&st),
+    );
+    if (std.os.linux.errno(rc) != .SUCCESS) return null;
+    return st.f_type;
 }

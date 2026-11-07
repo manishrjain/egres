@@ -79,13 +79,8 @@ pub const MetaStore = struct {
         path: String,
         alloc: std.mem.Allocator,
     ) !MetaStore {
-        // Directory creation is path metadata, not data I/O — go through
-        // std.Io.Dir (cheap) rather than vfs (which is bandwidth-limited
-        // for data ops).
-        const io = utils.context.g().io;
-        const cwd = std.Io.Dir.cwd();
-        cwd.access(io, path, .{}) catch |err| switch (err) {
-            error.FileNotFound => try cwd.createDirPath(io, path),
+        _vfs.access(path) catch |err| switch (err) {
+            error.FileNotFound => try _vfs.createDirPath(path),
             else => return err,
         };
 
