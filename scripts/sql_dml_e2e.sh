@@ -120,6 +120,12 @@ expect "IS NOT TRUE takes the NULL row too" "(2 rows)" \
 expect "IS FALSE" "2" v "SELECT id FROM flags WHERE on_ IS FALSE;"
 expect "IS UNKNOWN" "3" v "SELECT id FROM flags WHERE on_ IS UNKNOWN;"
 expect "IS NOT UNKNOWN" "(2 rows)" q "SELECT id FROM flags WHERE on_ IS NOT UNKNOWN;"
+expect "CREATE UNIQUE INDEX on a nullable bool" "CREATE INDEX" \
+    q "CREATE UNIQUE INDEX flags_on ON flags (on_);"
+expect "INSERT another unique NULL bool" "INSERT 0 1" \
+    q "INSERT INTO flags VALUES (4, NULL);"
+expect "IS UNKNOWN reads every unique NULL bool" "^2$" \
+    v "SELECT count(*) FROM flags WHERE on_ IS UNKNOWN;"
 expect "DROP the bool table" "DROP TABLE" q "DROP TABLE flags;"
 expect "expression target with an alias" "3" \
     v "SELECT id + 1 AS next FROM t WHERE id = 2;"
@@ -541,6 +547,10 @@ expect "two NULLs under the unique index" "INSERT 0 2" \
     q "INSERT INTO obi VALUES (5, 0, NULL), (6, 0, NULL);"
 expect "NULL rows walk in egid order" "2 1 3 4 5 6 " \
     seq_ "SELECT id FROM obi ORDER BY s;"
+expect "unique NULL range returns every NULL row" "^4 5 6 $" \
+    seq_ "SELECT id FROM obi WHERE s IS NULL;"
+expect "null-safe equality uses the unique NULL range" "^4 5 6 $" \
+    seq_ "SELECT id FROM obi WHERE s IS NOT DISTINCT FROM NULL;"
 expect "unique pagination crosses into NULLs" "^3 4 5 $" \
     seq_ "SELECT id FROM obi ORDER BY s LIMIT 3 OFFSET 2;"
 expect "reverse unique pagination crosses out of NULLs" "^4 3 1 $" \
@@ -566,6 +576,12 @@ expect "unique walk sees value <-> NULL in this txn" "2 4 3 1 " \
 UPDATE obi SET s = NULL WHERE id = 1;
 UPDATE obi SET s = 'aa' WHERE id = 4;
 SELECT id FROM obi ORDER BY s;
+ROLLBACK;"
+expect "unique NULL range sees this txn's writes" "101 ROLLBACK " \
+    txseq_ "BEGIN;
+UPDATE obi SET s = NULL WHERE id = 1;
+UPDATE obi SET s = 'aa' WHERE id = 4;
+SELECT id + 100 FROM obi WHERE s IS NULL;
 ROLLBACK;"
 expect "rolled back: the unique walk is unchanged" "2 1 3 4 " \
     seq_ "SELECT id FROM obi ORDER BY s;"
