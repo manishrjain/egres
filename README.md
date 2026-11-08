@@ -75,8 +75,13 @@ before it is considered.
 Open an issue first for anything large; Egres has strong opinions about
 its design, and a short discussion beats a week of rework. Run
 `scripts/prepush.sh` before opening a pull request. A bug fix comes with
-a test that fails without it. Commit messages name the subsystem and say
-what changed and why, as the history does.
+a test that fails without it. Aim to write commit messages by hand, so they
+are readable by humans; look at the history to understand the format
+that's expected from the message.
+
+In this new world of AI coding, the biggest overhead is reviews for the maintainer. A good
+contribution is small and with a specific goal, so it's easier to review.
+You can look at the issues to find what can use your contribution.
 
 Before a first pull request merges, its author must sign the
 [Contributor License Agreement](CLA.md) once, from their GitHub account.
