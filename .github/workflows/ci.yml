@@ -1,12 +1,21 @@
-# Every push to main runs the same gate as a local push:
-# scripts/prepush.sh — exe builds (default + jemalloc allocator) and
-# the full test suite including big tests (`zig build test -- --bigtest`).
+# Every push to main, and every pull request, runs the same gate as a
+# local push: scripts/prepush.sh — exe builds (default + jemalloc
+# allocator) and the full test suite including big tests
+# (`zig build test -- --bigtest`). A fork's PR runs with a read-only
+# token and no secrets, which this workflow never needed.
 name: ci
 
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
+
+# A new push to a PR supersedes its running build; pushes to main
+# each run to completion.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
