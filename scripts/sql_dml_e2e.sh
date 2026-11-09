@@ -1048,6 +1048,9 @@ expect "a param that does not parse for its column" "invalid value" \
     x 'SELECT name FROM pt WHERE id = $1 \bind abc \g'
 expect "\$0 is rejected" "there is no parameter \$0" \
     x 'SELECT name FROM pt WHERE id = $0 \bind \g'
+expect "a rejected statement with a param answers its reason, not 08P01" \
+    "function no_such_fn() is not supported" \
+    x 'SELECT name FROM pt WHERE name = no_such_fn($1) \bind a \g'
 expect "syntax error over the extended path" "syntax error" \
     x 'SELEC 1 \bind \g'
 expect "Describe of a missing table" "table does not exist" \
