@@ -814,6 +814,13 @@ pub const Handler = struct {
         const stmt = (try self.cachedStatement(ctx.sql)) orelse
             return replySyntaxError(state);
         fiber.ctx().record("bound {d} params", .{ctx.portal.params.values.len});
+        // A rejected statement counts no `$n`, so checking its Bind
+        // values would answer 08P01 in place of the reason it was
+        // rejected.
+        switch (stmt) {
+            .invalid, .unsupported => return self.runStatement(state, stmt),
+            else => {},
+        }
         const needed = stmt.paramCount();
         if (needed != ctx.portal.params.values.len) {
             var buf: [128]u8 = undefined;

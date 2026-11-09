@@ -999,6 +999,9 @@ expect "a param that does not parse for its column" "invalid value" \
     x 'SELECT name FROM pt WHERE id = $1 \bind abc \g'
 expect "\$0 is rejected" "there is no parameter \$0" \
     x 'SELECT name FROM pt WHERE id = $0 \bind \g'
+expect "a rejected statement with a param answers its reason, not 08P01" \
+    "an expression must be a literal" \
+    x 'SELECT name FROM pt WHERE id = $1::int8 \bind 1 \g'
 expect "syntax error over the extended path" "syntax error" \
     x 'SELEC 1 \bind \g'
 expect "Describe of a missing table" "table does not exist" \
