@@ -229,7 +229,10 @@ test "sql.parse: a cast constant is the constant (pgjdbc simple mode)" {
     const rhs = upd.update.sets[0].value.binop.rhs.*;
     try testing.expectEqualStrings(",1", rhs.literal.str);
     const row = try parse.statement(alloc, "SELECT 1::int8;");
-    try testing.expectEqual(@as(i64, 1), row.select_row.cells[0].value.int);
+    try testing.expectEqual(
+        @as(i64, 1),
+        row.select_row.targets[0].expr.literal.int,
+    );
     // A cast of anything but a constant is still not a literal.
     const bad = try parse.statement(alloc, "SELECT a FROM t WHERE a = b::int8;");
     try testing.expect(bad == .invalid);
@@ -723,7 +726,7 @@ test "sql.parse: SELECT rejections carry a reason" {
     }
 }
 
-test "sql.parse: SELECT without FROM is a row of constants" {
+test "sql.parse: SELECT without FROM is a row of expressions" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -731,31 +734,47 @@ test "sql.parse: SELECT without FROM is a row of constants" {
 
     const s1 = try parse.statement(alloc, "SELECT 1;");
     try testing.expect(s1 == .select_row);
-    try testing.expectEqual(1, s1.select_row.cells.len);
-    try testing.expectEqualStrings("?column?", s1.select_row.cells[0].name);
-    try testing.expectEqual(1, s1.select_row.cells[0].value.int);
+    try testing.expectEqual(1, s1.select_row.targets.len);
+    try testing.expectEqualStrings("?column?", s1.select_row.targets[0].name);
+    try testing.expectEqual(1, s1.select_row.targets[0].expr.literal.int);
     try testing.expectEqual(null, s1.select_row.limit);
+    try testing.expectEqual(0, s1.select_row.param_count);
 
     const s2 = try parse.statement(
         alloc,
         "SELECT 1 AS one, 'a' b, true, NULL, 1.5 LIMIT 0;",
     );
-    const cells = s2.select_row.cells;
-    try testing.expectEqual(5, cells.len);
-    try testing.expectEqualStrings("one", cells[0].name);
-    try testing.expectEqualStrings("b", cells[1].name);
-    try testing.expectEqualStrings("a", cells[1].value.str);
-    try testing.expectEqual(true, cells[2].value.bool_);
-    try testing.expect(cells[3].value == .null_value);
-    try testing.expectEqualStrings("1.5", cells[4].value.float);
+    const targets = s2.select_row.targets;
+    try testing.expectEqual(5, targets.len);
+    try testing.expectEqualStrings("one", targets[0].name);
+    try testing.expectEqualStrings("b", targets[1].name);
+    try testing.expectEqualStrings("a", targets[1].expr.literal.str);
+    try testing.expectEqual(true, targets[2].expr.literal.bool_);
+    try testing.expect(targets[3].expr.literal == .null_value);
+    try testing.expectEqualStrings("1.5", targets[4].expr.literal.float);
     try testing.expectEqual(0, s2.select_row.limit);
 
+    // Operators, calls, parameters and columns parse as a SELECT's
+    // targets do; a column is for bind to refuse, having no table.
+    const s3 = try parse.statement(
+        alloc,
+        "SELECT 1 + $2, abs(-3), a, $1 || 'x' AS t;",
+    );
+    const t3 = s3.select_row.targets;
+    try testing.expectEqual(4, t3.len);
+    try testing.expectEqual(parse.Expr.Op.add, t3[0].expr.binop.op);
+    try testing.expectEqualStrings("?column?", t3[0].name);
+    try testing.expectEqualStrings("abs", t3[1].name);
+    try testing.expectEqualStrings("a", t3[2].expr.column);
+    try testing.expectEqualStrings("t", t3[3].name);
+    try testing.expectEqual(2, s3.select_row.param_count);
+    try testing.expectEqual(2, s3.paramCount());
+
     const cases = [_]struct { sql: String, needle: String }{
-        .{ .sql = "SELECT now();", .needle = "constants" },
-        .{ .sql = "SELECT count(*);", .needle = "constants" },
-        .{ .sql = "SELECT a;", .needle = "constants" },
-        .{ .sql = "SELECT $1;", .needle = "constants" },
-        .{ .sql = "SELECT 1 + 1;", .needle = "constants" },
+        .{ .sql = "SELECT now();", .needle = "now()" },
+        .{ .sql = "SELECT count(*);", .needle = "FROM" },
+        .{ .sql = "SELECT *;", .needle = "no tables" },
+        .{ .sql = "SELECT sum(1);", .needle = "aggregates" },
         .{ .sql = "SELECT 1 WHERE true;", .needle = "FROM" },
         .{ .sql = "SELECT 1 FOR UPDATE;", .needle = "FROM" },
         .{ .sql = "VALUES (1);", .needle = "VALUES" },

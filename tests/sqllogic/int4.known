@@ -6,9 +6,9 @@
 #   accepted  diverges on purpose; note = the reason.
 skip	pg/test_setup.sql:69	INSERT INTO INT4_TBL(f1) VALUES	22P02 invalid value for column type
 skip	pg/test_setup.sql:75	VACUUM INT4_TBL	0A000 unsupported statement
-skip	pg/int4.sql:21	SELECT pg_input_is_valid('34', 'int4')	0A000 only constants are supported without a FROM
-skip	pg/int4.sql:22	SELECT pg_input_is_valid('asdf', 'int4')	0A000 only constants are supported without a FROM
-skip	pg/int4.sql:23	SELECT pg_input_is_valid('1000000000000', 'int4')	0A000 only constants are supported without a FROM
+skip	pg/int4.sql:21	SELECT pg_input_is_valid('34', 'int4')	0A000 function pg_input_is_valid() is not supported
+skip	pg/int4.sql:22	SELECT pg_input_is_valid('asdf', 'int4')	0A000 function pg_input_is_valid() is not supported
+skip	pg/int4.sql:23	SELECT pg_input_is_valid('1000000000000', 'int4')	0A000 function pg_input_is_valid() is not supported
 skip	pg/int4.sql:24	SELECT * FROM pg_input_error_info('1000000000000', 'int4')	0A000 only table sources are supported
 skip	pg/int4.sql:51	SELECT i.* FROM INT4_TBL i WHERE (i.f1 % int2 '2') = int2 '1'	42883 operator does not exist for these operand types
 skip	pg/int4.sql:54	SELECT i.* FROM INT4_TBL i WHERE (i.f1 % int4 '2') = int2 '0'	42883 operator does not exist for these operand types
@@ -20,21 +20,16 @@ skip	pg/int4.sql:78	SELECT i.f1, i.f1 - int2 '2' AS x FROM INT4_TBL i	42883 oper
 skip	pg/int4.sql:83	SELECT i.f1, i.f1 - int4 '2' AS x FROM INT4_TBL i	42883 operator does not exist for these operand types
 skip	pg/int4.sql:86	SELECT i.f1, i.f1 / int2 '2' AS x FROM INT4_TBL i	42883 operator does not exist for these operand types
 skip	pg/int4.sql:88	SELECT i.f1, i.f1 / int4 '2' AS x FROM INT4_TBL i	42883 operator does not exist for these operand types
-skip	pg/int4.sql:95	SELECT -2+3 AS one	0A000 only constants are supported without a FROM
-skip	pg/int4.sql:97	SELECT 4-2 AS two	0A000 only constants are supported without a FROM
-skip	pg/int4.sql:99	SELECT 2- -1 AS three	0A000 only constants are supported without a FROM
-skip	pg/int4.sql:101	SELECT 2 - -2 AS four	0A000 only constants are supported without a FROM
-skip	pg/int4.sql:103	SELECT int2 '2' * int2 '2' = int2 '16' / int2 '4' AS true	0A000 only constants are supported without a FROM
-skip	pg/int4.sql:105	SELECT int4 '2' * int2 '2' = int2 '16' / int4 '4' AS true	0A000 only constants are supported without a FROM
-skip	pg/int4.sql:107	SELECT int2 '2' * int4 '2' = int4 '16' / int2 '4' AS true	0A000 only constants are supported without a FROM
-skip	pg/int4.sql:109	SELECT int4 '1000' < int4 '999' AS false	0A000 only constants are supported without a FROM
-skip	pg/int4.sql:111	SELECT 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 AS ten	0A000 only constants are supported without a FROM
-skip	pg/int4.sql:113	SELECT 2 + 2 / 2 AS three	0A000 only constants are supported without a FROM
-skip	pg/int4.sql:115	SELECT (2 + 2) / 2 AS two	0A000 only constants are supported without a FROM
-skip	pg/int4.sql:118	SELECT (-1::int4<<31)::text	0A000 only constants are supported without a FROM
-skip	pg/int4.sql:119	SELECT ((-1::int4<<31)+1)::text	0A000 only constants are supported without a FROM
-skip	pg/int4.sql:124	SELECT (-2147483648)::int4 % (-1)::int4	0A000 only constants are supported without a FROM
-skip	pg/int4.sql:127	SELECT (-2147483648)::int4 % (-1)::int2	0A000 only constants are supported without a FROM
+skip	pg/int4.sql:103	SELECT int2 '2' * int2 '2' = int2 '16' / int2 '4' AS true	0A000 only the + - * / % || operators are supported
+skip	pg/int4.sql:105	SELECT int4 '2' * int2 '2' = int2 '16' / int4 '4' AS true	0A000 only the + - * / % || operators are supported
+skip	pg/int4.sql:107	SELECT int2 '2' * int4 '2' = int4 '16' / int2 '4' AS true	0A000 only the + - * / % || operators are supported
+skip	pg/int4.sql:109	SELECT int4 '1000' < int4 '999' AS false	0A000 only the + - * / % || operators are supported
+skip	pg/int4.sql:118	SELECT (-1::int4<<31)::text	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
+skip	pg/int4.sql:119	SELECT ((-1::int4<<31)+1)::text	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
+bug	pg/int4.sql:122	SELECT (-2147483648)::int4 * (-1)::int4	#26
+bug	pg/int4.sql:123	SELECT (-2147483648)::int4 / (-1)::int4	#26
+bug	pg/int4.sql:125	SELECT (-2147483648)::int4 * (-1)::int2	#26
+bug	pg/int4.sql:126	SELECT (-2147483648)::int4 / (-1)::int2	#26
 skip	pg/int4.sql:130	SELECT x, x::int4 AS int4_value	0A000 only table sources are supported
 skip	pg/int4.sql:140	SELECT x, x::int4 AS int4_value	0A000 only table sources are supported
 skip	pg/int4.sql:150	SELECT a, b, gcd(a, b), gcd(a, -b), gcd(b, a), gcd(-b, a)	0A000 only table sources are supported

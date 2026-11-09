@@ -93,7 +93,7 @@ FROM one_table
 
 | Clause | Status | Notes |
 |---|---|---|
-| `SELECT 1`, constants with no `FROM` | Yes | One row; a pool's connection check. Aliases allowed. |
+| `SELECT 1`, expressions with no `FROM` | Yes | One row; a pool's connection check. Literals, parameters, arithmetic, `\|\|` and the supported functions; aliases allowed. |
 | Column references and `*` in the target list | Yes | The `egid` column can be selected by name. |
 | Expressions in the target list, with `AS` | Yes | Arithmetic, `\|\|` and the [supported functions](#functions-and-operators) over the row's columns, literals and parameters. Without an alias the name is the column's, the function's, or `?column?`. |
 | `count(*)` | Yes | Alone in the target list. |

@@ -224,6 +224,58 @@ test "sql.expr: bind — literals, columns, operators, and the type rules" {
     try testing.expectError(error.UndefinedColumn, fx.bind("a = zz + 1"));
 }
 
+test "sql.expr: bind without a table — a SELECT with no FROM" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const arloc = arena.allocator();
+    const stmt = try sql.parse.statement(
+        arloc,
+        "SELECT 1, 1.50, 'a' || 'b', abs(-2) * 3, NULL, 7 / 0, $1 + 1;",
+    );
+    const targets = stmt.select_row.targets;
+    const none: expr.Row = .{ .scratch = arloc, .tbl = null, .item = null };
+    const params: pgwire.Params = .{
+        .values = &.{"41"},
+        .wirefmts = &.{.text},
+    };
+
+    // A literal is the widest cell of its kind; computed results are
+    // widened the same way; a NULL-only target has no type.
+    const want = [_]struct { ty: ?Type, cell: ?Value }{
+        .{ .ty = .int8, .cell = .{ .int8 = 1 } },
+        .{ .ty = .numeric, .cell = .{ .numeric = try sql.value.Numeric.parse("1.50") } },
+        .{ .ty = .text, .cell = .{ .text = "ab" } },
+        .{ .ty = .int8, .cell = .{ .int8 = 6 } },
+        .{ .ty = null, .cell = .null_value },
+        .{ .ty = .int8, .cell = null }, // DivisionByZero
+        .{ .ty = .int8, .cell = .{ .int8 = 42 } },
+    };
+    for (targets, want) |t, w| {
+        const node = try expr.bind(arloc, null, t.expr, null, params, null);
+        try testing.expectEqual(w.ty, node.ty());
+        if (w.cell) |cell| {
+            const got = try node.cell(none);
+            if (cell == .text)
+                try testing.expectEqualStrings(cell.text, got.text)
+            else
+                try testing.expectEqual(cell, got);
+        } else {
+            try testing.expectError(error.DivisionByZero, node.cell(none));
+        }
+    }
+
+    // No table: every column is undefined, EXCLUDED included.
+    const col = try sql.parse.statement(arloc, "SELECT a, 1;");
+    try testing.expectError(error.UndefinedColumn, expr.bind(
+        arloc,
+        null,
+        col.select_row.targets[0].expr,
+        null,
+        .{},
+        null,
+    ));
+}
+
 test "sql.expr: eval — integer arithmetic, NULLs, and range errors" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

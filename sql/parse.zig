@@ -303,20 +303,17 @@ pub const OrderBy = struct {
     nulls_first: bool,
 };
 
-/// One target of a SELECT without FROM: a constant and its output
-/// name, the alias or Postgres's `?column?`.
-pub const Cell = struct {
-    name: String, // borrowed
-    value: Literal,
-};
-
-/// SELECT constants with no FROM, the one-row answer a pool or driver
-/// uses to check a connection (`SELECT 1`). Constants only: a
-/// function, a column, an expression or a `$n` is refused.
+/// SELECT expressions with no FROM: one row computed from constants,
+/// `$n` values and calls (`SELECT 1`, a pool's connection check;
+/// `SELECT $1::text`; `SELECT abs(-2) * 3`). The targets are a
+/// Projection's, parsed by the same rules; a column has no table to
+/// resolve against and fails at bind. `*` and aggregates are refused.
 pub const SelectRow = struct {
-    cells: []Cell, // borrowed
+    targets: []Target, // borrowed
     /// LIMIT 0 drops the row; anything else keeps it.
     limit: ?usize = null,
+    /// How many `$n` values Bind must supply: the highest index used.
+    param_count: u16 = 0,
 };
 
 pub const Delete = struct {
@@ -415,12 +412,14 @@ pub const Stmt = union(enum) {
     invalid: String, // recognized but rejected; reason
     unsupported,
 
-    /// How many `$n` values Bind must supply. Only DML carries
-    /// placeholders; every other statement needs none.
+    /// How many `$n` values Bind must supply. Only DML and a SELECT
+    /// without FROM carry placeholders; every other statement needs
+    /// none.
     pub fn paramCount(self: Stmt) u16 {
         return switch (self) {
             .insert => |ins| ins.param_count,
             .select => |sel| sel.param_count,
+            .select_row => |sr| sr.param_count,
             .delete => |del| del.param_count,
             .update => |up| up.param_count,
             else => 0,
@@ -1509,7 +1508,7 @@ fn funcName(fc: *const c.FuncCall) ?String {
 }
 
 /// SELECT [exprs|*|count(*)] FROM one_table [WHERE ...] [FOR UPDATE]
-/// [ORDER BY ...] [LIMIT n] [OFFSET n], or constants with no FROM
+/// [ORDER BY ...] [LIMIT n] [OFFSET n], or expressions with no FROM
 /// (parseSelectRow). Joins, subqueries and GROUP BY / DISTINCT /
 /// HAVING are rejected.
 fn parseSelect(
@@ -1852,9 +1851,11 @@ fn targetName(
     };
 }
 
-/// SELECT constant [AS name], ... with no FROM: one row, nothing
-/// read. VALUES has no target list and is refused; WHERE and FOR
-/// UPDATE have nothing to apply to.
+/// SELECT expr [AS name], ... with no FROM: one row, nothing read.
+/// The targets parse as a SELECT's (parseTargets); `*` has no table
+/// to expand and count(*) nothing to count, so both are refused, as
+/// is a WHERE or FOR UPDATE with nothing to apply to. VALUES has no
+/// target list and is refused.
 fn parseSelectRow(
     alloc: std.mem.Allocator,
     ss: *const c.SelectStmt,
@@ -1863,26 +1864,24 @@ fn parseSelectRow(
     if (ss.valuesLists != null) return invalid("VALUES is not supported");
     if (ss.whereClause != null or ss.lockingClause != null)
         return invalid("WHERE and FOR UPDATE need a FROM");
-    const targets = parser.items(ss.targetList);
-    if (targets.len == 0) return .unsupported;
-    const cells = try alloc.alloc(Cell, targets.len);
-    for (targets, cells) |t, *cell| {
-        const rt = parser.cast(c.ResTarget, t.ptr_value) orelse
-            return .unsupported;
-        const ac = constant(rt.val) orelse
-            return invalid("only constants are supported without a FROM");
-        const lit = try literalFrom(alloc, ac);
-        if (lit == .unsupported)
-            return invalid("only constants are supported without a FROM");
-        cell.* = .{
-            .name = if (rt.name != null)
-                try dup(alloc, rt.name)
-            else
-                "?column?",
-            .value = lit,
-        };
-    }
-    return .{ .select_row = .{ .cells = cells, .limit = limit } };
+    if (parser.items(ss.targetList).len == 0) return .unsupported;
+    var params = ParamTally{};
+    const parsed = try parseTargets(alloc, &params, ss.targetList, .select);
+    const targets = switch (parsed) {
+        .projection => |projection| switch (projection) {
+            .targets => |targets| targets,
+            .star => return invalid(
+                "SELECT * with no tables specified is not valid",
+            ),
+            .count_star => return invalid("count(*) needs a FROM"),
+        },
+        .stmt => |rejected| return rejected,
+    };
+    return .{ .select_row = .{
+        .targets = targets,
+        .limit = limit,
+        .param_count = params.count,
+    } };
 }
 
 /// SET and RESET, any kind and parameter (Stmt.set_var).

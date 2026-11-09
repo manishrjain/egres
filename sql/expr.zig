@@ -43,11 +43,13 @@ const Func = _funcs.Func;
 /// item, and where a computed value lives. The executor passes its
 /// per-row scratch, reset after the row; a SET passes the statement
 /// arena, since the value outlives the row. Text a leaf yields
-/// borrows `item.value` either way.
+/// borrows `item.value` either way. A SELECT without FROM evaluates
+/// against no row at all: `tbl` and `item` are null, and no leaf
+/// reads them, since a tree bound without a table has no columns.
 pub const Row = struct {
     scratch: std.mem.Allocator,
-    tbl: *const Table,
-    item: zdb.kv.Item,
+    tbl: ?*const Table,
+    item: ?zdb.kv.Item,
 };
 
 pub const Node = union(enum) {
@@ -101,7 +103,7 @@ pub const Node = union(enum) {
     pub fn cell(self: *const Node, row: Row) EvalError!Value {
         switch (self.*) {
             .value => |v| return v,
-            .column => |col| return row.tbl.parseCol(row.item, col),
+            .column => |col| return row.tbl.?.parseCol(row.item.?, col),
             .param => unreachable, // Describe's tree is never evaluated
             .binop, .call => {},
         }
@@ -131,7 +133,7 @@ pub const Node = union(enum) {
         switch (self.*) {
             .value => |v| if (v == .null_value or v.ty() == col.ty) return v,
             .column => |scol| if (scol.ty == col.ty and scol.type_mod == col.type_mod)
-                return row.tbl.parseCol(row.item, scol),
+                return row.tbl.?.parseCol(row.item.?, scol),
             .param => unreachable, // Describe's tree is never evaluated
             .binop, .call => {},
         }
@@ -144,7 +146,7 @@ pub const Node = union(enum) {
     fn scalar(self: *const Node, row: Row) EvalError!?Scalar {
         switch (self.*) {
             .value => |v| return scalarOf(v),
-            .column => |col| return scalarOf(row.tbl.parseCol(row.item, col)),
+            .column => |col| return scalarOf(row.tbl.?.parseCol(row.item.?, col)),
             .param => unreachable, // Describe's tree is never evaluated
             .binop => |b| {
                 // Both sides first, then the NULL check: PG raises on
@@ -188,16 +190,18 @@ pub const BindError = error{
 
 /// Bind one node and, recursively, its children, pure: names →
 /// columns, literals and `$n` values → typed cells, operators
-/// type-checked against their operands. `target` is the column being
-/// assigned — set at the root, null under an operator. A literal
-/// takes its type (as PG resolves an "unknown" literal from where it
-/// stands: `'7'` into an int, `'t'` into a bool), and the root's
-/// result must fit it. `arloc` (the statement arena) backs the tree.
-/// `bindOrReply` adds the wire; pub for the unit tests, which have no
-/// connection to reply on.
+/// type-checked against their operands. `tbl` is what a column name
+/// resolves against; null for a SELECT without FROM, where every
+/// column is undefined. `target` is the column being assigned — set
+/// at the root, null under an operator. A literal takes its type (as
+/// PG resolves an "unknown" literal from where it stands: `'7'` into
+/// an int, `'t'` into a bool), and the root's result must fit it.
+/// `arloc` (the statement arena) backs the tree. `bindOrReply` adds
+/// the wire; pub for the unit tests, which have no connection to
+/// reply on.
 pub fn bind(
     arloc: std.mem.Allocator,
-    tbl: *const Table,
+    tbl: ?*const Table,
     expr: _parse.Expr,
     target: ?*const Column,
     params: pgwire.Params,
@@ -212,15 +216,19 @@ pub fn bind(
             .{ .param = _parse.paramDeclared(params, lit.param) }
         else
             .{ .value = try literalValue(arloc, lit, target, params) },
-        .column => |name| node.* = .{
-            .column = tbl.column(name) orelse return error.UndefinedColumn,
+        .column => |name| {
+            const t = tbl orelse return error.UndefinedColumn;
+            node.* = .{
+                .column = t.column(name) orelse return error.UndefinedColumn,
+            };
         },
         // EXCLUDED.col in ON CONFLICT DO UPDATE SET: the proposed
         // row's cell, already of its column's type, bound as a
         // constant. A SET with no proposed row (UPDATE) has no EXCLUDED.
         .excluded => |name| {
             const cells = excluded orelse return error.UndefinedColumn;
-            const col = tbl.column(name) orelse return error.UndefinedColumn;
+            const t = tbl orelse return error.UndefinedColumn;
+            const col = t.column(name) orelse return error.UndefinedColumn;
             node.* = .{ .value = cells[col.pos] };
         },
         .binop => |b| {

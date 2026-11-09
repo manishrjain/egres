@@ -1078,9 +1078,12 @@ fn describeRowsLoad(
     try state.sendRowDescription(proj.fields);
 }
 
-/// SELECT constants with no FROM: the one row, straight from the
-/// statement; no table, transaction or lock. Describe sends the
-/// fields on the extended path, as for select.
+/// SELECT expressions with no FROM: the one row, computed from the
+/// statement and its `$n` values; no table, transaction or lock. The
+/// targets bind against no table (expr.bind), so a column is
+/// undefined and a bare literal is the widest cell of its kind, as a
+/// SELECT's targets are typed. Describe sends the fields on the
+/// extended path, as for select.
 pub fn selectRow(
     self: *Handler,
     state: *pgwire.ConnState,
@@ -1089,32 +1092,28 @@ pub fn selectRow(
     var arena = fiber.ctx().newArena();
     defer arena.deinit();
     const arloc = arena.allocator();
-    const fields = try selectRowFields(arloc, sr);
-    if (!try applyFormats(state, fields, self.portal.result_wirefmts)) return;
-    if (self.mode == .simple) try state.sendRowDescription(fields);
+    const proj = try projectionOrReply(
+        self,
+        state,
+        arloc,
+        null,
+        .{ .targets = sr.targets },
+    ) orelse return;
+    if (self.mode == .simple) try state.sendRowDescription(proj.fields);
     const emit = (sr.limit orelse 1) > 0;
     if (emit) {
-        var dw = try state.beginDataRow(@intCast(sr.cells.len));
-        for (sr.cells, fields) |cell, fd| {
-            // SELECT 1.50 is a numeric; text keeps the literal's text,
-            // as Postgres echoes it, binary needs the number.
-            const v: _value.Value = switch (cell.value) {
-                .null_value => .null_value,
-                .int => |n| .{ .int8 = n },
-                .float => |text| if (fd.wirefmt == .binary) .{
-                    .numeric = _value.Numeric.parse(text) catch
-                        return replyErrorCode(
-                            state,
-                            pgwire.sqlstate.numeric_value_out_of_range,
-                            "numeric field overflow",
-                        ),
-                } else .{ .text = text },
-                .str => |text| .{ .text = text },
-                .bool_ => |b| .{ .bool_ = b },
-                else => unreachable, // the parser keeps only constants
+        // Every cell first, then the frame: a target that fails to
+        // compute (1/0) ends the result with the error and no row.
+        const row: _expr.Row = .{ .scratch = arloc, .tbl = null, .item = null };
+        const cells = try arloc.alloc(_value.Value, proj.outs.len);
+        for (proj.outs, cells) |node, *cell| {
+            cell.* = node.cell(row) catch |err| {
+                try replyEmitErr(state, err);
+                return;
             };
-            try writeCell(&dw, fd.wirefmt, null, v);
         }
+        var dw = try state.beginDataRow(@intCast(cells.len));
+        for (cells, proj.fields) |v, fd| try writeCell(&dw, fd.wirefmt, null, v);
         try dw.finish();
     }
     try state.sendCommandComplete(if (emit) "SELECT 1" else "SELECT 0");
@@ -1129,30 +1128,14 @@ pub fn describeSelectRow(
 ) !void {
     var arena = fiber.ctx().newArena();
     defer arena.deinit();
-    const fields = try selectRowFields(arena.allocator(), sr);
-    if (!try applyFormats(state, fields, self.portal.result_wirefmts)) return;
-    try state.sendRowDescription(fields);
-}
-
-/// The fields of a SELECT without FROM: each named by its target and
-/// typed by its constant, the widest of its kind; an untyped NULL is
-/// text, as Postgres resolves it.
-fn selectRowFields(
-    arloc: std.mem.Allocator,
-    sr: _parse.SelectRow,
-) ![]pgwire.FieldDescription {
-    const fields = try arloc.alloc(pgwire.FieldDescription, sr.cells.len);
-    for (sr.cells, fields) |cell, *fd| fd.* = .{
-        .name = cell.name,
-        .type_oid = switch (cell.value) {
-            .int => pgwire.oid.int8,
-            .float => pgwire.oid.numeric,
-            .bool_ => pgwire.oid.bool_,
-            .str, .null_value => pgwire.oid.text,
-            else => unreachable, // the parser keeps only constants
-        },
-    };
-    return fields;
+    const proj = try projectionOrReply(
+        self,
+        state,
+        arena.allocator(),
+        null,
+        .{ .targets = sr.targets },
+    ) orelse return;
+    try state.sendRowDescription(proj.fields);
 }
 
 /// What a statement that returns rows sends, SELECT's targets or a
@@ -1167,18 +1150,20 @@ const Outputs = struct {
 
 /// Bind a projection, SELECT's or RETURNING's: `*` is the user
 /// columns; a target is an expression over the row (expr.bind), typed
-/// by what it computes. Pure: the expression binder's errors. The
-/// field names borrow the Table or the statement.
+/// by what it computes. `tbl` is null for a SELECT without FROM,
+/// whose targets are expressions only (the parser refuses `*`). Pure:
+/// the expression binder's errors. The field names borrow the Table
+/// or the statement.
 fn projectionOf(
     arloc: std.mem.Allocator,
-    tbl: *const _table.Table,
+    tbl: ?*const _table.Table,
     projection: _parse.Projection,
     params: pgwire.Params,
 ) _expr.BindError!Outputs {
     var outs: std.ArrayList(*const Node) = .empty;
     var names: std.ArrayList(String) = .empty;
     switch (projection) {
-        .star => for (tbl.columns) |*c| {
+        .star => for (tbl.?.columns) |*c| {
             const node = try arloc.create(Node);
             node.* = .{ .column = c };
             try outs.append(arloc, node);
@@ -1227,7 +1212,7 @@ fn projectionOrReply(
     self: *Handler,
     state: *pgwire.ConnState,
     arloc: std.mem.Allocator,
-    tbl: *const _table.Table,
+    tbl: ?*const _table.Table,
     projection: _parse.Projection,
 ) !?Outputs {
     const params = self.portal.params;

@@ -689,7 +689,20 @@ expect "constants with aliases" "1|a|t||1.5" v \
 expect "constants keep their aliases" "one | b |" q \
     "SELECT 1 AS one, 'a' b, true, NULL, 1.5;"
 expect "SELECT 1 LIMIT 0" "(0 rows)" q "SELECT 1 LIMIT 0;"
-expect "a function without FROM errors" "constants" q "SELECT now();"
+# Expressions without FROM: computed as a SELECT's targets are, typed
+# by what they compute, with nothing read.
+expect "arithmetic without FROM" "7" v "SELECT 1 + 2 * 3;"
+expect "a call without FROM" "6" v "SELECT abs(-2) * 3;"
+expect "a call without FROM is named for the function" "abs" q \
+    "SELECT abs(-2);"
+expect "text without FROM" "ab" v "SELECT 'a' || 'b';"
+expect "a numeric literal keeps its scale" "1.50|0.3" v "SELECT 1.50, 0.1 + 0.2;"
+expect "an eval error without FROM" "division by zero" q "SELECT 7 / 0;"
+expect "a column without FROM is undefined" "column does not exist" q \
+    "SELECT a;"
+expect "an unknown function without FROM" "now() is not supported" q \
+    "SELECT now();"
+expect "SELECT * without FROM" "no tables specified" q "SELECT *;"
 expect "SET is accepted" "SET" q "SET extra_float_digits = 3;"
 expect "RESET is accepted" "RESET" q "RESET ALL;"
 # SHOW: the isolation a driver asks about, the connection's settings
@@ -955,6 +968,10 @@ expect "extended count(*)" "2" x 'SELECT count(*) FROM pt \bind \g'
 expect "extended SELECT 1" "1" x 'SELECT 1 \bind \g'
 expect "extended SELECT 1 header comes from Describe" "?column?" \
     xq 'SELECT 1 \bind \g'
+expect "extended SELECT of a param expression" "43" \
+    x 'SELECT $1 + 1 \bind 42 \g'
+expect "extended SELECT of a text param" "hi_there" \
+    x 'SELECT $1 || $2 \bind hi _there \g'
 expect "extended SET" "SET" xq 'SET application_name = e2e \bind \g'
 expect "extended UPDATE, param under an operator" "UPDATE 1" \
     xq 'UPDATE pt SET n = n + $1 WHERE name = $2 \bind 5 a \g'

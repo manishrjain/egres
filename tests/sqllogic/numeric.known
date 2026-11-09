@@ -56,9 +56,9 @@ skip	pg/numeric.sql:629	INSERT INTO num_result SELECT id, 0, POWER(numeric '10',
 skip	pg/numeric.sql:632	SELECT t1.id1, t1.result, t2.expected	0A000 SELECT must read exactly one table
 skip	pg/numeric.sql:643	WITH v(x) AS	0A000 SELECT must read exactly one table
 skip	pg/numeric.sql:651	WITH v(x) AS	0A000 SELECT must read exactly one table
-skip	pg/numeric.sql:661	SELECT 'nan'::numeric / '0'	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:665	SELECT 'nan'::numeric % '0'	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:669	SELECT div('nan'::numeric, '0')	0A000 only constants are supported without a FROM
+skip	pg/numeric.sql:661	SELECT 'nan'::numeric / '0'	42883 operator does not exist for these operand types
+skip	pg/numeric.sql:665	SELECT 'nan'::numeric % '0'	42883 operator does not exist for these operand types
+skip	pg/numeric.sql:669	SELECT div('nan'::numeric, '0')	0A000 function div() is not supported
 skip	pg/numeric.sql:672	WITH v(x) AS	0A000 function numeric_inc() is not supported
 skip	pg/numeric.sql:677	WITH v(x) AS	42P01 table does not exist
 skip	pg/numeric.sql:683	WITH v(x) AS	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
@@ -66,20 +66,20 @@ skip	pg/numeric.sql:690	WITH v(x) AS	42P01 table does not exist
 skip	pg/numeric.sql:698	WITH v(x) AS	0A000 function log() is not supported
 skip	pg/numeric.sql:710	WITH v(x) AS	0A000 SELECT must read exactly one table
 skip	pg/numeric.sql:724	WITH v(x) AS	0A000 SELECT must read exactly one table
-skip	pg/numeric.sql:732	SELECT power('-1'::numeric, 'inf')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:733	SELECT power('-2'::numeric, '3')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:735	SELECT power('-2'::numeric, '-1')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:737	SELECT power('-2'::numeric, 'inf')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:738	SELECT power('-2'::numeric, '-inf')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:739	SELECT power('inf'::numeric, '-2')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:740	SELECT power('inf'::numeric, '-inf')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:741	SELECT power('-inf'::numeric, '2')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:742	SELECT power('-inf'::numeric, '3')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:744	SELECT power('-inf'::numeric, '-2')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:745	SELECT power('-inf'::numeric, '-3')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:746	SELECT power('-inf'::numeric, '0')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:747	SELECT power('-inf'::numeric, 'inf')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:748	SELECT power('-inf'::numeric, '-inf')	0A000 only constants are supported without a FROM
+skip	pg/numeric.sql:732	SELECT power('-1'::numeric, 'inf')	42883 operator does not exist for these operand types
+skip	pg/numeric.sql:733	SELECT power('-2'::numeric, '3')	42883 operator does not exist for these operand types
+skip	pg/numeric.sql:735	SELECT power('-2'::numeric, '-1')	42883 operator does not exist for these operand types
+skip	pg/numeric.sql:737	SELECT power('-2'::numeric, 'inf')	42883 operator does not exist for these operand types
+skip	pg/numeric.sql:738	SELECT power('-2'::numeric, '-inf')	42883 operator does not exist for these operand types
+skip	pg/numeric.sql:739	SELECT power('inf'::numeric, '-2')	42883 operator does not exist for these operand types
+skip	pg/numeric.sql:740	SELECT power('inf'::numeric, '-inf')	42883 operator does not exist for these operand types
+skip	pg/numeric.sql:741	SELECT power('-inf'::numeric, '2')	42883 operator does not exist for these operand types
+skip	pg/numeric.sql:742	SELECT power('-inf'::numeric, '3')	42883 operator does not exist for these operand types
+skip	pg/numeric.sql:744	SELECT power('-inf'::numeric, '-2')	42883 operator does not exist for these operand types
+skip	pg/numeric.sql:745	SELECT power('-inf'::numeric, '-3')	42883 operator does not exist for these operand types
+skip	pg/numeric.sql:746	SELECT power('-inf'::numeric, '0')	42883 operator does not exist for these operand types
+skip	pg/numeric.sql:747	SELECT power('-inf'::numeric, 'inf')	42883 operator does not exist for these operand types
+skip	pg/numeric.sql:748	SELECT power('-inf'::numeric, '-inf')	42883 operator does not exist for these operand types
 skip	pg/numeric.sql:754	SELECT AVG(val) FROM num_data	0A000 only count(*) is supported among aggregates
 skip	pg/numeric.sql:755	SELECT MAX(val) FROM num_data	0A000 only count(*) is supported among aggregates
 skip	pg/numeric.sql:756	SELECT MIN(val) FROM num_data	0A000 only count(*) is supported among aggregates
@@ -98,47 +98,48 @@ bug	pg/numeric.sql:785	SELECT (-32768.5)::int2	#26 cast on a literal drops its t
 bug	pg/numeric.sql:786	SELECT (-32768.4)::int2	#26 cast on a literal drops its type
 bug	pg/numeric.sql:787	SELECT 32767.4::int2	#26 cast on a literal drops its type
 bug	pg/numeric.sql:788	SELECT 32767.5::int2	#26 cast on a literal drops its type
-skip	pg/numeric.sql:791	SELECT 'NaN'::float8::numeric	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:792	SELECT 'Infinity'::float8::numeric	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:793	SELECT '-Infinity'::float8::numeric	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:794	SELECT 'NaN'::numeric::float8	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:795	SELECT 'Infinity'::numeric::float8	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:796	SELECT '-Infinity'::numeric::float8	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:797	SELECT 'NaN'::float4::numeric	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:798	SELECT 'Infinity'::float4::numeric	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:799	SELECT '-Infinity'::float4::numeric	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:800	SELECT 'NaN'::numeric::float4	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:801	SELECT 'Infinity'::numeric::float4	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:802	SELECT '-Infinity'::numeric::float4	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:803	SELECT '42'::int2::numeric	0A000 only constants are supported without a FROM
+skip	pg/numeric.sql:791	SELECT 'NaN'::float8::numeric	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
+skip	pg/numeric.sql:792	SELECT 'Infinity'::float8::numeric	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
+skip	pg/numeric.sql:793	SELECT '-Infinity'::float8::numeric	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
+skip	pg/numeric.sql:794	SELECT 'NaN'::numeric::float8	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
+skip	pg/numeric.sql:795	SELECT 'Infinity'::numeric::float8	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
+skip	pg/numeric.sql:796	SELECT '-Infinity'::numeric::float8	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
+skip	pg/numeric.sql:797	SELECT 'NaN'::float4::numeric	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
+skip	pg/numeric.sql:798	SELECT 'Infinity'::float4::numeric	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
+skip	pg/numeric.sql:799	SELECT '-Infinity'::float4::numeric	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
+skip	pg/numeric.sql:800	SELECT 'NaN'::numeric::float4	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
+skip	pg/numeric.sql:801	SELECT 'Infinity'::numeric::float4	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
+skip	pg/numeric.sql:802	SELECT '-Infinity'::numeric::float4	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
+skip	pg/numeric.sql:803	SELECT '42'::int2::numeric	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
 skip	pg/numeric.sql:827	SELECT i as pow,	0A000 only table sources are supported
-skip	pg/numeric.sql:837	SELECT round(4.4e131071, -131071) = 4e131071	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:838	SELECT round(4.5e131071, -131071) = 5e131071	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:839	SELECT round(4.5e131071, -131072)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:841	SELECT round(5.5e131071, -131073)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:842	SELECT round(5.5e131071, -1000000)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:845	SELECT round(5e-16383, 1000000) = 5e-16383	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:846	SELECT round(5e-16383, 16383) = 5e-16383	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:847	SELECT round(5e-16383, 16382) = 1e-16382	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:848	SELECT round(5e-16383, 16381) = 0	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:851	SELECT trunc(9.9e131071, -131071) = 9e131071	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:852	SELECT trunc(9.9e131071, -131072)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:853	SELECT trunc(9.9e131071, -131073)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:854	SELECT trunc(9.9e131071, -1000000)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:857	SELECT trunc(5e-16383, 1000000) = 5e-16383	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:858	SELECT trunc(5e-16383, 16383) = 5e-16383	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:859	SELECT trunc(5e-16383, 16382) = 0	0A000 only constants are supported without a FROM
+skip	pg/numeric.sql:837	SELECT round(4.4e131071, -131071) = 4e131071	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:838	SELECT round(4.5e131071, -131071) = 5e131071	0A000 only the + - * / % || operators are supported
+accepted	pg/numeric.sql:839	SELECT round(4.5e131071, -131072)	numeric holds 38 digits; a wider value computes in float8
+accepted	pg/numeric.sql:840	SELECT round(5.5e131071, -131072)	numeric holds 38 digits; a wider value computes in float8
+accepted	pg/numeric.sql:841	SELECT round(5.5e131071, -131073)	numeric holds 38 digits; a wider value computes in float8
+accepted	pg/numeric.sql:842	SELECT round(5.5e131071, -1000000)	numeric holds 38 digits; a wider value computes in float8
+skip	pg/numeric.sql:845	SELECT round(5e-16383, 1000000) = 5e-16383	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:846	SELECT round(5e-16383, 16383) = 5e-16383	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:847	SELECT round(5e-16383, 16382) = 1e-16382	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:848	SELECT round(5e-16383, 16381) = 0	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:851	SELECT trunc(9.9e131071, -131071) = 9e131071	0A000 only the + - * / % || operators are supported
+accepted	pg/numeric.sql:852	SELECT trunc(9.9e131071, -131072)	numeric holds 38 digits; a wider value computes in float8
+accepted	pg/numeric.sql:853	SELECT trunc(9.9e131071, -131073)	numeric holds 38 digits; a wider value computes in float8
+accepted	pg/numeric.sql:854	SELECT trunc(9.9e131071, -1000000)	numeric holds 38 digits; a wider value computes in float8
+skip	pg/numeric.sql:857	SELECT trunc(5e-16383, 1000000) = 5e-16383	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:858	SELECT trunc(5e-16383, 16383) = 5e-16383	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:859	SELECT trunc(5e-16383, 16382) = 0	0A000 only the + - * / % || operators are supported
 skip	pg/numeric.sql:879	COPY width_bucket_test (operand_num) FROM stdin	0A000 unsupported statement
 skip	pg/numeric.sql:901	UPDATE width_bucket_test SET operand_f8 = operand_num::float8	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
 skip	pg/numeric.sql:903	SELECT	0A000 function width_bucket() is not supported
-skip	pg/numeric.sql:921	SELECT width_bucket('Infinity'::numeric, 1, 10, 10),	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:925	SELECT width_bucket('Infinity'::float8, 1, 10, 10),	0A000 only constants are supported without a FROM
+skip	pg/numeric.sql:921	SELECT width_bucket('Infinity'::numeric, 1, 10, 10),	0A000 function width_bucket() is not supported
+skip	pg/numeric.sql:925	SELECT width_bucket('Infinity'::float8, 1, 10, 10),	0A000 function width_bucket() is not supported
 skip	pg/numeric.sql:931	SELECT x, width_bucket(x::float8, 10, 100, 9) as flt,	0A000 only table sources are supported
 skip	pg/numeric.sql:934	SELECT x, width_bucket(x::float8, 100, 10, 9) as flt,	0A000 only table sources are supported
-skip	pg/numeric.sql:938	SELECT width_bucket(0, -1e100::numeric, 1, 10)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:939	SELECT width_bucket(0, -1e100::float8, 1, 10)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:940	SELECT width_bucket(1, 1e100::numeric, 0, 10)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:941	SELECT width_bucket(1, 1e100::float8, 0, 10)	0A000 only constants are supported without a FROM
+skip	pg/numeric.sql:938	SELECT width_bucket(0, -1e100::numeric, 1, 10)	0A000 function width_bucket() is not supported
+skip	pg/numeric.sql:939	SELECT width_bucket(0, -1e100::float8, 1, 10)	0A000 function width_bucket() is not supported
+skip	pg/numeric.sql:940	SELECT width_bucket(1, 1e100::numeric, 0, 10)	0A000 function width_bucket() is not supported
+skip	pg/numeric.sql:941	SELECT width_bucket(1, 1e100::float8, 0, 10)	0A000 function width_bucket() is not supported
 skip	pg/numeric.sql:944	SELECT oper, low, high, cnt, width_bucket(oper, low, high, cnt)	0A000 SELECT must read exactly one table
 skip	pg/numeric.sql:968	SELECT to_char(val, '9G999G999G999G999G999')	0A000 function to_char() is not supported
 skip	pg/numeric.sql:971	SELECT to_char(val, '9G999G999G999G999G999D999G999G999G999G999')	0A000 function to_char() is not supported
@@ -168,60 +169,60 @@ skip	pg/numeric.sql:1001	WITH v(val) AS	0A000 function to_char() is not supporte
 skip	pg/numeric.sql:1009	WITH v(exp) AS	0A000 function to_char() is not supported
 skip	pg/numeric.sql:1016	WITH v(val) AS	0A000 function to_char() is not supported
 skip	pg/numeric.sql:1024	WITH v(val) AS	0A000 function to_char() is not supported
-skip	pg/numeric.sql:1032	SELECT to_char('100'::numeric, 'FM999.9')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1033	SELECT to_char('100'::numeric, 'FM999.')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1034	SELECT to_char('100'::numeric, 'FM999')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1035	SELECT to_char('12345678901'::float8, 'FM9999999999D9999900000000000000000')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1037	SELECT to_char('100'::numeric, 'rn')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1038	SELECT to_char('1234'::numeric, 'rn')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1039	SELECT to_char('1235'::float4, 'rn')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1040	SELECT to_char('1236'::float8, 'rn')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1041	SELECT to_char('1237'::float8, 'fmrn')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1042	SELECT to_char('100e9'::numeric, 'RN')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1043	SELECT to_char('100e9'::float4, 'RN')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1044	SELECT to_char('100e9'::float8, 'RN')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1046	SELECT to_char(1234.56::numeric, '99999V99')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1047	SELECT to_char(1234.56::float4, '99999V99')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1048	SELECT to_char(1234.56::float8, '99999V99')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1051	SELECT to_char('100'::numeric, 'foo999')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1052	SELECT to_char('100'::numeric, 'f\oo999')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1053	SELECT to_char('100'::numeric, 'f\\oo999')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1054	SELECT to_char('100'::numeric, 'f\"oo999')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1055	SELECT to_char('100'::numeric, 'f\\"oo999')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1056	SELECT to_char('100'::numeric, 'f"ool"999')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1057	SELECT to_char('100'::numeric, 'f"\ool"999')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1058	SELECT to_char('100'::numeric, 'f"\\ool"999')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1059	SELECT to_char('100'::numeric, 'f"ool\"999')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1060	SELECT to_char('100'::numeric, 'f"ool\\"999')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1065	SELECT to_number('-34,338,492', '99G999G999')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1066	SELECT to_number('-34,338,492.654,878', '99G999G999D999G999')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1067	SELECT to_number('<564646.654564>', '999999.999999PR')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1068	SELECT to_number('0.00001-', '9.999999S')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1069	SELECT to_number('5.01-', 'FM9.999999S')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1070	SELECT to_number('5.01-', 'FM9.999999MI')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1071	SELECT to_number('5 4 4 4 4 8 . 7 8', '9 9 9 9 9 9 . 9 9')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1072	SELECT to_number('.01', 'FM9.99')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1073	SELECT to_number('.0', '99999999.99999999')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1074	SELECT to_number('0', '99.99')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1075	SELECT to_number('.-01', 'S99.99')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1076	SELECT to_number('.01-', '99.99S')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1077	SELECT to_number(' . 0 1-', ' 9 9 . 9 9 S')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1078	SELECT to_number('34,50','999,99')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1079	SELECT to_number('123,000','999G')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1080	SELECT to_number('123456','999G999')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1081	SELECT to_number('$1234.56','L9,999.99')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1082	SELECT to_number('$1234.56','L99,999.99')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1083	SELECT to_number('$1,234.56','L99,999.99')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1084	SELECT to_number('1234.56','L99,999.99')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1085	SELECT to_number('1,234.56','L99,999.99')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1086	SELECT to_number('42nd', '99th')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1087	SELECT to_number('123456', '99999V99')	0A000 only constants are supported without a FROM
+skip	pg/numeric.sql:1032	SELECT to_char('100'::numeric, 'FM999.9')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1033	SELECT to_char('100'::numeric, 'FM999.')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1034	SELECT to_char('100'::numeric, 'FM999')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1035	SELECT to_char('12345678901'::float8, 'FM9999999999D9999900000000000000000')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1037	SELECT to_char('100'::numeric, 'rn')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1038	SELECT to_char('1234'::numeric, 'rn')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1039	SELECT to_char('1235'::float4, 'rn')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1040	SELECT to_char('1236'::float8, 'rn')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1041	SELECT to_char('1237'::float8, 'fmrn')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1042	SELECT to_char('100e9'::numeric, 'RN')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1043	SELECT to_char('100e9'::float4, 'RN')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1044	SELECT to_char('100e9'::float8, 'RN')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1046	SELECT to_char(1234.56::numeric, '99999V99')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1047	SELECT to_char(1234.56::float4, '99999V99')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1048	SELECT to_char(1234.56::float8, '99999V99')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1051	SELECT to_char('100'::numeric, 'foo999')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1052	SELECT to_char('100'::numeric, 'f\oo999')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1053	SELECT to_char('100'::numeric, 'f\\oo999')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1054	SELECT to_char('100'::numeric, 'f\"oo999')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1055	SELECT to_char('100'::numeric, 'f\\"oo999')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1056	SELECT to_char('100'::numeric, 'f"ool"999')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1057	SELECT to_char('100'::numeric, 'f"\ool"999')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1058	SELECT to_char('100'::numeric, 'f"\\ool"999')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1059	SELECT to_char('100'::numeric, 'f"ool\"999')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1060	SELECT to_char('100'::numeric, 'f"ool\\"999')	0A000 function to_char() is not supported
+skip	pg/numeric.sql:1065	SELECT to_number('-34,338,492', '99G999G999')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1066	SELECT to_number('-34,338,492.654,878', '99G999G999D999G999')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1067	SELECT to_number('<564646.654564>', '999999.999999PR')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1068	SELECT to_number('0.00001-', '9.999999S')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1069	SELECT to_number('5.01-', 'FM9.999999S')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1070	SELECT to_number('5.01-', 'FM9.999999MI')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1071	SELECT to_number('5 4 4 4 4 8 . 7 8', '9 9 9 9 9 9 . 9 9')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1072	SELECT to_number('.01', 'FM9.99')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1073	SELECT to_number('.0', '99999999.99999999')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1074	SELECT to_number('0', '99.99')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1075	SELECT to_number('.-01', 'S99.99')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1076	SELECT to_number('.01-', '99.99S')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1077	SELECT to_number(' . 0 1-', ' 9 9 . 9 9 S')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1078	SELECT to_number('34,50','999,99')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1079	SELECT to_number('123,000','999G')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1080	SELECT to_number('123456','999G999')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1081	SELECT to_number('$1234.56','L9,999.99')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1082	SELECT to_number('$1234.56','L99,999.99')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1083	SELECT to_number('$1,234.56','L99,999.99')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1084	SELECT to_number('1234.56','L99,999.99')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1085	SELECT to_number('1,234.56','L99,999.99')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1086	SELECT to_number('42nd', '99th')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1087	SELECT to_number('123456', '99999V99')	0A000 function to_number() is not supported
 skip	pg/numeric.sql:1090	WITH rows AS	0A000 function bool_and() is not supported
-skip	pg/numeric.sql:1097	SELECT to_number('CvIiI', 'rn')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1098	SELECT to_number('MMXX ', 'RN')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1099	SELECT to_number(' XIV', ' RN')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1100	SELECT to_number(' XIV ', ' RN')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1101	SELECT to_number('M CC', 'RN')	0A000 only constants are supported without a FROM
+skip	pg/numeric.sql:1097	SELECT to_number('CvIiI', 'rn')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1098	SELECT to_number('MMXX ', 'RN')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1099	SELECT to_number(' XIV', ' RN')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1100	SELECT to_number(' XIV ', ' RN')	0A000 function to_number() is not supported
+skip	pg/numeric.sql:1101	SELECT to_number('M CC', 'RN')	0A000 function to_number() is not supported
 skip	pg/numeric.sql:1135	INSERT INTO num_input_test(n1) VALUES ('NaN ')	22P02 invalid value for column type
 skip	pg/numeric.sql:1136	INSERT INTO num_input_test(n1) VALUES (' nan')	22P02 invalid value for column type
 skip	pg/numeric.sql:1137	INSERT INTO num_input_test(n1) VALUES (' inf ')	22P02 invalid value for column type
@@ -242,90 +243,84 @@ skip	pg/numeric.sql:1151	INSERT INTO num_input_test(n1) VALUES ('-0O0012_5524_52
 skip	pg/numeric.sql:1152	INSERT INTO num_input_test(n1) VALUES ('-0x0000000000000000000000000deadbeef')	22P02 invalid value for column type
 skip	pg/numeric.sql:1153	INSERT INTO num_input_test(n1) VALUES (' 0X_30b1_F33a_6DF0_bD4E_64DF_9BdA_7D15 ')	22P02 invalid value for column type
 accepted	pg/numeric.sql:1174	INSERT INTO num_input_test(n1) VALUES ('1.2e3__4')	egres accepts underscores in numeric input; Postgres rejects these
-skip	pg/numeric.sql:1187	SELECT pg_input_is_valid('34.5', 'numeric')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1188	SELECT pg_input_is_valid('34xyz', 'numeric')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1189	SELECT pg_input_is_valid('1e400000', 'numeric')	0A000 only constants are supported without a FROM
+skip	pg/numeric.sql:1187	SELECT pg_input_is_valid('34.5', 'numeric')	0A000 function pg_input_is_valid() is not supported
+skip	pg/numeric.sql:1188	SELECT pg_input_is_valid('34xyz', 'numeric')	0A000 function pg_input_is_valid() is not supported
+skip	pg/numeric.sql:1189	SELECT pg_input_is_valid('1e400000', 'numeric')	0A000 function pg_input_is_valid() is not supported
 skip	pg/numeric.sql:1190	SELECT * FROM pg_input_error_info('1e400000', 'numeric')	0A000 only table sources are supported
-skip	pg/numeric.sql:1191	SELECT pg_input_is_valid('1234.567', 'numeric(8,4)')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1192	SELECT pg_input_is_valid('1234.567', 'numeric(7,4)')	0A000 only constants are supported without a FROM
+skip	pg/numeric.sql:1191	SELECT pg_input_is_valid('1234.567', 'numeric(8,4)')	0A000 function pg_input_is_valid() is not supported
+skip	pg/numeric.sql:1192	SELECT pg_input_is_valid('1234.567', 'numeric(7,4)')	0A000 function pg_input_is_valid() is not supported
 skip	pg/numeric.sql:1193	SELECT * FROM pg_input_error_info('1234.567', 'numeric(7,4)')	0A000 only table sources are supported
 skip	pg/numeric.sql:1194	SELECT * FROM pg_input_error_info('0x1234.567', 'numeric')	0A000 only table sources are supported
 skip	pg/numeric.sql:1200	CREATE TABLE num_typemod_test (	0A000 NUMERIC scale -6 must be between 0 and precision 3
 skip	pg/numeric.sql:1220	SELECT scale(millions), * FROM num_typemod_test ORDER BY millions	0A000 function scale() is not supported
-skip	pg/numeric.sql:1234	select 4790999999999999999999999999999999999999999999999999999999999999999999999999999999999999 * 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1236	select 4789999999999999999999999999999999999999999999999999999999999999999999999999999999999999 * 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1238	select 4770999999999999999999999999999999999999999999999999999999999999999999999999999999999999 * 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1240	select 4769999999999999999999999999999999999999999999999999999999999999999999999999999999999999 * 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1242	select trim_scale((0.1 - 2e-16383) * (0.1 - 3e-16383))	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1248	select 999999999999999999999::numeric/1000000000000000000000	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1249	select div(999999999999999999999::numeric,1000000000000000000000)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1250	select mod(999999999999999999999::numeric,1000000000000000000000)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1251	select div(-9999999999999999999999::numeric,1000000000000000000000)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1252	select mod(-9999999999999999999999::numeric,1000000000000000000000)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1253	select div(-9999999999999999999999::numeric,1000000000000000000000)*1000000000000000000000 + mod(-9999999999999999999999::numeric,1000000000000000000000)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1254	select mod (70.0,70)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1255	select div (70.0,70)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1256	select 70.0 / 70	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1257	select 12345678901234567890 % 123	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1258	select 12345678901234567890 / 123	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1259	select div(12345678901234567890, 123)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1260	select div(12345678901234567890, 123) * 123 + 12345678901234567890 % 123	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1261	select 8e9000 - div(8e18000 - 1, 9e9000 - 1) * 9	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1262	select 7328412092 - div(53705623790171816464 - 1, 7328412092)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1263	select div(539913372912345678, 539913372912345678)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1269	select sqrt(1.000000000000003::numeric)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1270	select sqrt(1.000000000000004::numeric)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1271	select sqrt(96627521408608.56340355805::numeric)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1272	select sqrt(96627521408608.56340355806::numeric)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1273	select sqrt(515549506212297735.073688290367::numeric)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1274	select sqrt(515549506212297735.073688290368::numeric)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1275	select sqrt(8015491789940783531003294973900306::numeric)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1276	select sqrt(8015491789940783531003294973900307::numeric)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1282	select 10.0 ^ -2147483648 as rounds_to_zero	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1283	select 10.0 ^ -2147483647 as rounds_to_zero	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1288	select 3.789 ^ 21.0000000000000000	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1289	select 3.789 ^ 35.0000000000000000	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1290	select 1.2 ^ 345	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1291	select 0.12 ^ (-20)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1292	select 1.000000000123 ^ (-2147483648)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1293	select coalesce(nullif(0.9999999999 ^ 23300000000000, 0), 0) as rounds_to_zero	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1294	select round(((1 - 1.500012345678e-1000) ^ 1.45e1003) * 1e1000)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1297	select 0.12 ^ (-25)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1298	select 0.5678 ^ (-85)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1299	select coalesce(nullif(0.9999999999 ^ 70000000000000, 0), 0) as underflows	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1302	select (-1.0) ^ 2147483646	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1303	select (-1.0) ^ 2147483647	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1304	select (-1.0) ^ 2147483648	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1305	select (-1.0) ^ 1000000000000000	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1306	select (-1.0) ^ 1000000000000001	0A000 only constants are supported without a FROM
+accepted	pg/numeric.sql:1234	select 4790999999999999999999999999999999999999999999999999999999999999999999999999999999999999 * 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999	numeric holds 38 digits; a wider value computes in float8
+accepted	pg/numeric.sql:1236	select 4789999999999999999999999999999999999999999999999999999999999999999999999999999999999999 * 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999	numeric holds 38 digits; a wider value computes in float8
+accepted	pg/numeric.sql:1238	select 4770999999999999999999999999999999999999999999999999999999999999999999999999999999999999 * 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999	numeric holds 38 digits; a wider value computes in float8
+accepted	pg/numeric.sql:1240	select 4769999999999999999999999999999999999999999999999999999999999999999999999999999999999999 * 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999	numeric holds 38 digits; a wider value computes in float8
+skip	pg/numeric.sql:1242	select trim_scale((0.1 - 2e-16383) * (0.1 - 3e-16383))	0A000 function trim_scale() is not supported
+skip	pg/numeric.sql:1249	select div(999999999999999999999::numeric,1000000000000000000000)	0A000 function div() is not supported
+skip	pg/numeric.sql:1251	select div(-9999999999999999999999::numeric,1000000000000000000000)	0A000 function div() is not supported
+skip	pg/numeric.sql:1253	select div(-9999999999999999999999::numeric,1000000000000000000000)*1000000000000000000000 + mod(-9999999999999999999999::numeric,1000000000000000000000)	0A000 function div() is not supported
+skip	pg/numeric.sql:1255	select div (70.0,70)	0A000 function div() is not supported
+bug	pg/numeric.sql:1258	select 12345678901234567890 / 123	numeric division scale: PG keeps 16 significant digits, egres 16 fractional
+skip	pg/numeric.sql:1259	select div(12345678901234567890, 123)	0A000 function div() is not supported
+skip	pg/numeric.sql:1260	select div(12345678901234567890, 123) * 123 + 12345678901234567890 % 123	0A000 function div() is not supported
+skip	pg/numeric.sql:1261	select 8e9000 - div(8e18000 - 1, 9e9000 - 1) * 9	0A000 function div() is not supported
+skip	pg/numeric.sql:1262	select 7328412092 - div(53705623790171816464 - 1, 7328412092)	0A000 function div() is not supported
+skip	pg/numeric.sql:1263	select div(539913372912345678, 539913372912345678)	0A000 function div() is not supported
+bug	pg/numeric.sql:1269	select sqrt(1.000000000000003::numeric)	sqrt(numeric) computes in float8; PG returns a numeric
+bug	pg/numeric.sql:1270	select sqrt(1.000000000000004::numeric)	sqrt(numeric) computes in float8; PG returns a numeric
+bug	pg/numeric.sql:1271	select sqrt(96627521408608.56340355805::numeric)	sqrt(numeric) computes in float8; PG returns a numeric
+bug	pg/numeric.sql:1272	select sqrt(96627521408608.56340355806::numeric)	sqrt(numeric) computes in float8; PG returns a numeric
+bug	pg/numeric.sql:1273	select sqrt(515549506212297735.073688290367::numeric)	sqrt(numeric) computes in float8; PG returns a numeric
+bug	pg/numeric.sql:1274	select sqrt(515549506212297735.073688290368::numeric)	sqrt(numeric) computes in float8; PG returns a numeric
+bug	pg/numeric.sql:1275	select sqrt(8015491789940783531003294973900306::numeric)	sqrt(numeric) computes in float8; PG returns a numeric
+bug	pg/numeric.sql:1276	select sqrt(8015491789940783531003294973900307::numeric)	sqrt(numeric) computes in float8; PG returns a numeric
+skip	pg/numeric.sql:1282	select 10.0 ^ -2147483648 as rounds_to_zero	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1283	select 10.0 ^ -2147483647 as rounds_to_zero	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1288	select 3.789 ^ 21.0000000000000000	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1289	select 3.789 ^ 35.0000000000000000	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1290	select 1.2 ^ 345	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1291	select 0.12 ^ (-20)	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1292	select 1.000000000123 ^ (-2147483648)	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1293	select coalesce(nullif(0.9999999999 ^ 23300000000000, 0), 0) as rounds_to_zero	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1294	select round(((1 - 1.500012345678e-1000) ^ 1.45e1003) * 1e1000)	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1297	select 0.12 ^ (-25)	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1298	select 0.5678 ^ (-85)	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1299	select coalesce(nullif(0.9999999999 ^ 70000000000000, 0), 0) as underflows	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1302	select (-1.0) ^ 2147483646	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1303	select (-1.0) ^ 2147483647	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1304	select (-1.0) ^ 2147483648	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1305	select (-1.0) ^ 1000000000000000	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1306	select (-1.0) ^ 1000000000000001	0A000 only the + - * / % || operators are supported
 skip	pg/numeric.sql:1309	select n, 10.0 ^ n as "10^n", (10.0 ^ n) * (10.0 ^ (-n)) = 1 as ok	0A000 only table sources are supported
-skip	pg/numeric.sql:1317	select 0.0 ^ 0.0	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1318	select (-12.34) ^ 0.0	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1319	select 12.34 ^ 0.0	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1320	select 0.0 ^ 12.34	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1323	select 'NaN'::numeric ^ 'NaN'::numeric	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1324	select 'NaN'::numeric ^ 0	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1325	select 'NaN'::numeric ^ 1	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1326	select 0 ^ 'NaN'::numeric	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1327	select 1 ^ 'NaN'::numeric	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1334	select 32.1 ^ 9.8	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1335	select 32.1 ^ (-9.8)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1336	select 12.3 ^ 45.6	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1337	select 12.3 ^ (-45.6)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1340	select 1.234 ^ 5678	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1347	select exp(0.0)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1348	select exp(1.0)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1349	select exp(1.0::numeric(71,70))	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1350	select exp('nan'::numeric)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1351	select exp('inf'::numeric)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1352	select exp('-inf'::numeric)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1353	select coalesce(nullif(exp(-5000::numeric), 0), 0) as rounds_to_zero	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1354	select coalesce(nullif(exp(-10000::numeric), 0), 0) as underflows	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1357	select exp(32.999)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1358	select exp(-32.999)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1359	select exp(123.456)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1360	select exp(-123.456)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1363	select exp(1234.5678)	0A000 only constants are supported without a FROM
+skip	pg/numeric.sql:1317	select 0.0 ^ 0.0	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1318	select (-12.34) ^ 0.0	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1319	select 12.34 ^ 0.0	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1320	select 0.0 ^ 12.34	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1323	select 'NaN'::numeric ^ 'NaN'::numeric	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1324	select 'NaN'::numeric ^ 0	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1325	select 'NaN'::numeric ^ 1	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1326	select 0 ^ 'NaN'::numeric	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1327	select 1 ^ 'NaN'::numeric	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1334	select 32.1 ^ 9.8	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1335	select 32.1 ^ (-9.8)	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1336	select 12.3 ^ 45.6	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1337	select 12.3 ^ (-45.6)	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1340	select 1.234 ^ 5678	0A000 only the + - * / % || operators are supported
+skip	pg/numeric.sql:1347	select exp(0.0)	0A000 function exp() is not supported
+skip	pg/numeric.sql:1348	select exp(1.0)	0A000 function exp() is not supported
+skip	pg/numeric.sql:1349	select exp(1.0::numeric(71,70))	0A000 function exp() is not supported
+skip	pg/numeric.sql:1350	select exp('nan'::numeric)	0A000 function exp() is not supported
+skip	pg/numeric.sql:1351	select exp('inf'::numeric)	0A000 function exp() is not supported
+skip	pg/numeric.sql:1352	select exp('-inf'::numeric)	0A000 function exp() is not supported
+skip	pg/numeric.sql:1353	select coalesce(nullif(exp(-5000::numeric), 0), 0) as rounds_to_zero	0A000 function exp() is not supported
+skip	pg/numeric.sql:1354	select coalesce(nullif(exp(-10000::numeric), 0), 0) as underflows	0A000 function exp() is not supported
+skip	pg/numeric.sql:1357	select exp(32.999)	0A000 function exp() is not supported
+skip	pg/numeric.sql:1358	select exp(-32.999)	0A000 function exp() is not supported
+skip	pg/numeric.sql:1359	select exp(123.456)	0A000 function exp() is not supported
+skip	pg/numeric.sql:1360	select exp(-123.456)	0A000 function exp() is not supported
+skip	pg/numeric.sql:1363	select exp(1234.5678)	0A000 function exp() is not supported
 skip	pg/numeric.sql:1368	select * from generate_series(0.0::numeric, 4.0::numeric)	0A000 only table sources are supported
 skip	pg/numeric.sql:1369	select * from generate_series(0.1::numeric, 4.0::numeric, 1.3::numeric)	0A000 only table sources are supported
 skip	pg/numeric.sql:1370	select * from generate_series(4.0::numeric, -1.5::numeric, -2.2::numeric)	0A000 only table sources are supported
@@ -333,56 +328,56 @@ skip	pg/numeric.sql:1380	select (i / (10::numeric ^ 131071))::numeric(1,0)	0A000
 skip	pg/numeric.sql:1385	select * from generate_series(1::numeric, 3::numeric) i, generate_series(i,3) j	0A000 SELECT must read exactly one table
 skip	pg/numeric.sql:1386	select * from generate_series(1::numeric, 3::numeric) i, generate_series(1,i) j	0A000 SELECT must read exactly one table
 skip	pg/numeric.sql:1387	select * from generate_series(1::numeric, 3::numeric) i, generate_series(1,5,i) j	0A000 SELECT must read exactly one table
-skip	pg/numeric.sql:1398	select ln(1.2345678e-28)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1399	select ln(0.0456789)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1400	select ln(0.349873948359354029493948309745709580730482050975)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1401	select ln(0.99949452)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1402	select ln(1.00049687395)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1403	select ln(1234.567890123456789)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1404	select ln(5.80397490724e5)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1405	select ln(9.342536355e34)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1416	select log(1.234567e-89)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1417	select log(3.4634998359873254962349856073435545)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1418	select log(9.999999999999999999)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1419	select log(10.00000000000000000)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1420	select log(10.00000000000000001)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1421	select log(590489.45235237)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1436	select log(1.23e-89, 6.4689e45)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1437	select log(0.99923, 4.58934e34)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1438	select log(1.000016, 8.452010e18)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1439	select log(3.1954752e47, 9.4792021e-73)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1445	select scale(numeric 'NaN')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1446	select scale(numeric 'inf')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1447	select scale(NULL::numeric)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1448	select scale(1.12)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1449	select scale(0)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1450	select scale(0.00)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1451	select scale(1.12345)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1452	select scale(110123.12475871856128)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1453	select scale(-1123.12471856128)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1454	select scale(-13.000000000000000)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1460	select min_scale(numeric 'NaN') is NULL	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1461	select min_scale(numeric 'inf') is NULL	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1462	select min_scale(0)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1463	select min_scale(0.00)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1464	select min_scale(1.0)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1465	select min_scale(1.1)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1466	select min_scale(1.12)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1467	select min_scale(1.123)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1468	select min_scale(1.1234)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1469	select min_scale(1.12345)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1470	select min_scale(1.1000)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1471	select min_scale(1e100)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1477	select trim_scale(numeric 'NaN')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1478	select trim_scale(numeric 'inf')	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1479	select trim_scale(1.120)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1480	select trim_scale(0)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1481	select trim_scale(0.00)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1482	select trim_scale(1.1234500)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1483	select trim_scale(110123.12475871856128000)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1484	select trim_scale(-1123.124718561280000000)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1485	select trim_scale(-13.00000000000000000000)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1486	select trim_scale(1e100)	0A000 only constants are supported without a FROM
+skip	pg/numeric.sql:1398	select ln(1.2345678e-28)	0A000 function ln() is not supported
+skip	pg/numeric.sql:1399	select ln(0.0456789)	0A000 function ln() is not supported
+skip	pg/numeric.sql:1400	select ln(0.349873948359354029493948309745709580730482050975)	0A000 function ln() is not supported
+skip	pg/numeric.sql:1401	select ln(0.99949452)	0A000 function ln() is not supported
+skip	pg/numeric.sql:1402	select ln(1.00049687395)	0A000 function ln() is not supported
+skip	pg/numeric.sql:1403	select ln(1234.567890123456789)	0A000 function ln() is not supported
+skip	pg/numeric.sql:1404	select ln(5.80397490724e5)	0A000 function ln() is not supported
+skip	pg/numeric.sql:1405	select ln(9.342536355e34)	0A000 function ln() is not supported
+skip	pg/numeric.sql:1416	select log(1.234567e-89)	0A000 function log() is not supported
+skip	pg/numeric.sql:1417	select log(3.4634998359873254962349856073435545)	0A000 function log() is not supported
+skip	pg/numeric.sql:1418	select log(9.999999999999999999)	0A000 function log() is not supported
+skip	pg/numeric.sql:1419	select log(10.00000000000000000)	0A000 function log() is not supported
+skip	pg/numeric.sql:1420	select log(10.00000000000000001)	0A000 function log() is not supported
+skip	pg/numeric.sql:1421	select log(590489.45235237)	0A000 function log() is not supported
+skip	pg/numeric.sql:1436	select log(1.23e-89, 6.4689e45)	0A000 function log() is not supported
+skip	pg/numeric.sql:1437	select log(0.99923, 4.58934e34)	0A000 function log() is not supported
+skip	pg/numeric.sql:1438	select log(1.000016, 8.452010e18)	0A000 function log() is not supported
+skip	pg/numeric.sql:1439	select log(3.1954752e47, 9.4792021e-73)	0A000 function log() is not supported
+skip	pg/numeric.sql:1445	select scale(numeric 'NaN')	0A000 function scale() is not supported
+skip	pg/numeric.sql:1446	select scale(numeric 'inf')	0A000 function scale() is not supported
+skip	pg/numeric.sql:1447	select scale(NULL::numeric)	0A000 function scale() is not supported
+skip	pg/numeric.sql:1448	select scale(1.12)	0A000 function scale() is not supported
+skip	pg/numeric.sql:1449	select scale(0)	0A000 function scale() is not supported
+skip	pg/numeric.sql:1450	select scale(0.00)	0A000 function scale() is not supported
+skip	pg/numeric.sql:1451	select scale(1.12345)	0A000 function scale() is not supported
+skip	pg/numeric.sql:1452	select scale(110123.12475871856128)	0A000 function scale() is not supported
+skip	pg/numeric.sql:1453	select scale(-1123.12471856128)	0A000 function scale() is not supported
+skip	pg/numeric.sql:1454	select scale(-13.000000000000000)	0A000 function scale() is not supported
+skip	pg/numeric.sql:1460	select min_scale(numeric 'NaN') is NULL	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
+skip	pg/numeric.sql:1461	select min_scale(numeric 'inf') is NULL	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
+skip	pg/numeric.sql:1462	select min_scale(0)	0A000 function min_scale() is not supported
+skip	pg/numeric.sql:1463	select min_scale(0.00)	0A000 function min_scale() is not supported
+skip	pg/numeric.sql:1464	select min_scale(1.0)	0A000 function min_scale() is not supported
+skip	pg/numeric.sql:1465	select min_scale(1.1)	0A000 function min_scale() is not supported
+skip	pg/numeric.sql:1466	select min_scale(1.12)	0A000 function min_scale() is not supported
+skip	pg/numeric.sql:1467	select min_scale(1.123)	0A000 function min_scale() is not supported
+skip	pg/numeric.sql:1468	select min_scale(1.1234)	0A000 function min_scale() is not supported
+skip	pg/numeric.sql:1469	select min_scale(1.12345)	0A000 function min_scale() is not supported
+skip	pg/numeric.sql:1470	select min_scale(1.1000)	0A000 function min_scale() is not supported
+skip	pg/numeric.sql:1471	select min_scale(1e100)	0A000 function min_scale() is not supported
+skip	pg/numeric.sql:1477	select trim_scale(numeric 'NaN')	0A000 function trim_scale() is not supported
+skip	pg/numeric.sql:1478	select trim_scale(numeric 'inf')	0A000 function trim_scale() is not supported
+skip	pg/numeric.sql:1479	select trim_scale(1.120)	0A000 function trim_scale() is not supported
+skip	pg/numeric.sql:1480	select trim_scale(0)	0A000 function trim_scale() is not supported
+skip	pg/numeric.sql:1481	select trim_scale(0.00)	0A000 function trim_scale() is not supported
+skip	pg/numeric.sql:1482	select trim_scale(1.1234500)	0A000 function trim_scale() is not supported
+skip	pg/numeric.sql:1483	select trim_scale(110123.12475871856128000)	0A000 function trim_scale() is not supported
+skip	pg/numeric.sql:1484	select trim_scale(-1123.124718561280000000)	0A000 function trim_scale() is not supported
+skip	pg/numeric.sql:1485	select trim_scale(-13.00000000000000000000)	0A000 function trim_scale() is not supported
+skip	pg/numeric.sql:1486	select trim_scale(1e100)	0A000 function trim_scale() is not supported
 skip	pg/numeric.sql:1493	SELECT SUM(9999::numeric) FROM generate_series(1, 100000)	0A000 only table sources are supported
 skip	pg/numeric.sql:1494	SELECT SUM((-9999)::numeric) FROM generate_series(1, 100000)	0A000 only table sources are supported
 skip	pg/numeric.sql:1501	INSERT INTO num_variance VALUES (3e-500)	22003 value is out of range for column type
@@ -396,9 +391,9 @@ skip	pg/numeric.sql:1520	SELECT variance(a) FROM num_variance	0A000 function var
 skip	pg/numeric.sql:1524	ALTER TABLE num_variance SET (parallel_workers = 4)	0A000 unsupported statement
 skip	pg/numeric.sql:1535	SELECT a, b, gcd(a, b), gcd(a, -b), gcd(-b, a), gcd(-b, -a)	0A000 only table sources are supported
 skip	pg/numeric.sql:1550	SELECT a,b, lcm(a, b), lcm(a, -b), lcm(-b, a), lcm(-b, -a)	0A000 only table sources are supported
-skip	pg/numeric.sql:1568	SELECT factorial(4)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1569	SELECT factorial(15)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1571	SELECT factorial(0)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1577	SELECT pg_lsn(23783416::numeric)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1578	SELECT pg_lsn(0::numeric)	0A000 only constants are supported without a FROM
-skip	pg/numeric.sql:1579	SELECT pg_lsn(18446744073709551615::numeric)	0A000 only constants are supported without a FROM
+skip	pg/numeric.sql:1568	SELECT factorial(4)	0A000 function factorial() is not supported
+skip	pg/numeric.sql:1569	SELECT factorial(15)	0A000 function factorial() is not supported
+skip	pg/numeric.sql:1571	SELECT factorial(0)	0A000 function factorial() is not supported
+skip	pg/numeric.sql:1577	SELECT pg_lsn(23783416::numeric)	0A000 function pg_lsn() is not supported
+skip	pg/numeric.sql:1578	SELECT pg_lsn(0::numeric)	0A000 function pg_lsn() is not supported
+skip	pg/numeric.sql:1579	SELECT pg_lsn(18446744073709551615::numeric)	0A000 function pg_lsn() is not supported
