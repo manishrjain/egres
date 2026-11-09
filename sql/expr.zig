@@ -614,6 +614,8 @@ pub const EvalError = error{
     DivisionByZero,
     SubstringLength,
     PowerArgument,
+    FieldPosition,
+    LengthTooLarge,
     StringTooLong,
     InvalidUtf8,
     /// A string cast to a type it does not read as, `'abc'::int4`.
