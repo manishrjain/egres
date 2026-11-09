@@ -461,6 +461,8 @@ pub const EvalError = error{
     DivisionByZero,
     SubstringLength,
     PowerArgument,
+    FieldPosition,
+    LengthTooLarge,
     StringTooLong,
     InvalidUtf8,
     OutOfMemory,
