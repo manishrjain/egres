@@ -4,7 +4,6 @@
 #             run.py --write-skips, which keeps every other line.
 #   bug       diverges, filed; note = the issue.
 #   accepted  diverges on purpose; note = the reason.
-skip	pg/test_setup.sql:59	INSERT INTO INT2_TBL(f1) VALUES	22P02 invalid value for column type
 skip	pg/test_setup.sql:65	VACUUM INT2_TBL	0A000 unsupported statement
 skip	pg/int2.sql:21	SELECT pg_input_is_valid('34', 'int2')	0A000 function pg_input_is_valid() is not supported
 skip	pg/int2.sql:22	SELECT pg_input_is_valid('asdf', 'int2')	0A000 function pg_input_is_valid() is not supported
@@ -13,45 +12,14 @@ skip	pg/int2.sql:24	SELECT * FROM pg_input_error_info('50000', 'int2')	0A000 onl
 skip	pg/int2.sql:27	SELECT pg_input_is_valid(' 1 3 5 ', 'int2vector')	0A000 function pg_input_is_valid() is not supported
 skip	pg/int2.sql:28	SELECT * FROM pg_input_error_info('1 asdf', 'int2vector')	0A000 only table sources are supported
 skip	pg/int2.sql:29	SELECT * FROM pg_input_error_info('50000', 'int2vector')	0A000 only table sources are supported
-skip	pg/int2.sql:60	SELECT i.* FROM INT2_TBL i WHERE (i.f1 % int2 '2') = int2 '1'	42883 operator does not exist for these operand types
-skip	pg/int2.sql:63	SELECT i.* FROM INT2_TBL i WHERE (i.f1 % int4 '2') = int2 '0'	42883 operator does not exist for these operand types
-skip	pg/int2.sql:67	SELECT i.f1, i.f1 * int2 '2' AS x FROM INT2_TBL i	42883 operator does not exist for these operand types
-skip	pg/int2.sql:70	SELECT i.f1, i.f1 * int4 '2' AS x FROM INT2_TBL i	42883 operator does not exist for these operand types
-skip	pg/int2.sql:74	SELECT i.f1, i.f1 + int2 '2' AS x FROM INT2_TBL i	42883 operator does not exist for these operand types
-skip	pg/int2.sql:77	SELECT i.f1, i.f1 + int4 '2' AS x FROM INT2_TBL i	42883 operator does not exist for these operand types
-skip	pg/int2.sql:81	SELECT i.f1, i.f1 - int2 '2' AS x FROM INT2_TBL i	42883 operator does not exist for these operand types
-skip	pg/int2.sql:84	SELECT i.f1, i.f1 - int4 '2' AS x FROM INT2_TBL i	42883 operator does not exist for these operand types
-skip	pg/int2.sql:86	SELECT i.f1, i.f1 / int2 '2' AS x FROM INT2_TBL i	42883 operator does not exist for these operand types
-skip	pg/int2.sql:88	SELECT i.f1, i.f1 / int4 '2' AS x FROM INT2_TBL i	42883 operator does not exist for these operand types
-skip	pg/int2.sql:91	SELECT (-1::int2<<15)::text	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
-skip	pg/int2.sql:92	SELECT ((-1::int2<<15)+1::int2)::text	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
-bug	pg/int2.sql:95	SELECT (-32768)::int2 * (-1)::int2	#26
-bug	pg/int2.sql:96	SELECT (-32768)::int2 / (-1)::int2	#26
+bug	pg/int2.sql:31	SELECT * FROM INT2_TBL AS f(a, b)	a table alias's column list, AS f(a, b), is ignored
+accepted	pg/int2.sql:65	SELECT i.f1, i.f1 * int2 '2' AS x FROM INT2_TBL i	arithmetic yields int8 whatever the operands' width; PG keeps the width and overflows
+accepted	pg/int2.sql:72	SELECT i.f1, i.f1 + int2 '2' AS x FROM INT2_TBL i	arithmetic yields int8 whatever the operands' width; PG keeps the width and overflows
+accepted	pg/int2.sql:79	SELECT i.f1, i.f1 - int2 '2' AS x FROM INT2_TBL i	arithmetic yields int8 whatever the operands' width; PG keeps the width and overflows
+skip	pg/int2.sql:91	SELECT (-1::int2<<15)::text	0A000 only the + - * / % || operators are supported
+skip	pg/int2.sql:92	SELECT ((-1::int2<<15)+1::int2)::text	0A000 only the + - * / % || operators are supported
+accepted	pg/int2.sql:95	SELECT (-32768)::int2 * (-1)::int2	arithmetic yields int8 whatever the operands' width; PG keeps the width and overflows
+accepted	pg/int2.sql:96	SELECT (-32768)::int2 / (-1)::int2	arithmetic yields int8 whatever the operands' width; PG keeps the width and overflows
 skip	pg/int2.sql:100	SELECT x, x::int2 AS int2_value	0A000 only table sources are supported
 skip	pg/int2.sql:110	SELECT x, x::int2 AS int2_value	0A000 only table sources are supported
-bug	pg/int2.sql:122	SELECT int2 '0b100101'	#26 cast on a literal drops its type
-bug	pg/int2.sql:123	SELECT int2 '0o273'	#26 cast on a literal drops its type
-bug	pg/int2.sql:124	SELECT int2 '0x42F'	#26 cast on a literal drops its type
-bug	pg/int2.sql:126	SELECT int2 '0b'	#26 cast on a literal drops its type
-bug	pg/int2.sql:127	SELECT int2 '0o'	#26 cast on a literal drops its type
-bug	pg/int2.sql:128	SELECT int2 '0x'	#26 cast on a literal drops its type
-bug	pg/int2.sql:131	SELECT int2 '0b111111111111111'	#26 cast on a literal drops its type
-bug	pg/int2.sql:132	SELECT int2 '0b1000000000000000'	#26 cast on a literal drops its type
-bug	pg/int2.sql:133	SELECT int2 '0o77777'	#26 cast on a literal drops its type
-bug	pg/int2.sql:134	SELECT int2 '0o100000'	#26 cast on a literal drops its type
-bug	pg/int2.sql:135	SELECT int2 '0x7FFF'	#26 cast on a literal drops its type
-bug	pg/int2.sql:136	SELECT int2 '0x8000'	#26 cast on a literal drops its type
-bug	pg/int2.sql:138	SELECT int2 '-0b1000000000000000'	#26 cast on a literal drops its type
-bug	pg/int2.sql:139	SELECT int2 '-0b1000000000000001'	#26 cast on a literal drops its type
-bug	pg/int2.sql:140	SELECT int2 '-0o100000'	#26 cast on a literal drops its type
-bug	pg/int2.sql:141	SELECT int2 '-0o100001'	#26 cast on a literal drops its type
-bug	pg/int2.sql:142	SELECT int2 '-0x8000'	#26 cast on a literal drops its type
-bug	pg/int2.sql:143	SELECT int2 '-0x8001'	#26 cast on a literal drops its type
-bug	pg/int2.sql:148	SELECT int2 '1_000'	#26 cast on a literal drops its type
-bug	pg/int2.sql:149	SELECT int2 '1_2_3'	#26 cast on a literal drops its type
-bug	pg/int2.sql:150	SELECT int2 '0xE_FF'	#26 cast on a literal drops its type
-bug	pg/int2.sql:151	SELECT int2 '0o2_73'	#26 cast on a literal drops its type
-bug	pg/int2.sql:152	SELECT int2 '0b_10_0101'	#26 cast on a literal drops its type
-accepted	pg/int2.sql:155	SELECT int2 '_100'	egres accepts underscores in numeric input; Postgres rejects these
-accepted	pg/int2.sql:156	SELECT int2 '100_'	egres accepts underscores in numeric input; Postgres rejects these
 accepted	pg/int2.sql:157	SELECT int2 '10__000'	egres accepts underscores in numeric input; Postgres rejects these

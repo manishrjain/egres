@@ -4,7 +4,7 @@
 #             run.py --write-skips, which keeps every other line.
 #   bug       diverges, filed; note = the issue.
 #   accepted  diverges on purpose; note = the reason.
-skip	pg/test_setup.sql:79	INSERT INTO INT8_TBL VALUES	22P02 invalid value for column type
+skip	pg/test_setup.sql:79	INSERT INTO INT8_TBL VALUES	0A000 unsupported value or column type
 skip	pg/test_setup.sql:85	VACUUM INT8_TBL	0A000 unsupported statement
 skip	pg/int8.sql:20	SELECT pg_input_is_valid('34', 'int8')	0A000 function pg_input_is_valid() is not supported
 skip	pg/int8.sql:21	SELECT pg_input_is_valid('asdf', 'int8')	0A000 function pg_input_is_valid() is not supported
@@ -38,50 +38,15 @@ skip	pg/int8.sql:129	SELECT to_char(1234::int8, '9.99eeee')	0A000 function to_ch
 skip	pg/int8.sql:130	SELECT to_char(-1234::int8, '9.99eeee')	0A000 function to_char() is not supported
 skip	pg/int8.sql:131	SELECT to_char(1234, '99999V99')	0A000 function to_char() is not supported
 skip	pg/int8.sql:132	SELECT to_char(1234::int8, '99999V99')	0A000 function to_char() is not supported
-bug	pg/int8.sql:136	select '-9223372036854775808'::int8	#26 cast on a literal drops its type
-bug	pg/int8.sql:137	select '-9223372036854775809'::int8	#26 cast on a literal drops its type
-bug	pg/int8.sql:138	select '9223372036854775807'::int8	#26 cast on a literal drops its type
-bug	pg/int8.sql:139	select '9223372036854775808'::int8	#26 cast on a literal drops its type
-skip	pg/int8.sql:141	select -('-9223372036854775807'::int8)	42883 operator does not exist for these operand types
-skip	pg/int8.sql:176	SELECT CAST(q1 AS int4) FROM int8_tbl WHERE q2 = 456	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
-skip	pg/int8.sql:179	SELECT CAST(q1 AS int2) FROM int8_tbl WHERE q2 = 456	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
-skip	pg/int8.sql:182	SELECT CAST('42'::int2 AS int8), CAST('-37'::int2 AS int8)	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
-skip	pg/int8.sql:184	SELECT CAST(q1 AS float4), CAST(q2 AS float8) FROM INT8_TBL	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
-skip	pg/int8.sql:185	SELECT CAST('36854775807.0'::float4 AS int8)	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
-skip	pg/int8.sql:189	SELECT oid::int8 FROM pg_class WHERE relname = 'pg_class'	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
+skip	pg/int8.sql:189	SELECT oid::int8 FROM pg_class WHERE relname = 'pg_class'	42P01 table does not exist
 skip	pg/int8.sql:194	SELECT q1, q2, q1 & q2 AS "and", q1 | q2 AS "or", q1 # q2 AS "xor", ~q1 AS "not" FROM INT8_TBL	0A000 only the + - * / % || operators are supported
 skip	pg/int8.sql:195	SELECT q1, q1 << 2 AS "shl", q1 >> 3 AS "shr" FROM INT8_TBL	0A000 only the + - * / % || operators are supported
 skip	pg/int8.sql:200	SELECT * FROM generate_series('+4567890123456789'::int8, '+4567890123456799'::int8)	0A000 only table sources are supported
 skip	pg/int8.sql:202	SELECT * FROM generate_series('+4567890123456789'::int8, '+4567890123456799'::int8, 2)	0A000 only table sources are supported
-skip	pg/int8.sql:205	SELECT (-1::int8<<63)::text	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
-skip	pg/int8.sql:206	SELECT ((-1::int8<<63)+1)::text	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
+skip	pg/int8.sql:205	SELECT (-1::int8<<63)::text	0A000 only the + - * / % || operators are supported
+skip	pg/int8.sql:206	SELECT ((-1::int8<<63)+1)::text	0A000 only the + - * / % || operators are supported
 skip	pg/int8.sql:220	SELECT x, x::int8 AS int8_value	0A000 only table sources are supported
 skip	pg/int8.sql:230	SELECT x, x::int8 AS int8_value	0A000 only table sources are supported
 skip	pg/int8.sql:240	SELECT a, b, gcd(a, b), gcd(a, -b), gcd(b, a), gcd(-b, a)	0A000 only table sources are supported
 skip	pg/int8.sql:253	SELECT a, b, lcm(a, b), lcm(a, -b), lcm(b, a), lcm(-b, a)	0A000 only table sources are supported
-bug	pg/int8.sql:267	SELECT int8 '0b100101'	#26 cast on a literal drops its type
-bug	pg/int8.sql:268	SELECT int8 '0o273'	#26 cast on a literal drops its type
-bug	pg/int8.sql:269	SELECT int8 '0x42F'	#26 cast on a literal drops its type
-bug	pg/int8.sql:271	SELECT int8 '0b'	#26 cast on a literal drops its type
-bug	pg/int8.sql:272	SELECT int8 '0o'	#26 cast on a literal drops its type
-bug	pg/int8.sql:273	SELECT int8 '0x'	#26 cast on a literal drops its type
-bug	pg/int8.sql:276	SELECT int8 '0b111111111111111111111111111111111111111111111111111111111111111'	#26 cast on a literal drops its type
-bug	pg/int8.sql:277	SELECT int8 '0b1000000000000000000000000000000000000000000000000000000000000000'	#26 cast on a literal drops its type
-bug	pg/int8.sql:278	SELECT int8 '0o777777777777777777777'	#26 cast on a literal drops its type
-bug	pg/int8.sql:279	SELECT int8 '0o1000000000000000000000'	#26 cast on a literal drops its type
-bug	pg/int8.sql:280	SELECT int8 '0x7FFFFFFFFFFFFFFF'	#26 cast on a literal drops its type
-bug	pg/int8.sql:281	SELECT int8 '0x8000000000000000'	#26 cast on a literal drops its type
-bug	pg/int8.sql:283	SELECT int8 '-0b1000000000000000000000000000000000000000000000000000000000000000'	#26 cast on a literal drops its type
-bug	pg/int8.sql:284	SELECT int8 '-0b1000000000000000000000000000000000000000000000000000000000000001'	#26 cast on a literal drops its type
-bug	pg/int8.sql:285	SELECT int8 '-0o1000000000000000000000'	#26 cast on a literal drops its type
-bug	pg/int8.sql:286	SELECT int8 '-0o1000000000000000000001'	#26 cast on a literal drops its type
-bug	pg/int8.sql:287	SELECT int8 '-0x8000000000000000'	#26 cast on a literal drops its type
-bug	pg/int8.sql:288	SELECT int8 '-0x8000000000000001'	#26 cast on a literal drops its type
-bug	pg/int8.sql:293	SELECT int8 '1_000_000'	#26 cast on a literal drops its type
-bug	pg/int8.sql:294	SELECT int8 '1_2_3'	#26 cast on a literal drops its type
-bug	pg/int8.sql:295	SELECT int8 '0x1EEE_FFFF'	#26 cast on a literal drops its type
-bug	pg/int8.sql:296	SELECT int8 '0o2_73'	#26 cast on a literal drops its type
-bug	pg/int8.sql:297	SELECT int8 '0b_10_0101'	#26 cast on a literal drops its type
-accepted	pg/int8.sql:300	SELECT int8 '_100'	egres accepts underscores in numeric input; Postgres rejects these
-accepted	pg/int8.sql:301	SELECT int8 '100_'	egres accepts underscores in numeric input; Postgres rejects these
 accepted	pg/int8.sql:302	SELECT int8 '100__000'	egres accepts underscores in numeric input; Postgres rejects these

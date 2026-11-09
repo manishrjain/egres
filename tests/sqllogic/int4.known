@@ -4,59 +4,29 @@
 #             run.py --write-skips, which keeps every other line.
 #   bug       diverges, filed; note = the issue.
 #   accepted  diverges on purpose; note = the reason.
-skip	pg/test_setup.sql:69	INSERT INTO INT4_TBL(f1) VALUES	22P02 invalid value for column type
 skip	pg/test_setup.sql:75	VACUUM INT4_TBL	0A000 unsupported statement
 skip	pg/int4.sql:21	SELECT pg_input_is_valid('34', 'int4')	0A000 function pg_input_is_valid() is not supported
 skip	pg/int4.sql:22	SELECT pg_input_is_valid('asdf', 'int4')	0A000 function pg_input_is_valid() is not supported
 skip	pg/int4.sql:23	SELECT pg_input_is_valid('1000000000000', 'int4')	0A000 function pg_input_is_valid() is not supported
 skip	pg/int4.sql:24	SELECT * FROM pg_input_error_info('1000000000000', 'int4')	0A000 only table sources are supported
-skip	pg/int4.sql:51	SELECT i.* FROM INT4_TBL i WHERE (i.f1 % int2 '2') = int2 '1'	42883 operator does not exist for these operand types
-skip	pg/int4.sql:54	SELECT i.* FROM INT4_TBL i WHERE (i.f1 % int4 '2') = int2 '0'	42883 operator does not exist for these operand types
-skip	pg/int4.sql:58	SELECT i.f1, i.f1 * int2 '2' AS x FROM INT4_TBL i	42883 operator does not exist for these operand types
-skip	pg/int4.sql:63	SELECT i.f1, i.f1 * int4 '2' AS x FROM INT4_TBL i	42883 operator does not exist for these operand types
-skip	pg/int4.sql:68	SELECT i.f1, i.f1 + int2 '2' AS x FROM INT4_TBL i	42883 operator does not exist for these operand types
-skip	pg/int4.sql:73	SELECT i.f1, i.f1 + int4 '2' AS x FROM INT4_TBL i	42883 operator does not exist for these operand types
-skip	pg/int4.sql:78	SELECT i.f1, i.f1 - int2 '2' AS x FROM INT4_TBL i	42883 operator does not exist for these operand types
-skip	pg/int4.sql:83	SELECT i.f1, i.f1 - int4 '2' AS x FROM INT4_TBL i	42883 operator does not exist for these operand types
-skip	pg/int4.sql:86	SELECT i.f1, i.f1 / int2 '2' AS x FROM INT4_TBL i	42883 operator does not exist for these operand types
-skip	pg/int4.sql:88	SELECT i.f1, i.f1 / int4 '2' AS x FROM INT4_TBL i	42883 operator does not exist for these operand types
+accepted	pg/int4.sql:56	SELECT i.f1, i.f1 * int2 '2' AS x FROM INT4_TBL i	arithmetic yields int8 whatever the operands' width; PG keeps the width and overflows
+accepted	pg/int4.sql:61	SELECT i.f1, i.f1 * int4 '2' AS x FROM INT4_TBL i	arithmetic yields int8 whatever the operands' width; PG keeps the width and overflows
+accepted	pg/int4.sql:66	SELECT i.f1, i.f1 + int2 '2' AS x FROM INT4_TBL i	arithmetic yields int8 whatever the operands' width; PG keeps the width and overflows
+accepted	pg/int4.sql:71	SELECT i.f1, i.f1 + int4 '2' AS x FROM INT4_TBL i	arithmetic yields int8 whatever the operands' width; PG keeps the width and overflows
+accepted	pg/int4.sql:76	SELECT i.f1, i.f1 - int2 '2' AS x FROM INT4_TBL i	arithmetic yields int8 whatever the operands' width; PG keeps the width and overflows
+accepted	pg/int4.sql:81	SELECT i.f1, i.f1 - int4 '2' AS x FROM INT4_TBL i	arithmetic yields int8 whatever the operands' width; PG keeps the width and overflows
 skip	pg/int4.sql:103	SELECT int2 '2' * int2 '2' = int2 '16' / int2 '4' AS true	0A000 only the + - * / % || operators are supported
 skip	pg/int4.sql:105	SELECT int4 '2' * int2 '2' = int2 '16' / int4 '4' AS true	0A000 only the + - * / % || operators are supported
 skip	pg/int4.sql:107	SELECT int2 '2' * int4 '2' = int4 '16' / int2 '4' AS true	0A000 only the + - * / % || operators are supported
 skip	pg/int4.sql:109	SELECT int4 '1000' < int4 '999' AS false	0A000 only the + - * / % || operators are supported
-skip	pg/int4.sql:118	SELECT (-1::int4<<31)::text	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
-skip	pg/int4.sql:119	SELECT ((-1::int4<<31)+1)::text	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
-bug	pg/int4.sql:122	SELECT (-2147483648)::int4 * (-1)::int4	#26
-bug	pg/int4.sql:123	SELECT (-2147483648)::int4 / (-1)::int4	#26
-bug	pg/int4.sql:125	SELECT (-2147483648)::int4 * (-1)::int2	#26
-bug	pg/int4.sql:126	SELECT (-2147483648)::int4 / (-1)::int2	#26
+skip	pg/int4.sql:118	SELECT (-1::int4<<31)::text	0A000 only the + - * / % || operators are supported
+skip	pg/int4.sql:119	SELECT ((-1::int4<<31)+1)::text	0A000 only the + - * / % || operators are supported
+accepted	pg/int4.sql:122	SELECT (-2147483648)::int4 * (-1)::int4	arithmetic yields int8 whatever the operands' width; PG keeps the width and overflows
+accepted	pg/int4.sql:123	SELECT (-2147483648)::int4 / (-1)::int4	arithmetic yields int8 whatever the operands' width; PG keeps the width and overflows
+accepted	pg/int4.sql:125	SELECT (-2147483648)::int4 * (-1)::int2	arithmetic yields int8 whatever the operands' width; PG keeps the width and overflows
+accepted	pg/int4.sql:126	SELECT (-2147483648)::int4 / (-1)::int2	arithmetic yields int8 whatever the operands' width; PG keeps the width and overflows
 skip	pg/int4.sql:130	SELECT x, x::int4 AS int4_value	0A000 only table sources are supported
 skip	pg/int4.sql:140	SELECT x, x::int4 AS int4_value	0A000 only table sources are supported
 skip	pg/int4.sql:150	SELECT a, b, gcd(a, b), gcd(a, -b), gcd(b, a), gcd(-b, a)	0A000 only table sources are supported
 skip	pg/int4.sql:163	SELECT a, b, lcm(a, b), lcm(a, -b), lcm(b, a), lcm(-b, a)	0A000 only table sources are supported
-bug	pg/int4.sql:177	SELECT int4 '0b100101'	#26 cast on a literal drops its type
-bug	pg/int4.sql:178	SELECT int4 '0o273'	#26 cast on a literal drops its type
-bug	pg/int4.sql:179	SELECT int4 '0x42F'	#26 cast on a literal drops its type
-bug	pg/int4.sql:181	SELECT int4 '0b'	#26 cast on a literal drops its type
-bug	pg/int4.sql:182	SELECT int4 '0o'	#26 cast on a literal drops its type
-bug	pg/int4.sql:183	SELECT int4 '0x'	#26 cast on a literal drops its type
-bug	pg/int4.sql:186	SELECT int4 '0b1111111111111111111111111111111'	#26 cast on a literal drops its type
-bug	pg/int4.sql:187	SELECT int4 '0b10000000000000000000000000000000'	#26 cast on a literal drops its type
-bug	pg/int4.sql:188	SELECT int4 '0o17777777777'	#26 cast on a literal drops its type
-bug	pg/int4.sql:189	SELECT int4 '0o20000000000'	#26 cast on a literal drops its type
-bug	pg/int4.sql:190	SELECT int4 '0x7FFFFFFF'	#26 cast on a literal drops its type
-bug	pg/int4.sql:191	SELECT int4 '0x80000000'	#26 cast on a literal drops its type
-bug	pg/int4.sql:193	SELECT int4 '-0b10000000000000000000000000000000'	#26 cast on a literal drops its type
-bug	pg/int4.sql:194	SELECT int4 '-0b10000000000000000000000000000001'	#26 cast on a literal drops its type
-bug	pg/int4.sql:195	SELECT int4 '-0o20000000000'	#26 cast on a literal drops its type
-bug	pg/int4.sql:196	SELECT int4 '-0o20000000001'	#26 cast on a literal drops its type
-bug	pg/int4.sql:197	SELECT int4 '-0x80000000'	#26 cast on a literal drops its type
-bug	pg/int4.sql:198	SELECT int4 '-0x80000001'	#26 cast on a literal drops its type
-bug	pg/int4.sql:203	SELECT int4 '1_000_000'	#26 cast on a literal drops its type
-bug	pg/int4.sql:204	SELECT int4 '1_2_3'	#26 cast on a literal drops its type
-bug	pg/int4.sql:205	SELECT int4 '0x1EEE_FFFF'	#26 cast on a literal drops its type
-bug	pg/int4.sql:206	SELECT int4 '0o2_73'	#26 cast on a literal drops its type
-bug	pg/int4.sql:207	SELECT int4 '0b_10_0101'	#26 cast on a literal drops its type
-accepted	pg/int4.sql:210	SELECT int4 '_100'	egres accepts underscores in numeric input; Postgres rejects these
-accepted	pg/int4.sql:211	SELECT int4 '100_'	egres accepts underscores in numeric input; Postgres rejects these
 accepted	pg/int4.sql:212	SELECT int4 '100__000'	egres accepts underscores in numeric input; Postgres rejects these

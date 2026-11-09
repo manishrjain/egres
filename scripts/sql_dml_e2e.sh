@@ -71,7 +71,7 @@ expect "SELECT * returns both" "(2 rows)" q "SELECT * FROM t;"
 expect "egid 1 = first row" "a" v "SELECT name FROM t WHERE egid = 1;"
 expect "egid 2 = second row" "b" v "SELECT name FROM t WHERE egid = 2;"
 expect "egid 0 rejected" "positive integer" q "SELECT name FROM t WHERE egid = 0;"
-expect "negative egid rejected (uint8 parse)" "invalid value" q "SELECT name FROM t WHERE egid = -1;"
+expect "negative egid rejected (uint8 parse)" "overflow" q "SELECT name FROM t WHERE egid = -1;"
 expect "WHERE on payload column" "b" v "SELECT name FROM t WHERE id = 2;"
 expect "SELECT egid, id, name" "(2 rows)" q "SELECT egid, id, name FROM t;"
 
@@ -719,6 +719,20 @@ expect "a column without FROM is undefined" "column does not exist" q \
 expect "an unknown function without FROM" "now() is not supported" q \
     "SELECT now();"
 expect "SELECT * without FROM" "no tables specified" q "SELECT *;"
+# Casts (#26): a literal is read as the type, an expression converts.
+expect "a cast reads a literal as its type" "-16|42|2|1.3" v \
+    "SELECT '-0x_10'::int4, 42::text, 1.5::int4, '1.25'::numeric(3,1);"
+expect "a cast is named for its type" "int8" q "SELECT 1::int8;"
+expect "a cast of an expression converts at eval" "2x|12" v \
+    "SELECT (1 + 1)::text || 'x', ('1' || '2')::int8;"
+expect "a char cast pads on output" "ab  |" v "SELECT 'ab'::char(4), '';"
+expect "a literal that does not read as the type" "invalid value" q \
+    "SELECT 'abc'::int4;"
+expect "a literal past the type's range" "overflow" q \
+    "SELECT 99999999999::int2;"
+expect "a cast with no meaning" "cannot cast" q "SELECT (1 + 1)::bool;"
+expect "a bad conversion at eval" "invalid input syntax" q \
+    "SELECT ('a' || 'b')::int4;"
 expect "SET is accepted" "SET" q "SET extra_float_digits = 3;"
 expect "RESET is accepted" "RESET" q "RESET ALL;"
 # SHOW: the isolation a driver asks about, the connection's settings
@@ -988,6 +1002,7 @@ expect "extended SELECT of a param expression" "43" \
     x 'SELECT $1 + 1 \bind 42 \g'
 expect "extended SELECT of a text param" "hi_there" \
     x 'SELECT $1 || $2 \bind hi _there \g'
+expect "extended cast of a param" "42" x 'SELECT $1::int8 + 1 \bind 41 \g'
 expect "extended SET" "SET" xq 'SET application_name = e2e \bind \g'
 expect "extended UPDATE, param under an operator" "UPDATE 1" \
     xq 'UPDATE pt SET n = n + $1 WHERE name = $2 \bind 5 a \g'

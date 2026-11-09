@@ -247,12 +247,12 @@ pub const Row = struct {
 pub fn textToValue(alloc: std.mem.Allocator, ty: Type, text: String) !Value {
     return switch (ty) {
         .bool_ => .{ .bool_ = try textToBool(text) },
-        .int2 => .{ .int2 = try std.fmt.parseInt(i16, text, 10) },
-        .int4 => .{ .int4 = try std.fmt.parseInt(i32, text, 10) },
-        .int8 => .{ .int8 = try std.fmt.parseInt(i64, text, 10) },
-        .uint2 => .{ .uint2 = try std.fmt.parseInt(u16, text, 10) },
-        .uint4 => .{ .uint4 = try std.fmt.parseInt(u32, text, 10) },
-        .uint8 => .{ .uint8 = try std.fmt.parseInt(u64, text, 10) },
+        .int2 => .{ .int2 = try textToInt(i16, text) },
+        .int4 => .{ .int4 = try textToInt(i32, text) },
+        .int8 => .{ .int8 = try textToInt(i64, text) },
+        .uint2 => .{ .uint2 = try textToInt(u16, text) },
+        .uint4 => .{ .uint4 = try textToInt(u32, text) },
+        .uint8 => .{ .uint8 = try textToInt(u64, text) },
         .float4 => .{ .float4 = try std.fmt.parseFloat(f32, text) },
         .float8 => .{ .float8 = try std.fmt.parseFloat(f64, text) },
         .text, .bpchar, .varchar => .{ .text = text },
@@ -264,6 +264,32 @@ pub fn textToValue(alloc: std.mem.Allocator, ty: Type, text: String) !Value {
         .uuid => .{ .uuid = try textToUuid(text) },
         .time, .interval => error.UnsupportedType,
     };
+}
+
+/// An integer as Postgres's input functions read one: decimal, or
+/// `0x` / `0o` / `0b` with that radix, a sign, underscores between
+/// digits (and one right after the prefix, `0x_FF`), and whitespace
+/// around it. Base 0 is std's spelling of the radix prefixes; the
+/// underscore after one it does not take, so that form is parsed by
+/// its radix from past the underscore.
+fn textToInt(comptime T: type, text: String) !T {
+    const s = std.mem.trim(u8, text, " \t\n\r");
+    const signed = s.len > 0 and (s[0] == '-' or s[0] == '+');
+    const body = if (signed) s[1..] else s;
+    if (body.len > 3 and body[0] == '0' and body[2] == '_') {
+        const base: u8 = switch (body[1]) {
+            'x', 'X' => 16,
+            'o', 'O' => 8,
+            'b', 'B' => 2,
+            else => 0,
+        };
+        if (base != 0) {
+            const mag = try std.fmt.parseInt(i128, body[3..], base);
+            const v = if (s[0] == '-') -mag else mag;
+            return std.math.cast(T, v) orelse error.Overflow;
+        }
+    }
+    return std.fmt.parseInt(T, s, 0);
 }
 
 /// A text literal or parameter as a cell of `col`: parsed as its type

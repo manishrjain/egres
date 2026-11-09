@@ -56,12 +56,12 @@ skip	pg/numeric.sql:629	INSERT INTO num_result SELECT id, 0, POWER(numeric '10',
 skip	pg/numeric.sql:632	SELECT t1.id1, t1.result, t2.expected	0A000 SELECT must read exactly one table
 skip	pg/numeric.sql:643	WITH v(x) AS	0A000 SELECT must read exactly one table
 skip	pg/numeric.sql:651	WITH v(x) AS	0A000 SELECT must read exactly one table
-skip	pg/numeric.sql:661	SELECT 'nan'::numeric / '0'	42883 operator does not exist for these operand types
-skip	pg/numeric.sql:665	SELECT 'nan'::numeric % '0'	42883 operator does not exist for these operand types
+skip	pg/numeric.sql:661	SELECT 'nan'::numeric / '0'	22P02 invalid value for column type
+skip	pg/numeric.sql:665	SELECT 'nan'::numeric % '0'	22P02 invalid value for column type
 skip	pg/numeric.sql:669	SELECT div('nan'::numeric, '0')	0A000 function div() is not supported
 skip	pg/numeric.sql:672	WITH v(x) AS	0A000 function numeric_inc() is not supported
 skip	pg/numeric.sql:677	WITH v(x) AS	42P01 table does not exist
-skip	pg/numeric.sql:683	WITH v(x) AS	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
+skip	pg/numeric.sql:683	WITH v(x) AS	42P01 table does not exist
 skip	pg/numeric.sql:690	WITH v(x) AS	42P01 table does not exist
 skip	pg/numeric.sql:698	WITH v(x) AS	0A000 function log() is not supported
 skip	pg/numeric.sql:710	WITH v(x) AS	0A000 SELECT must read exactly one table
@@ -71,46 +71,33 @@ skip	pg/numeric.sql:733	SELECT power('-2'::numeric, '3')	42883 operator does not
 skip	pg/numeric.sql:735	SELECT power('-2'::numeric, '-1')	42883 operator does not exist for these operand types
 skip	pg/numeric.sql:737	SELECT power('-2'::numeric, 'inf')	42883 operator does not exist for these operand types
 skip	pg/numeric.sql:738	SELECT power('-2'::numeric, '-inf')	42883 operator does not exist for these operand types
-skip	pg/numeric.sql:739	SELECT power('inf'::numeric, '-2')	42883 operator does not exist for these operand types
-skip	pg/numeric.sql:740	SELECT power('inf'::numeric, '-inf')	42883 operator does not exist for these operand types
-skip	pg/numeric.sql:741	SELECT power('-inf'::numeric, '2')	42883 operator does not exist for these operand types
-skip	pg/numeric.sql:742	SELECT power('-inf'::numeric, '3')	42883 operator does not exist for these operand types
-skip	pg/numeric.sql:744	SELECT power('-inf'::numeric, '-2')	42883 operator does not exist for these operand types
-skip	pg/numeric.sql:745	SELECT power('-inf'::numeric, '-3')	42883 operator does not exist for these operand types
-skip	pg/numeric.sql:746	SELECT power('-inf'::numeric, '0')	42883 operator does not exist for these operand types
-skip	pg/numeric.sql:747	SELECT power('-inf'::numeric, 'inf')	42883 operator does not exist for these operand types
-skip	pg/numeric.sql:748	SELECT power('-inf'::numeric, '-inf')	42883 operator does not exist for these operand types
+skip	pg/numeric.sql:739	SELECT power('inf'::numeric, '-2')	22P02 invalid value for column type
+skip	pg/numeric.sql:740	SELECT power('inf'::numeric, '-inf')	22P02 invalid value for column type
+skip	pg/numeric.sql:741	SELECT power('-inf'::numeric, '2')	22P02 invalid value for column type
+skip	pg/numeric.sql:742	SELECT power('-inf'::numeric, '3')	22P02 invalid value for column type
+skip	pg/numeric.sql:744	SELECT power('-inf'::numeric, '-2')	22P02 invalid value for column type
+skip	pg/numeric.sql:745	SELECT power('-inf'::numeric, '-3')	22P02 invalid value for column type
+skip	pg/numeric.sql:746	SELECT power('-inf'::numeric, '0')	22P02 invalid value for column type
+skip	pg/numeric.sql:747	SELECT power('-inf'::numeric, 'inf')	22P02 invalid value for column type
+skip	pg/numeric.sql:748	SELECT power('-inf'::numeric, '-inf')	22P02 invalid value for column type
 skip	pg/numeric.sql:754	SELECT AVG(val) FROM num_data	0A000 only count(*) is supported among aggregates
 skip	pg/numeric.sql:755	SELECT MAX(val) FROM num_data	0A000 only count(*) is supported among aggregates
 skip	pg/numeric.sql:756	SELECT MIN(val) FROM num_data	0A000 only count(*) is supported among aggregates
 skip	pg/numeric.sql:757	SELECT STDDEV(val) FROM num_data	0A000 function stddev() is not supported
 skip	pg/numeric.sql:758	SELECT VARIANCE(val) FROM num_data	0A000 function variance() is not supported
 skip	pg/numeric.sql:770	INSERT INTO fract_only VALUES (9, 'NaN')	22P02 invalid value for column type
-bug	pg/numeric.sql:777	SELECT (-9223372036854775808.5)::int8	#26 cast on a literal drops its type
-bug	pg/numeric.sql:778	SELECT (-9223372036854775808.4)::int8	#26 cast on a literal drops its type
-bug	pg/numeric.sql:779	SELECT 9223372036854775807.4::int8	#26 cast on a literal drops its type
-bug	pg/numeric.sql:780	SELECT 9223372036854775807.5::int8	#26 cast on a literal drops its type
-bug	pg/numeric.sql:781	SELECT (-2147483648.5)::int4	#26 cast on a literal drops its type
-bug	pg/numeric.sql:782	SELECT (-2147483648.4)::int4	#26 cast on a literal drops its type
-bug	pg/numeric.sql:783	SELECT 2147483647.4::int4	#26 cast on a literal drops its type
-bug	pg/numeric.sql:784	SELECT 2147483647.5::int4	#26 cast on a literal drops its type
-bug	pg/numeric.sql:785	SELECT (-32768.5)::int2	#26 cast on a literal drops its type
-bug	pg/numeric.sql:786	SELECT (-32768.4)::int2	#26 cast on a literal drops its type
-bug	pg/numeric.sql:787	SELECT 32767.4::int2	#26 cast on a literal drops its type
-bug	pg/numeric.sql:788	SELECT 32767.5::int2	#26 cast on a literal drops its type
-skip	pg/numeric.sql:791	SELECT 'NaN'::float8::numeric	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
-skip	pg/numeric.sql:792	SELECT 'Infinity'::float8::numeric	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
-skip	pg/numeric.sql:793	SELECT '-Infinity'::float8::numeric	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
-skip	pg/numeric.sql:794	SELECT 'NaN'::numeric::float8	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
-skip	pg/numeric.sql:795	SELECT 'Infinity'::numeric::float8	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
-skip	pg/numeric.sql:796	SELECT '-Infinity'::numeric::float8	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
-skip	pg/numeric.sql:797	SELECT 'NaN'::float4::numeric	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
-skip	pg/numeric.sql:798	SELECT 'Infinity'::float4::numeric	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
-skip	pg/numeric.sql:799	SELECT '-Infinity'::float4::numeric	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
-skip	pg/numeric.sql:800	SELECT 'NaN'::numeric::float4	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
-skip	pg/numeric.sql:801	SELECT 'Infinity'::numeric::float4	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
-skip	pg/numeric.sql:802	SELECT '-Infinity'::numeric::float4	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
-skip	pg/numeric.sql:803	SELECT '42'::int2::numeric	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
+skip	pg/numeric.sql:791	SELECT 'NaN'::float8::numeric	22003 numeric field overflow
+skip	pg/numeric.sql:792	SELECT 'Infinity'::float8::numeric	22003 numeric field overflow
+skip	pg/numeric.sql:793	SELECT '-Infinity'::float8::numeric	22003 numeric field overflow
+skip	pg/numeric.sql:794	SELECT 'NaN'::numeric::float8	22P02 invalid value for column type
+skip	pg/numeric.sql:795	SELECT 'Infinity'::numeric::float8	22P02 invalid value for column type
+skip	pg/numeric.sql:796	SELECT '-Infinity'::numeric::float8	22P02 invalid value for column type
+skip	pg/numeric.sql:797	SELECT 'NaN'::float4::numeric	22003 numeric field overflow
+skip	pg/numeric.sql:798	SELECT 'Infinity'::float4::numeric	22003 numeric field overflow
+skip	pg/numeric.sql:799	SELECT '-Infinity'::float4::numeric	22003 numeric field overflow
+skip	pg/numeric.sql:800	SELECT 'NaN'::numeric::float4	22P02 invalid value for column type
+skip	pg/numeric.sql:801	SELECT 'Infinity'::numeric::float4	22P02 invalid value for column type
+skip	pg/numeric.sql:802	SELECT '-Infinity'::numeric::float4	22P02 invalid value for column type
 skip	pg/numeric.sql:827	SELECT i as pow,	0A000 only table sources are supported
 skip	pg/numeric.sql:837	SELECT round(4.4e131071, -131071) = 4e131071	0A000 only the + - * / % || operators are supported
 skip	pg/numeric.sql:838	SELECT round(4.5e131071, -131071) = 5e131071	0A000 only the + - * / % || operators are supported
@@ -130,7 +117,6 @@ skip	pg/numeric.sql:857	SELECT trunc(5e-16383, 1000000) = 5e-16383	0A000 only th
 skip	pg/numeric.sql:858	SELECT trunc(5e-16383, 16383) = 5e-16383	0A000 only the + - * / % || operators are supported
 skip	pg/numeric.sql:859	SELECT trunc(5e-16383, 16382) = 0	0A000 only the + - * / % || operators are supported
 skip	pg/numeric.sql:879	COPY width_bucket_test (operand_num) FROM stdin	0A000 unsupported statement
-skip	pg/numeric.sql:901	UPDATE width_bucket_test SET operand_f8 = operand_num::float8	0A000 an expression must be a literal, a column, a function call, or an operator expression over them
 skip	pg/numeric.sql:903	SELECT	0A000 function width_bucket() is not supported
 skip	pg/numeric.sql:921	SELECT width_bucket('Infinity'::numeric, 1, 10, 10),	0A000 function width_bucket() is not supported
 skip	pg/numeric.sql:925	SELECT width_bucket('Infinity'::float8, 1, 10, 10),	0A000 function width_bucket() is not supported

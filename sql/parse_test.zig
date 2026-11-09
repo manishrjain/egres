@@ -206,36 +206,74 @@ test "sql.parse: NOT NULL is a column constraint; the PRIMARY KEY implies it" {
     try testing.expect(!cols[3].not_null);
 }
 
-test "sql.parse: a cast constant is the constant (pgjdbc simple mode)" {
+test "sql.parse: a cast is a node over its operand, typed as written" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
+    // In a WHERE, a SET and a target list a cast is an expression;
+    // pred.bind reads a cast literal against a bare column as the
+    // column's type, the pgjdbc simple-mode shape.
     const sel = try parse.statement(
         alloc,
         "SELECT val FROM t WHERE sk = '6'::int8;",
     );
     const eq = sel.select.where.?.cmp;
-    try testing.expectEqualStrings("6", eq.rhs.literal.str);
+    try testing.expectEqual(sql.value.Type.int8, eq.rhs.cast.ty);
+    try testing.expectEqualStrings("6", eq.rhs.cast.expr.literal.str);
+    const upd = try parse.statement(
+        alloc,
+        "UPDATE t SET val = val || ',1'::text WHERE id = '6'::int8;",
+    );
+    const rhs = upd.update.sets[0].value.binop.rhs.*;
+    try testing.expectEqual(sql.value.Type.text, rhs.cast.ty);
+    try testing.expectEqualStrings(",1", rhs.cast.expr.literal.str);
+    // The spellings, the modifiers and the output name.
+    const row = try parse.statement(
+        alloc,
+        "SELECT 1::int8, CAST('x' AS text), int2 '2', 1.5::numeric(3, 1), " ++
+            "'a'::varchar(2), 'b'::char, a::int, (1 + 1)::int4 AS n;",
+    );
+    const t = row.select_row.targets;
+    try testing.expectEqual(sql.value.Type.int8, t[0].expr.cast.ty);
+    try testing.expectEqual(@as(i64, 1), t[0].expr.cast.expr.literal.int);
+    try testing.expectEqualStrings("int8", t[0].name);
+    try testing.expectEqual(sql.value.Type.text, t[1].expr.cast.ty);
+    try testing.expectEqualStrings("text", t[1].name);
+    try testing.expectEqual(sql.value.Type.int2, t[2].expr.cast.ty);
+    try testing.expectEqualStrings("2", t[2].expr.cast.expr.literal.str);
+    try testing.expectEqual(sql.value.Type.numeric, t[3].expr.cast.ty);
+    try testing.expectEqual((3 << 16) | 1, t[3].expr.cast.type_mod.?);
+    try testing.expectEqualStrings("numeric", t[3].name);
+    try testing.expectEqual(sql.value.Type.varchar, t[4].expr.cast.ty);
+    try testing.expectEqual(2, t[4].expr.cast.type_mod.?);
+    try testing.expectEqual(sql.value.Type.bpchar, t[5].expr.cast.ty);
+    try testing.expectEqual(1, t[5].expr.cast.type_mod.?);
+    try testing.expectEqual(sql.value.Type.int4, t[6].expr.cast.ty);
+    try testing.expectEqualStrings("a", t[6].name); // the column's, not int4
+    try testing.expect(t[7].expr.cast.expr.* == .binop);
+    try testing.expectEqualStrings("n", t[7].name);
+    // A cast of anything parses; a type egres has no cell for does not.
+    const col = try parse.statement(alloc, "SELECT a FROM t WHERE a = b::int8;");
+    try testing.expect(col == .select);
+    const cases = [_]struct { sql: String, needle: String }{
+        .{ .sql = "SELECT 1::oid;", .needle = "unsupported type" },
+        .{ .sql = "SELECT 1::int4(3);", .needle = "type modifier" },
+        .{ .sql = "SELECT 'x'::varchar(0);", .needle = "at least 1" },
+    };
+    for (cases) |case| {
+        const stmt = try parse.statement(alloc, case.sql);
+        try testing.expect(stmt == .invalid);
+        try testing.expect(
+            std.mem.indexOf(u8, stmt.invalid, case.needle) != null,
+        );
+    }
+    // INSERT's VALUES items stay literals: the column types them.
     const ins = try parse.statement(
         alloc,
         "INSERT INTO t (id, val) VALUES (CAST('7' AS int8), 'x'::text);",
     );
     try testing.expectEqualStrings("7", ins.insert.rows[0][0].str);
     try testing.expectEqualStrings("x", ins.insert.rows[0][1].str);
-    const upd = try parse.statement(
-        alloc,
-        "UPDATE t SET val = val || ',1'::text WHERE id = '6'::int8;",
-    );
-    const rhs = upd.update.sets[0].value.binop.rhs.*;
-    try testing.expectEqualStrings(",1", rhs.literal.str);
-    const row = try parse.statement(alloc, "SELECT 1::int8;");
-    try testing.expectEqual(
-        @as(i64, 1),
-        row.select_row.targets[0].expr.literal.int,
-    );
-    // A cast of anything but a constant is still not a literal.
-    const bad = try parse.statement(alloc, "SELECT a FROM t WHERE a = b::int8;");
-    try testing.expect(bad == .invalid);
 }
 
 test "sql.parse: SHOW names its parameter; SET and RESET are accepted" {

@@ -264,6 +264,64 @@ test "sql.expr: bind without a table — a SELECT with no FROM" {
         }
     }
 
+    // Casts: a literal is read as the type and folded to its value, a
+    // numeric one rounding into an integer; a computed operand is
+    // converted at eval; a NULL keeps the type for Describe.
+    const casts = try sql.parse.statement(
+        arloc,
+        "SELECT '0x_10'::int4, 42::text, 1.5::int4, '1.25'::numeric(3,1), " ++
+            "(1 + 1)::text, ('1' || '2')::int8, NULL::int4, 2.5::int2 + 1, " ++
+            "'a'::char(3), ('a' || 'b')::int4;",
+    );
+    const cast_want = [_]struct { ty: ?Type, cell: ?Value }{
+        .{ .ty = .int4, .cell = .{ .int4 = 16 } },
+        .{ .ty = .text, .cell = .{ .text = "42" } },
+        .{ .ty = .int4, .cell = .{ .int4 = 2 } },
+        .{ .ty = .numeric, .cell = .{ .numeric = try sql.value.Numeric.parse("1.3") } },
+        .{ .ty = .text, .cell = .{ .text = "2" } },
+        .{ .ty = .int8, .cell = .{ .int8 = 12 } },
+        .{ .ty = .int4, .cell = .null_value },
+        .{ .ty = .int8, .cell = .{ .int8 = 4 } },
+        .{ .ty = .bpchar, .cell = .{ .text = "a" } },
+        .{ .ty = .int4, .cell = null }, // InvalidValue at eval
+    };
+    for (casts.select_row.targets, cast_want, 0..) |t, w, i| {
+        const node = try expr.bind(arloc, null, t.expr, null, .{}, null);
+        try testing.expectEqual(w.ty, node.ty());
+        if (w.cell) |cell| {
+            const got = try node.cell(none);
+            if (cell == .text)
+                try testing.expectEqualStrings(cell.text, got.text)
+            else
+                try testing.expectEqual(cell, got);
+            // A literal cast is folded to its value; a computed operand,
+            // the NULL (for Describe) and the char(n) (for the padding)
+            // keep their cast node.
+            const keeps = i == 4 or i == 5 or i == 6 or i == 8;
+            try testing.expect((node.* == .cast) == keeps);
+        } else {
+            try testing.expectError(error.InvalidValue, node.cell(none));
+        }
+    }
+    // A literal that does not read as the type, or past its range,
+    // fails at bind; a conversion with no meaning never binds.
+    const bad = try sql.parse.statement(
+        arloc,
+        "SELECT 'abc'::int4, '1.9'::int4, 99999999999::int2, (1 + 1)::bool;",
+    );
+    const bad_want = [_]anyerror{
+        error.InvalidValue,
+        error.InvalidValue,
+        error.NumericOutOfRange,
+        error.CannotCast,
+    };
+    for (bad.select_row.targets, bad_want) |t, want_err| {
+        try testing.expectError(
+            want_err,
+            expr.bind(arloc, null, t.expr, null, .{}, null),
+        );
+    }
+
     // No table: every column is undefined, EXCLUDED included.
     const col = try sql.parse.statement(arloc, "SELECT a, 1;");
     try testing.expectError(error.UndefinedColumn, expr.bind(

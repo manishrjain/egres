@@ -102,7 +102,7 @@ test "sql.pred: bind resolves columns, coerces literals, and checks the egid" {
         .{ .sql = "SELECT * FROM t WHERE a = 1 AND nope = 2;", .err = error.UndefinedColumn },
         .{ .sql = "SELECT * FROM t WHERE NOT a = 'zz';", .err = error.InvalidValue },
         .{ .sql = "SELECT * FROM t WHERE egid = 0;", .err = error.EgidZero },
-        .{ .sql = "SELECT * FROM t WHERE egid = -1;", .err = error.InvalidValue },
+        .{ .sql = "SELECT * FROM t WHERE egid = -1;", .err = error.NumericOutOfRange },
         .{ .sql = "SELECT * FROM t WHERE nope IS NULL;", .err = error.UndefinedColumn },
         .{ .sql = "SELECT * FROM t WHERE a = b;", .err = error.NoSuchOperator },
         .{ .sql = "SELECT * FROM t WHERE a > 'x';", .err = error.InvalidValue },

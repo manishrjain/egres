@@ -339,10 +339,25 @@ pub const Expr = union(enum) {
     excluded: String,
     binop: BinOp,
     call: Call,
+    /// `expr::type`, `CAST(expr AS type)`, `type 'literal'`: the
+    /// expression read or converted as `ty` (parseTypeName). A literal
+    /// under a cast is read as the type, as it is read as a column's
+    /// (expr.bind); anything else is converted at eval.
+    cast: Cast,
 
     pub const Op = enum { add, sub, mul, div, mod, concat };
     pub const BinOp = struct { op: Op, lhs: *const Expr, rhs: *const Expr };
     pub const Call = struct { func: *const _funcs.Func, args: []const Expr };
+    pub const Cast = struct {
+        expr: *const Expr,
+        ty: _value.Type,
+        /// `varchar(n)`, `char(n)`, `numeric(p, s)`: as a column's.
+        type_mod: ?u32,
+        /// The type as the client spelled it, after the grammar's
+        /// normalization (`int` is `int4`): the output name of a cast
+        /// target, as Postgres names it.
+        name: String, // borrowed
+    };
 };
 
 /// One SET assignment: `column = expr`.
@@ -548,6 +563,84 @@ fn literalFrom(
     };
 }
 
+/// A type as the grammar spells it, resolved to a storage Type and its
+/// modifier; or the rejection, a Stmt.invalid with the reason (and
+/// `.unsupported` for a shape the grammar should not produce).
+const ParsedType = union(enum) {
+    spec: TypeSpec,
+    stmt: Stmt,
+};
+
+pub const TypeSpec = struct {
+    ty: _value.Type,
+    type_mod: ?u32,
+    /// The last component of the name, as the grammar normalized it:
+    /// `int` and `integer` arrive as `int4` (borrowed from the arena).
+    name: String,
+};
+
+/// A column's or a cast's type: `int` arrives pg_catalog-qualified,
+/// names = [pg_catalog, int4]; `char(84)` is [pg_catalog, bpchar] with
+/// typmods = [84]. A bare `char` arrives as `bpchar` with typmods [1]
+/// (the grammar fills it), a bare `varchar` with none. A length
+/// modifier: only `char(n)` / `varchar(n)` take one, a single integer
+/// in 1..max_type_mod. A lengthless `char` is `char(1)`; a lengthless
+/// `varchar` stays `.text`. `numeric(p, s)` packs both into the one
+/// modifier (value.Type.numeric).
+fn parseTypeName(
+    alloc: std.mem.Allocator,
+    tn_ptr: [*c]c.TypeName,
+) parser.ParseError!ParsedType {
+    const tn = tn_ptr.*;
+    const tyname = try lastName(alloc, tn.names) orelse
+        return .{ .stmt = .unsupported };
+    var ty = _value.Type.fromName(tyname) orelse return .{
+        .stmt = try invalidFmt(alloc, "unsupported type \"{s}\"", .{tyname}),
+    };
+
+    const typmods = parser.items(tn.typmods);
+    var type_mod: ?u32 = null;
+    if (typmods.len > 0 and ty == .numeric) {
+        type_mod = switch (try numericTypmod(alloc, typmods)) {
+            .mod => |m| m,
+            .stmt => |rejected| return .{ .stmt = rejected },
+        };
+    } else if (typmods.len > 0) {
+        const is_varchar = std.mem.eql(u8, tyname, "varchar");
+        if (ty != .bpchar and !is_varchar) return .{ .stmt = try invalidFmt(
+            alloc,
+            "type modifier is not allowed for type \"{s}\"",
+            .{tyname},
+        ) };
+        const ac = if (typmods.len == 1)
+            parser.cast(c.A_Const, typmods[0].ptr_value)
+        else
+            null;
+        if (ac == null or ac.?.val.node.type != c.T_Integer)
+            return .{ .stmt = try invalidFmt(
+                alloc,
+                "invalid type modifier for type \"{s}\"",
+                .{tyname},
+            ) };
+        const n = ac.?.val.ival.ival;
+        if (n < 1) return .{ .stmt = try invalidFmt(
+            alloc,
+            "length for type {s} must be at least 1",
+            .{tyname},
+        ) };
+        if (n > _value.Type.max_type_mod) return .{ .stmt = try invalidFmt(
+            alloc,
+            "length for type {s} cannot exceed {d}",
+            .{ tyname, _value.Type.max_type_mod },
+        ) };
+        type_mod = @intCast(n);
+        if (is_varchar) ty = .varchar;
+    } else if (ty == .bpchar) {
+        type_mod = 1;
+    }
+    return .{ .spec = .{ .ty = ty, .type_mod = type_mod, .name = tyname } };
+}
+
 /// CREATE TABLE. Only bare `name type` columns with an optional
 /// single-column PRIMARY KEY or UNIQUE parse; any other constraint (NOT
 /// NULL, FK, DEFAULT, table-level) is a clean `.invalid`.
@@ -575,52 +668,13 @@ fn parseCreateTable(
                 );
         }
 
-        // `int` arrives pg_catalog-qualified: names = [pg_catalog, int4];
-        // `char(84)` is [pg_catalog, bpchar] with typmods = [84]. A bare
-        // `char` arrives as `bpchar` with typmods [1] (the grammar fills
-        // it), a bare `varchar` with none.
         if (cd.typeName == null) return .unsupported;
-        const tn = cd.typeName.*;
-        const tyname = try lastName(alloc, tn.names) orelse return .unsupported;
-        var ty = _value.Type.fromName(tyname) orelse
-            return invalidFmt(alloc, "unsupported type \"{s}\"", .{tyname});
-
-        // A length modifier: only `char(n)` / `varchar(n)` take one, a
-        // single integer in 1..max_type_mod. A lengthless `char` is
-        // `char(1)`; a lengthless `varchar` stays `.text`. `numeric(p,
-        // s)` packs both into the one modifier (value.Type.numeric).
-        const typmods = parser.items(tn.typmods);
-        var type_mod: ?u32 = null;
-        if (typmods.len > 0 and ty == .numeric) {
-            type_mod = switch (try numericTypmod(alloc, typmods)) {
-                .mod => |m| m,
-                .stmt => |rejected| return rejected,
-            };
-        } else if (typmods.len > 0) {
-            const is_varchar = std.mem.eql(u8, tyname, "varchar");
-            if (ty != .bpchar and !is_varchar)
-                return invalidFmt(alloc, "type modifier is not allowed for type \"{s}\"", .{tyname});
-            const ac = if (typmods.len == 1)
-                parser.cast(c.A_Const, typmods[0].ptr_value)
-            else
-                null;
-            if (ac == null or ac.?.val.node.type != c.T_Integer)
-                return invalidFmt(
-                    alloc,
-                    "invalid type modifier for type \"{s}\"",
-                    .{tyname},
-                );
-            const n = ac.?.val.ival.ival;
-            if (n < 1)
-                return invalidFmt(alloc, "length for type {s} must be at least 1", .{tyname});
-            if (n > _value.Type.max_type_mod)
-                return invalidFmt(alloc, "length for type {s} cannot exceed {d}", //
-                    .{ tyname, _value.Type.max_type_mod });
-            type_mod = @intCast(n);
-            if (is_varchar) ty = .varchar;
-        } else if (ty == .bpchar) {
-            type_mod = 1;
-        }
+        const spec = switch (try parseTypeName(alloc, cd.typeName)) {
+            .spec => |spec| spec,
+            .stmt => |rejected| return rejected,
+        };
+        const ty = spec.ty;
+        const type_mod = spec.type_mod;
 
         var pkey = false;
         var unique = false;
@@ -1356,6 +1410,27 @@ fn parseExpr(
 ) parser.ParseError!ParsedExpr {
     if (pastStackBudget())
         return ParsedExpr.reject("statement nested too deeply");
+    if (parser.cast(c.TypeCast, p)) |tc| {
+        if (tc.typeName == null) return ParsedExpr.reject("unsupported type");
+        const spec = switch (try parseTypeName(arloc, tc.typeName)) {
+            .spec => |spec| spec,
+            .stmt => |rejected| return switch (rejected) {
+                .invalid => |msg| .{ .invalid = msg },
+                else => ParsedExpr.reject("unsupported type"),
+            },
+        };
+        const inner = try arloc.create(Expr);
+        inner.* = switch (try parseExpr(arloc, params, parser.asNode(tc.arg))) {
+            .expr => |e| e,
+            .invalid => |msg| return .{ .invalid = msg },
+        };
+        return .{ .expr = .{ .cast = .{
+            .expr = inner,
+            .ty = spec.ty,
+            .type_mod = spec.type_mod,
+            .name = spec.name,
+        } } };
+    }
     if (constant(p)) |ac| {
         const lit = try literalFrom(arloc, ac);
         if (lit == .unsupported)
@@ -1836,18 +1911,24 @@ fn numericTypmod(
 }
 
 /// A target's output name: its alias, else what Postgres prints, the
-/// column's name for a column, the function's for a call, `?column?`
-/// for anything else.
+/// column's name for a column, the function's for a call, the type's
+/// for a cast of anything unnamed (`SELECT 1::int8` is `int8`),
+/// `?column?` for anything else.
 fn targetName(
     alloc: std.mem.Allocator,
     rt: *const c.ResTarget,
     expr: Expr,
 ) parser.ParseError!String {
     if (rt.name != null) return dup(alloc, rt.name);
+    return exprName(expr) orelse "?column?";
+}
+
+fn exprName(expr: Expr) ?String {
     return switch (expr) {
         .column, .excluded => |name| name,
         .call => |call| call.func.name,
-        .literal, .binop => "?column?",
+        .cast => |cast| exprName(cast.expr.*) orelse cast.name,
+        .literal, .binop => null,
     };
 }
 

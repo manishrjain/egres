@@ -62,7 +62,18 @@ pub const Node = union(enum) {
     param: ?Type,
     binop: BinOp,
     call: CallNode,
+    /// A conversion at eval, `(a + 1)::text`: the operand's cell as a
+    /// cell of `col`, the cast's type and modifier as a Column (what
+    /// value.fitString and fitNumeric read). A cast of a literal never
+    /// gets here: bind reads the literal as the type and the node is
+    /// its value, so only a NULL and a computed operand are cast at
+    /// eval.
+    cast: CastNode,
 
+    pub const CastNode = struct {
+        expr: *const Node,
+        col: *const Column,
+    };
     pub const BinOp = struct {
         op: Op,
         lhs: *const Node,
@@ -87,6 +98,18 @@ pub const Node = union(enum) {
             .param => |t| t,
             .binop => |b| b.ty,
             .call => |call| call.ty,
+            .cast => |cast| cast.col.ty,
+        };
+    }
+
+    /// The column that decides how this node's cell prints and is
+    /// described, when one does: a column's, or a cast's target
+    /// (`'a'::char(3)` pads to 3). null for a computed cell.
+    pub fn formatColumn(self: *const Node) ?*const Column {
+        return switch (self.*) {
+            .column => |col| col,
+            .cast => |cast| cast.col,
+            else => null,
         };
     }
 
@@ -105,6 +128,7 @@ pub const Node = union(enum) {
             .value => |v| return v,
             .column => |col| return row.tbl.?.parseCol(row.item.?, col),
             .param => unreachable, // Describe's tree is never evaluated
+            .cast => |cast| return castCell(row.scratch, cast, row),
             .binop, .call => {},
         }
         const s = try self.scalar(row) orelse return .null_value;
@@ -135,10 +159,21 @@ pub const Node = union(enum) {
             .column => |scol| if (scol.ty == col.ty and scol.type_mod == col.type_mod)
                 return row.tbl.?.parseCol(row.item.?, scol),
             .param => unreachable, // Describe's tree is never evaluated
+            // A cast's cell is already of its type, which fits the
+            // target (bind checked): the same type is the cell itself,
+            // a string of another length goes through the length
+            // check, a number is widened or narrowed as a computed one.
+            .cast => |cast| {
+                const v = try castCell(row.scratch, cast, row);
+                if (v == .null_value) return v;
+                if (v.ty() == col.ty and cast.col.type_mod == col.type_mod)
+                    return v;
+                return coerceScalar(row.scratch, scalarOf(v).?, col);
+            },
             .binop, .call => {},
         }
         const result = try self.scalar(row) orelse return .null_value;
-        return coerceScalar(result, col);
+        return coerceScalar(row.scratch, result, col);
     }
 
     /// This subtree's value for one row, before assignment; null = SQL
@@ -148,6 +183,9 @@ pub const Node = union(enum) {
             .value => |v| return scalarOf(v),
             .column => |col| return scalarOf(row.tbl.?.parseCol(row.item.?, col)),
             .param => unreachable, // Describe's tree is never evaluated
+            // Under an operator or a call a cast is to a number or a
+            // string (bind), so its cell is a scalar or NULL.
+            .cast => |cast| return scalarOf(try castCell(row.scratch, cast, row)),
             .binop => |b| {
                 // Both sides first, then the NULL check: PG raises on
                 // `NULL + 1/0` too.
@@ -183,6 +221,7 @@ pub const BindError = error{
     UnsupportedValue,
     TypeMismatch,
     NoSuchOperator,
+    CannotCast,
     StringTooLong,
     InvalidUtf8,
     OutOfMemory,
@@ -253,11 +292,114 @@ pub fn bind(
                 .ty = try call.func.resultType(tys),
             } };
         },
+        .cast => |cast| node.* = try bindCast(arloc, tbl, cast, params, excluded),
     }
     if (target) |col| {
         if (!node.fits(col)) return error.TypeMismatch;
     }
     return node;
+}
+
+/// `expr::type`. A literal is read as the type, as it is read as the
+/// type of a column it meets (`'0x10'::int4` is 16, `'NaN'::float8`
+/// a NaN), and the node is the value; a `$n` under Describe is a
+/// param leaf of the type. A NULL keeps a cast node so Describe types
+/// it. Anything else is converted at eval, so the operand must be
+/// something castCell converts: a string to any type (read as its
+/// text), a number to a number or a string. Any other pairing is
+/// CannotCast, PG's 42846.
+fn bindCast(
+    arloc: std.mem.Allocator,
+    tbl: ?*const Table,
+    cast: _parse.Expr.Cast,
+    params: pgwire.Params,
+    excluded: ?[]const Value,
+) BindError!Node {
+    const col = try arloc.create(Column);
+    col.* = .{
+        .column_id = std.math.maxInt(u32), // never egid's 0
+        .pos = std.math.maxInt(usize),
+        .name = "",
+        .ty = cast.ty,
+        .type_mod = cast.type_mod,
+        .pkey_position = null,
+    };
+
+    if (cast.expr.* == .literal) {
+        const lit = cast.expr.literal;
+        if (lit == .param and !_parse.paramBound(params, lit.param))
+            return .{ .param = cast.ty };
+
+        // `1.5::int4` is 2: a number with a point is a numeric, and a
+        // numeric converts to an integer by rounding, not by being
+        // re-read as integer text. Bound as the number it is, then
+        // converted as a computed operand would be, here at bind.
+        if (lit == .float and cast.ty.isInteger()) {
+            const inner = try arloc.create(Node);
+            inner.* = .{ .value = try literalValue(arloc, lit, null, params) };
+            const none: Row = .{ .scratch = arloc, .tbl = null, .item = null };
+            const v = castCell(arloc, .{ .expr = inner, .col = col }, none) catch |err|
+                return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.IntOutOfRange,
+                    error.NumericOutOfRange,
+                    error.FloatOutOfRange,
+                    => error.NumericOutOfRange,
+                    else => error.InvalidValue,
+                };
+            return .{ .value = v };
+        }
+        const v = try literalValue(arloc, lit, col, params);
+        // The value stands for the cast, except a NULL, whose type
+        // Describe needs, and a char(n), whose padding the output
+        // needs (formatColumn): those keep the node.
+        if (v != .null_value and cast.ty != .bpchar) return .{ .value = v };
+
+        const inner = try arloc.create(Node);
+        inner.* = .{ .value = v };
+        return .{ .cast = .{ .expr = inner, .col = col } };
+    }
+    const inner = try bind(arloc, tbl, cast.expr.*, null, params, excluded);
+    if (inner.ty()) |from| {
+        const ok = from.isString() or
+            (from.isNumeric() and (cast.ty.isNumeric() or cast.ty.isString()));
+        if (!ok) return error.CannotCast;
+    }
+    return .{ .cast = .{ .expr = inner, .col = col } };
+}
+
+/// A cast's cell: the operand's cell converted to `cast.col`
+/// (coerceScalar). NULL stays NULL.
+fn castCell(
+    arloc: std.mem.Allocator,
+    cast: Node.CastNode,
+    row: Row,
+) EvalError!Value {
+    const v = try cast.expr.cell(row);
+    if (v == .null_value) return v;
+    // bind admits only a string or a number operand.
+    return coerceScalar(arloc, scalarOf(v).?, cast.col);
+}
+
+/// A float or numeric as the nearest integer, half away from zero, as
+/// Postgres casts a numeric to an integer; a NaN or infinity has none.
+fn roundToInt(s: Scalar) EvalError!i128 {
+    switch (s) {
+        .numeric => |d| {
+            const whole = d.rescale(0, .round) catch return error.IntOutOfRange;
+            return whole.coef;
+        },
+        .float => |f| {
+            if (!std.math.isFinite(f)) return error.IntOutOfRange;
+
+            const r = @round(f);
+            const lim: f64 = @floatFromInt(std.math.maxInt(i64)); // 2^63
+            if (r < -lim or r >= lim) return error.IntOutOfRange;
+
+            return @intFromFloat(r);
+        },
+        .int, .text => unreachable,
+    }
 }
 
 /// A literal as a cell: of `target`'s type when there is one
@@ -287,6 +429,12 @@ fn literalValue(
             => return error.UnsupportedValue,
             error.StringTooLong => return error.StringTooLong,
             error.InvalidUtf8 => return error.InvalidUtf8,
+            // A number the type cannot hold, `99999999999::int2`: PG's
+            // 22003, as for a computed one.
+            error.Overflow,
+            error.NumericOutOfRange,
+            error.IntOutOfRange,
+            => return error.NumericOutOfRange,
             else => return error.InvalidValue,
         };
     }
@@ -416,6 +564,11 @@ pub fn replyBindErr(
             code.undefined_function,
             "operator does not exist for these operand types",
         ),
+        error.CannotCast => try replyErrorCode(
+            state,
+            code.cannot_coerce,
+            "cannot cast between these types",
+        ),
         error.StringTooLong => if (target) |col|
             try replyStringTooLong(state, arloc, col)
         else
@@ -463,6 +616,8 @@ pub const EvalError = error{
     PowerArgument,
     StringTooLong,
     InvalidUtf8,
+    /// A string cast to a type it does not read as, `'abc'::int4`.
+    InvalidValue,
     OutOfMemory,
 };
 
@@ -620,37 +775,60 @@ fn floatOp(op: Op, x: f64, y: f64) EvalError!f64 {
     return r;
 }
 
-/// Assign a computed scalar to `target`: integers with a range check,
-/// an int into a float widened, an f64 into a float4 narrowed
-/// (overflow → FloatOutOfRange), text through the column's string
-/// rules (value.fitString: `char(n)` stripped, lengths checked).
-/// Any other pairing never binds.
-fn coerceScalar(s: Scalar, target: *const Column) EvalError!Value {
+/// A scalar as a cell of `target`, for an assignment and for a cast
+/// alike; which pairings each may ask for is bind's to decide. Text
+/// is read as the type (value.textToColumn, what a literal goes
+/// through: `char(n)` stripped, lengths checked). A number becomes
+/// text as it prints; an integer with a range check, a float or
+/// numeric rounded half away from zero first, as Postgres does; a
+/// float widened, or narrowed into a float4 (overflow →
+/// FloatOutOfRange); a numeric fitted to its precision and scale.
+fn coerceScalar(
+    arloc: std.mem.Allocator,
+    s: Scalar,
+    target: *const Column,
+) EvalError!Value {
+    if (s == .text) {
+        return _value.textToColumn(arloc, target, s.text) catch |err|
+            switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.StringTooLong => error.StringTooLong,
+                error.InvalidUtf8 => error.InvalidUtf8,
+                error.NumericOutOfRange => error.NumericOutOfRange,
+                else => error.InvalidValue,
+            };
+    }
+    if (target.ty.isString()) {
+        const text = try _funcs.scalarText(arloc, s);
+        return .{ .text = try _value.fitString(text, target) };
+    }
+    const n: Scalar = if (target.ty.isInteger() and s != .int)
+        .{ .int = try roundToInt(s) }
+    else
+        s;
     switch (target.ty) {
-        .int2 => return .{ .int2 = try intCast(i16, s) },
-        .int4 => return .{ .int4 = try intCast(i32, s) },
-        .int8 => return .{ .int8 = try intCast(i64, s) },
-        .uint2 => return .{ .uint2 = try intCast(u16, s) },
-        .uint4 => return .{ .uint4 = try intCast(u32, s) },
-        .uint8 => return .{ .uint8 = try intCast(u64, s) },
-        .float8 => return .{ .float8 = toFloat(s) },
+        .int2 => return .{ .int2 = try intCast(i16, n) },
+        .int4 => return .{ .int4 = try intCast(i32, n) },
+        .int8 => return .{ .int8 = try intCast(i64, n) },
+        .uint2 => return .{ .uint2 = try intCast(u16, n) },
+        .uint4 => return .{ .uint4 = try intCast(u32, n) },
+        .uint8 => return .{ .uint8 = try intCast(u64, n) },
+        .float8 => return .{ .float8 = toFloat(n) },
         .float4 => {
-            const wide = toFloat(s);
+            const wide = toFloat(n);
             const narrow: f32 = @floatCast(wide);
             if (std.math.isInf(narrow) and !std.math.isInf(wide))
                 return error.FloatOutOfRange;
             return .{ .float4 = narrow };
         },
-        .text, .bpchar, .varchar => return .{
-            .text = try _value.fitString(s.text, target),
-        },
         .numeric => {
-            const d = if (s == .float)
-                Numeric.fromFloat(s.float) catch return error.NumericOutOfRange
+            const d = if (n == .float)
+                Numeric.fromFloat(n.float) catch return error.NumericOutOfRange
             else
-                toNumeric(s);
+                toNumeric(n);
             return .{ .numeric = try _value.fitNumeric(d, target) };
         },
+        // A number is cast only to a number or a string (bind).
         else => unreachable,
     }
 }

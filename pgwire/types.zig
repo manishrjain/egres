@@ -86,6 +86,7 @@ pub const sqlstate = struct {
     pub const undefined_column: [5]u8 = .{ '4', '2', '7', '0', '3' };
     pub const undefined_function: [5]u8 = .{ '4', '2', '8', '8', '3' };
     pub const datatype_mismatch: [5]u8 = .{ '4', '2', '8', '0', '4' };
+    pub const cannot_coerce: [5]u8 = .{ '4', '2', '8', '4', '6' };
     pub const invalid_catalog_name: [5]u8 = .{ '3', 'D', '0', '0', '0' };
     pub const object_in_use: [5]u8 = .{ '5', '5', '0', '0', '6' };
     pub const feature_not_supported: [5]u8 = .{ '0', 'A', '0', '0', '0' };

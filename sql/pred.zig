@@ -157,15 +157,21 @@ pub fn bind(
             const lhs = try _expr.bind(arloc, tbl, f.lhs.*, null, params, null);
             // A constant against a bare column takes the column's type,
             // as a literal does from any column it meets: WHERE name =
-            // 'x' binds 'x' as name's type.
-            const target = if (lhs.* == .column and f.rhs.* == .literal)
-                lhs.column
-            else
-                null;
+            // 'x' binds 'x' as name's type. So does one under a cast,
+            // `id = '6'::int8` as a driver inlines a value, `f1 = int2
+            // '0'`: the cast is dropped, and the leaf stays a column
+            // against a cell of its type, the shape the planner answers
+            // from an index.
+            var rhs_expr = f.rhs;
+            var target: ?*const _table.Column = null;
+            if (lhs.* == .column) if (literalUnderCasts(f.rhs)) |lit| {
+                rhs_expr = lit;
+                target = lhs.column;
+            };
             const rhs = _expr.bind(
                 arloc,
                 tbl,
-                f.rhs.*,
+                rhs_expr.*,
                 target,
                 params,
                 null,
@@ -177,7 +183,7 @@ pub fn bind(
                 error.StringTooLong => if (f.op == .eq or f.op == .same)
                     return .never
                 else
-                    try _expr.bind(arloc, tbl, f.rhs.*, null, params, null),
+                    try _expr.bind(arloc, tbl, rhs_expr.*, null, params, null),
                 else => return err,
             };
 
@@ -219,6 +225,14 @@ pub fn bind(
             return .{ .not = out };
         },
     }
+}
+
+/// The literal under zero or more casts, `'6'`, `'6'::int8`,
+/// `'6'::int4::int8`; null for anything else.
+fn literalUnderCasts(expr: *const _parse.Expr) ?*const _parse.Expr {
+    var e = expr;
+    while (e.* == .cast) e = e.cast.expr;
+    return if (e.* == .literal) e else null;
 }
 
 /// `col op val` as a tree, for a predicate the server builds itself

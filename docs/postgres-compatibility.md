@@ -97,7 +97,8 @@ FROM one_table
 | Column references and `*` in the target list | Yes | The `egid` column can be selected by name. |
 | Expressions in the target list, with `AS` | Yes | Arithmetic, `\|\|` and the [supported functions](#functions-and-operators) over the row's columns, literals and parameters. Without an alias the name is the column's, the function's, or `?column?`. |
 | `count(*)` | Yes | Alone in the target list. |
-| Other aggregates, casts, `CASE`, subqueries in the target list | Not&nbsp;yet | |
+| Casts: `expr::type`, `CAST(expr AS type)`, `type 'literal'` | Yes | To any supported column type. A literal is read as the type, as it would be for a column of that type (`'0x10'::int4`, `'NaN'::float8`); a numeric literal rounds into an integer. An expression converts between numbers and strings at eval. Against a bare column in a WHERE, a cast literal takes the column's type, as a bare literal does. |
+| Other aggregates, `CASE`, subqueries in the target list | Not&nbsp;yet | |
 | One table in `FROM`, named directly | Yes | |
 | `JOIN`, subqueries, `VALUES` in `FROM`, table aliases | Not&nbsp;yet | |
 | `WHERE` | Partial | See below. |

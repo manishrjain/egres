@@ -1113,7 +1113,8 @@ pub fn selectRow(
             };
         }
         var dw = try state.beginDataRow(@intCast(cells.len));
-        for (cells, proj.fields) |v, fd| try writeCell(&dw, fd.wirefmt, null, v);
+        for (cells, proj.outs, proj.fields) |v, node, fd|
+            try writeCell(&dw, fd.wirefmt, node.formatColumn(), v);
         try dw.finish();
     }
     try state.sendCommandComplete(if (emit) "SELECT 1" else "SELECT 0");
@@ -1189,10 +1190,7 @@ fn projectionOf(
     } else for (outs.items, names.items, fields) |node, name, *fd| {
         // A NULL-only target has no type; text is what Postgres
         // advertises for an unknown.
-        const col: ?*const _table.Column = switch (node.*) {
-            .column => |c| c,
-            else => null,
-        };
+        const col = node.formatColumn();
         fd.* = .{
             .name = name,
             .type_oid = _value.pgTypeOid(node.ty() orelse .text),
@@ -1310,6 +1308,7 @@ fn replyEmitErr(state: *pgwire.ConnState, err: anyerror) !void {
         error.SubstringLength,
         error.PowerArgument,
         error.InvalidUtf8,
+        error.InvalidValue,
         => replyExprErr(state, @errorCast(err)),
         else => err,
     };
@@ -1350,15 +1349,11 @@ pub const RowEmitter = struct {
         };
         var dw = try self.state.beginDataRow(@intCast(self.proj.outs.len));
         for (self.proj.outs, self.proj.fields) |node, fd| {
-            const col: ?*const _table.Column = switch (node.*) {
-                .column => |c| c,
-                else => null,
+            const v = switch (node.*) {
+                .column => |c| self.tbl.parseCol(item, c),
+                else => try node.cell(row),
             };
-            const v = if (col) |c|
-                self.tbl.parseCol(item, c)
-            else
-                try node.cell(row);
-            try writeCell(&dw, fd.wirefmt, col, v);
+            try writeCell(&dw, fd.wirefmt, node.formatColumn(), v);
         }
         try dw.finish();
         self.count += 1;
@@ -1589,6 +1584,11 @@ fn replyExprErr(state: *pgwire.ConnState, err: _expr.EvalError) !void {
             state,
             pgwire.sqlstate.division_by_zero,
             "division by zero",
+        ),
+        error.InvalidValue => replyErrorCode(
+            state,
+            pgwire.sqlstate.invalid_text_representation,
+            "invalid input syntax for the cast's type",
         ),
         error.SubstringLength => replyErrorCode(
             state,
@@ -1894,6 +1894,7 @@ fn replyRunErr(
         error.SubstringLength,
         error.PowerArgument,
         error.InvalidUtf8,
+        error.InvalidValue,
         => replyExprErr(state, @errorCast(err)),
         else => {
             log.err(
