@@ -7,7 +7,8 @@
 //! it, `sleepMs` parks on it, and the loop jumps it to the next
 //! deadline when nothing is runnable. A run with one seed replays the
 //! same dispatch order; `traceHash` is the fingerprint two runs of the
-//! same seed must share. `Sim.run` is the loop, driving the worker's
+//! same seed must share, over every dispatch and every disk and network
+//! op. `Sim.run` is the loop, driving the worker's
 //! steps (`runFiber`, `chargeCpu`, the rings and deadlines) from here.
 //!
 //! The pick is random, not FIFO, on purpose: FIFO is deterministic too
@@ -23,7 +24,9 @@ const _fb = @import("fiber.zig");
 const _queue = @import("queue.zig");
 const _rt = @import("runtime.zig");
 const _simdisk = @import("simdisk.zig");
+const _simnet = @import("simnet.zig");
 
+const String = @import("utils").String;
 const Fiber = _fb.Fiber;
 const Priority = _fb.Priority;
 const Ring = _queue.LocalQueue(.withlock);
@@ -95,13 +98,15 @@ pub const Sim = struct {
     trace: std.hash.Wyhash,
     outcome: Outcome = .running,
     /// A real xev timer bounding a wait: 1 ms while real I/O is in
-    /// flight (this milestone keeps the real disk and network), the idle
-    /// grace period otherwise.
+    /// flight (what the simulation does not serve itself, a name lookup
+    /// for one), the idle grace period otherwise.
     timer: xev.Timer,
     timer_c: xev.Completion = .{},
     timer_fired: bool = false,
     /// Every file op of the run (`fs.submit` asks `Runtime.simDisk`).
     disk: _simdisk.SimDisk,
+    /// Every socket op of the run (`net.submit` asks `Runtime.simNet`).
+    net: _simnet.SimNet,
 
     pub fn init(alloc: std.mem.Allocator, opts: Options) !Sim {
         var timer = try xev.Timer.init();
@@ -115,10 +120,12 @@ pub const Sim = struct {
             .trace = std.hash.Wyhash.init(opts.seed),
             .timer = timer,
             .disk = disk,
+            .net = _simnet.SimNet.init(alloc, opts.seed),
         };
     }
 
     pub fn deinit(self: *Sim) void {
+        self.net.deinit();
         self.disk.deinit();
         self.timer.deinit();
     }
@@ -166,6 +173,17 @@ pub const Sim = struct {
         self.trace.update(std.mem.asBytes(&at_ms));
     }
 
+    /// One disk or network op into the trace: which op (`kind`) and the
+    /// numbers that tell two of them apart, a handle, an offset, a
+    /// length. Without it two runs whose fibers ran in the same order
+    /// share a hash though one wrote more bytes than the other, and the
+    /// difference shows only in the rare run where it moves the
+    /// schedule.
+    pub fn recordOp(self: *Sim, kind: String, nums: []const u64) void {
+        self.trace.update(kind);
+        self.trace.update(std.mem.sliceAsBytes(nums));
+    }
+
     /// The trace so far. Two runs of one seed must agree.
     pub fn traceHash(self: *const Sim) u64 {
         var h = self.trace;
@@ -196,10 +214,10 @@ pub const Sim = struct {
     /// The loop, in place of the worker's `runMain`: one worker, `pick`
     /// over both rings, a virtual clock the deadlines read. With nothing
     /// runnable it jumps the clock to the next deadline. While a real
-    /// completion is in flight (this milestone keeps the real disk and
-    /// network) the clock cannot jump past it, so it tracks real time
-    /// instead, 1 ms per 1 ms, until the I/O is done; an idle runtime
-    /// with nothing pending is a deadlock after `idle_grace_ms`,
+    /// completion is in flight (the disk and the network are simulated,
+    /// a name lookup is not) the clock cannot jump past it, so it tracks
+    /// real time instead, 1 ms per 1 ms, until the I/O is done; an idle
+    /// runtime with nothing pending is a deadlock after `idle_grace_ms`,
     /// reported through `outcome`, and the run stops.
     pub fn run(self: *Sim, w: *_rt.Worker) void {
         const prev = _rt.Worker.current_do_not_use_directly;

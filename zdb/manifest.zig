@@ -414,7 +414,10 @@ pub const Manifest = struct {
         return out.toOwnedSlice(alloc);
     }
 
-    /// A fresh SST file id, drawn from the process CSPRNG.
+    /// A fresh SST file id, drawn from the worker's PRNG
+    /// (`fiber.random`): seeded by the OS in production, and by the run
+    /// under a simulation, where two runs of one seed must name their
+    /// files alike.
     ///
     /// Ids are unique by probability: with n ids in play the chance that
     /// any two of them collide is about n²/2⁶⁵, which stays negligible
@@ -429,9 +432,7 @@ pub const Manifest = struct {
         defer self.mu.unlockShared();
 
         while (true) {
-            var bytes: [8]u8 = undefined;
-            utils.context.g().io.random(&bytes);
-            const id = std.mem.readInt(u64, &bytes, .little);
+            const id = fiber.random().int(u64);
 
             if (id == 0 or self.ssts.contains(id)) continue;
             if (self.to_delete.contains(id)) continue;

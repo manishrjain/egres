@@ -13,6 +13,10 @@
 //!     (`interface`) — this is what the pgwire and zdb protocol stacks
 //!     are written against.
 //!
+//! Every socket operation is one `Op` handed to `submit`, as file
+//! operations are in `fs.zig`: one function sees them all, and under a
+//! sim it hands every op to `simnet.zig` instead of the kernel.
+//!
 //! Unlike zio, the read/write methods take no timeout argument (fiber has
 //! no per-op cancellation yet) — call sites drop the trailing timeout.
 //! The Reader/Writer adapters do single-buffer socket reads/writes rather
@@ -28,6 +32,7 @@ const _fb = @import("fiber.zig");
 const _rt = @import("runtime.zig");
 const _fsops = @import("fsops.zig");
 const _context = @import("utils").context;
+const String = @import("utils").String;
 
 const net_log = std.log.scoped(.net);
 
@@ -77,6 +82,66 @@ fn socketClose(fd: Sionet.Socket.Handle) void {
 fn socketShutdown(fd: Sionet.Socket.Handle, how: ShutdownHow) !void {
     var s: Sionet.Stream = .{ .socket = .{ .handle = fd, .address = undefined } };
     return s.shutdown(_fsops.io(), how);
+}
+
+// ───────────────────────── Op / submit ─────────────────────────
+
+/// Every socket operation there is, with its arguments; `submit` runs
+/// it.
+pub const Op = union(enum) {
+    listen: Listen,
+    connect: IpAddress,
+    accept: Server,
+    read: Read,
+    write: Write,
+    shutdown: Shutdown,
+    close: Stream,
+    close_server: Server,
+
+    pub const Tag = std.meta.Tag(Op);
+
+    /// The payload of one `Op`: what `submit(tag, ...)` takes.
+    pub fn Args(comptime tag: Tag) type {
+        return @FieldType(Op, @tagName(tag));
+    }
+
+    pub const Listen = struct {
+        addr: IpAddress,
+        options: IpAddress.ListenOptions,
+    };
+    pub const Read = struct { stream: Stream, buf: []u8 };
+    pub const Write = struct { stream: Stream, data: String };
+    pub const Shutdown = struct { stream: Stream, how: ShutdownHow };
+};
+
+/// What `submit(tag, ...)` returns. Any error, as `fs.Result`: the
+/// kernel's arrive under std's and libxev's names, the simulated
+/// network's under its own.
+pub fn Result(comptime tag: Op.Tag) type {
+    return switch (tag) {
+        .listen => anyerror!Server,
+        .connect, .accept => anyerror!Stream,
+        .read, .write => anyerror!usize,
+        .shutdown => anyerror!void,
+        .close, .close_server => void,
+    };
+}
+
+/// The one door: runs `tag` with `args` and returns its result. Must be
+/// called on a fiber: connect, accept, read and write park.
+pub fn submit(comptime tag: Op.Tag, args: Op.Args(tag)) Result(tag) {
+    if (_rt.simNet()) |net| {
+        return net.apply(tag, args);
+    }
+    switch (tag) {
+        .listen => return listenImpl(args),
+        .connect => return connectImpl(args),
+        .accept => return acceptImpl(args),
+        .read => return socketRead(args.stream.tcp, args.buf),
+        .write => return socketWrite(args.stream.tcp, args.data),
+        .shutdown => return socketShutdown(args.stream.tcp.fd, args.how),
+        .close, .close_server => socketClose(args.tcp.fd),
+    }
 }
 
 // ───────────────────────── IpAddress ─────────────────────────
@@ -273,37 +338,12 @@ pub const IpAddress = struct {
     }
 
     pub fn listen(self: IpAddress, options: ListenOptions) !Server {
-        // Create + bind + listen via std.Io.net — portable, sets SO_REUSEADDR,
-        // and resolves an ephemeral (port 0) bind into `socket.address`. Then
-        // drive accept asynchronously through libxev on the resulting fd.
-        const srv = try self.inner.listen(_fsops.io(), .{
-            .reuse_address = options.reuse_address,
-            .kernel_backlog = options.backlog,
-        });
-        errdefer socketClose(srv.socket.handle);
-        // std.Io.net's listen socket is blocking; xev's readiness backends
-        // need it non-blocking. (Accepted sockets are xev's own domain.)
-        try setNonBlocking(srv.socket.handle);
-        return .{ .tcp = xev.TCP.initFd(srv.socket.handle), .bound_addr = srv.socket.address };
+        return submit(.listen, .{ .addr = self, .options = options });
     }
 
     pub fn connect(self: IpAddress, options: ConnectOptions) !Stream {
         _ = options;
-        var tcp = try xev.TCP.init(self.inner);
-        errdefer socketClose(tcp.fd);
-
-        const w = _rt.currentWorker();
-        const f = w.current_fiber.?;
-        var c: xev.Completion = undefined;
-        var waiter: ConnectWaiter = .{ .fiber = f, .result = {} };
-        tcp.connect(&w.loop, &c, self.inner, ConnectWaiter, &waiter, connectCallback);
-        parkAssertDone(&waiter.done);
-        try waiter.result;
-        const stream: Stream = .{ .tcp = tcp };
-        // NODELAY is a universal low-latency default — apply it to every
-        // connected stream at creation so callers don't have to.
-        stream.setNoDelay(true) catch {};
-        return stream;
+        return submit(.connect, self);
     }
 };
 
@@ -315,24 +355,11 @@ pub const Server = struct {
 
     pub fn accept(self: Server, options: IpAddress.AcceptOptions) !Stream {
         _ = options;
-        const w = _rt.currentWorker();
-        const f = w.current_fiber.?;
-        var c: xev.Completion = undefined;
-        var waiter: AcceptWaiter = .{ .fiber = f, .result = undefined };
-        self.tcp.accept(&w.loop, &c, AcceptWaiter, &waiter, acceptCallback);
-        parkAssertDone(&waiter.done);
-        const tcp = try waiter.result;
-        const stream: Stream = .{ .tcp = tcp };
-        stream.setNoDelay(true) catch {}; // low-latency default (see connect)
-        return stream;
-    }
-
-    pub fn shutdown(self: Server, how: ShutdownHow) !void {
-        try socketShutdown(self.tcp.fd, how);
+        return submit(.accept, self);
     }
 
     pub fn close(self: Server) void {
-        socketClose(self.tcp.fd);
+        submit(.close_server, self);
     }
 
     /// The actual bound port — useful after listening on port 0.
@@ -348,40 +375,39 @@ pub const Stream = struct {
 
     /// Read up to `buf.len` bytes. Returns 0 only for a zero-length
     /// `buf`; end-of-stream surfaces as `error.EOF`.
-    pub fn read(self: Stream, buf: []u8) xev.ReadError!usize {
-        return socketRead(self.tcp, buf);
+    pub fn read(self: Stream, buf: []u8) !usize {
+        return submit(.read, .{ .stream = self, .buf = buf });
     }
 
     /// Read exactly `buf.len` bytes. `error.EndOfStream` if the peer
     /// closes before the buffer is filled.
-    pub fn readAll(self: Stream, buf: []u8) (xev.ReadError || error{EndOfStream})!void {
+    pub fn readAll(self: Stream, buf: []u8) !void {
         var off: usize = 0;
         while (off < buf.len) {
-            const n = socketRead(self.tcp, buf[off..]) catch |err| switch (err) {
+            off += self.read(buf[off..]) catch |err| switch (err) {
                 error.EOF => return error.EndOfStream,
                 else => |e| return e,
             };
-            off += n;
         }
     }
 
-    pub fn write(self: Stream, buf: []const u8) xev.WriteError!usize {
-        return socketWrite(self.tcp, buf);
+    pub fn write(self: Stream, buf: String) !usize {
+        return submit(.write, .{ .stream = self, .data = buf });
     }
 
-    pub fn writeAll(self: Stream, buf: []const u8) xev.WriteError!void {
+    pub fn writeAll(self: Stream, buf: String) !void {
         var off: usize = 0;
         while (off < buf.len) {
-            off += try socketWrite(self.tcp, buf[off..]);
+            off += try self.write(buf[off..]);
         }
     }
 
     pub fn shutdown(self: Stream, how: ShutdownHow) !void {
-        try socketShutdown(self.tcp.fd, how);
+        return submit(.shutdown, .{ .stream = self, .how = how });
     }
 
     pub fn close(self: Stream) void {
-        socketClose(self.tcp.fd);
+        submit(.close, self);
     }
 
     /// Raw socket fd — for `setsockopt` and friends.
@@ -391,34 +417,37 @@ pub const Stream = struct {
 
     /// Disable Nagle's algorithm (TCP_NODELAY).
     pub fn setNoDelay(self: Stream, on: bool) !void {
+        // A simulated stream has no socket to set options on.
+        if (_rt.isSim()) return;
         const TCP = if (builtin.os.tag == .macos) std.c.TCP else std.os.linux.TCP;
         try posix.setsockopt(self.tcp.fd, posix.IPPROTO.TCP, TCP.NODELAY, &std.mem.toBytes(@as(c_int, if (on) 1 else 0)));
     }
 
     /// Enable / disable SO_KEEPALIVE.
     pub fn setKeepAlive(self: Stream, on: bool) !void {
+        if (_rt.isSim()) return;
         try posix.setsockopt(self.tcp.fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(@as(c_int, if (on) 1 else 0)));
     }
 
     /// Buffered reader exposing a `std.Io.Reader` via `.interface`.
     pub fn reader(self: Stream, buffer: []u8) Reader {
-        return Reader.init(self.tcp, buffer);
+        return Reader.init(self, buffer);
     }
 
     /// Buffered writer exposing a `std.Io.Writer` via `.interface`.
     pub fn writer(self: Stream, buffer: []u8) Writer {
-        return Writer.init(self.tcp, buffer);
+        return Writer.init(self, buffer);
     }
 
     // ── std.Io adapters (mirror zio.net.Stream.Reader/Writer) ──
 
     pub const Reader = struct {
-        tcp: xev.TCP,
+        stream: Stream,
         interface: std.Io.Reader,
 
-        pub fn init(tcp: xev.TCP, buffer: []u8) Reader {
+        pub fn init(stream: Stream, buffer: []u8) Reader {
             return .{
-                .tcp = tcp,
+                .stream = stream,
                 .interface = .{
                     .vtable = &.{ .stream = streamImpl },
                     .buffer = buffer,
@@ -440,7 +469,7 @@ pub const Stream = struct {
         ) std.Io.Reader.StreamError!usize {
             const r: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
             const dest = limit.slice(try io_w.writableSliceGreedy(1));
-            const n = socketRead(r.tcp, dest) catch |err| switch (err) {
+            const n = r.stream.read(dest) catch |err| switch (err) {
                 error.EOF => return error.EndOfStream,
                 else => return error.ReadFailed,
             };
@@ -450,12 +479,12 @@ pub const Stream = struct {
     };
 
     pub const Writer = struct {
-        tcp: xev.TCP,
+        stream: Stream,
         interface: std.Io.Writer,
 
-        pub fn init(tcp: xev.TCP, buffer: []u8) Writer {
+        pub fn init(stream: Stream, buffer: []u8) Writer {
             return .{
-                .tcp = tcp,
+                .stream = stream,
                 .interface = .{
                     .vtable = &.{ .drain = drainImpl },
                     .buffer = buffer,
@@ -473,21 +502,24 @@ pub const Stream = struct {
             // 1. Flush the writer's own buffer (coalesced small writes).
             const buffered = io_w.buffered();
             if (buffered.len > 0) {
-                writeAllTcp(w.tcp, buffered) catch return error.WriteFailed;
+                w.stream.writeAll(buffered) catch
+                    return error.WriteFailed;
                 total += buffered.len;
             }
             // 2. Then each explicit slice; the last repeated `splat` times.
             if (data.len > 0) {
                 for (data[0 .. data.len - 1]) |slice| {
                     if (slice.len == 0) continue;
-                    writeAllTcp(w.tcp, slice) catch return error.WriteFailed;
+                    w.stream.writeAll(slice) catch
+                        return error.WriteFailed;
                     total += slice.len;
                 }
                 const last = data[data.len - 1];
                 if (last.len > 0) {
                     var i: usize = 0;
                     while (i < splat) : (i += 1) {
-                        writeAllTcp(w.tcp, last) catch return error.WriteFailed;
+                        w.stream.writeAll(last) catch
+                            return error.WriteFailed;
                         total += last.len;
                     }
                 }
@@ -520,11 +552,64 @@ fn socketWrite(tcp: xev.TCP, buf: []const u8) xev.WriteError!usize {
     return waiter.result;
 }
 
-fn writeAllTcp(tcp: xev.TCP, buf: []const u8) xev.WriteError!void {
-    var off: usize = 0;
-    while (off < buf.len) {
-        off += try socketWrite(tcp, buf[off..]);
-    }
+fn listenImpl(op: Op.Listen) !Server {
+    // Create + bind + listen via std.Io.net — portable, sets SO_REUSEADDR,
+    // and resolves an ephemeral (port 0) bind into `socket.address`. Then
+    // drive accept asynchronously through libxev on the resulting fd.
+    const srv = try op.addr.inner.listen(_fsops.io(), .{
+        .reuse_address = op.options.reuse_address,
+        .kernel_backlog = op.options.backlog,
+    });
+    errdefer socketClose(srv.socket.handle);
+    // std.Io.net's listen socket is blocking; xev's readiness backends
+    // need it non-blocking. (Accepted sockets are xev's own domain.)
+    try setNonBlocking(srv.socket.handle);
+    return .{
+        .tcp = xev.TCP.initFd(srv.socket.handle),
+        .bound_addr = srv.socket.address,
+    };
+}
+
+fn connectImpl(addr: IpAddress) !Stream {
+    var tcp = try xev.TCP.init(addr.inner);
+    errdefer socketClose(tcp.fd);
+
+    const w = _rt.currentWorker();
+    const f = w.current_fiber.?;
+    var c: xev.Completion = undefined;
+    var waiter: ConnectWaiter = .{ .fiber = f, .result = {} };
+    tcp.connect(
+        &w.loop,
+        &c,
+        addr.inner,
+        ConnectWaiter,
+        &waiter,
+        connectCallback,
+    );
+
+    parkAssertDone(&waiter.done);
+
+    try waiter.result;
+    const stream: Stream = .{ .tcp = tcp };
+    // NODELAY is a universal low-latency default — apply it to every
+    // connected stream at creation so callers don't have to.
+    stream.setNoDelay(true) catch {};
+    return stream;
+}
+
+fn acceptImpl(srv: Server) !Stream {
+    const w = _rt.currentWorker();
+    const f = w.current_fiber.?;
+    var c: xev.Completion = undefined;
+    var waiter: AcceptWaiter = .{ .fiber = f, .result = undefined };
+    srv.tcp.accept(&w.loop, &c, AcceptWaiter, &waiter, acceptCallback);
+
+    parkAssertDone(&waiter.done);
+
+    const tcp = try waiter.result;
+    const stream: Stream = .{ .tcp = tcp };
+    stream.setNoDelay(true) catch {}; // low-latency default (see connect)
+    return stream;
 }
 
 /// Park until the op's completion callback has fired (`done`).

@@ -2,11 +2,11 @@
 # The simulation's two promises, checked end to end on the test suite:
 #
 #   1. Determinism: one seed, run twice over a suite, prints the same
-#      dispatch trace; another seed prints a different one. Checked on
-#      the Channel tests (pure scheduling) and the WAL tests (the disk,
-#      which the simulation serves itself). Until the sim network
-#      lands, tests with real sockets complete in real time and are
-#      not deterministic, so they are not in the default set.
+#      trace hash, which covers every dispatch and every disk and
+#      network op; another seed prints a different one. Checked on the
+#      Channel tests (pure scheduling), the WAL tests (the disk), the
+#      pgwire driver tests (the network) and the engine harness (a
+#      whole node across crashes).
 #   2. Deadlock detection: a fiber parked with nothing left to wake it
 #      ends the run with outcome=deadlock and exit code 3.
 #
@@ -15,7 +15,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 seed=${1:-42}
-if [ $# -ge 2 ]; then filters=("$2"); else filters=("Channel:" "diskwal"); fi
+if [ $# -ge 2 ]; then
+    filters=("$2")
+else
+    filters=("Channel:" "diskwal" "driver:" "sim: engine")
+fi
 
 trace() {
     zig build test -- --sim-seed "$1" --filter "$2" 2>&1 |

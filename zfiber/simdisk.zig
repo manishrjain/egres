@@ -194,6 +194,7 @@ pub const SimDisk = struct {
         comptime tag: Op.Tag,
         args: Op.Args(tag),
     ) _fs.Result(tag) {
+        record(tag, args);
         self.wait(tag);
         switch (tag) {
             .read => return self.read(args),
@@ -248,6 +249,54 @@ pub const SimDisk = struct {
                 node.mtime_ms = args.mtime_s * std.time.ms_per_s;
             },
         }
+    }
+
+    /// The op into the run's trace (`Sim.recordOp`), when there is a
+    /// run: its handle, offset and length. A path op goes in by its tag
+    /// alone, since a test names its temp directory from the OS's
+    /// random source.
+    fn record(comptime tag: Op.Tag, args: Op.Args(tag)) void {
+        const sim = _rt.runtime().simState() orelse return;
+        const kind = "fs." ++ @tagName(tag);
+        switch (tag) {
+            .read => sim.recordOp(kind, &.{
+                fdOf(args.file), args.offset, args.buf.len,
+            }),
+            .write => sim.recordOp(kind, &.{
+                fdOf(args.file), args.offset, args.data.len,
+            }),
+            .read_batch => for (args.ops) |req| sim.recordOp(kind, &.{
+                fdOf(req.file), req.offset, req.buf.len,
+            }),
+            .sync => sim.recordOp(kind, &.{
+                fdOf(args.file), @intFromBool(args.data_only),
+            }),
+            .set_size => sim.recordOp(kind, &.{
+                fdOf(args.file), args.length,
+            }),
+            .stat,
+            .close,
+            .device,
+            .advise_random,
+            .no_cache,
+            => sim.recordOp(kind, &.{fdOf(args)}),
+            .open => sim.recordOp(kind, &.{
+                @as(u32, @bitCast(args.flags)),
+            }),
+            .access,
+            .rename,
+            .delete_file,
+            .create_dir_path,
+            .delete_tree,
+            .list,
+            .fs_magic,
+            .set_mtime,
+            => sim.recordOp(kind, &.{}),
+        }
+    }
+
+    fn fdOf(file: File) u64 {
+        return @intCast(file.fd);
     }
 
     /// Park for what `tag` takes on the device, in whole virtual ms: a

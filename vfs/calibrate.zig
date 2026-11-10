@@ -272,10 +272,9 @@ fn worker(
     defer a.free(buf);
     @memset(buf, 0xA5);
 
-    var seed: [8]u8 = undefined;
-    utils.context.g().io.random(&seed);
-    const seed_int = std.mem.readInt(u64, &seed, .little);
-    var prng = std.Random.DefaultPrng.init(seed_int);
+    // Seeded from the worker's PRNG: the OS's seed in production, the
+    // run's under a simulation, where two runs read the same pages.
+    var prng = std.Random.DefaultPrng.init(fiber.random().int(u64));
     const rand = prng.random();
     const pages = (_lookahead.probe_max - request_size) / _vfs.page_size;
 

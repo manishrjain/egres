@@ -82,10 +82,9 @@ pub fn calibrate(a: std.mem.Allocator, store: anytype, block_size: u64) !u64 {
 
     // Every trial reads a random region of the probe object — and a fresh
     // seed each run — so no CDN / range cache can serve a repeat of the
-    // same slice and flatter the numbers.
-    var seed_bytes: [8]u8 = undefined;
-    utils.context.g().io.random(&seed_bytes);
-    var prng = std.Random.DefaultPrng.init(std.mem.readInt(u64, &seed_bytes, .little));
+    // same slice and flatter the numbers. The seed is drawn from the
+    // worker's PRNG: the OS's in production, the run's under a simulation.
+    var prng = std.Random.DefaultPrng.init(fiber.random().int(u64));
     const rand = prng.random();
 
     // A few throwaway fetches pay the cold-start cost — connection setup

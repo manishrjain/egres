@@ -36,6 +36,7 @@ const _fsops = @import("fsops.zig");
 const _context = @import("utils").context;
 const _sim = @import("sim.zig");
 const _simdisk = @import("simdisk.zig");
+const _simnet = @import("simnet.zig");
 
 /// Flush a busy worker's io_uring SQ once this many SQEs have queued, so reads
 /// issued by running fibers dispatch promptly instead of waiting for the ~1 ms
@@ -1658,6 +1659,13 @@ pub fn isSim() bool {
 pub fn simDisk() ?*_simdisk.SimDisk {
     const sim = runtime().simState() orelse return null;
     return &sim.disk;
+}
+
+/// The simulation's network, which `net.submit` runs every socket op
+/// on under a sim; null on the real one.
+pub fn simNet() ?*_simnet.SimNet {
+    const sim = runtime().simState() orelse return null;
+    return &sim.net;
 }
 
 /// The current worker's randomness: OS-seeded in production, seeded
