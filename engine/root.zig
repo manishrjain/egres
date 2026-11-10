@@ -20,8 +20,9 @@
 //!     loops propose manifest changes so every node installs the same SSTs, and
 //!     snapshots prune the raft WAL.
 //!
-//! `Engine.open` assembles and wires it (state machine ↔ node, file-id
-//! allocator ↔ node+WAL, raft runtime); `start` recovers + runs the loops; the
+//! `Engine.open` opens one node's parts (raft WAL, raft node, forest) and
+//! wires them (state machine ↔ node, file-id allocator ↔ node+WAL, raft
+//! runtime); `start` recovers + runs the loops, `stop` ends them; the
 //! data/control API (`proposeAndWaitForApply`, `get`, `scan`,
 //! `createNamespace`) lets callers treat replicated storage as one unit.
 //!

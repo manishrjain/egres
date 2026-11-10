@@ -39,7 +39,11 @@ pub const RaftRuntime = struct {
     /// Run the raft tick, main, and apply loops. Transport must already be
     /// initialized via node.initTransport(). Blocks until shutdown.
     pub fn run(self: *RaftRuntime) !void {
-        if (self.node.transport == null) try self.node.initTransport();
+        // No listen address is a node with no peers to hear from: a
+        // single node under the simulation, which has no network yet.
+        if (self.node.transport == null and
+            self.node.config.listen_addr.len > 0)
+            try self.node.initTransport();
 
         try self.node.blockingRunAllLoops();
     }

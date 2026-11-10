@@ -714,6 +714,8 @@ pub const Node = struct {
         self: *Node,
         files: []const zen.FileRefStruct,
     ) !void {
+        // No peers: this node is the quorum, and it wrote the files.
+        if (self.peers.count() == 0) return;
         const tr = self.transport orelse return error.NoTransport;
 
         const announce_id = self.next_announce_id.fetchAdd(1, .monotonic);

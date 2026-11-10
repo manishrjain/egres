@@ -39,7 +39,7 @@ const log = std.log.scoped(.sql);
 const String = _value.String;
 
 /// The default database, present from a node's very first boot — created
-/// by the WAL's genesis entry (see egres seedGenesis), never at runtime.
+/// by the WAL's genesis entry (see `engine.Engine.open`), never at runtime.
 /// Sessions that name no database land here (psql defaults dbname to the
 /// user name; that also misses and falls back per onStartup).
 pub const default_database = "egres";

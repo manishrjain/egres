@@ -391,6 +391,10 @@ pub const Wait = enum { commit, apply };
 /// replicated manifest changes. See `root.zig` for the full contract.
 pub const Engine = struct {
     allocator: std.mem.Allocator,
+    /// One node's parts, owned: `open` opens the raft log, the node over
+    /// it and the forest, and `deinit` closes them. The log is on the
+    /// heap because the node keeps its address.
+    wal: *raft.DiskWAL,
     forest: *Forest,
     node: *raft.Node,
     /// The apply state machine (owned). Loops/handlers gate on
@@ -432,32 +436,64 @@ pub const Engine = struct {
     /// Spawned by `start()`, joined by `wait()`.
     bg: fiber.Group(void),
 
-    /// Construct the engine and do all the node/forest wiring: build the apply
-    /// state machine and install it on the node, and create the raft runtime.
-    /// Heap-allocated so `storage_impl`/`sm`/`raft_rt` keep stable addresses.
-    pub fn open(
-        allocator: std.mem.Allocator,
-        node: *raft.Node,
-        forest: *Forest,
+    /// What one node needs to come up. What the process shares stays
+    /// with the caller: the store, the flags, the block cache.
+    pub const OpenOptions = struct {
+        wal_dir: String,
+        wal: raft.diskwal.OpenOptions = .{},
+        raft: raft.Config,
+        /// Borrowed, and outlives the engine.
+        store: *zdb.vfs.Store,
+        /// The database a new WAL's genesis entry creates.
+        database: String,
+        zdb_cfg: *flags.Live(zdb.config.Config),
         snapshot_cfg: *flags.Live(SnapshotCfg),
         runtime_cfg: *flags.Live(fiber.Runtime.Cfg),
-    ) !*Engine {
+    };
+
+    /// Open one node: the raft log, with its genesis entry when new, the
+    /// node over it, the forest, and the wiring between them (the apply
+    /// state machine installed on the node, the raft runtime). The one
+    /// start sequence there is: the binary and the simulation both call
+    /// it. Nothing runs until `start`. Heap-allocated so
+    /// `storage_impl`/`sm`/`raft_rt` keep stable addresses.
+    pub fn open(allocator: std.mem.Allocator, opts: OpenOptions) !*Engine {
+        log.info("opening raft WAL at {s}", .{opts.wal_dir});
+        const wal = try allocator.create(raft.DiskWAL);
+        errdefer allocator.destroy(wal);
+
+        wal.* = try raft.DiskWAL.openPath(opts.wal_dir, allocator, opts.wal);
+        errdefer wal.deinit();
+
+        // Before the node reads the log.
+        try seedGenesis(allocator, wal, opts.database);
+
+        const node = try raft.Node.init(allocator, &.{}, wal, opts.raft);
+        errdefer node.deinit();
+        log.info("raft node initialized id={d}", .{opts.raft.id});
+
+        log.info("opening forest", .{});
+        const forest = try Forest.open(allocator, opts.zdb_cfg, opts.store);
+        errdefer forest.close();
+        log.info("forest opened", .{});
+
         const self = try allocator.create(Engine);
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
+            .wal = wal,
             .forest = forest,
             .node = node,
             .storage_impl = .{
                 .forest = forest,
                 .allocator = allocator,
                 .node = node,
-                .snapshot_cfg = snapshot_cfg,
+                .snapshot_cfg = opts.snapshot_cfg,
             },
             .sm = undefined,
             .raft_rt = raft.RaftRuntime.init(allocator, node),
-            .snapshot_cfg = snapshot_cfg,
-            .runtime_cfg = runtime_cfg,
+            .snapshot_cfg = opts.snapshot_cfg,
+            .runtime_cfg = opts.runtime_cfg,
             .bg = fiber.Group(void).init(allocator),
         };
         self.sm = self.storage_impl.asStateMachine();
@@ -465,6 +501,8 @@ pub const Engine = struct {
         return self;
     }
 
+    /// After `stop`, when `start` ran. The forest, the node and the raft
+    /// log close here too, in that order.
     pub fn deinit(self: *Engine) void {
         self.in_flight_mu.lock(@src());
         self.in_flight.deinit(self.allocator);
@@ -473,6 +511,14 @@ pub const Engine = struct {
         self.flush_split_mu.deinit();
         self.bg.deinit();
         self.raft_rt.deinit();
+
+        self.forest.close();
+        log.info("deinit: forest done", .{});
+        self.node.deinit();
+        log.info("deinit: node done", .{});
+        self.wal.deinit();
+        self.allocator.destroy(self.wal);
+        log.info("deinit: wal done", .{});
         self.allocator.destroy(self);
     }
 
@@ -591,6 +637,15 @@ pub const Engine = struct {
     /// Block until every background fiber (loops + front-ends) has exited.
     pub fn wait(self: *Engine) void {
         self.bg.wait();
+    }
+
+    /// End what `start` began: the loops and the listeners exit, and a
+    /// proposal still in flight fails, since nothing is left to resolve
+    /// it.
+    pub fn stop(self: *Engine) void {
+        self.node.shutdown.startShutdown();
+        self.wait();
+        self.node.abortPending();
     }
 
     /// Reserve a tree against compaction/split for a long-running
@@ -1600,6 +1655,71 @@ pub const Engine = struct {
         });
     }
 };
+
+/// Seed a fresh WAL with the deterministic genesis prefix: entry 1 creates
+/// the database `name` at the first user namespace id (ns 16 on every
+/// cluster). Every node writes the same bytes — fixed ids, term 0,
+/// fixed timestamp — so raft's log matching holds across fresh nodes, and
+/// the entry is committed by construction (HardState.commit_index covers
+/// it): engine recovery applies it before any election or client traffic.
+/// A restarted or joining node with a non-empty WAL skips this.
+fn seedGenesis(
+    allocator: std.mem.Allocator,
+    wal: *raft.DiskWAL,
+    name: String,
+) !void {
+    if (wal.lastIndex() != 0) return;
+
+    // Same trees as forest.buildNsCreate — one per system table,
+    // posting indexes as there; tree 0 (the raw-KV default table)
+    // carries the database name.
+    const sys = zdb.manifest.namespace_system_table_ids;
+    var tc: [sys.len]zdb.manifest.TreeChange = undefined;
+    for (sys, &tc) |table_id, *c|
+        c.* = zdb.manifest.createTreeChange(
+            zdb.kv.makeTreeId(table_id, 0),
+            zdb.manifest.first_namespace,
+            "",
+            "",
+            .posting_index,
+        );
+    tc[0].name = @constCast(name);
+    const mc: _manifest.ManifestChange = .{
+        .cmd = .create_ns,
+        .tree_changes = &tc,
+        .sstable_changes = &.{},
+        .memtable_id = 0,
+    };
+    const payload = try zdb_bufs.marshalRoot(allocator, mc);
+    defer allocator.free(payload);
+
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    var writer = try raft.buffers.LogEntryWriter.initWithBuf(allocator, &buf);
+    defer writer.deinit();
+    try writer.set(.{
+        .index = 1,
+        .term = 0,
+        .timestamp = 1, // fixed; real HLC values are far larger
+        .data = payload,
+        .entry_type = .manifest,
+    });
+    _ = try writer.finishWithTail();
+    const data = try buf.toOwnedSlice(allocator);
+    var entry = try raft.buffers.LogEntryBuffer.initWithTail(
+        allocator,
+        data,
+        .owned,
+    );
+    defer entry.deinit();
+
+    try wal.addEntries(&.{entry});
+    try wal.sync();
+    try wal.setHardState(.{ .commit_index = 1 });
+    log.info("seeded genesis: database '{s}' -> ns={d}", .{
+        name, zdb.manifest.first_namespace,
+    });
+}
 
 /// Encode a ManifestChange into a zbuf-serialized payload to propose.
 fn encodeManifestChange(

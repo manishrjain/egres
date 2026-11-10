@@ -734,6 +734,30 @@ test "table checksum mismatch is detected" {
     try std.testing.expectError(error.ChecksumMismatch, r.readBlock(0));
 }
 
+test "table iterator survives a failed read of its next block" {
+    const alloc = std.testing.allocator;
+    var tb = try buildRangeTable(alloc, "e", 0, 400, 256);
+    defer tb.deinit();
+    const t = try openBuffer(alloc, &tb);
+    defer destroyTable(t);
+    try std.testing.expect(t.blockCount() > 1);
+
+    var it = TableIterator.init(alloc, t, zero_table_key, .forward);
+    // The double free this guards against is caught here.
+    defer it.deinit();
+    try it.seekRange(Key.inf, Key.inf);
+
+    // Damage block 1 while the iterator stands in block 0.
+    const second = t.index.blocks[1];
+    t.obj.file.owned_buf.?[second.offset + second.len - 5] ^= 0x01;
+    var failed = false;
+    while (it.itemRef() != null) it.next() catch {
+        failed = true;
+        break;
+    };
+    try std.testing.expect(failed);
+}
+
 test "merge iterator merges sorted streams" {
     var b1 = Builder.init(std.testing.allocator, .{ .block_bytes = 256 });
     defer b1.deinit();

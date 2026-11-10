@@ -1169,7 +1169,10 @@ pub const TableIterator = struct {
     }
 
     fn setBlock(self: *TableIterator, bpos: usize) Error!void {
+        // Null before the read: a failed one returns with nothing for
+        // `deinit` to free a second time.
         if (self.bi) |*bi| bi.deinit();
+        self.bi = null;
         if (self.current_block) |b| b.decrRef();
         self.current_block = null;
 

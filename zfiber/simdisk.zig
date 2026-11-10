@@ -18,7 +18,7 @@
 //! Durability is the device's, a page at a time. A file is 4096-byte
 //! pages; a write to one page lands whole or not at all, and nothing
 //! orders two pages until a sync. A written page is dirty until then,
-//! and keeps the image the platter still holds. `fsync` and `fdatasync`
+//! and keeps the image the device still holds. `fsync` and `fdatasync`
 //! make every dirty page and the size durable, an O_DSYNC handle makes
 //! each write's pages durable as it lands. A directory's names are
 //! visible at once and durable after a sync of the directory, and only
@@ -69,7 +69,7 @@ const stall_ms: u64 = 50;
 /// What a crash does to a file's dirty pages, those written since its
 /// last sync.
 pub const Crash = enum {
-    /// None of them reached the platter.
+    /// None of them reached the device.
     lose_all,
     /// Each one did or did not, a coin per page: the device had
     /// reordered them in its queue, so a write across pages is torn.
@@ -121,15 +121,15 @@ pub const SimDisk = struct {
         kind: Kind,
         /// Regular file: the bytes as a reader sees them.
         data: std.ArrayList(u8) = .empty,
-        /// Regular file: the size on the platter, from the last sync.
+        /// Regular file: the size on the device, from the last sync.
         durable_len: usize = 0,
         /// Regular file: for each page written since the last sync, the
-        /// image the platter still holds. Only pages inside
+        /// image the device still holds. Only pages inside
         /// `durable_len` are kept: past it, a crash cuts the file.
         old_pages: Pages = .empty,
         /// Directory: name to child as a lookup sees it.
         children: Names = .empty,
-        /// Directory: the names on the platter, from its last sync.
+        /// Directory: the names on the device, from its last sync.
         durable_children: Names = .empty,
         mtime_ms: i64,
         /// The directory this node was created in or last renamed into:
@@ -357,26 +357,99 @@ pub const SimDisk = struct {
         for (node.children.values()) |child| self.restore(child, mode);
     }
 
-    /// The file as the platter has it: the synced size, and each dirty
-    /// page's old image unless `mode` lets the new one stand.
     fn crashFile(self: *SimDisk, node: *Node, mode: Crash) void {
+        self.crashPages(node, &node.data, mode);
+        self.dropOldPages(node);
+    }
+
+    /// `data`, holding `node`'s visible bytes, becomes what a crash
+    /// leaves of the file: the synced size, and each dirty page's old
+    /// image unless `mode` lets the new one stand.
+    fn crashPages(
+        self: *SimDisk,
+        node: *const Node,
+        data: *std.ArrayList(u8),
+        mode: Crash,
+    ) void {
         const rand = self.prng.random();
-        // Room for whole pages first; the size is cut below.
+        // Grow to whole pages if short, so each saved image fits. The
+        // copy below runs either way, and the last line sets the size.
         const full = pageEnd(node.durable_len);
-        if (node.data.items.len < full) self.resizeData(node, full);
+        if (data.items.len < full) self.resize(data, full);
+
         var it = node.old_pages.iterator();
         while (it.next()) |kv| {
             if (mode == .lose_some and rand.boolean()) continue;
             const start = kv.key_ptr.* * page_size;
-            @memcpy(node.data.items[start..][0..page_size], kv.value_ptr.*);
+            @memcpy(data.items[start..][0..page_size], kv.value_ptr.*);
         }
-        self.dropOldPages(node);
-        self.resizeData(node, node.durable_len);
+        self.resize(data, node.durable_len);
+    }
+
+    /// What a power cut now would leave of the directory `src`, as the
+    /// new directory `dst`. `src` and the handles into it are untouched:
+    /// the process that owns them cannot be killed mid-step, so it runs
+    /// on, shuts down in its own time, and whatever it does after this
+    /// instant is not in the copy a restart opens.
+    pub fn crashCopy(
+        self: *SimDisk,
+        src: String,
+        dst: String,
+        mode: Crash,
+    ) !void {
+        const from = try self.lookup(src);
+        if (from.kind != .directory) return error.NotDir;
+
+        const to = try self.placeOf(dst);
+        if (to.name.len == 0 or to.dir.children.get(to.name) != null)
+            return error.PathAlreadyExists;
+
+        const copy = try self.crashCopyOf(from, mode);
+        errdefer self.release(copy);
+        // Held here until the two names hold it.
+        copy.refs = 1;
+        copy.parent = to.dir;
+        try self.putName(&to.dir.children, to.name, copy);
+        errdefer self.removeName(&to.dir.children, to.name);
+        try self.putName(&to.dir.durable_children, to.name, copy);
+        self.release(copy);
+    }
+
+    /// A copy of `node` as a crash would leave it, in no directory yet:
+    /// durable names only, each file's bytes as `crashPages` leaves them.
+    fn crashCopyOf(
+        self: *SimDisk,
+        node: *const Node,
+        mode: Crash,
+    ) Allocator.Error!*Node {
+        const copy = try newNode(self.alloc, node.kind);
+        copy.refs = 1;
+        errdefer self.release(copy);
+        copy.mtime_ms = node.mtime_ms;
+        if (node.kind != .directory) {
+            try copy.data.appendSlice(self.alloc, node.data.items);
+            self.crashPages(node, &copy.data, mode);
+            copy.durable_len = node.durable_len;
+            copy.refs = 0;
+            return copy;
+        }
+        var it = node.durable_children.iterator();
+        while (it.next()) |kv| {
+            const child = try self.crashCopyOf(kv.value_ptr.*, mode);
+            child.refs = 1;
+            errdefer self.release(child);
+            child.parent = copy;
+            try self.putName(&copy.children, kv.key_ptr.*, child);
+            try self.putName(&copy.durable_children, kv.key_ptr.*, child);
+            self.release(child);
+        }
+        copy.refs = 0;
+        return copy;
     }
 
     // ───────────────────────── durability ─────────────────────────
 
-    /// A sync: a directory's names reach the platter, or a file's
+    /// A sync: a directory's names reach the device, or a file's
     /// pending writes and size do. A file's sync leaves its name to the
     /// directory's.
     fn fold(self: *SimDisk, node: *Node) void {
@@ -402,7 +475,7 @@ pub const SimDisk = struct {
 
     /// The pages holding `data[off..end]` are about to change: each one
     /// inside the durable size keeps its image from before, once. A
-    /// page past that size has no image on the platter to keep.
+    /// page past that size has no image on the device to keep.
     fn keepOldPages(
         self: *SimDisk,
         node: *Node,
@@ -423,7 +496,7 @@ pub const SimDisk = struct {
         }
     }
 
-    /// The pages holding `data[off..end]` reach the platter, and the size
+    /// The pages holding `data[off..end]` reach the device, and the size
     /// grows to `end` as the kernel's size update with a write does.
     fn foldPages(self: *SimDisk, node: *Node, off: usize, end: usize) void {
         var idx = off / page_size;
@@ -546,7 +619,7 @@ pub const SimDisk = struct {
         const end = off + len;
         try self.keepOldPages(o.node, off, end);
 
-        if (end > o.node.data.items.len) self.resizeData(o.node, end);
+        if (end > o.node.data.items.len) self.resize(&o.node.data, end);
         @memcpy(o.node.data.items[off..end], op.data[0..len]);
         o.node.mtime_ms = nowMs();
         if (o.dsync) self.foldPages(o.node, off, end);
@@ -585,16 +658,16 @@ pub const SimDisk = struct {
         const old_len = node.data.items.len;
         if (len < old_len) self.keepOldPages(node, len, old_len) catch
             @panic("simdisk: out of memory on a truncate");
-        self.resizeData(node, len);
+        self.resize(&node.data, len);
         node.mtime_ms = nowMs();
     }
 
     /// `data` is `len` bytes, zero-filled where it grew.
-    fn resizeData(self: *SimDisk, node: *Node, len: usize) void {
-        const old_len = node.data.items.len;
-        node.data.resize(self.alloc, len) catch
+    fn resize(self: *SimDisk, data: *std.ArrayList(u8), len: usize) void {
+        const old_len = data.items.len;
+        data.resize(self.alloc, len) catch
             @panic("simdisk: out of memory resizing a file");
-        if (len > old_len) @memset(node.data.items[old_len..len], 0);
+        if (len > old_len) @memset(data.items[old_len..len], 0);
     }
 
     fn assertDirect(ptr: [*]const u8, len: usize, offset: u64) void {
@@ -659,7 +732,7 @@ pub const SimDisk = struct {
         errdefer destroy(self.alloc, child);
         child.parent = dir;
         try self.putName(&dir.children, name, child);
-        // The platter may still hold this name, from a tree deleted with
+        // The device may still hold this name, from a tree deleted with
         // no sync since: the new directory takes its place there too.
         if (dir.durable_children.contains(name))
             self.removeName(&dir.durable_children, name);

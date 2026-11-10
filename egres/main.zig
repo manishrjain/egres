@@ -172,63 +172,9 @@ const probe_help =
 const log = std.log.scoped(.egres);
 
 /// The default database, present from a node's very first boot — created by
-/// the WAL's genesis entry (see seedGenesis), never at runtime. The SQL
-/// layer owns the name (sessions with no database fall back to it).
+/// the WAL's genesis entry (see `engine.Engine.open`), never at runtime.
+/// The SQL layer owns the name (sessions with no database fall back to it).
 const default_database = sql.default_database;
-
-/// Seed a fresh WAL with the deterministic genesis prefix: entry 1 creates
-/// the default database at the first user namespace id ('egres' is ns 16 on
-/// every cluster). Every node writes the same bytes — fixed ids, term 0,
-/// fixed timestamp — so raft's log matching holds across fresh nodes, and
-/// the entry is committed by construction (HardState.commit_index covers
-/// it): engine recovery applies it before any election or client traffic.
-/// A restarted or joining node with a non-empty WAL skips this.
-fn seedGenesis(allocator: std.mem.Allocator, wal: *raft.DiskWAL) !void {
-    if (wal.lastIndex() != 0) return;
-
-    // Same trees as forest.buildNsCreate — one per system table,
-    // posting indexes as there; tree 0 (the raw-KV default table)
-    // carries the database name.
-    const sys = zdb.manifest.namespace_system_table_ids;
-    var tc: [sys.len]zdb.manifest.TreeChange = undefined;
-    for (sys, &tc) |table_id, *c|
-        c.* = zdb.manifest.createTreeChange(
-            zdb.kv.makeTreeId(table_id, 0),
-            zdb.manifest.first_namespace,
-            "",
-            "",
-            .posting_index,
-        );
-    tc[0].name = @constCast(default_database);
-    const payload = try zdb.buffers.marshalRoot(allocator, zdb.manifest.ManifestChange{
-        .cmd = .create_ns,
-        .tree_changes = &tc,
-        .sstable_changes = &.{},
-        .memtable_id = 0,
-    });
-    defer allocator.free(payload);
-
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(allocator);
-    var writer = try raft.buffers.LogEntryWriter.initWithBuf(allocator, &buf);
-    defer writer.deinit();
-    try writer.set(.{
-        .index = 1,
-        .term = 0,
-        .timestamp = 1, // fixed; real HLC values are far larger
-        .data = payload,
-        .entry_type = .manifest,
-    });
-    _ = try writer.finishWithTail();
-    const data = try buf.toOwnedSlice(allocator);
-    var entry = try raft.buffers.LogEntryBuffer.initWithTail(allocator, data, .owned);
-    defer entry.deinit();
-
-    try wal.addEntries(&.{entry});
-    try wal.sync();
-    try wal.setHardState(.{ .commit_index = 1 });
-    log.info("seeded genesis: database '{s}' -> ns={d}", .{ default_database, zdb.manifest.first_namespace });
-}
 
 fn deinitWithLog(comptime msg: String, ptr: anytype) void {
     ptr.deinit();
@@ -576,37 +522,10 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     try raft.metrics.initGlobal(allocator);
     defer raft.metrics.deinitGlobal();
 
-    // Open raft WAL.
-    log.info("opening raft WAL at {s}", .{wal_dir});
-    var wal = try raft.DiskWAL.openPath(wal_dir, allocator, .{
-        .vfs = wal_vfs,
-        .log_file_size = wal_cfg.log_file_bytes,
-        .prezero = wal_cfg.prezero,
-        .max_spare_log_files = wal_cfg.max_spare_log_files,
-    });
-    defer deinitWithLog("wal", &wal);
-    // Genesis before the node reads the log: a fresh WAL gets its
-    // deterministic bootstrap prefix (default database), pre-committed.
-    try seedGenesis(allocator, &wal);
-
-    const node = try raft.Node.init(
-        allocator,
-        &.{},
-        &wal,
-        .{
-            .id = raft_cfg.id,
-            .cluster_id = raft_cfg.cluster_id,
-            .listen_addr = raft_addr,
-            .tick_interval_ms = raft_cfg.tick_ms,
-        },
-    );
-    defer deinitWithLog("node", node);
-
-    log.info("raft node initialized id={d}", .{raft_cfg.id});
-
-    // The SST block cache, created before the forest so it outlives every
-    // open table. With blocks cached decompressed here, tables open
-    // O_DIRECT: the page cache would otherwise hold the same data twice.
+    // The SST block cache, created before the engine opens its forest
+    // so it outlives every open table. With blocks cached decompressed
+    // here, tables open O_DIRECT: the page cache would otherwise hold
+    // the same data twice.
     const mem = utils.host.memory();
     const total = engine.governor.resolveTotal(memory_cfg.total_bytes);
     // Starts at the cap the governor's first tick would set.
@@ -630,34 +549,42 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
         .{ total >> 20, mem.bytes >> 20, mem.source },
     );
 
-    // Open zdb forest.
-    log.info("opening forest", .{});
     zdb_cfg.validate() catch |err| {
         log.err("--zdb: invalid storage options: {s}", .{@errorName(err)});
         std.process.exit(1);
     };
-    var forest = try zdb.forest.Forest.open(allocator, live_zdb, &store);
+
+    // The replicated storage engine, one node of it: opens the raft WAL
+    // (a new one gets its genesis entry, the default database), the
+    // raft node and the forest, and wires the apply state machine and
+    // the raft runtime between them.
+    const eng = try engine.Engine.open(allocator, .{
+        .wal_dir = wal_dir,
+        .wal = .{
+            .vfs = wal_vfs,
+            .log_file_size = wal_cfg.log_file_bytes,
+            .prezero = wal_cfg.prezero,
+            .max_spare_log_files = wal_cfg.max_spare_log_files,
+        },
+        .raft = .{
+            .id = raft_cfg.id,
+            .cluster_id = raft_cfg.cluster_id,
+            .listen_addr = raft_addr,
+            .tick_interval_ms = raft_cfg.tick_ms,
+        },
+        .store = &store,
+        .database = default_database,
+        .zdb_cfg = live_zdb,
+        .snapshot_cfg = live_snapshot,
+        .runtime_cfg = live_runtime,
+    });
     defer {
         // Closing the forest frees every table, and a table drops its
         // blocks from the block cache as it goes. The whole cache is
         // freed right after, so skip that per-block work.
         zdb.table.table.block_cache = null;
-        forest.close();
-        log.info("deinit: forest done", .{});
+        deinitWithLog("engine", eng);
     }
-    log.info("forest opened", .{});
-
-    // The replicated storage engine: builds the apply state machine + raft
-    // runtime and installs the SM on the node. Owns all that node/forest
-    // wiring.
-    const eng = try engine.Engine.open(
-        allocator,
-        node,
-        forest,
-        live_snapshot,
-        live_runtime,
-    );
-    defer deinitWithLog("engine", eng);
 
     // The admin protocol front-end over the engine.
     var admin_srv = try engine.AdminServer.init(eng, args.client_addr);
@@ -672,7 +599,11 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
 
     log.info("all components initialized", .{});
 
-    var handle = try fiber.spawn(.{}, appMain, .{ eng, &admin_srv, &sql_srv, node, &args });
+    var handle = try fiber.spawn(
+        .{},
+        appMain,
+        .{ eng, &admin_srv, &sql_srv, &args },
+    );
     handle.join();
 
     log.info("shutting down...", .{});
@@ -681,8 +612,14 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
 /// Drives the node lifecycle: bring up transport, (optionally) join the
 /// cluster, then hand off to the engine (recovery + loops) and register the
 /// admin front-end, finally blocking until a shutdown signal.
-fn appMain(eng: *engine.Engine, admin_srv: *engine.AdminServer, sql_srv: *sql.Server, node: *raft.Node, args: *const Args) void {
+fn appMain(
+    eng: *engine.Engine,
+    admin_srv: *engine.AdminServer,
+    sql_srv: *sql.Server,
+    args: *const Args,
+) void {
     log.debug("inside appMain", .{});
+    const node = eng.node;
 
     // Transport must be up before the cluster join (seeded nodes) and before
     // recovery fetches missing SSTs from the leader.
@@ -747,19 +684,15 @@ fn appMain(eng: *engine.Engine, admin_srv: *engine.AdminServer, sql_srv: *sql.Se
 
     // The stop: the node reacts on its own (`shutdownWatchLoop` closes
     // everything raft fibers park on) and the statements the grace cut
-    // off fail at their next yield point (Ctx.maybeYield), so there is
-    // nothing to invoke here beyond starting it — then wait for the
-    // fibers to drain.
-    node.shutdown.startShutdown();
+    // off fail at their next yield point (Ctx.maybeYield), so `stop`
+    // only starts it, waits for the fibers to drain and fails the
+    // proposals still in flight. Every statement the grace cut off then
+    // runs its error path and exits while the databases it holds
+    // pointers into exist. The deinits in main run after this returns.
     log.info("shutting down...", .{});
     fiber.spawnDetached(.{}, shutdownWatchdog, .{eng.allocator}) catch {};
-    eng.wait();
+    eng.stop();
     stop_done.store(true, .release);
-    // The loops are gone, so nothing will resolve a proposal still in
-    // flight: fail them now, then let every statement the grace cut off
-    // run its error path and exit while the databases it holds pointers
-    // into exist. The deinits in main run after this returns.
-    node.abortPending();
     if (!node.shutdown.waitForActiveCtxs(args.shutdown.grace_ms))
         log.warn("{d} statements still in flight at exit", .{
             node.shutdown.activeCtxs(),

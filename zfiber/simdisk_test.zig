@@ -367,13 +367,13 @@ test "simdisk: a deleted tree is back after a crash until a sync" {
     try expectFile(&d, "/tmp/t/f", "/tmp/t/f");
     try expectFile(&d, "/tmp/t/sub/g", "/tmp/t/sub/g");
 
-    // The sync of its directory takes the tree off the platter.
+    // The sync of its directory takes the tree off the device.
     try d.apply(.delete_tree, "/tmp/t");
     try syncDir(&d, "/tmp");
     d.crash("/tmp", .lose_all);
     try expectGone(&d, "/tmp/t");
 
-    // A directory made again starts empty on the platter too.
+    // A directory made again starts empty on the device too.
     try d.apply(.create_dir_path, "/tmp/u");
     d.apply(.close, try open(&d, "/tmp/u/h", rdwr_creat));
     try syncDir(&d, "/tmp/u");
@@ -415,7 +415,7 @@ test "simdisk: lose_some keeps or drops each dirty page whole" {
     defer d.deinit();
     const f = try open(&d, "/tmp/p", rdwr_creat);
     try syncDir(&d, "/tmp");
-    // Four pages of 0xaa on the platter, then one write across all four
+    // Four pages of 0xaa on the device, then one write across all four
     // with a page's index in each.
     var pages: [4 * 4096]u8 = undefined;
     @memset(&pages, 0xaa);
