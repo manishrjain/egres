@@ -21,8 +21,13 @@ for ((seed = first; seed < first + count; seed++)); do
     timeout 600 zig build test -- --sim-seed "$seed" \
         --sim-sched "$sched" --filter "$filter" >"$out" 2>&1
     code=$?
+    # The runner runs a failed test once more and exits 0 when that
+    # passes. Under a seed the first failure is the finding.
+    if [ $code -eq 0 ] && grep -aq ' \.\.\. FAIL: ' "$out"; then
+        code=retried
+    fi
     summary=$(grep -aE '^sim: ' "$out" | tail -1)
-    if [ $code -eq 0 ]; then
+    if [ "$code" = 0 ]; then
         echo "ok   ${summary#sim: }"
         rm -f "$out"
     else

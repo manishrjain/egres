@@ -563,6 +563,50 @@ test "simdisk: the path_ops rate refuses every op that takes a path" {
     try std.testing.expectEqualStrings("sub", entries[1].name);
 }
 
+test "simdisk: a sync that gave up on its writes is not made good by the next" {
+    var d = try SimDisk.init(std.testing.allocator, 7);
+    defer d.deinit();
+    try d.apply(.create_dir_path, "/tmp");
+    const f = try open(&d, "/tmp/kept", rdwr_creat);
+    defer d.apply(.close, f);
+    try syncDir(&d, "/tmp");
+    _ = try write(&d, f, "0123456789", 0);
+    try sync(&d, f);
+
+    // An overwrite and an append, then the sync that fails for good.
+    _ = try write(&d, f, "abcd", 0);
+    _ = try write(&d, f, "tail", 10);
+    try d.setFaults("/tmp", .{ .sync_drop = 1000 });
+    try std.testing.expectError(error.InputOutput, sync(&d, f));
+    try d.setFaults("/tmp", .{});
+
+    // The bytes still read back, and the next sync reports success.
+    try expectFile(&d, "/tmp/kept", "abcd456789tail");
+    try sync(&d, f);
+    // The device has the size, and under it what it had before.
+    d.crash("/tmp", .lose_all);
+    try expectFile(&d, "/tmp/kept", "0123456789\x00\x00\x00\x00");
+}
+
+test "simdisk: writing the bytes again after a failed sync lands them" {
+    var d = try SimDisk.init(std.testing.allocator, 7);
+    defer d.deinit();
+    try d.apply(.create_dir_path, "/tmp");
+    const f = try open(&d, "/tmp/again", rdwr_creat);
+    defer d.apply(.close, f);
+    try syncDir(&d, "/tmp");
+
+    _ = try write(&d, f, "all of it", 0);
+    try d.setFaults("/tmp", .{ .sync_drop = 1000 });
+    try std.testing.expectError(error.InputOutput, sync(&d, f));
+    try d.setFaults("/tmp", .{});
+
+    _ = try write(&d, f, "all of it", 0);
+    try sync(&d, f);
+    d.crash("/tmp", .lose_all);
+    try expectFile(&d, "/tmp/again", "all of it");
+}
+
 test "simdisk: a short write on an O_DIRECT handle is whole pages" {
     // macOS has no O_DIRECT to open the handle with.
     if (!@hasField(std.posix.O, "DIRECT")) return error.SkipZigTest;

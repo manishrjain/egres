@@ -34,8 +34,9 @@
 //!
 //! Faults are the device's errors, each at a rate per thousand ops and
 //! drawn from the same PRNG: a read or write that fails, a write that
-//! lands in part, a sync or a resize that fails, an op that names a
-//! path and fails. Each is `InputOutput`,
+//! lands in part, a sync or a resize that fails, a sync that fails and
+//! gives up on its writes, an op that names a path and fails. Each is
+//! `InputOutput`,
 //! the kernel's EIO, so the code's error paths run under schedules
 //! production rarely gives them. `setFaults` puts them on a directory
 //! tree, a test's own, since the suite's tests share the disk;
@@ -89,6 +90,11 @@ pub const Faults = struct {
     /// A sync fails with `InputOutput`; the pending writes stay pending,
     /// so a retry can land them.
     sync: u16 = 0,
+    /// A sync fails with `InputOutput` and the pending writes are given
+    /// up on, as Linux does after a failed writeback: they still read
+    /// back, the device does not have them, and a later sync does not
+    /// write them. Only writing them again does.
+    sync_drop: u16 = 0,
     /// A resize fails with `InputOutput`.
     set_size: u16 = 0,
     /// An op that takes a path under the tree fails with `InputOutput`,
@@ -105,6 +111,7 @@ pub const Faults = struct {
             .write = per_mille,
             .short_write = per_mille,
             .sync = per_mille,
+            .sync_drop = per_mille,
             .set_size = per_mille,
         };
     }
@@ -134,6 +141,11 @@ pub const SimDisk = struct {
         /// image the device still holds. Only pages inside
         /// `durable_len` are kept: past it, a crash cuts the file.
         old_pages: Pages = .empty,
+        /// Regular file: for each page a failed sync gave up on
+        /// (`Faults.sync_drop`), the image the device holds. A sync
+        /// leaves these alone; a write to the page makes it pending
+        /// again.
+        lost_pages: Pages = .empty,
         /// Directory: name to child as a lookup sees it.
         children: Names = .empty,
         /// Directory: the names on the device, from its last sync.
@@ -228,8 +240,12 @@ pub const SimDisk = struct {
             .sync => {
                 const o = self.open(args.file);
                 if (o.dead) return error.InputOutput;
-                if (self.fault(faultsOf(o.node).sync))
+                const faults = faultsOf(o.node);
+                if (self.fault(faults.sync)) return error.InputOutput;
+                if (self.fault(faults.sync_drop)) {
+                    self.losePending(o.node);
                     return error.InputOutput;
+                }
                 self.fold(o.node);
             },
             .set_size => return self.setSize(args),
@@ -394,12 +410,14 @@ pub const SimDisk = struct {
 
     fn crashFile(self: *SimDisk, node: *Node, mode: Crash) void {
         self.crashPages(node, mode);
-        self.dropOldPages(node);
+        self.dropPages(&node.old_pages);
+        self.dropPages(&node.lost_pages);
     }
 
     /// `node`'s visible bytes become what a crash leaves of the file:
-    /// the synced size, and each dirty page's old image unless `mode`
-    /// lets the new one stand.
+    /// the synced size, each dirty page's old image unless `mode` lets
+    /// the new one stand, and the device's image of every page a failed
+    /// sync gave up on.
     fn crashPages(self: *SimDisk, node: *Node, mode: Crash) void {
         const rand = self.prng.random();
         // Grow to whole pages if short, so each saved image fits. The
@@ -411,6 +429,13 @@ pub const SimDisk = struct {
         while (it.next()) |kv| {
             if (mode == .lose_some and rand.boolean()) continue;
             const start = kv.key_ptr.* * page_size;
+            @memcpy(node.data.items[start..][0..page_size], kv.value_ptr.*);
+        }
+        var lost = node.lost_pages.iterator();
+        while (lost.next()) |kv| {
+            const start = kv.key_ptr.* * page_size;
+            // Past the synced size the file is cut anyway.
+            if (start >= full) continue;
             @memcpy(node.data.items[start..][0..page_size], kv.value_ptr.*);
         }
         self.resize(&node.data, node.durable_len);
@@ -427,7 +452,56 @@ pub const SimDisk = struct {
             return;
         }
         node.durable_len = node.data.items.len;
-        self.dropOldPages(node);
+        self.dropPages(&node.old_pages);
+    }
+
+    /// A failed sync gave up on `node`'s pending writes. Each page
+    /// written since the last sync moves to `lost_pages` with the image
+    /// the device holds, and each page past the synced size goes there
+    /// as zeros: the device never got it. The visible bytes stay.
+    fn losePending(self: *SimDisk, node: *Node) void {
+        if (node.kind == .directory) return;
+        var it = node.old_pages.iterator();
+        while (it.next()) |kv| {
+            node.lost_pages.putNoClobber(
+                self.alloc,
+                kv.key_ptr.*,
+                kv.value_ptr.*,
+            ) catch @panic("simdisk: out of memory on a failed sync");
+        }
+        node.old_pages.clearRetainingCapacity();
+
+        var idx = pageEnd(node.durable_len) / page_size;
+        while (idx * page_size < node.data.items.len) : (idx += 1) {
+            if (node.lost_pages.contains(idx)) continue;
+            const img = self.alloc.create([page_size]u8) catch
+                @panic("simdisk: out of memory on a failed sync");
+            @memset(img, 0);
+            node.lost_pages.putNoClobber(self.alloc, idx, img) catch
+                @panic("simdisk: out of memory on a failed sync");
+        }
+    }
+
+    /// The pages holding `data[off..end]` are about to be written or
+    /// cut again, so none of them is lost any more: the next sync
+    /// covers them. Inside the synced size the image the device holds
+    /// becomes the page's old image.
+    fn lostToPending(
+        self: *SimDisk,
+        node: *Node,
+        off: usize,
+        end: usize,
+    ) void {
+        if (node.lost_pages.count() == 0) return;
+        var idx = off / page_size;
+        while (idx * page_size < end) : (idx += 1) {
+            const kv = node.lost_pages.fetchSwapRemove(idx) orelse continue;
+            const durable = idx * page_size < node.durable_len;
+            if (durable and !node.old_pages.contains(idx)) {
+                node.old_pages.putNoClobber(self.alloc, idx, kv.value) catch
+                    @panic("simdisk: out of memory on a write");
+            } else self.alloc.destroy(kv.value);
+        }
     }
 
     fn foldNames(self: *SimDisk, dir: *Node) void {
@@ -476,9 +550,9 @@ pub const SimDisk = struct {
         node.durable_len = @max(node.durable_len, end);
     }
 
-    fn dropOldPages(self: *SimDisk, node: *Node) void {
-        for (node.old_pages.values()) |img| self.alloc.destroy(img);
-        node.old_pages.clearRetainingCapacity();
+    fn dropPages(self: *SimDisk, pages: *Pages) void {
+        for (pages.values()) |img| self.alloc.destroy(img);
+        pages.clearRetainingCapacity();
     }
 
     fn pageEnd(len: usize) usize {
@@ -586,6 +660,7 @@ pub const SimDisk = struct {
         const len = self.writeLen(op.data.len, o.direct, faults.short_write);
         const off: usize = @intCast(op.offset);
         const end = off + len;
+        self.lostToPending(o.node, off, end);
         try self.keepOldPages(o.node, off, end);
 
         if (end > o.node.data.items.len) self.resize(&o.node.data, end);
@@ -625,8 +700,11 @@ pub const SimDisk = struct {
     /// the pages it cuts, since a crash brings them back.
     fn truncate(self: *SimDisk, node: *Node, len: usize) void {
         const old_len = node.data.items.len;
-        if (len < old_len) self.keepOldPages(node, len, old_len) catch
-            @panic("simdisk: out of memory on a truncate");
+        if (len < old_len) {
+            self.lostToPending(node, len, old_len);
+            self.keepOldPages(node, len, old_len) catch
+                @panic("simdisk: out of memory on a truncate");
+        }
         self.resize(&node.data, len);
         node.mtime_ms = nowMs();
     }
@@ -847,7 +925,8 @@ pub const SimDisk = struct {
         for (node.durable_children.values()) |child| child.parent = null;
         self.clearNames(&node.children);
         self.clearNames(&node.durable_children);
-        self.dropOldPages(node);
+        self.dropPages(&node.old_pages);
+        self.dropPages(&node.lost_pages);
         destroy(self.alloc, node);
     }
 
@@ -858,6 +937,8 @@ pub const SimDisk = struct {
         node.durable_children.deinit(alloc);
         std.debug.assert(node.old_pages.count() == 0);
         node.old_pages.deinit(alloc);
+        std.debug.assert(node.lost_pages.count() == 0);
+        node.lost_pages.deinit(alloc);
         node.data.deinit(alloc);
         alloc.destroy(node);
     }

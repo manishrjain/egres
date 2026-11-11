@@ -22,6 +22,14 @@
 //! in flight must fail, the node must stop by itself once the log
 //! gives up, and a restart must have every acknowledged row.
 //!
+//! A run with faults makes the WAL's directory and the store's each a
+//! `Resource`. Each draws its own kinds of error, their rates and its
+//! outages from the seed, so the seeds between them run the kinds
+//! alone and together, on one resource and on both at once. A
+//! statement may then be answered with an error. What it had in flight
+//! is read back: all of it applied or none. The log must not give up,
+//! and once every resource works again no statement may fail.
+//!
 //! One sim seed is one workload and one schedule:
 //! `zig build test -- --sim-seed N --filter "sim: sql"`.
 
@@ -37,13 +45,46 @@ const utils = @import("utils");
 const zdb = @import("zdb");
 
 const String = utils.String;
+const Faults = fiber.simdisk.Faults;
 const vfs = zdb.vfs;
 const log = std.log.scoped(.sim_test);
 
 const num_writers = 4;
 const rows_per_writer = 48;
-/// Crashes in one run; each is followed by a restart and a check.
-const crashes = 4;
+/// What one run of the test does. The values here are the test every
+/// run of the suite includes: seconds per seed.
+const Shape = struct {
+    /// Crashes, each followed by a restart and a check.
+    crashes: u32 = 4,
+    /// The writers run this long before a crash, and up to
+    /// `stretch_more_ms` longer.
+    stretch_ms: u64 = 300,
+    stretch_more_ms: u64 = 2500,
+    /// The most bytes a row's body is the hex of.
+    body_max: usize = 450,
+    /// The resources have faults while the writers run, drawn from
+    /// the seed (`Resources.drawDirs`).
+    faults: bool = false,
+};
+
+/// Every kind of error, each off one time in two: a seed runs some of
+/// them together and the others not at all.
+fn drawFaults() Faults {
+    var faults: Faults = .{};
+    inline for (std.meta.fields(Faults)) |field|
+        @field(faults, field.name) = drawRate();
+    return faults;
+}
+
+/// Per thousand ops: 0.2%, 1% or 5%. At more than that a table, which
+/// is many writes, is rarely written whole.
+fn drawRate() u16 {
+    const rates = [_]u16{ 0, 0, 0, 2, 10, 50 };
+    return rates[fiber.random().uintLessThan(usize, rates.len)];
+}
+
+/// `Shape.body_max` of the run, for `bodyOf`.
+var body_max: usize = 450;
 /// Writer `w` has the ids and the seqs in [w * span, (w + 1) * span).
 const span = 1_000_000;
 
@@ -75,7 +116,7 @@ const wal_opts: raft.diskwal.OpenOptions = .{
 const retry_ms = 2000;
 
 /// A disk that fails every op, on a file or by path.
-const dead_disk: fiber.simdisk.Faults = .{
+const dead_disk: Faults = .{
     .read = 1000,
     .write = 1000,
     .sync = 1000,
@@ -83,9 +124,224 @@ const dead_disk: fiber.simdisk.Faults = .{
     .path_ops = 1000,
 };
 
-/// True from a crash until the disk works again. A statement that
-/// fails meanwhile is the crash's, not a failed run.
-var disk_down = false;
+/// Virtual milliseconds, `min` up to `max` and not `max` itself.
+const Range = struct {
+    min: u64,
+    max: u64,
+
+    fn draw(self: Range) u64 {
+        const width = self.max - self.min;
+        return self.min + fiber.random().uintLessThan(u64, width);
+    }
+};
+
+/// One thing the server depends on that fails by itself. It has its
+/// own error rates and moves between working, having its errors and
+/// an outage at times it draws: two resources are out together when
+/// their times cross.
+const Resource = struct {
+    name: String,
+    target: Target,
+    /// `outage` is one of its states: every op on it fails.
+    outages: bool,
+    /// How long it stays in `works` or in `errors`.
+    period_ms: Range = .{ .min = 300, .max = 1500 },
+    state: State = .works,
+    /// When `state` next changes, in `Resources.elapsed_ms`.
+    change_at: u64 = never,
+
+    const State = enum { works, errors, outage };
+    const never = std.math.maxInt(u64);
+    /// An outage lasts a period over this: much shorter than the log's
+    /// retry bound, and the period after it takes several retries, so
+    /// the log must not give up.
+    const outage_fraction = 4;
+
+    /// Where the faults are applied: what it takes to apply them and
+    /// the rates this run drew.
+    const Target = union(enum) {
+        dir: struct {
+            sim: *fiber.simdisk.SimDisk,
+            path: String,
+            rates: Faults,
+        },
+    };
+
+    fn set(self: *Resource, state: State) !void {
+        switch (self.target) {
+            .dir => |dir| try dir.sim.setFaults(dir.path, switch (state) {
+                .works => .{},
+                .errors => dir.rates,
+                .outage => dead_disk,
+            }),
+        }
+        self.state = state;
+    }
+
+    /// Goes to `state` at `change_at` and draws how long it stays.
+    fn enter(self: *Resource, state: State) !void {
+        try self.set(state);
+        log.debug("{s}: {s} from {d} ms", .{
+            self.name, @tagName(state), self.change_at,
+        });
+        const period = self.period_ms.draw();
+        self.change_at += switch (state) {
+            .works, .errors => period,
+            .outage => period / outage_fraction,
+        };
+    }
+
+    /// The next state, one of the other two.
+    fn change(self: *Resource) !void {
+        const first = fiber.random().boolean();
+        const out = self.outages and first;
+        try self.enter(switch (self.state) {
+            .works => if (out) .outage else .errors,
+            .errors => if (out) .outage else .works,
+            .outage => if (first) .works else .errors,
+        });
+    }
+
+    /// Whether its faults may have a statement answered with an error.
+    /// The server retries a write or a sync that failed. A failed
+    /// read, resize or path op may fail the statement that needed it,
+    /// and so may an outage.
+    fn refuses(self: Resource) bool {
+        if (self.outages) return true;
+        switch (self.target) {
+            .dir => |dir| return dir.rates.read != 0 or
+                dir.rates.set_size != 0 or dir.rates.path_ops != 0,
+        }
+    }
+};
+
+/// What the server runs on, each with its own faults, and the power
+/// cut, which takes the whole data directory at once.
+const Resources = struct {
+    sim: *fiber.simdisk.SimDisk,
+    data_dir: String,
+    list: std.ArrayList(Resource) = .empty,
+    /// Virtual milliseconds of `injectFaults` since `start`.
+    elapsed_ms: u64 = 0,
+    /// True from `start` until `clear`. A statement may be answered
+    /// with an error meanwhile, also when the resource that failed it
+    /// works again by then.
+    active: bool = false,
+    /// True from a power cut until `clear`. A statement that fails
+    /// meanwhile is the crash's, not a failed run.
+    down: bool = false,
+
+    /// The WAL's directory and the store's, each a resource. The store
+    /// gets no failed syncs until issue 46 is fixed: a failed fsync of
+    /// an SST is ignored, and every seed would end on that.
+    fn drawDirs(
+        self: *Resources,
+        alloc: std.mem.Allocator,
+        wal_dir: String,
+        store_dir: String,
+    ) !void {
+        try self.addDir(alloc, "wal", wal_dir, drawFaults());
+
+        var store = drawFaults();
+        store.sync = 0;
+        store.sync_drop = 0;
+        try self.addDir(alloc, "store", store_dir, store);
+    }
+
+    fn addDir(
+        self: *Resources,
+        alloc: std.mem.Allocator,
+        name: String,
+        path: String,
+        rates: Faults,
+    ) !void {
+        const outages = fiber.random().boolean();
+        log.info("{s}: {any}, outages {}", .{ name, rates, outages });
+        try self.list.append(alloc, .{
+            .name = name,
+            .target = .{
+                .dir = .{ .sim = self.sim, .path = path, .rates = rates },
+            },
+            .outages = outages,
+        });
+    }
+
+    /// Every resource starts out working or with its errors.
+    fn start(self: *Resources) !void {
+        self.elapsed_ms = 0;
+        self.active = true;
+        for (self.list.items) |*res| {
+            res.change_at = 0;
+            const works = fiber.random().boolean();
+            try res.enter(if (works) .works else .errors);
+        }
+    }
+
+    /// `ms` virtual milliseconds of the writers' run. Each resource
+    /// changes state at the times it drew.
+    fn injectFaults(self: *Resources, ms: u64) !void {
+        const end = self.elapsed_ms + ms;
+        while (self.earliest()) |res| {
+            if (res.change_at >= end) break;
+            fiber.sleepMs(res.change_at - self.elapsed_ms);
+            self.elapsed_ms = res.change_at;
+            try res.change();
+        }
+        fiber.sleepMs(end - self.elapsed_ms);
+        self.elapsed_ms = end;
+    }
+
+    /// The resource whose state changes first.
+    fn earliest(self: *Resources) ?*Resource {
+        var first: ?*Resource = null;
+        for (self.list.items) |*res| {
+            if (first == null or res.change_at < first.?.change_at)
+                first = res;
+        }
+        return first;
+    }
+
+    /// An outage in progress ends, and no state changes from here.
+    fn endOutages(self: *Resources) !void {
+        for (self.list.items) |*res| {
+            if (res.state == .outage) try res.set(.errors);
+            res.change_at = Resource.never;
+        }
+    }
+
+    /// Everything works again.
+    fn clear(self: *Resources) !void {
+        for (self.list.items) |*res| {
+            try res.set(.works);
+            res.change_at = Resource.never;
+        }
+        try self.sim.setFaults(self.data_dir, .{});
+        self.active = false;
+        self.down = false;
+    }
+
+    /// The power cut. Every op under the data directory fails from
+    /// then on for the server still running, so nothing that server
+    /// does is there after a restart.
+    fn powerCut(self: *Resources, mode: fiber.simdisk.Crash) !void {
+        self.sim.crash(self.data_dir, mode);
+        try self.sim.setFaults(self.data_dir, dead_disk);
+        for (self.list.items) |*res| switch (res.target) {
+            .dir => try res.set(.outage),
+        };
+        self.down = true;
+    }
+
+    fn mayRefuse(self: *const Resources) bool {
+        if (!self.active) return false;
+        for (self.list.items) |res| if (res.refuses()) return true;
+        return false;
+    }
+};
+
+/// The run's resources, where `ask` and the writers read whether a
+/// statement that failed is the faults' or a failed run.
+var resources: Resources = undefined;
 
 /// One boot of the server on a data directory: the store and the flags
 /// `egres/main.zig` hands to `Engine.open`, then its calls in its
@@ -211,7 +467,8 @@ fn ask(
 ) !pgwire.client.Reply {
     const reply = try client.query(arloc, text);
     const refused = reply.err orelse return reply;
-    if (!disk_down) log.err("{s} {s}: {s}", .{
+    const faults = resources.down or resources.mayRefuse();
+    if (!faults) log.err("{s} {s}: {s}", .{
         &refused.code,
         refused.message,
         text[0..@min(text.len, 100)],
@@ -282,30 +539,94 @@ const Writer = struct {
     ops: u64 = 0,
     /// Crashes that kept what was in flight.
     kept_in_flight: u32 = 0,
+    /// Steps the server answered with an error under disk errors.
+    refused: u64 = 0,
     failed: ?anyerror = null,
 
     fn deinit(self: *Writer) void {
         self.pending.deinit(self.alloc);
     }
 
-    /// The writer's fiber: one session of statements until `stop`.
+    /// The writer's fiber: sessions of statements until `stop`.
     fn run(self: *Writer, stop: *const bool) void {
-        self.session(stop) catch |err| {
-            self.failed = err;
+        self.sessions(stop) catch |err| {
+            // The crash took the step in flight: an error, or the
+            // connection gone. `recover` decides what became of it.
+            if (!resources.down) self.failed = err;
         };
     }
 
-    fn session(self: *Writer, stop: *const bool) !void {
-        self.client = try connect(self.alloc);
-        defer self.client.close();
+    /// One session until a statement is refused under disk errors, then
+    /// the next: closing the first ends the block it may have had open.
+    fn sessions(self: *Writer, stop: *const bool) !void {
         while (!stop.*) {
-            self.step() catch |err| {
-                // The crash took the step in flight: an error, or the
-                // connection gone. `recover` decides what became of it.
-                if (disk_down) return;
-                return err;
+            self.client = try connect(self.alloc);
+            defer self.client.close();
+            self.session(stop) catch |err| {
+                if (err != error.StatementRefused) return err;
+                if (resources.down or !resources.mayRefuse()) return err;
+                self.refused += 1;
+                log.debug("writer {d}: refused, in flight {any}", .{
+                    self.id, self.pending.items,
+                });
             };
+        }
+    }
+
+    fn session(self: *Writer, stop: *const bool) !void {
+        try self.settle(stop);
+        while (!stop.*) {
+            try self.step();
             self.ops += 1;
+        }
+    }
+
+    /// What became of the writes a refused statement left in flight:
+    /// all of them are there or none is. A read the server refuses is
+    /// asked again, and at `stop` they stay in flight for the next
+    /// session or for `recover`.
+    fn settle(self: *Writer, stop: *const bool) !void {
+        if (self.pending.items.len == 0) return;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        var applied: usize = 0;
+        for (self.pending.items) |write| {
+            const row = write.row;
+            const found = try self.getAnswered(arena.allocator(), row, stop);
+            if (std.meta.eql(found, write.seq)) {
+                applied += 1;
+                continue;
+            }
+            try expectSeq(self.id, row, self.acked[row], found);
+        }
+        log.debug("writer {d}: {d} of the {d} in flight are there", .{
+            self.id, applied, self.pending.items.len,
+        });
+        if (applied == self.pending.items.len) return self.acknowledged();
+        if (applied != 0) {
+            log.err("writer {d}: {d} of {d} writes of a refused block", .{
+                self.id, applied, self.pending.items.len,
+            });
+            return error.RefusedBlockHalfApplied;
+        }
+        self.pending.clearRetainingCapacity();
+    }
+
+    /// `get`, asked again while the disk's errors fail it.
+    fn getAnswered(
+        self: *Writer,
+        arloc: std.mem.Allocator,
+        row: u32,
+        stop: *const bool,
+    ) !?u64 {
+        while (true) {
+            return self.get(arloc, row) catch |err| {
+                if (err != error.StatementRefused) return err;
+                if (stop.* or resources.down) return err;
+                if (!resources.mayRefuse()) return err;
+                fiber.sleepMs(5);
+                continue;
+            };
         }
     }
 
@@ -421,6 +742,9 @@ const Writer = struct {
 
     /// The server answered what was in flight.
     fn acknowledged(self: *Writer) void {
+        log.debug("writer {d}: acknowledged {any}", .{
+            self.id, self.pending.items,
+        });
         apply(&self.acked, self.pending.items);
         self.pending.clearRetainingCapacity();
     }
@@ -527,6 +851,9 @@ const Writer = struct {
             return error.CrashLostOrTornWrites;
         }
         if (moved) self.kept_in_flight += 1;
+        log.debug("writer {d}: after the crash, in flight {any} kept: {}", .{
+            self.id, self.pending.items, moved,
+        });
         self.acked = found;
         self.pending.clearRetainingCapacity();
     }
@@ -590,7 +917,7 @@ fn idOf(writer: u32, row: u32) u64 {
 fn bodyOf(arloc: std.mem.Allocator, id: u64, seq: u64) !String {
     var prng = std.Random.DefaultPrng.init(seq *% 0x9e3779b97f4a7c15 +% id);
     const rand = prng.random();
-    const raw = try arloc.alloc(u8, 1 + rand.uintLessThan(usize, 450));
+    const raw = try arloc.alloc(u8, 1 + rand.uintLessThan(usize, body_max));
     rand.bytes(raw);
     return std.fmt.allocPrint(arloc, "{x}", .{raw});
 }
@@ -629,35 +956,66 @@ fn runWriters(
     defer stop = true;
 
     for (writers) |*w| try group.spawn(.{}, Writer.run, .{ w, &stop });
-    fiber.sleepMs(ms);
+    try resources.injectFaults(ms);
     try at_end(ctx);
 }
 
 const CrashAt = struct {
-    disk: *fiber.simdisk.SimDisk,
-    dir: String,
+    inst: *Instance,
     mode: fiber.simdisk.Crash,
 
-    /// The power cut. The disk stays dead for the server still
-    /// running on it, so nothing that server does from here is there
-    /// after a restart. The caller stops the writers in the same step
+    /// The power cut. The caller stops the writers in the same step
     /// of its fiber: none starts a statement the crash did not see.
     fn take(self: *const CrashAt) anyerror!void {
-        self.disk.crash(self.dir, self.mode);
-        try self.disk.setFaults(self.dir, dead_disk);
-        disk_down = true;
+        try stillUp(self.inst);
+        try resources.powerCut(self.mode);
     }
 };
 
-fn nothing(_: void) anyerror!void {}
+/// The node has not stopped by itself: no error the writers ran under
+/// lasts long enough for the log to give up.
+fn stillUp(inst: *Instance) anyerror!void {
+    if (inst.eng.node.shutdown.hasFailed()) return error.NodeGaveUp;
+}
+
+/// The end of a stretch that no crash ends. An outage left on would
+/// last until the writers have stopped, which they do only once the
+/// log has answered them: longer than its retry bound.
+fn endWithoutCrash(inst: *Instance) anyerror!void {
+    try stillUp(inst);
+    try resources.endOutages();
+}
 
 fn firstFailure(writers: []const Writer) !void {
     for (writers) |w| if (w.failed) |err| return err;
 }
 
 test "sim: sql keeps acknowledged statements across crashes" {
-    const disk = fiber.simDisk() orelse return error.SkipZigTest;
+    try run(.{});
+}
+
+// Minutes per seed, so opt-in (`--bigtest`): bodies larger than a
+// block, enough of them to outgrow a table, and a WAL that rotates
+// many times.
+test "BIG: sim: sql keeps acknowledged statements across many crashes" {
+    try run(.{
+        .crashes = 40,
+        .stretch_ms = 500,
+        .stretch_more_ms = 4000,
+        .body_max = 6000,
+        .faults = true,
+    });
+}
+
+// Opt-in: the disk has the errors the seed draws.
+test "BIG: sim: sql rides through disk errors" {
+    try run(.{ .faults = true });
+}
+
+fn run(shape: Shape) !void {
+    const sim = fiber.simDisk() orelse return error.SkipZigTest;
     const alloc = testing.allocator;
+    body_max = shape.body_max;
 
     var tmp = try vfs.TmpDir.init(alloc);
     defer tmp.deinit();
@@ -672,19 +1030,29 @@ test "sim: sql keeps acknowledged statements across crashes" {
 
     const dir = try std.fmt.allocPrint(alloc, "{s}/data", .{tmp.path});
     defer alloc.free(dir);
+    const wal_dir = try std.fmt.allocPrint(alloc, "{s}/wal", .{dir});
+    defer alloc.free(wal_dir);
+    const store_dir = try std.fmt.allocPrint(alloc, "{s}/store", .{dir});
+    defer alloc.free(store_dir);
+
+    resources = .{ .sim = sim, .data_dir = dir };
+    defer resources.list.deinit(alloc);
+    if (shape.faults) try resources.drawDirs(alloc, wal_dir, store_dir);
+
     // Null between a close and the open that follows it.
     var booted: ?*Instance = try Instance.open(alloc, dir);
     defer if (booted) |inst| inst.close();
 
     try createTable(alloc);
 
-    for (0..crashes) |_| {
+    for (0..shape.crashes) |_| {
         const crash: CrashAt = .{
-            .disk = disk,
-            .dir = dir,
+            .inst = booted.?,
             .mode = if (fiber.random().boolean()) .lose_all else .lose_some,
         };
-        const ms = 300 + fiber.random().uintLessThan(u64, 2500);
+        const ms = shape.stretch_ms +
+            fiber.random().uintLessThan(u64, shape.stretch_more_ms);
+        try resources.start();
         try runWriters(alloc, &writers, ms, &crash, CrashAt.take);
         try firstFailure(&writers);
 
@@ -694,15 +1062,23 @@ test "sim: sql keeps acknowledged statements across crashes" {
         fiber.sleepMs(fiber.random().uintLessThan(u64, 2 * retry_ms));
         booted.?.close();
         booted = null;
-        try disk.setFaults(dir, .{});
-        disk_down = false;
+        try resources.clear();
         booted = try Instance.open(alloc, dir);
         for (&writers) |*w| try w.recover();
     }
 
     // A last stretch, a clean stop, and a restart that must lose nothing.
-    try runWriters(alloc, &writers, 1000, {}, nothing);
+    try resources.start();
+    try runWriters(alloc, &writers, 1000, booted.?, endWithoutCrash);
     try firstFailure(&writers);
+    try stillUp(booted.?);
+    try resources.clear();
+    if (shape.faults) {
+        // The faults are over: every statement is answered again, the
+        // first of each writer the read of what it had in flight.
+        try runWriters(alloc, &writers, 500, booted.?, stillUp);
+        try firstFailure(&writers);
+    }
     booted.?.close();
     booted = null;
     booted = try Instance.open(alloc, dir);
@@ -711,9 +1087,7 @@ test "sim: sql keeps acknowledged statements across crashes" {
     // The WAL's disk stops taking writes. The statement in flight
     // fails once the log gives up, the node stops by itself, and a
     // restart on a disk that works has every acknowledged row.
-    const wal_dir = try std.fmt.allocPrint(alloc, "{s}/wal", .{dir});
-    defer alloc.free(wal_dir);
-    try disk.setFaults(wal_dir, .{ .write = 1000 });
+    try sim.setFaults(wal_dir, .{ .write = 1000 });
     const started = utils.coarseMs();
     try writers[0].refusedWrite();
     const waited = utils.coarseMs() - started;
@@ -721,19 +1095,22 @@ test "sim: sql keeps acknowledged statements across crashes" {
     try testing.expect(booted.?.eng.node.shutdown.hasFailed());
     booted.?.close();
     booted = null;
-    try disk.setFaults(wal_dir, .{});
+    try sim.setFaults(wal_dir, .{});
     booted = try Instance.open(alloc, dir);
     for (&writers) |*w| try w.expectAcked();
 
     var ops: u64 = 0;
     var kept: u32 = 0;
+    var refused: u64 = 0;
     for (writers) |w| {
         ops += w.ops;
         kept += w.kept_in_flight;
+        refused += w.refused;
     }
     log.info(
         "{d} statements and blocks across {d} crashes," ++
-            " {d} of them in flight at a crash and kept",
-        .{ ops, crashes, kept },
+            " {d} of them in flight at a crash and kept," ++
+            " {d} refused under disk errors",
+        .{ ops, shape.crashes, kept, refused },
     );
 }
