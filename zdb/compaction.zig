@@ -1030,7 +1030,9 @@ fn runPartition(
     snapshot_ts: u64,
 ) ?Emitter.Result {
     return runPartition_(self, job, part, snapshot_ts) catch |err| {
-        log.err("compact tree={d} L{d}->L{d} partition failed: {s}", .{
+        // The engine's loop takes a failed job again after a wait.
+        utils.logEvery(.err, 30, "compact tree={d} L{d}->L{d} partition " ++
+            "failed: {s}", .{
             self.tree_id, job.src_level, job.dest_level, @errorName(err),
         });
         return null;

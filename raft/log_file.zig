@@ -136,6 +136,9 @@ pub const OpenOptions = struct {
     /// `NextLog.adoptLogFile`). The pool holds fewer when fewer were needed,
     /// and 0 turns reuse off.
     max_spare_log_files: usize = 64,
+    /// How long a failing log write is retried before the log is given
+    /// up on (`LogBuf.fail`), which stops the node.
+    write_retry_ms: u64 = 10_000,
 };
 
 pub const log_suffix = ".wal";
@@ -1071,6 +1074,18 @@ pub const LogBuf = struct {
     /// The writer fiber, from `start` until `stop` joins it.
     writer: ?fiber.JoinHandle(void) = null,
     stopping: std.atomic.Value(bool) = .init(false),
+    /// `OpenOptions.write_retry_ms`.
+    retry_ms: u64,
+    /// Set once a write was given up on, and no write is tried after
+    /// it: one landing past the dropped one would leave a hole.
+    failed: std.atomic.Value(bool) = .init(false),
+    /// Called once, by `fail`, on the fiber whose write it was.
+    on_failed: ?FailedHook = null,
+
+    pub const FailedHook = struct {
+        ctx: *anyopaque,
+        call: *const fn (*anyopaque) void,
+    };
 
     /// One unit of the writer's work: `buf` for a file at `offset` and,
     /// for a file rotated out, its `header`: written at 0 once the
@@ -1096,9 +1111,10 @@ pub const LogBuf = struct {
         }
     };
 
-    pub fn init(allocator: std.mem.Allocator) LogBuf {
+    pub fn init(allocator: std.mem.Allocator, retry_ms: u64) LogBuf {
         return .{
             .allocator = allocator,
+            .retry_ms = retry_ms,
             .synced = fiber.Watermark.init(allocator),
             .buffered = fiber.Watermark.init(allocator),
         };
@@ -1236,18 +1252,23 @@ pub const LogBuf = struct {
     /// parks until `buffered` moves past `synced`. A truncation resets
     /// both, which wakes it to recompute the target rather than wait
     /// for an index that may never come back. Exits as soon as `stop`
-    /// is seen, leaving the rest for the closing flush.
+    /// is seen, leaving the rest for the closing flush, or once the
+    /// log failed, which leaves nothing to write.
     fn writerLoop(self: *LogBuf, dw: *DiskWAL) void {
         while (true) {
-            while (!self.stopping.load(.acquire) and self.writeOne(dw)) {}
+            while (!self.halted() and self.writeOne(dw)) {}
 
-            if (self.stopping.load(.acquire)) return;
+            if (self.halted()) return;
 
             self.buffered.waitForOrReset(self.synced.load() + 1) catch |err| switch (err) {
                 error.Reset => continue,
                 error.Closed, error.OutOfMemory => return,
             };
         }
+    }
+
+    fn halted(self: *const LogBuf) bool {
+        return self.stopping.load(.acquire) or self.failed.load(.acquire);
     }
 
     /// One item: take under the lock, write with it released. False
@@ -1318,22 +1339,42 @@ pub const LogBuf = struct {
     }
 
     /// One item to disk, `inflight` set by the caller: retried after a
-    /// pause until it lands, logging every failure, since nothing is
-    /// durable until it does. The writer calls it with the lock
-    /// released, `drain` and `flush` with it held. False when the WAL
-    /// stopped meanwhile; the item is then dropped, nothing of it
-    /// having been acknowledged.
+    /// pause until it lands, since nothing is durable until it does,
+    /// for `retry_ms` from its first failure. The writer calls it with
+    /// the lock released, `drain` and `flush` with it held. False when
+    /// the WAL stopped meanwhile or the log failed, here or before;
+    /// the item is then dropped, nothing of it having been
+    /// acknowledged.
     fn blockingWrite(self: *LogBuf, item: *Item) bool {
         defer self.inflight.setDone();
+        if (self.failed.load(.acquire)) {
+            item.deinit(self.allocator);
+            return false;
+        }
+        var failing_since: ?i64 = null;
         while (true) {
             self.write_(item) catch |err| {
-                log.err("write through index {d}: {s}", .{
-                    item.last_index, @errorName(err),
-                });
                 if (self.stopping.load(.acquire)) {
+                    log.err("write through index {d}, dropped at stop: {s}", .{
+                        item.last_index, @errorName(err),
+                    });
                     item.deinit(self.allocator);
                     return false;
                 }
+                const now = utils.coarseMs();
+                const since = failing_since orelse now;
+                failing_since = since;
+                if (now - since >= self.retry_ms) {
+                    self.fail(item.last_index, err);
+                    item.deinit(self.allocator);
+                    return false;
+                }
+                utils.logEvery(
+                    .warn,
+                    1,
+                    "wal: write through index {d}: {s}, retrying",
+                    .{ item.last_index, @errorName(err) },
+                );
                 fiber.sleepMs(100);
                 continue;
             };
@@ -1345,6 +1386,21 @@ pub const LogBuf = struct {
             } else item.buf.deinit(self.allocator);
             return true;
         }
+    }
+
+    /// A write was retried for `retry_ms` and never landed: the log is
+    /// closed for good. Everything parked on it wakes with
+    /// `error.Closed`, the writer exits, and the owner is told, once.
+    fn fail(self: *LogBuf, last_index: u64, err: anyerror) void {
+        log.err(
+            "write through index {d} failed for {d} ms, last with {s}:" ++
+                " giving up on the log",
+            .{ last_index, self.retry_ms, @errorName(err) },
+        );
+        self.failed.store(true, .release);
+        self.buffered.close();
+        self.synced.close();
+        if (self.on_failed) |hook| hook.call(hook.ctx);
     }
 
     /// The I/O of one item; the log file is O_DSYNC, so a write

@@ -137,7 +137,7 @@ pub fn testPrint(comptime fmt: String, args: anytype) void {
     _ = args;
 }
 
-/// Rate-limited log: each call site (one comptime instantiation) logs
+/// Rate-limited log: each call site, told apart by its format, logs
 /// at most once per interval, at the given level. For a line that a
 /// loop would otherwise print on every pass, a retry above all.
 pub fn logEvery(
@@ -146,20 +146,33 @@ pub fn logEvery(
     comptime fmt: String,
     args: anytype,
 ) void {
-    const S = struct {
-        var last: i64 = 0;
-    };
-    const now = coarse_clock.ms();
-    if (now - S.last > interval_secs * 1_000) {
-        // std.log.log is private: pick the level's function.
-        switch (level) {
-            .err => std.log.err(fmt, args),
-            .warn => std.log.warn(fmt, args),
-            .info => std.log.info(fmt, args),
-            .debug => std.log.debug(fmt, args),
-        }
-        S.last = now;
+    if (!logDue(fmt, interval_secs * 1_000, coarse_clock.ms())) return;
+    // std.log.log is private: pick the level's function.
+    switch (level) {
+        .err => std.log.err(fmt, args),
+        .warn => std.log.warn(fmt, args),
+        .info => std.log.info(fmt, args),
+        .debug => std.log.debug(fmt, args),
     }
+}
+
+/// Whether the call site with format `site` logs at `now_ms`: its
+/// first call does, then one per `interval_ms`.
+pub fn logDue(comptime site: String, interval_ms: i64, now_ms: i64) bool {
+    const S = struct {
+        // A type that names nothing of its function is one type for
+        // every instantiation, and its stamp one stamp for every call
+        // site in the process. Naming the format makes it this site's.
+        const of = site;
+        /// Null until the first call: a clock that starts at zero, the
+        /// simulation's, is not an interval old.
+        var last: ?i64 = null;
+    };
+    if (S.last) |last| {
+        if (now_ms - last <= interval_ms) return false;
+    }
+    S.last = now_ms;
+    return true;
 }
 
 /// search finds the first index in [0, items.len) for which pred(c, items[i]) is true,

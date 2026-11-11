@@ -34,7 +34,8 @@
 //!
 //! Faults are the device's errors, each at a rate per thousand ops and
 //! drawn from the same PRNG: a read or write that fails, a write that
-//! lands in part, a sync or a resize that fails. Each is `InputOutput`,
+//! lands in part, a sync or a resize that fails, an op that names a
+//! path and fails. Each is `InputOutput`,
 //! the kernel's EIO, so the code's error paths run under schedules
 //! production rarely gives them. `setFaults` puts them on a directory
 //! tree, a test's own, since the suite's tests share the disk;
@@ -90,8 +91,14 @@ pub const Faults = struct {
     sync: u16 = 0,
     /// A resize fails with `InputOutput`.
     set_size: u16 = 0,
+    /// An op that takes a path under the tree fails with `InputOutput`,
+    /// nothing changed: open, access, rename, delete, list, and a
+    /// make that has a directory to make.
+    path_ops: u16 = 0,
 
-    /// Every kind at one rate.
+    /// Every kind on an open file at one rate. `path_ops` stays off: the
+    /// suite runs under this, and its setup does not expect a
+    /// directory that cannot be made.
     pub fn all(per_mille: u16) Faults {
         return .{
             .read = per_mille,
@@ -196,6 +203,18 @@ pub const SimDisk = struct {
     ) _fs.Result(tag) {
         record(tag, args);
         self.wait(tag);
+        switch (tag) {
+            .open, .list, .set_mtime => if (self.pathFault(args.path))
+                return error.InputOutput,
+            // `create_dir_path` draws where it makes a directory.
+            .access, .delete_file, .delete_tree => {
+                if (self.pathFault(args)) return error.InputOutput;
+            },
+            // Either end in a tree that fails paths refuses the move.
+            .rename => if (self.pathFault(args.old_path) or
+                self.pathFault(args.new_path)) return error.InputOutput,
+            else => {},
+        }
         switch (tag) {
             .read => return self.read(args),
             .write => return self.write(args),
@@ -309,6 +328,15 @@ pub const SimDisk = struct {
         return .{};
     }
 
+    /// One draw at the `path_ops` rate in force at `path`, or for a name
+    /// still to be made at the directory it would go in. A path that
+    /// does not resolve draws nothing: the op fails by itself.
+    fn pathFault(self: *SimDisk, path: String) bool {
+        const place = self.placeOf(path) catch return false;
+        const at = place.dir.children.get(place.name) orelse place.dir;
+        return self.fault(faultsOf(at).path_ops);
+    }
+
     /// One draw at `per_mille`; none at all at zero, so a disk without
     /// faults draws the same durations as before faults existed.
     fn fault(self: *SimDisk, per_mille: u16) bool {
@@ -365,93 +393,27 @@ pub const SimDisk = struct {
     }
 
     fn crashFile(self: *SimDisk, node: *Node, mode: Crash) void {
-        self.crashPages(node, &node.data, mode);
+        self.crashPages(node, mode);
         self.dropOldPages(node);
     }
 
-    /// `data`, holding `node`'s visible bytes, becomes what a crash
-    /// leaves of the file: the synced size, and each dirty page's old
-    /// image unless `mode` lets the new one stand.
-    fn crashPages(
-        self: *SimDisk,
-        node: *const Node,
-        data: *std.ArrayList(u8),
-        mode: Crash,
-    ) void {
+    /// `node`'s visible bytes become what a crash leaves of the file:
+    /// the synced size, and each dirty page's old image unless `mode`
+    /// lets the new one stand.
+    fn crashPages(self: *SimDisk, node: *Node, mode: Crash) void {
         const rand = self.prng.random();
         // Grow to whole pages if short, so each saved image fits. The
         // copy below runs either way, and the last line sets the size.
         const full = pageEnd(node.durable_len);
-        if (data.items.len < full) self.resize(data, full);
+        if (node.data.items.len < full) self.resize(&node.data, full);
 
         var it = node.old_pages.iterator();
         while (it.next()) |kv| {
             if (mode == .lose_some and rand.boolean()) continue;
             const start = kv.key_ptr.* * page_size;
-            @memcpy(data.items[start..][0..page_size], kv.value_ptr.*);
+            @memcpy(node.data.items[start..][0..page_size], kv.value_ptr.*);
         }
-        self.resize(data, node.durable_len);
-    }
-
-    /// What a power cut now would leave of the directory `src`, as the
-    /// new directory `dst`. `src` and the handles into it are untouched:
-    /// the process that owns them cannot be killed mid-step, so it runs
-    /// on, shuts down in its own time, and whatever it does after this
-    /// instant is not in the copy a restart opens.
-    pub fn crashCopy(
-        self: *SimDisk,
-        src: String,
-        dst: String,
-        mode: Crash,
-    ) !void {
-        const from = try self.lookup(src);
-        if (from.kind != .directory) return error.NotDir;
-
-        const to = try self.placeOf(dst);
-        if (to.name.len == 0 or to.dir.children.get(to.name) != null)
-            return error.PathAlreadyExists;
-
-        const copy = try self.crashCopyOf(from, mode);
-        errdefer self.release(copy);
-        // Held here until the two names hold it.
-        copy.refs = 1;
-        copy.parent = to.dir;
-        try self.putName(&to.dir.children, to.name, copy);
-        errdefer self.removeName(&to.dir.children, to.name);
-        try self.putName(&to.dir.durable_children, to.name, copy);
-        self.release(copy);
-    }
-
-    /// A copy of `node` as a crash would leave it, in no directory yet:
-    /// durable names only, each file's bytes as `crashPages` leaves them.
-    fn crashCopyOf(
-        self: *SimDisk,
-        node: *const Node,
-        mode: Crash,
-    ) Allocator.Error!*Node {
-        const copy = try newNode(self.alloc, node.kind);
-        copy.refs = 1;
-        errdefer self.release(copy);
-        copy.mtime_ms = node.mtime_ms;
-        if (node.kind != .directory) {
-            try copy.data.appendSlice(self.alloc, node.data.items);
-            self.crashPages(node, &copy.data, mode);
-            copy.durable_len = node.durable_len;
-            copy.refs = 0;
-            return copy;
-        }
-        var it = node.durable_children.iterator();
-        while (it.next()) |kv| {
-            const child = try self.crashCopyOf(kv.value_ptr.*, mode);
-            child.refs = 1;
-            errdefer self.release(child);
-            child.parent = copy;
-            try self.putName(&copy.children, kv.key_ptr.*, child);
-            try self.putName(&copy.durable_children, kv.key_ptr.*, child);
-            self.release(child);
-        }
-        copy.refs = 0;
-        return copy;
+        self.resize(&node.data, node.durable_len);
     }
 
     // ───────────────────────── durability ─────────────────────────
@@ -729,6 +691,7 @@ pub const SimDisk = struct {
                 dir = child;
                 continue;
             }
+            if (self.fault(faultsOf(dir).path_ops)) return error.InputOutput;
             try self.makeDir(dir, name);
             dir = dir.children.get(name).?;
         }

@@ -453,6 +453,83 @@ test "diskwal: the writer retries through disk faults" {
     try std.testing.expectEqual(@as(?u64, 3), try ds2.term(40));
 }
 
+fn countFailure(ctx: *anyopaque) void {
+    const failures: *u32 = @ptrCast(@alignCast(ctx));
+    failures.* += 1;
+}
+
+test "diskwal: a write lands once the disk takes writes again" {
+    const disk = fiber.simDisk() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{
+        .write_retry_ms = 2000,
+    });
+    defer ds.deinit();
+    var failures: u32 = 0;
+    ds.onFailed(.{ .ctx = &failures, .call = countFailure });
+
+    // Every write fails for half a second, well inside the bound.
+    try disk.setFaults(wal_dir, .{ .write = 1000 });
+    try appendRange(alloc, &ds, 1, 8, 3);
+    fiber.sleepMs(500);
+    try std.testing.expectEqual(@as(u64, 0), ds.wal_store.buf.syncedIndex());
+    try disk.setFaults(wal_dir, .{});
+
+    try ds.sync();
+    try std.testing.expectEqual(@as(u64, 8), ds.wal_store.buf.syncedIndex());
+    try std.testing.expectEqual(@as(u32, 0), failures);
+}
+
+test "diskwal: a write that never lands fails the log, once" {
+    const disk = fiber.simDisk() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+
+    const retry_ms = 2000;
+    {
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{
+            .write_retry_ms = retry_ms,
+        });
+        defer ds.deinit();
+        var failures: u32 = 0;
+        ds.onFailed(.{ .ctx = &failures, .call = countFailure });
+        try appendRange(alloc, &ds, 1, 4, 3);
+        try ds.sync();
+
+        try disk.setFaults(wal_dir, .{ .write = 1000 });
+        const started = utils.coarseMs();
+        try appendRange(alloc, &ds, 5, 8, 3);
+        // Parked until the writer gives up, then woken with the error.
+        try std.testing.expectError(error.Unavailable, ds.sync());
+        const waited = utils.coarseMs() - started;
+        try std.testing.expect(waited >= retry_ms);
+        try std.testing.expect(waited < 2 * retry_ms);
+        try std.testing.expectEqual(@as(u32, 1), failures);
+
+        // The disk works again, and the log still takes no write: one
+        // past the dropped entries would leave a hole.
+        try disk.setFaults(wal_dir, .{});
+        try appendRange(alloc, &ds, 9, 10, 3);
+        try std.testing.expectError(error.Unavailable, ds.sync());
+        try std.testing.expectEqual(@as(u32, 1), failures);
+    }
+
+    // What was durable before the failure, and nothing after it.
+    var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
+    defer ds2.deinit();
+    try std.testing.expectEqual(@as(u64, 4), ds2.lastIndex());
+}
+
 test "diskwal drops malformed trailing wal files on reopen" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);

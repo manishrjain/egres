@@ -233,6 +233,7 @@ pub fn main(init: std.process.Init) !void {
 
     try fiber.spawnDetached(.{}, bootstrapAndStop, .{ allocator, argv });
     fiber_rt.run();
+    if (failed.load(.acquire)) return error.Failed;
 }
 
 /// Detached and never joined: parked in sleepMs at shutdown, freed by
@@ -264,8 +265,13 @@ fn bootstrapAndStop(allocator: std.mem.Allocator, argv: []const String) void {
     defer fiber.stop();
     bootstrap(allocator, argv) catch |err| {
         log.err("bootstrap failed: {s}", .{@errorName(err)});
+        failed.store(true, .release);
     };
 }
+
+/// Bootstrap returned an error, a node that stopped on a failure
+/// included: `main` exits non-zero.
+var failed = std.atomic.Value(bool).init(false);
 
 /// Scheduler knobs for A/B runs; the defaults are the measured-best
 /// settings. See zfiber.Runtime.steal_lone / prepark_poll_us.
@@ -280,6 +286,7 @@ const WalCfg = struct {
     log_file_bytes: u64 = 256 << 20,
     prezero: raft.diskwal.Prezero = .auto,
     max_spare_log_files: usize = 64,
+    write_retry_ms: u64 = 10_000,
 
     pub const docs = .{
         .self = "Raft WAL location and log files (see raft/diskwal.zig" ++
@@ -295,6 +302,8 @@ const WalCfg = struct {
             " snapshot drops them. Fewer are kept when fewer were needed" ++
             " since the last snapshot, none on an idle node. 0 = never" ++
             " reuse. Only with prezero.",
+        .write_retry_ms = "How long a failing log write is retried." ++
+            " Past it the node stops and the process exits non-zero.",
     };
 };
 
@@ -565,6 +574,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
             .log_file_size = wal_cfg.log_file_bytes,
             .prezero = wal_cfg.prezero,
             .max_spare_log_files = wal_cfg.max_spare_log_files,
+            .write_retry_ms = wal_cfg.write_retry_ms,
         },
         .raft = .{
             .id = raft_cfg.id,
@@ -609,6 +619,8 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     handle.join();
 
     log.info("shutting down...", .{});
+    // Read before the deferred teardown frees the node.
+    if (eng.node.shutdown.hasFailed()) return error.NodeFailed;
 }
 
 /// Drives the node lifecycle: bring up transport, (optionally) join the

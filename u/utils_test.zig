@@ -63,3 +63,17 @@ test "ChunkBuffer reset keeps chunks and refills from the start" {
     cb.copyTo(&got);
     try testing.expectEqualStrings("hello, chunks", &got);
 }
+
+test "logEvery: each call site has its own interval" {
+    const due = utils.logDue;
+    // A site's first call logs, whatever the clock reads.
+    try testing.expect(due("site a {d}", 30_000, 0));
+    try testing.expect(!due("site a {d}", 30_000, 30_000));
+    try testing.expect(due("site a {d}", 30_000, 30_001));
+    // Another site logging in between does not hold this one back,
+    // nor is it held back by it.
+    try testing.expect(due("site b {s}", 1_000, 30_002));
+    try testing.expect(due("site b {s}", 1_000, 31_003));
+    try testing.expect(!due("site a {d}", 30_000, 59_000));
+    try testing.expect(due("site a {d}", 30_000, 60_002));
+}

@@ -8,13 +8,19 @@
 //!
 //! Each writer owns its rows of one table, so a read of one has one
 //! right answer: the last write the writer saw acknowledged. A crash
-//! is a copy of the data directory as a power cut at that instant
-//! would leave it (`SimDisk.crashCopy`); the server that was running
-//! is stopped and a new one opens on the copy. There each writer's
-//! rows must read as its acknowledged statements, with or without the
+//! is a power cut under the data directory (`SimDisk.crash`): it shows
+//! what was durable at that instant, and every op on it fails from
+//! then on. The statements in flight fail or lose their connection,
+//! the server is stopped on its dead disk, the disk works again and a
+//! new server opens on the same directory. There each writer's rows
+//! must read as its acknowledged statements, with or without the
 //! whole transaction it had in flight: an acknowledged write gone, or
 //! half a transaction, fails the run. The rows read through the
 //! secondary index must be the same rows.
+//!
+//! At the end the WAL's disk stops taking writes: the statement then
+//! in flight must fail, the node must stop by itself once the log
+//! gives up, and a restart must have every acknowledged row.
 //!
 //! One sim seed is one workload and one schedule:
 //! `zig build test -- --sim-seed N --filter "sim: sql"`.
@@ -64,7 +70,22 @@ const snapshot_cfg: engine.SnapshotCfg = .{
 const wal_opts: raft.diskwal.OpenOptions = .{
     .log_file_size = raft.diskwal.log_file_offset + (2 << 20),
     .max_spare_log_files = 2,
+    .write_retry_ms = retry_ms,
 };
+const retry_ms = 2000;
+
+/// A disk that fails every op, on a file or by path.
+const dead_disk: fiber.simdisk.Faults = .{
+    .read = 1000,
+    .write = 1000,
+    .sync = 1000,
+    .set_size = 1000,
+    .path_ops = 1000,
+};
+
+/// True from a crash until the disk works again. A statement that
+/// fails meanwhile is the crash's, not a failed run.
+var disk_down = false;
 
 /// One boot of the server on a data directory: the store and the flags
 /// `egres/main.zig` hands to `Engine.open`, then its calls in its
@@ -181,8 +202,8 @@ fn connect(alloc: std.mem.Allocator) !pgwire.Client {
     return error.ServerNeverListened;
 }
 
-/// One statement and its reply. No statement here is one a healthy
-/// server may refuse: a refusal fails the run.
+/// One statement and its reply. No statement here is one a server
+/// on a working disk may refuse: a refusal there fails the run.
 fn ask(
     client: *pgwire.Client,
     arloc: std.mem.Allocator,
@@ -190,7 +211,7 @@ fn ask(
 ) !pgwire.client.Reply {
     const reply = try client.query(arloc, text);
     const refused = reply.err orelse return reply;
-    log.err("{s} {s}: {s}", .{
+    if (!disk_down) log.err("{s} {s}: {s}", .{
         &refused.code,
         refused.message,
         text[0..@min(text.len, 100)],
@@ -256,10 +277,8 @@ const Writer = struct {
     /// What the server acknowledged.
     acked: Rows = @splat(null),
     /// The statement or transaction sent and not yet acknowledged.
+    /// Left as it is by a step that failed.
     pending: std.ArrayList(Write) = .empty,
-    /// `acked` and `pending` at the instant of the crash copy.
-    crash_acked: Rows = @splat(null),
-    crash_pending: std.ArrayList(Write) = .empty,
     ops: u64 = 0,
     /// Crashes that kept what was in flight.
     kept_in_flight: u32 = 0,
@@ -267,7 +286,6 @@ const Writer = struct {
 
     fn deinit(self: *Writer) void {
         self.pending.deinit(self.alloc);
-        self.crash_pending.deinit(self.alloc);
     }
 
     /// The writer's fiber: one session of statements until `stop`.
@@ -281,7 +299,12 @@ const Writer = struct {
         self.client = try connect(self.alloc);
         defer self.client.close();
         while (!stop.*) {
-            try self.step();
+            self.step() catch |err| {
+                // The crash took the step in flight: an error, or the
+                // connection gone. `recover` decides what became of it.
+                if (disk_down) return;
+                return err;
+            };
             self.ops += 1;
         }
     }
@@ -475,10 +498,12 @@ const Writer = struct {
         return found;
     }
 
-    /// After a restart on a crash copy: the rows must read as they
-    /// were acknowledged at the crash, or as that plus the whole of
-    /// what was then in flight. What is found is what the writer
-    /// carries on from.
+    /// After a restart on the crashed disk: the rows must read as
+    /// they were acknowledged, or as that plus the whole of what the
+    /// crash failed in flight. An acknowledgement read after the crash
+    /// counts as any other: the dead disk took no commit, so the
+    /// server made that one durable before it. What is found is what
+    /// the writer carries on from.
     fn recover(self: *Writer) !void {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
@@ -486,12 +511,12 @@ const Writer = struct {
         defer self.client.close();
 
         const found = try self.readAll(arena.allocator());
-        var with_pending = self.crash_acked;
-        apply(&with_pending, self.crash_pending.items);
+        var with_pending = self.acked;
+        apply(&with_pending, self.pending.items);
 
-        const moved = !std.meta.eql(found, self.crash_acked);
+        const moved = !std.meta.eql(found, self.acked);
         if (moved and !std.meta.eql(found, with_pending)) {
-            for (found, self.crash_acked, with_pending, 0..) |got, a, b, row| {
+            for (found, self.acked, with_pending, 0..) |got, a, b, row| {
                 if (std.meta.eql(got, a) and std.meta.eql(got, b)) continue;
                 log.err(
                     "writer {d} row {d}: found {?d}, acked {?d}," ++
@@ -504,6 +529,21 @@ const Writer = struct {
         if (moved) self.kept_in_flight += 1;
         self.acked = found;
         self.pending.clearRetainingCapacity();
+    }
+
+    /// One write to a server whose log takes no write: it must come
+    /// back failed, as an error or a closed connection, and the rows
+    /// stay as they were acknowledged.
+    fn refusedWrite(self: *Writer) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const arloc = arena.allocator();
+        self.client = try connect(self.alloc);
+        defer self.client.close();
+
+        const st = try self.statement(arloc, self.draw(0));
+        const reply = self.client.query(arloc, st.text) catch return;
+        if (reply.err == null) return error.AcknowledgedWithoutLog;
     }
 
     /// After a clean stop and a restart: every acknowledged write.
@@ -594,22 +634,18 @@ fn runWriters(
 }
 
 const CrashAt = struct {
-    alloc: std.mem.Allocator,
     disk: *fiber.simdisk.SimDisk,
-    writers: []Writer,
-    from: String,
-    to: String,
+    dir: String,
     mode: fiber.simdisk.Crash,
 
-    /// The copy and what each writer had acknowledged and in flight,
-    /// taken in one step of this fiber: no write lands between them.
+    /// The power cut. The disk stays dead for the server still
+    /// running on it, so nothing that server does from here is there
+    /// after a restart. The caller stops the writers in the same step
+    /// of its fiber: none starts a statement the crash did not see.
     fn take(self: *const CrashAt) anyerror!void {
-        try self.disk.crashCopy(self.from, self.to, self.mode);
-        for (self.writers) |*w| {
-            w.crash_acked = w.acked;
-            w.crash_pending.clearRetainingCapacity();
-            try w.crash_pending.appendSlice(self.alloc, w.pending.items);
-        }
+        self.disk.crash(self.dir, self.mode);
+        try self.disk.setFaults(self.dir, dead_disk);
+        disk_down = true;
     }
 };
 
@@ -634,44 +670,32 @@ test "sim: sql keeps acknowledged statements across crashes" {
     };
     defer for (&writers) |*w| w.deinit();
 
-    // One data directory per boot; each crash copies the last into
-    // the next.
-    var dirs: std.ArrayList([]u8) = .empty;
-    defer {
-        for (dirs.items) |d| alloc.free(d);
-        dirs.deinit(alloc);
-    }
-    try dirs.ensureTotalCapacity(alloc, crashes + 1);
-    for (0..crashes + 1) |boot| dirs.appendAssumeCapacity(
-        try std.fmt.allocPrint(alloc, "{s}/boot{d}", .{ tmp.path, boot }),
-    );
-    var dir: String = dirs.items[0];
+    const dir = try std.fmt.allocPrint(alloc, "{s}/data", .{tmp.path});
+    defer alloc.free(dir);
     // Null between a close and the open that follows it.
     var booted: ?*Instance = try Instance.open(alloc, dir);
     defer if (booted) |inst| inst.close();
 
     try createTable(alloc);
 
-    for (1..crashes + 1) |boot| {
-        const next: String = dirs.items[boot];
+    for (0..crashes) |_| {
         const crash: CrashAt = .{
-            .alloc = alloc,
             .disk = disk,
-            .writers = &writers,
-            .from = dir,
-            .to = next,
+            .dir = dir,
             .mode = if (fiber.random().boolean()) .lose_all else .lose_some,
         };
         const ms = 300 + fiber.random().uintLessThan(u64, 2500);
         try runWriters(alloc, &writers, ms, &crash, CrashAt.take);
         try firstFailure(&writers);
 
-        // The server that was running stops in its own time; nothing
-        // it does from here is in the copy.
+        // The server runs on for a while on its dead disk, long enough
+        // one time in two for the log to give up, and is stopped
+        // there. Then the disk works again.
+        fiber.sleepMs(fiber.random().uintLessThan(u64, 2 * retry_ms));
         booted.?.close();
         booted = null;
-        try vfs.deleteTree(dir);
-        dir = next;
+        try disk.setFaults(dir, .{});
+        disk_down = false;
         booted = try Instance.open(alloc, dir);
         for (&writers) |*w| try w.recover();
     }
@@ -683,6 +707,24 @@ test "sim: sql keeps acknowledged statements across crashes" {
     booted = null;
     booted = try Instance.open(alloc, dir);
     for (&writers) |*w| try w.expectAcked();
+
+    // The WAL's disk stops taking writes. The statement in flight
+    // fails once the log gives up, the node stops by itself, and a
+    // restart on a disk that works has every acknowledged row.
+    const wal_dir = try std.fmt.allocPrint(alloc, "{s}/wal", .{dir});
+    defer alloc.free(wal_dir);
+    try disk.setFaults(wal_dir, .{ .write = 1000 });
+    const started = utils.coarseMs();
+    try writers[0].refusedWrite();
+    const waited = utils.coarseMs() - started;
+    try testing.expect(waited < 2 * retry_ms);
+    try testing.expect(booted.?.eng.node.shutdown.hasFailed());
+    booted.?.close();
+    booted = null;
+    try disk.setFaults(wal_dir, .{});
+    booted = try Instance.open(alloc, dir);
+    for (&writers) |*w| try w.expectAcked();
+
     var ops: u64 = 0;
     var kept: u32 = 0;
     for (writers) |w| {

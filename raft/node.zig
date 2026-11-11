@@ -398,6 +398,7 @@ pub const Node = struct {
         node.proposal_ch = try fiber.Channel(ProposalRequest).initAlloc(allocator, proposal_queue_capacity);
         node.apply_waiters = try fiber.Channel(*ProposalWaiter).initAlloc(allocator, 1024);
         node.log.on_written = .{ .ctx = node, .call = onWritten };
+        node.log.onFailed(.{ .ctx = node, .call = onLogFailed });
         node.inbound_ch = try fiber.Channel(InboundMsg).initAlloc(allocator, 1024);
         node.shutdown = fiber.Shutdown.init(allocator);
         errdefer allocator.destroy(node);
@@ -2119,6 +2120,13 @@ pub const Node = struct {
         tl.recordRange(written.first_index, written.last_index, .write_start, written.started_us);
         tl.recordRange(written.first_index, written.last_index, .write_end, written.done_us);
         self.event_notify.notify();
+    }
+
+    /// The log gave up on a write, so nothing more can be made
+    /// durable: the node stops, and the proposals in flight fail.
+    fn onLogFailed(ctx: *anyopaque) void {
+        const self: *Node = @ptrCast(@alignCast(ctx));
+        self.shutdown.fail();
     }
 
     /// The timeline's clock: monotonic microseconds, since it only

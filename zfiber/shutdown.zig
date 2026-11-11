@@ -64,6 +64,9 @@ pub const Shutdown = struct {
     active_ctxs: std.atomic.Value(u32) = .init(0),
     wm: _watermark.Watermark,
     watcher: ?_rt.JoinHandle(void) = null,
+    /// The stop was started by a failure, not a request: the binary
+    /// exits non-zero.
+    failed: std.atomic.Value(bool) = .init(false),
 
     pub const Stage = enum(u8) { running, draining, stopping };
 
@@ -91,6 +94,16 @@ pub const Shutdown = struct {
     pub fn startShutdown(self: *Shutdown) void {
         self.stage.store(@intFromEnum(Stage.stopping), .seq_cst);
         self.wm.close();
+    }
+
+    /// A fatal path's `startShutdown`: the process cannot go on.
+    pub fn fail(self: *Shutdown) void {
+        self.failed.store(true, .release);
+        self.startShutdown();
+    }
+
+    pub fn hasFailed(self: *const Shutdown) bool {
+        return self.failed.load(.acquire);
     }
 
     /// Begin the drain stage: `isDraining` flips and a `.drain` waiter

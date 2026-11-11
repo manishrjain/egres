@@ -506,6 +506,63 @@ test "simdisk: each fault surfaces as the kernel's error would" {
     try std.testing.expectEqual(@as(u64, 10), (try d.apply(.stat, g)).size);
 }
 
+test "simdisk: the path_ops rate refuses every op that takes a path" {
+    const alloc = std.testing.allocator;
+    var d = try SimDisk.init(alloc, 7);
+    defer d.deinit();
+    try d.apply(.create_dir_path, "/data/node/sub");
+    try d.apply(.create_dir_path, "/data/other");
+    const f = try open(&d, "/data/node/a", rdwr_creat);
+    _ = try write(&d, f, "kept", 0);
+    try sync(&d, f);
+    try syncDir(&d, "/data/node");
+
+    try d.setFaults("/data/node", .{ .path_ops = 1000 });
+    const io = error.InputOutput;
+    const expectError = std.testing.expectError;
+    try expectError(io, open(&d, "/data/node/a", rdonly));
+    try expectError(io, open(&d, "/data/node/new", rdwr_creat));
+    try expectError(io, syncDir(&d, "/data/node"));
+    try expectError(io, d.apply(.access, "/data/node/a"));
+    try expectError(io, d.apply(.delete_file, "/data/node/a"));
+    try expectError(io, d.apply(.create_dir_path, "/data/node/sub/deep"));
+    try expectError(io, d.apply(.create_dir_path, "/data/node/x/y"));
+    // Nothing to make, nothing refused.
+    try d.apply(.create_dir_path, "/data/node/sub");
+    try expectError(io, d.apply(.delete_tree, "/data/node/sub"));
+    try expectError(io, d.apply(.delete_tree, "/data/node"));
+    try expectError(
+        io,
+        d.apply(.list, .{ .alloc = alloc, .path = "/data/node" }),
+    );
+    // Out of the tree and into it.
+    try expectError(io, d.apply(.rename, .{
+        .old_path = "/data/node/a",
+        .new_path = "/data/other/a",
+    }));
+    d.apply(.close, try open(&d, "/data/other/b", rdwr_creat));
+    try expectError(io, d.apply(.rename, .{
+        .old_path = "/data/other/b",
+        .new_path = "/data/node/b",
+    }));
+    // The rate is the tree's alone, and an open file is not a path.
+    try d.apply(.access, "/data/other/b");
+    _ = try d.apply(.stat, f);
+    d.apply(.close, f);
+
+    // With the rate off the tree is as it was.
+    try d.setFaults("/data/node", .{});
+    try expectFile(&d, "/data/node/a", "kept");
+    const entries = try d.apply(.list, .{
+        .alloc = alloc,
+        .path = "/data/node",
+    });
+    defer fs.freeEntries(alloc, entries);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("a", entries[0].name);
+    try std.testing.expectEqualStrings("sub", entries[1].name);
+}
+
 test "simdisk: a short write on an O_DIRECT handle is whole pages" {
     // macOS has no O_DIRECT to open the handle with.
     if (!@hasField(std.posix.O, "DIRECT")) return error.SkipZigTest;

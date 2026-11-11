@@ -1080,6 +1080,21 @@ pub const Engine = struct {
         }
     }
 
+    /// What the flush loop and the compaction loops wait after a failed
+    /// job, from the first, doubling per failure in a row, up to the
+    /// second. A job that failed on a full disk, a table that cannot
+    /// be read or a store that returns errors fails again at once, and
+    /// every attempt rebuilds the whole job. Short, since frozen
+    /// memtables and a deep L0 brake writes.
+    const retry_min_ms: u64 = 250;
+    const retry_max_ms: u64 = 3000;
+
+    /// The wait after one more failure; `retry_ms` is the wait the
+    /// last one got, 0 after a success.
+    fn nextRetryMs(retry_ms: u64) u64 {
+        return @min(@max(retry_ms * 2, retry_min_ms), retry_max_ms);
+    }
+
     /// Leader-only. A flush covers every frozen memtable waiting at that
     /// moment (`Forest.buildFlush`), so holding off lets them accumulate:
     /// each tree gets one larger L0 table in place of several small ones.
@@ -1091,11 +1106,6 @@ pub const Engine = struct {
         // stalls writes.
         fiber.ctx().class = .fg;
         const interval: u64 = 200;
-        // After a failure the next attempt waits, doubling up to this:
-        // a flush that failed on a full disk or an unreachable store
-        // fails again at once, and every attempt rebuilds the whole
-        // job. Short, since frozen memtables brake writes.
-        const max_retry_ms: u64 = 3000;
         var retry_ms: u64 = 0;
         var last_flush_ms: ?i64 = null;
         while (!self.node.isShuttingDown()) {
@@ -1107,7 +1117,7 @@ pub const Engine = struct {
             if (self.proposeFlush()) |_| {
                 retry_ms = 0;
             } else |err| {
-                retry_ms = @min(@max(retry_ms * 2, 250), max_retry_ms);
+                retry_ms = nextRetryMs(retry_ms);
                 utils.logEvery(.err, 30, "proposeFlush failed: {s}; " ++
                     "retrying in {d} ms", .{ @errorName(err), retry_ms });
                 if (self.node.shutdown.waitForStart(.shutdown, retry_ms))
@@ -1152,6 +1162,7 @@ pub const Engine = struct {
     // overlapping levels of one tree.
     fn runLevelsLoop(self: *Engine) void {
         const interval: u64 = 500;
+        var retry_ms: u64 = 0;
         while (!self.node.isShuttingDown()) {
             if (!self.node.isLeader()) {
                 if (self.node.shutdown.waitForStart(.shutdown, interval))
@@ -1163,48 +1174,54 @@ pub const Engine = struct {
                     return;
                 continue;
             };
-            defer job.tree.release();
-            defer job.tree.releaseJob(job.cand);
-            // The job is the tree's database's work, charged to its
-            // tenant, by the fibers the build spawns too. The class is
-            // the job's: foreground from L0, as the partitions run.
-            const ctx = fiber.ctx();
-            ctx.tenant = fiber.meter.tenants.get(
-                job.key.namespace,
-                utils.coarseMs(),
-            ) catch &fiber.meter.shared;
-            ctx.class = zdb.compaction.classFor(job.cand.level);
-
-            defer {
-                ctx.tenant = &fiber.meter.shared;
-                ctx.class = .fg;
-            }
-            // The candidate's job is a split when the tree has outgrown
-            // `Config.splitBytes`, its Lmax target plus the levels above
-            // it. updateCompactCandidate sets this in the apply path
-            // (after every compaction/flush), so the dispatch here
-            // always reflects the latest applied state — no separate
-            // polling for splits is needed.
-            if (job.cand.job == .split) {
-                self.proposeSplit(job.key) catch |err| {
-                    log.err("proposeSplit failed for tree {d}: {s}", .{
-                        job.key.tree_id, @errorName(err),
-                    });
-                };
-            } else {
-                self.proposeCompaction(job) catch |err| {
-                    // A job that outlives the proposal queue is redone
-                    // after the restart; only a live node has failed.
-                    if (self.node.isShuttingDown()) {
-                        log.info("compaction result dropped at shutdown", .{});
-                    } else {
-                        log.err("proposeCompaction failed: {s}", .{
-                            @errorName(err),
-                        });
-                    }
-                };
+            const kind = @tagName(job.cand.job);
+            if (self.runJob(job)) |_| {
+                retry_ms = 0;
+            } else |err| {
+                // A job that outlives the proposal queue is redone
+                // after the restart; only a live node has failed.
+                if (self.node.isShuttingDown()) {
+                    log.info("{s} dropped at shutdown", .{kind});
+                    return;
+                }
+                retry_ms = nextRetryMs(retry_ms);
+                utils.logEvery(.err, 30, "{s} of tree {d} failed: {s}; " ++
+                    "next job in {d} ms", .{
+                    kind, job.key.tree_id, @errorName(err), retry_ms,
+                });
+                if (self.node.shutdown.waitForStart(.shutdown, retry_ms))
+                    return;
             }
         }
+    }
+
+    /// One job to its end, where the tree and the job's levels are
+    /// released: a wait after a failure holds neither.
+    fn runJob(self: *Engine, job: TakenJob) !void {
+        defer job.tree.release();
+        defer job.tree.releaseJob(job.cand);
+        // The job is the tree's database's work, charged to its
+        // tenant, by the fibers the build spawns too. The class is
+        // the job's: foreground from L0, as the partitions run.
+        const ctx = fiber.ctx();
+        ctx.tenant = fiber.meter.tenants.get(
+            job.key.namespace,
+            utils.coarseMs(),
+        ) catch &fiber.meter.shared;
+        ctx.class = zdb.compaction.classFor(job.cand.level);
+
+        defer {
+            ctx.tenant = &fiber.meter.shared;
+            ctx.class = .fg;
+        }
+        // The candidate's job is a split when the tree has outgrown
+        // `Config.splitBytes`, its Lmax target plus the levels above
+        // it. updateCompactCandidate sets this in the apply path
+        // (after every compaction/flush), so the dispatch here
+        // always reflects the latest applied state — no separate
+        // polling for splits is needed.
+        if (job.cand.job == .split) return self.proposeSplit(job.key);
+        return self.proposeCompaction(job);
     }
 
     /// A job taken from a tree, held with a reference to the tree until

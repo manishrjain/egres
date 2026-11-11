@@ -343,7 +343,7 @@ pub const wal = struct {
                 .cache = entry_cache,
                 .opts = settled,
                 .next = next_log,
-                .buf = LogBuf.init(alloc),
+                .buf = LogBuf.init(alloc, opts.write_retry_ms),
             };
         }
 
@@ -446,7 +446,7 @@ pub const wal = struct {
             .cache = entry_cache,
             .opts = settled,
             .next = next_log,
-            .buf = LogBuf.init(alloc),
+            .buf = LogBuf.init(alloc, opts.write_retry_ms),
         };
     }
 
@@ -912,6 +912,12 @@ pub const DiskWAL = struct {
         ctx: *anyopaque,
         call: *const fn (*anyopaque, Written) void,
     };
+
+    /// `hook` is called once, should a log write be given up on
+    /// (`LogBuf.fail`): the log takes no write from then on.
+    pub fn onFailed(self: *DiskWAL, hook: LogBuf.FailedHook) void {
+        self.wal_store.buf.on_failed = hook;
+    }
 
     pub fn openPath(
         path: String,
