@@ -173,15 +173,61 @@ pub const Sim = struct {
         self.trace.update(std.mem.asBytes(&at_ms));
     }
 
-    /// One disk or network op into the trace: which op (`kind`) and the
-    /// numbers that tell two of them apart, a handle, an offset, a
-    /// length. Without it two runs whose fibers ran in the same order
-    /// share a hash though one wrote more bytes than the other, and the
-    /// difference shows only in the rare run where it moves the
+    /// One disk or network op into the trace: which op (`kind`) and
+    /// its arguments. Without it two runs whose fibers ran in the same
+    /// order share a hash though one wrote other bytes than the other,
+    /// and the difference shows only in the rare run where it moves the
     /// schedule.
-    pub fn recordOp(self: *Sim, kind: String, nums: []const u64) void {
+    pub fn recordOp(self: *Sim, comptime kind: String, args: anytype) void {
         self.trace.update(kind);
-        self.trace.update(std.mem.sliceAsBytes(nums));
+        self.recordValue(args);
+    }
+
+    /// `v` into the trace, by its type: a number by its value, constant
+    /// bytes by their content (a path, a write's data), a buffer to
+    /// fill by its length, a struct field by field. Never an address,
+    /// which differs from run to run, and never a struct's raw bytes,
+    /// whose padding is undefined. A type with no rule here does not
+    /// compile.
+    fn recordValue(self: *Sim, v: anytype) void {
+        const T = @TypeOf(v);
+        switch (T) {
+            // Says where memory comes from, not what the op does.
+            std.mem.Allocator => return,
+            xev.TCP => return self.recordValue(v.fd),
+            // One host: an address is its port.
+            std.Io.net.IpAddress => return self.recordValue(v.getPort()),
+            else => {},
+        }
+        switch (@typeInfo(T)) {
+            .int => {
+                // Widened: an odd width has padding bits.
+                const wide: i128 = v;
+                self.trace.update(std.mem.asBytes(&wide));
+            },
+            .bool => self.recordValue(@intFromBool(v)),
+            .@"enum" => self.recordValue(@intFromEnum(v)),
+            .pointer => |ptr| {
+                if (ptr.size != .slice)
+                    @compileError("recordOp: an address: " ++ @typeName(T));
+                // The length first: it keeps two slices in a row apart.
+                self.recordValue(v.len);
+                if (ptr.child != u8) {
+                    for (v) |item| self.recordValue(item);
+                } else if (ptr.is_const) {
+                    self.trace.update(v);
+                }
+            },
+            .@"struct" => |info| {
+                if (info.backing_integer) |Int|
+                    return self.recordValue(@as(Int, @bitCast(v)));
+                inline for (info.fields) |field|
+                    self.recordValue(@field(v, field.name));
+            },
+            // A slot for the op's result: nothing in it yet.
+            .error_union => {},
+            else => @compileError("recordOp: no rule for " ++ @typeName(T)),
+        }
     }
 
     /// The trace so far. Two runs of one seed must agree.

@@ -77,8 +77,7 @@ const String = []const u8;
 const ns: u64 = 7;
 
 const ApplyFixture = struct {
-    tmp: std.testing.TmpDir,
-    dir_path: [:0]u8,
+    tmp: zdb.vfs.TmpDir,
     live: *flags.Live(zdb.config.Config),
     store: *zdb.vfs.Store,
     forest: *Forest,
@@ -95,15 +94,13 @@ const ApplyFixture = struct {
     fn setup(self: *ApplyFixture, oldest_memtable_index: u64) !void {
         const alloc = testing.allocator;
         self.wal = .empty;
-        self.tmp = std.testing.tmpDir(.{});
-        errdefer self.tmp.cleanup();
-        self.dir_path = try zdb.vfs.tmpDirPath(alloc, &self.tmp);
-        errdefer alloc.free(self.dir_path);
+        self.tmp = try zdb.vfs.TmpDir.init(alloc);
+        errdefer self.tmp.deinit();
         self.store = try alloc.create(zdb.vfs.Store);
         errdefer alloc.destroy(self.store);
         self.store.* = try zdb.vfs.Store.initFile(
             alloc,
-            self.dir_path,
+            self.tmp.path,
             zdb.vfs.g(),
         );
         errdefer self.store.deinit();
@@ -141,8 +138,7 @@ const ApplyFixture = struct {
         self.live.destroy();
         self.store.deinit();
         alloc.destroy(self.store);
-        alloc.free(self.dir_path);
-        self.tmp.cleanup();
+        self.tmp.deinit();
     }
 
     fn apply(

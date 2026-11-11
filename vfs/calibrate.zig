@@ -272,15 +272,14 @@ fn worker(
     defer a.free(buf);
     @memset(buf, 0xA5);
 
-    // Seeded from the worker's PRNG: the OS's seed in production, the
-    // run's under a simulation, where two runs read the same pages.
-    var prng = std.Random.DefaultPrng.init(fiber.random().int(u64));
-    const rand = prng.random();
     const pages = (_lookahead.probe_max - request_size) / _vfs.page_size;
 
     var bytes: u64 = 0;
     while (!stop.load(.acquire)) {
-        const off = rand.uintAtMost(u64, pages) * _vfs.page_size;
+        // A fresh handle per draw: it is the worker's, and this fiber
+        // parks on every read below.
+        const off = fiber.random().uintAtMost(u64, pages) *
+            _vfs.page_size;
         var done: usize = 0;
         while (done < size) {
             const n = switch (kind) {

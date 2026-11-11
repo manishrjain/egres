@@ -125,30 +125,10 @@ pub const SimNet = struct {
         }
     }
 
-    /// The op into the run's trace (`Sim.recordOp`): its socket, and
-    /// the port or the length asked for.
+    /// The op into the run's trace.
     fn record(comptime tag: Op.Tag, args: Op.Args(tag)) void {
         const sim = _rt.runtime().simState().?;
-        const kind = "net." ++ @tagName(tag);
-        switch (tag) {
-            .listen => sim.recordOp(kind, &.{args.addr.inner.getPort()}),
-            .connect => sim.recordOp(kind, &.{args.inner.getPort()}),
-            .accept, .close_server => sim.recordOp(kind, &.{fdOf(args.tcp)}),
-            .read => sim.recordOp(kind, &.{
-                fdOf(args.stream.tcp), args.buf.len,
-            }),
-            .write => sim.recordOp(kind, &.{
-                fdOf(args.stream.tcp), args.data.len,
-            }),
-            .shutdown => sim.recordOp(kind, &.{
-                fdOf(args.stream.tcp), @intFromEnum(args.how),
-            }),
-            .close => sim.recordOp(kind, &.{fdOf(args.tcp)}),
-        }
-    }
-
-    fn fdOf(tcp: xev.TCP) u64 {
-        return @intCast(tcp.fd);
+        sim.recordOp("net." ++ @tagName(tag), args);
     }
 
     /// Park for what `tag` takes on the wire, 0 or 1 virtual ms. 0 ms

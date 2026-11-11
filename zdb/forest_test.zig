@@ -146,10 +146,9 @@ test "forest: route table multi-entry" {
 
 test "forest: open close empty" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -167,10 +166,9 @@ test "forest: open close empty" {
 
 test "forest: create tree and get" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -226,10 +224,9 @@ fn buildAndWriteTable(
 
 test "forest: split tree" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     // findSplitKey now requires Lmax to have ≥ 10 tables and pulls
     // candidates from there. Install 10 single-key SSTs ("k01"…"k10")
@@ -327,10 +324,9 @@ fn buildAndWriteTableKV(
 
 test "forest: two-level routing isolates by table_id" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -410,10 +406,9 @@ test "forest: two-level routing isolates by table_id" {
 
 test "forest: create_tree + drop_tree round-trip" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -478,10 +473,9 @@ test "forest: create_tree + drop_tree round-trip" {
 
 test "forest: drop_ns removes every table and forgets the id counter" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -581,10 +575,9 @@ test "forest: drop_ns removes every table and forgets the id counter" {
 
 test "forest: drop_tree keeps an SST shared with another tree" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -660,10 +653,9 @@ test "forest: drop_tree keeps an SST shared with another tree" {
 
 test "forest: buildTables allocates and never reuses a dropped id" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -714,10 +706,9 @@ test "forest: buildTables allocates and never reuses a dropped id" {
 
 test "forest: buildNsCreate allocates global namespace ids" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -806,10 +797,9 @@ fn expectRow(
 
 test "forest: branch_ns shares the files and forks the memtables as of its ts" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
     defer f_live.destroy();
@@ -976,10 +966,9 @@ fn expectTableRow(
 
 test "forest: branch_table shares files and forks memtables as of its ts" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
     defer f_live.destroy();
@@ -1128,10 +1117,9 @@ test "forest: branch_table shares files and forks memtables as of its ts" {
 
 test "forest: ns_create installs default + catalog trees, idempotent re-apply" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -1173,10 +1161,9 @@ test "forest: ns_create installs default + catalog trees, idempotent re-apply" {
 
 test "forest: table names — create registers, duplicate rejects, drop frees" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -1242,10 +1229,9 @@ test "forest: table names — create registers, duplicate rejects, drop frees" {
 
 test "forest: snapshot manifest round-trip" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     // Phase 1: build source forest with content + serialize manifest.
     const ak = try (Key{ .namespace = 42, .primary = "a" }).marshal(alloc);
@@ -1491,10 +1477,9 @@ test "forest: getIterators outlives a concurrent flush+pop" {
 
 test "forest: routes to correct tree" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -1535,10 +1520,9 @@ fn beKey(egid: u64) [8]u8 {
 
 test "forest: maxKey finds the largest row id (memtable), or null when empty" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -1596,10 +1580,9 @@ test "forest: maxKey finds the largest row id (memtable), or null when empty" {
 
 test "forest: maxKey counts a tombstoned max key" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -1658,10 +1641,9 @@ test "forest: maxKey counts a tombstoned max key" {
 
 test "forest: meta survives put, flush to L0, compaction, and get" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{
         .lmax_target_bytes = push_lmax,
@@ -1770,10 +1752,9 @@ test "forest: meta survives put, flush to L0, compaction, and get" {
 
 test "forest: a tombstone reads as absent" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -1830,10 +1811,9 @@ test "forest: a tombstone reads as absent" {
 
 test "forest: snapshotTs rejects older reads and only moves forward" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -1877,10 +1857,9 @@ test "forest: snapshotTs rejects older reads and only moves forward" {
 
 test "forest: a bottom-level compaction discards under the read floor" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     // Two levels, so L0->L1 is the bottom and may discard.
     const f_live = try flags.Live(Config).create(
@@ -2030,10 +2009,9 @@ fn runScan(
 
 test "scan: by default emits one version per key and hides deleted keys" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -2060,10 +2038,9 @@ test "scan: by default emits one version per key and hides deleted keys" {
 
 test "scan: num_versions returns extra versions but still stops at a tombstone" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -2097,10 +2074,9 @@ test "scan: num_versions returns extra versions but still stops at a tombstone" 
 
 test "scan: include_deleted surfaces tombstones and the versions behind them" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -2140,10 +2116,9 @@ test "scan: include_deleted surfaces tombstones and the versions behind them" {
 
 test "scan: num_versions caps deleted runs too" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -2174,10 +2149,9 @@ test "scan: num_versions caps deleted runs too" {
 
 test "scan: num_versions 0 behaves as 1 rather than returning nothing" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -2197,10 +2171,9 @@ test "scan: num_versions 0 behaves as 1 rather than returning nothing" {
 
 test "scan: max_rows bounds emitted items, not versions walked" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -2224,10 +2197,9 @@ test "scan: max_rows bounds emitted items, not versions walked" {
 
 test "scan: read_ts reports the world as of that timestamp" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -2267,10 +2239,9 @@ test "scan: read_ts reports the world as of that timestamp" {
 
 test "scan: min_ts emits only what changed after it" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -2367,10 +2338,9 @@ test "scan: min_ts emits only what changed after it" {
 
 test "scan: versions above read_ts do not consume num_versions" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -2399,10 +2369,9 @@ test "scan: versions above read_ts do not consume num_versions" {
 
 test "scan: read_ts at the delete sees the key as gone" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -2425,10 +2394,9 @@ test "scan: read_ts at the delete sees the key as gone" {
 
 test "scan: rejects a read_ts below snapshotTs" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -2504,10 +2472,9 @@ fn expectCursorMatchesScan(
 
 test "cursor: agrees with scan under every option" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -2540,10 +2507,9 @@ test "cursor: agrees with scan under every option" {
 
 test "cursor: null is sticky and emitted counts hand-outs" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -2586,10 +2552,9 @@ test "cursor: null is sticky and emitted counts hand-outs" {
 
 test "cursor: max_rows 0 opens exhausted without the min-read check" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -2638,10 +2603,9 @@ test "cursor: max_rows 0 opens exhausted without the min-read check" {
 
 test "cursor: deinit mid-walk releases the sources" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -2671,10 +2635,9 @@ test "cursor: deinit mid-walk releases the sources" {
 
 test "cursor: a flush between two next calls does not disturb the walk" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -2731,10 +2694,9 @@ test "cursor: a flush between two next calls does not disturb the walk" {
 
 test "cursor: pin_values holds handed-out values until releasePins" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -2888,10 +2850,9 @@ fn seedSplitForest(alloc: std.mem.Allocator, f: *Forest) !void {
 
 test "cursor: a split applied by another fiber mid-walk loses and repeats nothing" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -2944,10 +2905,9 @@ test "cursor: a split applied by another fiber mid-walk loses and repeats nothin
 
 test "split: a reader holding the old tree keeps its full range until it lets go" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -2987,10 +2947,9 @@ test "split: a reader holding the old tree keeps its full range until it lets go
 
 test "cursor: hops across a split like scan does" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -3024,10 +2983,9 @@ test "cursor: hops across a split like scan does" {
 
 test "cursor: reverse hops across a split from the upper tree down" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -3166,10 +3124,9 @@ const roar = struct {
 
 test "forest: getBitmap folds deltas from memtable, L0, and history" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -3215,10 +3172,9 @@ test "forest: getBitmap folds deltas from memtable, L0, and history" {
 
 test "forest: getBitmap tombstone resets, absent key is empty" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -3256,10 +3212,9 @@ test "forest: getBitmap tombstone resets, absent key is empty" {
 
 test "forest: rollup is read-invariant across flush and compactions" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{
         .lmax_target_bytes = push_lmax,
@@ -3323,10 +3278,9 @@ test "forest: rollup is read-invariant across flush and compactions" {
 
 test "forest: getBitmap rejects non-roaring chains and old reads" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -3374,10 +3328,9 @@ test "forest: getBitmap rejects non-roaring chains and old reads" {
 
 test "forest: index backfill installs bottom states below live deltas" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -3499,10 +3452,9 @@ fn copySst(
 
 test "forest: deleteFiles unlinks compaction inputs at the retire index" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{
         .lmax_target_bytes = push_lmax,
@@ -3618,10 +3570,9 @@ fn backdate(path: String, secs: i64) !void {
 
 test "table cache: a table loaded for an install survives an evict before it is installed" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -3682,10 +3633,9 @@ fn snapshotAt(f: *Forest, secs: i64) void {
 
 test "forest: removeOrphans unlinks only unknown files at or before the cutoff" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -3790,10 +3740,9 @@ test "forest: removeOrphans unlinks only unknown files at or before the cutoff" 
 
 test "forest: evictTables evicts a compacted-away file; its blocks go with the table" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     // A private block cache: never installed in the process-wide slot,
     // since the runner executes tests in parallel and they would share
@@ -3909,10 +3858,9 @@ fn expectRowAt(f: *Forest, primary: String, read_ts: u64, want: String) !void {
 
 test "forest: one flush covers every waiting memtable" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -3964,10 +3912,9 @@ test "forest: one flush covers every waiting memtable" {
 
 test "forest: an L0 to L0 merge folds small tables into one and keeps L0's read order" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     // Four tables to a merge, so three ask for nothing below.
     const f_live = try flags.Live(Config).create(
@@ -4091,10 +4038,9 @@ test "forest: an L0 to L0 merge folds small tables into one and keeps L0's read 
 
 test "buildFlush takes the oldest memtables up to job_max_bytes" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     // A budget one memtable's writes exceed: each flush takes exactly
     // the oldest frozen memtable, and the rest wait.
@@ -4146,10 +4092,9 @@ test "buildFlush takes the oldest memtables up to job_max_bytes" {
 
 test "maxL0TableCountForKeys counts each key's own table" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     // One memtable per flush, so three flushes leave three L0 tables.
     const f_live = try flags.Live(Config).create(alloc, .{

@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const utils = @import("utils");
+const fiber = @import("zfiber");
 const compress = utils.compression;
 const String = utils.String;
 const zdb = @import("zdb");
@@ -687,8 +688,7 @@ test "table binary fuse large keyset contains sampled keys" {
     const t = try openBuffer(alloc, &tb);
     defer destroyTable(t);
 
-    const seed: u64 = @intCast(utils.timestampNow(.realtime, .nanos));
-    var prng = std.Random.DefaultPrng.init(seed);
+    var prng = std.Random.DefaultPrng.init(fiber.random().int(u64));
     const rnd = prng.random();
 
     i = 0;

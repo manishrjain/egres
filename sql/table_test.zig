@@ -24,10 +24,9 @@ const Type = sql.Type;
 // (table_id, column_id) BE, then reconstruct the schema via loadTableSchema.
 test "sql.table: load reconstructs a user table's schema from catalog rows" {
     const alloc = testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 
@@ -212,10 +211,9 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
 
 test "sql.table: load returns UndefinedTable when no catalog rows exist" {
     const alloc = testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(dir_path);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
 
     const f_live = try flags.Live(Config).create(alloc, .{});
 

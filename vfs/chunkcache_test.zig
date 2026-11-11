@@ -69,10 +69,9 @@ fn span(idx: u64, off: u64, buf: []u8) Chunk {
 
 test "chunkcache: put then read, any offset, tail chunk, miss" {
     const alloc = testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(root);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const root = tmp.path;
     const path = try std.fmt.allocPrint(alloc, "{s}/slots", .{root});
     defer alloc.free(path);
 
@@ -109,10 +108,9 @@ test "chunkcache: put then read, any offset, tail chunk, miss" {
 
 test "chunkcache: restart restores slots; a bad page drops its chunk" {
     const alloc = testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(root);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const root = tmp.path;
     const path = try std.fmt.allocPrint(alloc, "{s}/slots", .{root});
     defer alloc.free(path);
 
@@ -190,10 +188,9 @@ test "chunkcache: restart restores slots; a bad page drops its chunk" {
 
 test "chunkcache: eviction frees slots for new chunks" {
     const alloc = testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(root);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const root = tmp.path;
     const path = try std.fmt.allocPrint(alloc, "{s}/slots", .{root});
     defer alloc.free(path);
 
@@ -247,10 +244,9 @@ test "chunkcache: disabled without a path; bad sizes refused" {
 
 test "chunkcache: restart restores records across header pages" {
     const alloc = testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(root);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const root = tmp.path;
     const path = try std.fmt.allocPrint(alloc, "{s}/slots", .{root});
     defer alloc.free(path);
 

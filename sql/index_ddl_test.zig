@@ -27,8 +27,7 @@ const read_ts: u64 = 100;
 /// oracle and Forest a Txn needs — the Forest is never read here —
 /// and an arena everything else lives in.
 const Fixture = struct {
-    tmp: std.testing.TmpDir,
-    dir_path: [:0]u8,
+    tmp: zdb.vfs.TmpDir,
     forest: *Forest,
     /// The forest reads its options through this; freed after it.
     live: *flags.Live(Config),
@@ -68,15 +67,13 @@ const Fixture = struct {
             .column = &columns[0],
         };
 
-        var tmp = std.testing.tmpDir(.{});
-        errdefer tmp.cleanup();
-        const dir_path = try zdb.vfs.tmpDirPath(testing.allocator, &tmp);
-        errdefer testing.allocator.free(dir_path);
+        var tmp = try zdb.vfs.TmpDir.init(testing.allocator);
+        errdefer tmp.deinit();
         const store = try testing.allocator.create(zdb.vfs.Store);
         errdefer testing.allocator.destroy(store);
         store.* = try zdb.vfs.Store.initFile(
             testing.allocator,
-            dir_path,
+            tmp.path,
             zdb.vfs.g(),
         );
         errdefer store.deinit();
@@ -87,7 +84,6 @@ const Fixture = struct {
 
         return .{
             .tmp = tmp,
-            .dir_path = dir_path,
             .forest = f,
             .live = f_live,
             .store = store,
@@ -110,8 +106,7 @@ const Fixture = struct {
         self.live.destroy();
         self.store.deinit();
         testing.allocator.destroy(self.store);
-        testing.allocator.free(self.dir_path);
-        self.tmp.cleanup();
+        self.tmp.deinit();
         self.arena.deinit();
     }
 

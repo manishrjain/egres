@@ -9,10 +9,9 @@ const fiber = @import("zfiber");
 
 test "store: file backend put/get/exists/delete round-trip" {
     const alloc = testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(root);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const root = tmp.path;
     const depot = try std.fmt.allocPrint(alloc, "{s}/depot", .{root});
     defer alloc.free(depot);
 
@@ -66,10 +65,9 @@ test "store: file probeRead times an O_DIRECT ranged read" {
     // one, so the timings are 0 under the simulation.
     if (fiber.isSim()) return error.SkipZigTest;
     const alloc = testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(root);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const root = tmp.path;
     const depot = try std.fmt.allocPrint(alloc, "{s}/depot", .{root});
     defer alloc.free(depot);
 

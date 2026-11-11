@@ -53,14 +53,13 @@ fn benchOne(
     // to call across samples.
     vfs.VFS.initGlobal(.{ .bytes_per_sec = 10 * 1024 * 1024 * 1024 });
 
-    // Fresh dir per sample. `std.testing.tmpDir` puts each one under
+    // Fresh dir per sample. `vfs.TmpDir` puts each one under
     // `.zig-cache/tmp/<random_hex>/` — real-disk path (NOT tmpfs, so
     // fsync actually waits for the disk), gitignored, unique per call so
     // concurrent `zig build bench` invocations don't collide.
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try vfs.tmpDirPath(b.alloc, &tmp);
-    defer b.alloc.free(dir);
+    var tmp = try vfs.TmpDir.init(b.alloc);
+    defer tmp.deinit();
+    const dir = tmp.path;
 
     var dwal = try diskwal.DiskWAL.openPath(dir, b.alloc, .{ .cache_len = 0 });
     defer dwal.deinit();
@@ -281,8 +280,8 @@ fn benchLoad(b: *Bench, batch_size: u32, mode: Compress) !void {
 
     // The WAL goes under EGRES_BENCH_DIR when it is set, so the cells
     // can be pointed at the disk in question; else a temp dir here.
-    var tmp: ?std.testing.TmpDir = null;
-    defer if (tmp) |*t| t.cleanup();
+    var tmp: ?vfs.TmpDir = null;
+    defer if (tmp) |*t| t.deinit();
     const dir = if (utils.context.g().env("EGRES_BENCH_DIR")) |root| blk: {
         const ts = utils.timestampNow(.realtime, .nanos);
         const path = try std.fmt.allocPrint(
@@ -293,10 +292,11 @@ fn benchLoad(b: *Bench, batch_size: u32, mode: Compress) !void {
         try vfs.createDirPath(path);
         break :blk path;
     } else blk: {
-        tmp = std.testing.tmpDir(.{});
-        break :blk try vfs.tmpDirPath(b.alloc, &tmp.?);
+        tmp = try vfs.TmpDir.init(b.alloc);
+        break :blk tmp.?.path;
     };
-    defer b.alloc.free(dir);
+    // A directory under EGRES_BENCH_DIR is this function's to remove.
+    defer if (tmp == null) b.alloc.free(dir);
     defer if (tmp == null) vfs.deleteTree(dir) catch {};
 
     var dwal = try diskwal.DiskWAL.openPath(dir, b.alloc, .{

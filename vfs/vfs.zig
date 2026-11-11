@@ -465,19 +465,31 @@ pub fn createDirPath(path: String) !void {
     try fs.submit(.create_dir_path, path);
 }
 
-/// A test's temp directory as an absolute path the VFS knows: it exists
-/// on the real disk, the simulated one learns of it here. Sentinel
-/// slice because realPathFileAlloc allocates len+1.
-pub fn tmpDirPath(
+/// A test's own directory: made and removed through the VFS and named
+/// from `fiber.random()`, so under a sim the name replays with the seed
+/// and the real disk is not touched. It sits in the build's cache
+/// directory, relative to where the tests run, as `std.testing.tmpDir`
+/// does: a real filesystem, where `/tmp` is often memory.
+pub const TmpDir = struct {
     alloc: std.mem.Allocator,
-    tmp: *std.testing.TmpDir,
-) ![:0]u8 {
-    const io = utils.context.g().io;
-    const path = try tmp.dir.realPathFileAlloc(io, ".", alloc);
-    errdefer alloc.free(path);
-    try createDirPath(path);
-    return path;
-}
+    path: []u8,
+
+    pub fn init(alloc: std.mem.Allocator) !TmpDir {
+        const path = try std.fmt.allocPrint(
+            alloc,
+            ".zig-cache/tmp/{x:0>16}",
+            .{fiber.random().int(u64)},
+        );
+        errdefer alloc.free(path);
+        try createDirPath(path);
+        return .{ .alloc = alloc, .path = path };
+    }
+
+    pub fn deinit(self: *TmpDir) void {
+        deleteTree(self.path) catch {};
+        self.alloc.free(self.path);
+    }
+};
 
 /// Recursive delete.
 pub fn deleteTree(path: String) !void {

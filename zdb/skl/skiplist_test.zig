@@ -8,6 +8,7 @@ const Key = @import("zdb").kv.Key;
 const Meta = @import("zdb").kv.Meta;
 const Kind = @import("zdb").kv.Kind;
 const u = @import("utils");
+const fiber = @import("zfiber");
 const String = u.String;
 
 /// The value of `primary`'s newest version at or below `ts`, in the
@@ -283,9 +284,7 @@ test "skiplist grows beyond 64 MiB up to 256 MiB and validates full iteration" {
     _ = tmp_arena.reset(.{ .retain_with_limit = target_capacity });
     defer tmp_arena.deinit();
 
-    var value_prng = std.Random.DefaultPrng.init(
-        @intCast(u.timestampNow(.realtime, .nanos)),
-    );
+    var value_prng = std.Random.DefaultPrng.init(fiber.random().int(u64));
     var value_rand = value_prng.random();
 
     const insert_start_ns = u.timestampNow(.monotonic, .nanos);

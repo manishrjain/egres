@@ -80,12 +80,9 @@ pub fn calibrate(a: std.mem.Allocator, store: anytype, block_size: u64) !u64 {
     const have = store.head(probe_object) catch 0;
     if (have < probe_max) try uploadProbe(a, store);
 
-    // Every trial reads a random region of the probe object — and a fresh
-    // seed each run — so no CDN / range cache can serve a repeat of the
-    // same slice and flatter the numbers. The seed is drawn from the
-    // worker's PRNG: the OS's in production, the run's under a simulation.
-    var prng = std.Random.DefaultPrng.init(fiber.random().int(u64));
-    const rand = prng.random();
+    // Every trial reads a random region of the probe object, different
+    // in every run, so no CDN / range cache can serve a repeat of the
+    // same slice and flatter the numbers (`randomOffset`).
 
     // A few throwaway fetches pay the cold-start cost — connection setup
     // on a network store, power-state exit on an idle device (NVMe APST
@@ -94,7 +91,8 @@ pub fn calibrate(a: std.mem.Allocator, store: anytype, block_size: u64) !u64 {
     // uploaded with different bytes fails verification and is replaced.
     const first_size = @max(block_size, 1);
     for (0..probe_repeats) |_| {
-        _ = store.probeRead(randomOffset(rand, first_size), first_size) catch |err| switch (err) {
+        const off = randomOffset(first_size);
+        _ = store.probeRead(off, first_size) catch |err| switch (err) {
             error.BadProbeData => try uploadProbe(a, store),
             else => {},
         };
@@ -126,7 +124,7 @@ pub fn calibrate(a: std.mem.Allocator, store: anytype, block_size: u64) !u64 {
         for (0..probe_repeats) |_| {
             // A failed trial is skipped, never fatal; the minimum-sample
             // guard below catches a dead endpoint.
-            const s = store.probeRead(randomOffset(rand, size), size) catch |err| {
+            const s = store.probeRead(randomOffset(size), size) catch |err| {
                 log.warn("lookahead probe: size={d} trial failed: {s}", .{ size, @errorName(err) });
                 continue;
             };
@@ -170,7 +168,7 @@ pub fn calibrate(a: std.mem.Allocator, store: anytype, block_size: u64) !u64 {
         const start_ms = utils.coarseMs();
         const before = probes.items.len;
         for (heavy.items) |sz| {
-            const s = store.probeRead(randomOffset(rand, sz), sz) catch |err| {
+            const s = store.probeRead(randomOffset(sz), sz) catch |err| {
                 log.warn("lookahead probe: size={d} trial failed: {s}", .{ sz, @errorName(err) });
                 continue;
             };
@@ -203,7 +201,7 @@ pub fn calibrate(a: std.mem.Allocator, store: anytype, block_size: u64) !u64 {
         var totals: std.ArrayList(u64) = .empty;
         defer totals.deinit(a);
         for (0..probe_repeats) |_| {
-            const s = store.probeRead(randomOffset(rand, sz), sz) catch continue;
+            const s = store.probeRead(randomOffset(sz), sz) catch continue;
             try totals.append(a, s.total_ns);
         }
         med.* = median(totals.items);
@@ -218,8 +216,10 @@ pub fn calibrate(a: std.mem.Allocator, store: anytype, block_size: u64) !u64 {
 /// A random offset for a read of `size` — anywhere in the probe object.
 /// A stray near-collision at most cache-warms one trial, which the fit's
 /// medians shed.
-fn randomOffset(rand: std.Random, size: u64) u64 {
-    return rand.uintAtMost(u64, probe_max - size);
+fn randomOffset(size: u64) u64 {
+    // A fresh handle per draw: it is the worker's, and the caller parks
+    // on every read.
+    return fiber.random().uintAtMost(u64, probe_max - size);
 }
 
 /// The probe object's byte at absolute position `i`: a cheap

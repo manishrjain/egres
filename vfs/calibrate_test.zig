@@ -10,10 +10,9 @@ const calibrate = vfs.calibrate;
 // tests run on yields both bandwidths, and the scratch dir is gone.
 test "calibrate: runCalibration profiles a directory and cleans up" {
     const alloc = testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try vfs.tmpDirPath(alloc, &tmp);
-    defer alloc.free(root);
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const root = tmp.path;
 
     const p = try calibrate.runCalibration(alloc, root);
     try testing.expect(p.read_bps > 0);

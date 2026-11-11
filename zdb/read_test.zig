@@ -31,8 +31,7 @@ const table_key: zdb.kv.TableKey = .{ .namespace = ns, .table_id = tid };
 /// immutable memtable, flushed to L0, compacted to L1.
 const Fixture = struct {
     alloc: std.mem.Allocator,
-    tmp: std.testing.TmpDir,
-    dir: [:0]u8,
+    tmp: vfs.TmpDir,
     /// The forest reads its options through this; freed after it.
     live: *flags.Live(Config),
     /// The forest's SSTs; freed after it.
@@ -47,21 +46,19 @@ const Fixture = struct {
     fn setup(self: *Fixture, alloc: std.mem.Allocator) !void {
         self.* = .{
             .alloc = alloc,
-            .tmp = std.testing.tmpDir(.{}),
-            .dir = undefined,
+            .tmp = try vfs.TmpDir.init(alloc),
             .live = undefined,
             .store = undefined,
             .f = undefined,
             .tree_id = undefined,
             .next_index = 0,
         };
-        self.dir = try vfs.tmpDirPath(alloc, &self.tmp);
         // A bottom target of one byte makes a push L0's job at any
         // size (`pickJob`), so `compactL0` below pushes into L1.
         self.live = try flags.Live(Config).create(alloc, .{
             .lmax_target_bytes = 1,
         });
-        self.store = try vfs.Store.initFile(alloc, self.dir, vfs.g());
+        self.store = try vfs.Store.initFile(alloc, self.tmp.path, vfs.g());
         self.f = try Forest.open(alloc, self.live, &self.store);
         self.tree_id = try createTree(self.f, table_key, .{}, .posting_index);
         // Forest.open leaves an id-0 placeholder memtable that a swap
@@ -78,8 +75,7 @@ const Fixture = struct {
         self.f.close();
         self.store.deinit();
         self.live.destroy();
-        self.alloc.free(self.dir);
-        self.tmp.cleanup();
+        self.tmp.deinit();
     }
 
     fn key(primary: String) Key {

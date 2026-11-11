@@ -16,12 +16,10 @@ const u = raft.utils;
 /// simulation every test in one virtual ms reads the same time.
 fn makeTempWalDir(alloc: std.mem.Allocator) ![]u8 {
     var path_buf: [160]u8 = undefined;
-    var tag: [8]u8 = undefined;
-    utils.context.g().io.random(&tag);
     const path = try std.fmt.bufPrint(
         &path_buf,
-        "/tmp/egres-diskwal-{x}",
-        .{std.mem.readInt(u64, &tag, .little)},
+        "/tmp/egres-diskwal-{x:0>16}",
+        .{fiber.random().int(u64)},
     );
     try vfs.createDirPath(path);
     return alloc.dupe(u8, path);
