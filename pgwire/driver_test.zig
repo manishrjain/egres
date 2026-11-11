@@ -128,54 +128,11 @@ const StubHandler = struct {
     }
 };
 
-/// Build the bytes of a Startup3("user=u\0database=d\0\0") message.
+const appendFrame = pgwire.client.appendFrame;
+
+/// The startup every client here sends: user "u", database "d".
 fn buildStartup(buf: *std.ArrayList(u8), a: std.mem.Allocator) !void {
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(a);
-    try body.appendSlice(a, "user");
-    try body.append(a, 0);
-    try body.appendSlice(a, "u");
-    try body.append(a, 0);
-    try body.appendSlice(a, "database");
-    try body.append(a, 0);
-    try body.appendSlice(a, "d");
-    try body.append(a, 0);
-    try body.append(a, 0);
-
-    const total: u32 = @intCast(8 + body.items.len);
-    var hdr: [8]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], total, .big);
-    std.mem.writeInt(u32, hdr[4..8], pgwire.types.protocol_version_3, .big);
-    try buf.appendSlice(a, &hdr);
-    try buf.appendSlice(a, body.items);
-}
-
-fn buildQuery(
-    buf: *std.ArrayList(u8),
-    a: std.mem.Allocator,
-    sql: String,
-) !void {
-    const total: u32 = @intCast(4 + sql.len + 1);
-    try buf.append(a, 'Q');
-    var len_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_buf, total, .big);
-    try buf.appendSlice(a, &len_buf);
-    try buf.appendSlice(a, sql);
-    try buf.append(a, 0);
-}
-
-/// One tagged frame: tag, then len (4 + body), then the body.
-fn buildFrame(
-    buf: *std.ArrayList(u8),
-    a: std.mem.Allocator,
-    tag: u8,
-    body: String,
-) !void {
-    try buf.append(a, tag);
-    var len_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_buf, @intCast(4 + body.len), .big);
-    try buf.appendSlice(a, &len_buf);
-    try buf.appendSlice(a, body);
+    try pgwire.client.appendStartup(buf, a, "u", "d");
 }
 
 /// Parse: `name` (unnamed = ""), `sql`, no parameter OIDs.
@@ -192,7 +149,7 @@ fn buildParse(
     try body.appendSlice(a, sql);
     try body.append(a, 0);
     try body.appendSlice(a, &[_]u8{ 0, 0 }); // n_oids = 0
-    try buildFrame(buf, a, 'P', body.items);
+    try appendFrame(buf, a, .parse, body.items);
 }
 
 /// Bind: the unnamed portal over statement `name`, text-format
@@ -219,28 +176,25 @@ fn buildBind(
         try body.appendSlice(a, p);
     }
     try body.appendSlice(a, &[_]u8{ 0, 0 }); // n_rfmt = 0 (all text)
-    try buildFrame(buf, a, 'B', body.items);
+    try appendFrame(buf, a, .bind, body.items);
 }
 
 /// Describe the unnamed portal.
 fn buildDescribePortal(buf: *std.ArrayList(u8), a: std.mem.Allocator) !void {
-    try buildFrame(buf, a, 'D', &[_]u8{ 'P', 0 });
+    try appendFrame(buf, a, .describe, &[_]u8{ 'P', 0 });
 }
 
 /// Execute the unnamed portal, no row limit.
 fn buildExecute(buf: *std.ArrayList(u8), a: std.mem.Allocator) !void {
-    try buildFrame(buf, a, 'E', &[_]u8{ 0, 0, 0, 0, 0 });
+    try appendFrame(buf, a, .execute, &[_]u8{ 0, 0, 0, 0, 0 });
 }
 
 fn buildSync(buf: *std.ArrayList(u8), a: std.mem.Allocator) !void {
-    try buildFrame(buf, a, 'S', "");
+    try appendFrame(buf, a, .sync, "");
 }
 
 fn buildTerminate(buf: *std.ArrayList(u8), a: std.mem.Allocator) !void {
-    try buf.append(a, 'X');
-    var len_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_buf, 4, .big);
-    try buf.appendSlice(a, &len_buf);
+    try appendFrame(buf, a, .terminate, "");
 }
 
 const TestCtx = struct {
@@ -268,68 +222,20 @@ fn clientFn(ctx: *TestCtx) anyerror!void {
     const addr_str = try std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{port});
     const addr = try IpAddress.parseIpAndPort(addr_str);
 
-    var stream = try addr.connect(.{});
-    defer stream.close();
+    // The startup, one query and the Terminate, as `pgwire.Client`
+    // sends them; `close` returns once the server has closed its end.
+    var arena = std.heap.ArenaAllocator.init(ctx.a);
+    defer arena.deinit();
+    var client = try pgwire.Client.connect(ctx.a, addr, "d");
+    const reply = try client.query(arena.allocator(), "SELECT 'hello'");
+    client.close();
 
-    // Send Startup3 + Query("SELECT 'hello'") + Terminate.
-    var to_send: std.ArrayList(u8) = .empty;
-    defer to_send.deinit(ctx.a);
-    try buildStartup(&to_send, ctx.a);
-    try buildQuery(&to_send, ctx.a, "SELECT 'hello'");
-    try buildTerminate(&to_send, ctx.a);
-    try stream.writeAll(to_send.items);
-
-    // Drain the server's response. The driver loop terminates when
-    // the peer sends 'X', then the server closes the stream — so
-    // reading until EOF here is sufficient.
-    var inbox: std.ArrayList(u8) = .empty;
-    defer inbox.deinit(ctx.a);
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        // fiber.net surfaces end-of-stream as error.EOF (not a 0 return),
-        // so a clean peer close lands here — treat it as the loop end.
-        const n = stream.read(&buf) catch |e| switch (e) {
-            error.EOF => break,
-            else => return e,
-        };
-        if (n == 0) break;
-        try inbox.appendSlice(ctx.a, buf[0..n]);
-    }
-
-    // Walk the response and assert the message-tag sequence matches a
-    // valid simple-query session: AuthOk + ParameterStatus* +
-    // BackendKeyData + ReadyForQuery + RowDescription + DataRow +
-    // CommandComplete + ReadyForQuery.
-    var off: usize = 0;
-    var tags: std.ArrayList(u8) = .empty;
-    defer tags.deinit(ctx.a);
-    while (off < inbox.items.len) {
-        const r = try pgwire.proto.decodeMessage(inbox.items[off..]);
-        try tags.append(ctx.a, r.msg.tag);
-        off += r.consumed;
-    }
-
-    // Required tags in order. We don't pin the exact count of 'S'
-    // (ParameterStatus) entries — the state machine bundles a few.
-    try testing.expectEqual(@as(u8, 'R'), tags.items[0]);
-    try expectContainsInOrder(tags.items, &[_]u8{ 'R', 'K', 'Z', 'T', 'D', 'C', 'Z' });
-
-    // Verify DataRow body holds "hello".
-    off = 0;
-    var saw_data_row = false;
-    while (off < inbox.items.len) {
-        const r = try pgwire.proto.decodeMessage(inbox.items[off..]);
-        if (r.msg.tag == 'D') {
-            const cnt = std.mem.readInt(i16, r.msg.body[0..2], .big);
-            try testing.expectEqual(@as(i16, 1), cnt);
-            const len = std.mem.readInt(i32, r.msg.body[2..6], .big);
-            try testing.expectEqual(@as(i32, 5), len);
-            try testing.expectEqualStrings("hello", r.msg.body[6..11]);
-            saw_data_row = true;
-        }
-        off += r.consumed;
-    }
-    try testing.expect(saw_data_row);
+    try testing.expect(reply.err == null);
+    try testing.expectEqual(pgwire.TxStatus.idle, reply.status);
+    try testing.expectEqualStrings("SELECT 1", reply.tag);
+    try testing.expectEqual(@as(usize, 1), reply.rows.len);
+    try testing.expectEqual(@as(usize, 1), reply.rows[0].len);
+    try testing.expectEqualStrings("hello", reply.rows[0][0].?);
 
     // And the handler must have been called with the right SQL.
     try testing.expectEqual(@as(u32, 1), ctx.handler.call_count);
@@ -337,23 +243,6 @@ fn clientFn(ctx: *TestCtx) anyerror!void {
         "SELECT 'hello'",
         ctx.handler.last_sql.items,
     );
-}
-
-/// Assert that `needle` appears in `hay` as a subsequence — every
-/// element of `needle` is found in `hay` in order, but other tags may
-/// be interleaved.
-fn expectContainsInOrder(hay: String, needle: String) !void {
-    var ni: usize = 0;
-    for (hay) |b| {
-        if (ni < needle.len and b == needle[ni]) ni += 1;
-    }
-    if (ni != needle.len) {
-        std.debug.print(
-            "expected subsequence {x} in tag stream {x}\n",
-            .{ needle, hay },
-        );
-        return error.MissingTagSubsequence;
-    }
 }
 
 test "driver: full startup + Query + Terminate round-trip" {

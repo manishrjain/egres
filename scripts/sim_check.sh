@@ -5,8 +5,8 @@
 #      trace hash, which covers every dispatch and every disk and
 #      network op; another seed prints a different one. Checked on the
 #      Channel tests (pure scheduling), the WAL tests (the disk), the
-#      pgwire driver tests (the network) and the engine harness (a
-#      whole node across crashes).
+#      pgwire driver tests (the network) and the SQL harness (a whole
+#      node across crashes).
 #   2. Deadlock detection: a fiber parked with nothing left to wake it
 #      ends the run with outcome=deadlock and exit code 3.
 #
@@ -18,7 +18,7 @@ seed=${1:-42}
 if [ $# -ge 2 ]; then
     filters=("$2")
 else
-    filters=("Channel:" "diskwal" "driver:" "sim: engine")
+    filters=("Channel:" "diskwal" "driver:" "sim: sql")
 fi
 
 trace() {

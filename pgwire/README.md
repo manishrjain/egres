@@ -13,6 +13,7 @@ driver. The protocol layer (`proto.zig` / `conn_state.zig` / `parser.zig` /
 | `parser.zig` | libpg_query bridge (`@cImport`) |
 | `binary.zig` | Encoders/decoders for the 6 primitive binary types |
 | `driver.zig` | `Session` — a `zio.net.Stream`'s buffers, reader/writer and `ConnState` |
+| `client.zig` | `Client` — the other end, for tests: startup, one simple query at a time, rows as text |
 
 Tests live in `*_test.zig` siblings; auto-discovered by `build.zig`.
 

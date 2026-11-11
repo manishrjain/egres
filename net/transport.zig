@@ -125,6 +125,8 @@ pub const Transport = struct {
         log.debug("Transport accept loop woken", .{});
         self.group.wait();
         self.group.deinit();
+        // Nothing accepts any more: give the port back.
+        if (self.listener) |listener| listener.close();
         log.debug("node {d}: Transport group stopped", .{self.cfg.self_id});
 
         var it = self.peers.valueIterator();

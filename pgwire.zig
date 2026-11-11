@@ -6,7 +6,8 @@
 //! Layered structure:
 //!   - proto / conn_state / parser / types: pure logic, no I/O. Do
 //!     not import the fiber runtime in any of them.
-//!   - driver: the only place sockets / fiber / syscalls appear.
+//!   - driver: the server's sockets / fiber / syscalls, and only there.
+//!   - client: the other end of the socket, for the tests.
 //!
 //! See pgwire/README.md for usage.
 
@@ -14,6 +15,7 @@ pub const proto = @import("pgwire/proto.zig");
 pub const conn_state = @import("pgwire/conn_state.zig");
 pub const parser = @import("pgwire/parser.zig");
 pub const driver = @import("pgwire/driver.zig");
+pub const client = @import("pgwire/client.zig");
 pub const types = @import("pgwire/types.zig");
 pub const binary = @import("pgwire/binary.zig");
 
@@ -21,6 +23,9 @@ pub const binary = @import("pgwire/binary.zig");
 pub const Session = driver.Session;
 pub const Options = driver.Options;
 pub const Stream = driver.Stream;
+
+// Client — one simple query at a time, for the tests.
+pub const Client = client.Client;
 
 // State machine — exposed for callers that want to drive pgwire from
 // somewhere other than fiber.net.Stream (e.g. tests, alternate runtimes).

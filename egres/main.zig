@@ -594,15 +594,17 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     // and table names live in the zdb manifest, so there is no separate SQL
     // store — DDL resolves names via the forest and proposes manifest
     // changes (see sql/server.zig).
-    var sql_srv = try sql.Server.init(eng, sql_addr);
-    defer deinitWithLog("sql_srv", &sql_srv);
+    // Before the engine starts: it gives the engine the hook that feeds
+    // the commit stream to its per-table state.
+    const sql_srv = try sql.Server.create(eng, sql_addr);
+    defer deinitWithLog("sql_srv", sql_srv);
 
     log.info("all components initialized", .{});
 
     var handle = try fiber.spawn(
         .{},
         appMain,
-        .{ eng, &admin_srv, &sql_srv, &args },
+        .{ eng, &admin_srv, sql_srv, &args },
     );
     handle.join();
 
@@ -635,11 +637,6 @@ fn appMain(
         runJoin(args, eng.allocator);
     }
 
-    // Feed the commit stream to the SQL server's per-table caches (egid
-    // counters). Register before start so no applied entry is missed; the
-    // apply loop stops (eng.wait) before sql_srv is torn down.
-    eng.setApplyObserver(sql_srv.applyObserver());
-
     // The engine owns recovery + applyCommits + the raft/compaction/snapshot
     // loops; register the admin front-end into its loop group.
     eng.start() catch |err| {
@@ -650,12 +647,8 @@ fn appMain(
         log.err("appMain: spawn admin server failed: {s}", .{@errorName(err)});
         return;
     };
-    eng.spawnListener(sql.Server.runListener, .{sql_srv}) catch |err| {
-        log.err("appMain: spawn sql server failed: {s}", .{@errorName(err)});
-        return;
-    };
-    eng.spawnListener(sql.Server.runOracleRotation, .{sql_srv}) catch |err| {
-        log.err("appMain: spawn oracle rotation failed: {s}", .{@errorName(err)});
+    sql_srv.start() catch |err| {
+        log.err("appMain: sql server start failed: {s}", .{@errorName(err)});
         return;
     };
 

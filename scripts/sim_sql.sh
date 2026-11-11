@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# The engine workload under the simulation (engine/sim_test.zig), one
-# run per seed: writers against a real engine on the simulated disk,
-# crashes, restarts, and the check that no acknowledged write is lost.
+# The SQL workload under the simulation (sql/sim_test.zig), one run per
+# seed: pgwire clients against a real server on the simulated disk and
+# network, crashes, restarts, and the check that no acknowledged
+# statement is lost.
 # A failing seed replays with the command printed for it; its log is
 # kept under the directory named at the end.
 #
-# Usage: scripts/sim_engine.sh [first_seed] [count] [sched]
+# Usage: scripts/sim_sql.sh [first_seed] [count] [sched]
 set -uo pipefail
 cd "$(dirname "$0")/.."
 first=${1:-1}
 count=${2:-20}
 sched=${3:-random}
-logs=$(mktemp -d "${TMPDIR:-/tmp}/sim-engine.XXXXXX")
-filter="sim: engine"
+logs=$(mktemp -d "${TMPDIR:-/tmp}/sim-sql.XXXXXX")
+filter="sim: sql"
 
 failed=0
 for ((seed = first; seed < first + count; seed++)); do

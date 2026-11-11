@@ -78,27 +78,59 @@ pub const Server = struct {
     databases: std.AutoHashMap(u64, *Database),
     next_txn_id: std.atomic.Value(u64) = .init(1),
 
-    pub fn init(eng: *engine.Engine, addr: String) !Server {
-        return .{
+    /// Before `eng.start`: this hands the engine the commit-stream
+    /// hook, and no applied entry may be missed. The hook holds the
+    /// server's address, so the server is on the heap.
+    pub fn create(eng: *engine.Engine, addr: String) !*Server {
+        const alloc = eng.allocator;
+        const self = try alloc.create(Server);
+        errdefer alloc.destroy(self);
+
+        const listen_addr = try fiber.net.IpAddress.parseIpAndPort(addr);
+        var catalog_ps = try _schema.compile(
+            alloc,
+            _catalog.logical_schema,
+            _catalog.logical_schema.current_version,
+        );
+        errdefer catalog_ps.deinit(alloc);
+
+        const index_catalog_ps = try _schema.compile(
+            alloc,
+            _catalog.index_logical_schema,
+            _catalog.index_logical_schema.current_version,
+        );
+        self.* = .{
             .engine = eng,
-            .listen_addr = try fiber.net.IpAddress.parseIpAndPort(addr),
-            .catalog_ps = try _schema.compile(eng.allocator, _catalog.logical_schema, _catalog.logical_schema.current_version),
-            .index_catalog_ps = try _schema.compile(eng.allocator, _catalog.index_logical_schema, _catalog.index_logical_schema.current_version),
-            .databases = std.AutoHashMap(u64, *Database).init(eng.allocator),
+            .listen_addr = listen_addr,
+            .catalog_ps = catalog_ps,
+            .index_catalog_ps = index_catalog_ps,
+            .databases = std.AutoHashMap(u64, *Database).init(alloc),
         };
+        eng.setApplyObserver(.{ .ctx = self, .onData = onDataApplied });
+        return self;
     }
 
+    /// The listener and the oracle rotation, in the engine's loop
+    /// group, so they end with its loops. After `eng.start`.
+    pub fn start(self: *Server) !void {
+        try self.engine.spawnListener(runListener, .{self});
+        try self.engine.spawnListener(runOracleRotation, .{self});
+    }
+
+    /// After `eng.stop`: the apply loop calls the hook until then.
     pub fn deinit(self: *Server) void {
-        self.catalog_ps.deinit(self.engine.allocator);
-        self.index_catalog_ps.deinit(self.engine.allocator);
+        const alloc = self.engine.allocator;
+        self.catalog_ps.deinit(alloc);
+        self.index_catalog_ps.deinit(alloc);
         var dbs = self.databases.valueIterator();
         while (dbs.next()) |d| {
             d.*.deinit();
-            self.engine.allocator.destroy(d.*);
+            alloc.destroy(d.*);
         }
         self.databases.deinit();
         self.ddl_mu.deinit();
         self.databases_mu.deinit();
+        alloc.destroy(self);
     }
 
     /// The Database for `ns`, created on first use and never deleted
@@ -131,7 +163,7 @@ pub const Server = struct {
     /// the bound on oracle memory AND on how long a txn can run before
     /// horizon conservatism may force a bump or abort. Runs until
     /// shutdown; `waitTimeout` doubles as the sleep.
-    pub fn runOracleRotation(self: *Server) void {
+    fn runOracleRotation(self: *Server) void {
         const period_ms: u64 = 10 * 60 * 1000;
 
         while (!self.engine.node.isShuttingDown()) {
@@ -144,11 +176,6 @@ pub const Server = struct {
             var it = self.databases.valueIterator();
             while (it.next()) |d| d.*.oracle.rotate(period_ms - 1000);
         }
-    }
-
-    /// The commit-stream hook to register with the engine (before eng.start).
-    pub fn applyObserver(self: *Server) engine.ApplyObserver {
-        return .{ .ctx = self, .onData = onDataApplied };
     }
 
     /// Apply-fiber callback (every node): hand the committed entry to its
@@ -249,7 +276,7 @@ pub const Server = struct {
         return egid;
     }
 
-    pub fn runListener(self: *Server) void {
+    fn runListener(self: *Server) void {
         defer log.info("sql listener exiting (shutdown)", .{});
         // No SQL before apply has passed the WAL tail from boot: a
         // statement answered earlier comes from the pre-crash state, and
