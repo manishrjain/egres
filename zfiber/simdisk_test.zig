@@ -507,10 +507,12 @@ test "simdisk: each fault surfaces as the kernel's error would" {
 }
 
 test "simdisk: a short write on an O_DIRECT handle is whole pages" {
+    // macOS has no O_DIRECT to open the handle with.
+    if (!@hasField(std.posix.O, "DIRECT")) return error.SkipZigTest;
     var d = try SimDisk.init(std.testing.allocator, 7);
     defer d.deinit();
     var flags = rdwr_creat;
-    if (@hasField(std.posix.O, "DIRECT")) flags.DIRECT = true;
+    flags.DIRECT = true;
     const f = try open(&d, "/tmp/dio", flags);
     defer d.apply(.close, f);
     var page_buf: [4 * 4096]u8 align(4096) = undefined;

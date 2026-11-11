@@ -736,7 +736,7 @@ q "CREATE TABLE numin (id int8 PRIMARY KEY, f float8);" >/dev/null
 expect "INSERT takes a unary plus" "INSERT 0 2" q \
     "INSERT INTO numin VALUES (+1, +1.5), (+2, -0.0);"
 expect "an unquoted -0.0 is zero" "1|1.5,2|0" bash -c \
-    "psql '$E' -X -tA -c 'SELECT id, f FROM numin ORDER BY id' | paste -sd,"
+    "psql '$E' -X -tA -c 'SELECT id, f FROM numin ORDER BY id' | paste -sd, -"
 # Casts (#26): a literal is read as the type, an expression converts.
 expect "a cast reads a literal as its type" "-16|42|2|1.3" v \
     "SELECT '-0x_10'::int4, 42::text, 1.5::int4, '1.25'::numeric(3,1);"
