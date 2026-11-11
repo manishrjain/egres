@@ -562,7 +562,7 @@ pub const strpos: Func = .{
     .min_args = 2,
     .max_args = 2,
     .args = .{ .each = text_arg },
-    .result = .{ .fixed = .int8 },
+    .result = .{ .fixed = .int4 },
     .eval = .{ .strict = evalStrpos },
 };
 pub const position = alias("position", strpos);
@@ -602,9 +602,26 @@ fn evalReverse(
     return .{ .text = out };
 }
 
-/// Postgres's limit on one value, MaxAllocSize: REPEAT, LPAD and RPAD
-/// refuse a longer result before allocating it.
-const max_text_bytes: usize = (1 << 30) - 1;
+/// The largest value Postgres builds: MaxAllocSize less the 4-byte
+/// varlena header. REPEAT refuses a longer result, and LPAD and RPAD
+/// one whose 4-byte-per-character worst case is longer, before
+/// allocating anything.
+const max_value_bytes: usize = (1 << 30) - 1 - 4;
+
+/// `dst` filled with `pattern` again and again, cut where `dst` ends:
+/// a memset for one byte, else one copy and then each pass copies
+/// everything written so far, so n copies take log n memcpys.
+fn fillRepeating(dst: []u8, pattern: String) void {
+    std.debug.assert(pattern.len > 0);
+    if (pattern.len == 1) return @memset(dst, pattern[0]);
+    var done = @min(pattern.len, dst.len);
+    @memcpy(dst[0..done], pattern[0..done]);
+    while (done < dst.len) {
+        const n = @min(done, dst.len - done);
+        @memcpy(dst[done..][0..n], dst[0..n]);
+        done += n;
+    }
+}
 
 /// REPEAT(s, n): s n times; empty for n below 1.
 pub const repeat: Func = .{
@@ -625,13 +642,12 @@ fn evalRepeat(
     // An empty s is empty at any n, which also keeps a huge n from
     // looping.
     if (n <= 0 or text.len == 0) return .{ .text = "" };
-    if (n > max_text_bytes) return error.LengthTooLarge;
-    const times: usize = @intCast(n);
-    const total = std.math.mul(usize, text.len, times) catch
+    if (n > max_value_bytes) return error.LengthTooLarge;
+    const total = std.math.mul(usize, text.len, @intCast(n)) catch
         return error.LengthTooLarge;
-    if (total > max_text_bytes) return error.LengthTooLarge;
+    if (total > max_value_bytes) return error.LengthTooLarge;
     const out = try arloc.alloc(u8, total);
-    for (0..times) |i| @memcpy(out[i * text.len ..][0..text.len], text);
+    fillRepeating(out, text);
     return .{ .text = out };
 }
 
@@ -676,33 +692,37 @@ fn pad(
     const text = args[0].text;
     const n = try intArg(args[1]);
     if (n <= 0) return .{ .text = "" };
-    // Every character is at least a byte, so a longer n is too long.
-    if (n > max_text_bytes) return error.LengthTooLarge;
-    const want: usize = @intCast(n);
     const fill = if (args.len > 2) args[2].text else " ";
     const len = try charCount(text);
+    // An empty fill pads nothing, so the result is at most s; Postgres
+    // decides that before it checks the size, so a huge n is fine.
+    if (fill.len == 0) {
+        if (n >= len) return .{ .text = text };
+        return .{ .text = try charSlice(text, 0, @intCast(n)) };
+    }
+    if (n > max_value_bytes / 4) return error.LengthTooLarge;
+    const want: usize = @intCast(n);
     if (len >= want) return .{ .text = try charSlice(text, 0, want) };
-    if (fill.len == 0) return .{ .text = text };
+    // The padding is the fill repeated and cut at a character
+    // boundary: whole copies and then its first `missing % fill_chars`
+    // characters.
     const missing = want - len;
     const fill_chars = try charCount(fill);
-    const whole = missing / fill_chars;
     const rest = try charSlice(fill, 0, missing % fill_chars);
-    const pad_bytes = (std.math.mul(usize, whole, fill.len) catch
-        return error.LengthTooLarge) + rest.len;
-    if (text.len + pad_bytes > max_text_bytes) return error.LengthTooLarge;
+    const pad_bytes = missing / fill_chars * fill.len + rest.len;
     const out = try arloc.alloc(u8, text.len + pad_bytes);
     const padding = if (side == .left)
         out[0..pad_bytes]
     else
         out[text.len..];
-    for (0..whole) |i| @memcpy(padding[i * fill.len ..][0..fill.len], fill);
-    @memcpy(padding[whole * fill.len ..], rest);
+    fillRepeating(padding, fill);
     @memcpy(if (side == .left) out[pad_bytes..] else out[0..text.len], text);
     return .{ .text = out };
 }
 
 /// SPLIT_PART(s, delim, n): the n-th field of s split on `delim`, from
-/// 1; a negative n counts from the end; past the last field is empty.
+/// 1; a negative n counts from the end of the same fields; past the
+/// last field is empty.
 /// An empty `delim` makes s one field. n of 0 is an error, as in
 /// Postgres 14 and on.
 pub const split_part: Func = .{
@@ -726,21 +746,15 @@ fn evalSplitPart(
     if (delim.len == 0) {
         return .{ .text = if (n == 1 or n == -1) text else "" };
     }
-    var nth: i128 = 0;
-    if (n > 0) {
-        var fields = std.mem.splitSequence(u8, text, delim);
-        while (fields.next()) |field| {
-            nth += 1;
-            if (nth == n) return .{ .text = field };
-        }
-    } else {
-        var fields = std.mem.splitBackwardsSequence(u8, text, delim);
-        while (fields.next()) |field| {
-            nth -= 1;
-            if (nth == n) return .{ .text = field };
-        }
-    }
-    return .{ .text = "" };
+    // Fields are found scanning forward, as Postgres does, so a
+    // self-overlapping delim ('aa' in 'aaa') splits the same way for a
+    // negative n: count the fields, then take that one from the front.
+    const count: i128 = @intCast(std.mem.count(u8, text, delim) + 1);
+    const nth = if (n > 0) n else count + n + 1;
+    if (nth < 1 or nth > count) return .{ .text = "" };
+    var fields = std.mem.splitSequence(u8, text, delim);
+    for (1..@intCast(nth)) |_| _ = fields.next();
+    return .{ .text = fields.next().? };
 }
 
 // ---- numbers --------------------------------------------------------
