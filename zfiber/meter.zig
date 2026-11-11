@@ -46,8 +46,11 @@
 //! allocator before the wait, so a burst of large statements fills
 //! the pool as it arrives rather than after each is admitted. The
 //! wait is bounded, since a waiting statement can hold a lock a
-//! running one needs, and ends in a refusal. A single statement past
-//! `query_mem_bytes` is refused at its next yield.
+//! running one needs, and ends in a refusal. A running statement is
+//! refused at its next yield once it alone holds more than its
+//! tenant's soft limit while the pool is full (`overShare`), so one
+//! statement grows as far as the pool has room and no further; and
+//! past `query_mem_bytes` whatever the pool, when that is set.
 //!
 //! Time is the caller's: every call takes `now_ms`, a monotonic
 //! millisecond clock, so all of it is testable and the runtime passes
@@ -331,6 +334,14 @@ pub const Tenant = struct {
         return memPressure() and held > self.mem_soft_limit.load(.monotonic);
     }
 
+    /// One statement holding `held` bytes is past the tenant's whole
+    /// soft limit while the pool is full: no wait frees that, so the
+    /// statement is refused. Alone on the box the soft limit is the
+    /// pool, and that is how far a single sort or scan can grow.
+    pub fn overShare(self: *const Tenant, held: i64) bool {
+        return memPressure() and held > self.mem_soft_limit.load(.monotonic);
+    }
+
     /// Room for a statement: the wait while the tenant is past its
     /// soft limit under pressure, at most `mem_wait_ms`, then a
     /// refusal. Polls: a waiter exists only under pressure, and a
@@ -461,8 +472,9 @@ pub fn memPressure() bool {
 /// the pool, `memPressure`.
 pub var mem_held_total: std.atomic.Value(i64) = .init(0);
 
-/// A statement's live bytes past which its next yield refuses it;
-/// 0 = no cap. `--memory query_bytes`, written by the governor's
+/// A statement's live bytes past which its next yield refuses it,
+/// whatever the pool holds; 0 = only `Tenant.overShare` bounds it.
+/// `--memory query_bytes`, written by the governor's
 /// fiber and read at every statement's yield.
 pub var query_mem_bytes: std.atomic.Value(i64) = .init(0);
 

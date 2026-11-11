@@ -47,8 +47,9 @@ pub const Options = struct {
     count_only: bool = false,
     /// ORDER BY: the bound keys, first key first; empty = the source's
     /// order. An index walked in key order is the ordering when it can
-    /// be (walkFor); else a Sort node gathers every row before the
-    /// first goes out.
+    /// be (walkFor); else a Sort node reads every row before the first
+    /// goes out, dropping as it reads those past LIMIT plus OFFSET
+    /// when there is a LIMIT.
     order_by: []const _exec.SortKey = &.{},
     /// OFFSET: rows dropped before the first one produced, after the
     /// ordering.
@@ -112,7 +113,11 @@ pub fn plan(
     var child = src;
     if (walk == null and opts.order_by.len > 0) {
         child = try arloc.create(RowNode);
-        child.* = .{ .sort = .{ .child = src, .keys = opts.order_by } };
+        child.* = .{ .sort = .{
+            .child = src,
+            .keys = opts.order_by,
+            .max_rows = if (opts.limit) |limit| limit +| opts.offset else null,
+        } };
     }
     const root = try arloc.create(RowNode);
     root.* = .{ .materialize = .{

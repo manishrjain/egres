@@ -2,7 +2,7 @@
 # Copyright 2026 Manish R Jain
 # SPDX-License-Identifier: Apache-2.0
 
-# End-to-end test of memory bounds under a budget. Three server
+# End-to-end test of memory bounds under a budget. Four server
 # starts, since the memory flags are fixed at startup:
 #   1. a burst of large INSERTs against a small statement pool: every
 #      client ends with a row written or out of memory, the server's
@@ -10,7 +10,9 @@
 #   2. a pool smaller than one frame: the INSERT is refused after the
 #      wait, deterministically, and a small one goes through;
 #   3. a scan of wide rows to a client that reads nothing: the server
-#      holds one batch of the result, not all of it.
+#      holds one batch of the result, not all of it;
+#   4. a sort of those rows under a pool smaller than the table: it is
+#      refused, and with a LIMIT it runs holding only the rows it needs.
 # Wipes $DATA (default /data/egres) — that dir is throw-away.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -96,10 +98,12 @@ rm -rf "$DATA" && mkdir -p "$DATA" /tmp/zdb
 trap stop_server EXIT
 
 # --- 1. a burst of large INSERTs against a small pool ---------------------
-# A 512 MiB budget with 2% for statements: a pool of about 10 MiB, so
-# 8 MiB frames go through one at a time and the rest wait, up to the
-# bound, then are refused. 16 of them at once are 128 MiB of frames.
-start_server "total_bytes=512MiB;query_ratio=0.02"
+# A 512 MiB budget with 5% for statements: a pool of about 25 MiB.
+# An 8 MiB INSERT holds its frame and about as much again, and one
+# statement may not hold more than the pool, so they go through one
+# or two at a time and the rest wait, up to the bound, then are
+# refused. 16 of them at once are 128 MiB of frames.
+start_server "total_bytes=512MiB;query_ratio=0.05"
 q "CREATE TABLE burst (id int4, v text);" >/dev/null
 ROW=$(head -c 8388608 /dev/zero | tr '\0' 'x')
 clients=16
@@ -129,7 +133,7 @@ fi
 rm -rf "$OUT"
 if kill -0 "$SERVER_PID" 2>/dev/null; then ok "server survived the burst"
 else bad "server died during the burst"; fi
-# One at a time through a 10 MiB pool, 16 clients outlast the wait
+# One or two at a time through a 25 MiB pool, 16 clients outlast the wait
 # bound: without admission none would be turned away.
 if [ "$refused" -ge 1 ]; then ok "the full pool turned clients away"
 else bad "no client was refused: nothing waited for the pool"; fi
@@ -217,6 +221,22 @@ exec 3>&-
 if [ "$drained" -gt $((64 * 2097152)) ]; then ok "the whole result was sent"
 else bad "only ${drained} bytes of the result arrived"; fi
 expect "the table reads after the scan" "64" v "SELECT count(*) FROM wide;"
+
+# --- 4. a sort larger than the statement pool ------------------------------
+# The same 128 MiB table under a pool of about 100 MiB. ORDER BY on
+# the unindexed column holds every row, so it is refused once the pool
+# is full, where it used to grow until the kernel stopped the server.
+# With a LIMIT the sort holds that many rows and goes through.
+stop_server
+start_server "total_bytes=512MiB;query_ratio=0.2" \
+    --zdb="table_bytes=4MiB;flush_min_memtables=1"
+expect "a sort past the pool is out of memory" \
+    "out of memory: the statement is over its memory limit" \
+    v "SELECT id FROM wide ORDER BY b;"
+TOP="SELECT id FROM wide ORDER BY b DESC, id DESC LIMIT 2"
+expect "the same sort under a LIMIT holds two rows" "64,63" bash -c \
+    "psql '$E' -X -tA -c '$TOP' | paste -sd, -"
+expect "the table reads after the sorts" "64" v "SELECT count(*) FROM wide;"
 
 # --- no unexpected server-side errors --------------------------------------
 if grep -qE '^[^ ]+ ERROR ' "$LOG"; then bad "server log has errors"

@@ -906,6 +906,88 @@ test "sql.exec: materialize with lock and a limit locks the limited rows" {
     try testing.expect(!try node.next(&ctx, &b));
 }
 
+test "sql.exec: sort under max_rows holds and returns the first rows only" {
+    var fx = try Fixture.setup(&alternatingRows);
+    defer fx.teardown();
+    var tx = fx.txn();
+    defer tx.deinit();
+    var ctx = fx.ctx(&tx, false);
+    var b = try Batch.init(testing.allocator);
+    defer b.deinit();
+
+    const on_a = sql.expr.Node{ .column = fx.col("a") };
+    const on_b = sql.expr.Node{ .column = fx.col("b") };
+    const K = exec.SortKey;
+    const b_asc = K{ .node = &on_b, .desc = false, .nulls_first = false };
+    const a_desc = K{ .node = &on_a, .desc = true, .nulls_first = true };
+
+    // ORDER BY b LIMIT 5: 1250 rows tie on "x", and the five that came
+    // first stay first, as the unbounded sort has them.
+    var scan = RowNode{ .seq_scan = .{} };
+    var ties = RowNode{ .sort = .{
+        .child = &scan,
+        .keys = &.{b_asc},
+        .max_rows = 5,
+    } };
+    defer ties.deinit();
+    try testing.expect(try ties.next(&ctx, &b));
+    try testing.expectEqual(@as(usize, 5), b.sel.count());
+    var it = b.selected();
+    var want: u64 = 2;
+    while (it.next()) |r| : (want += 2)
+        try testing.expectEqual(want, sql.key.decodeEgid(r.key.primary).?);
+    try testing.expect(!try ties.next(&ctx, &b));
+
+    // ORDER BY b, a DESC with LIMIT 3 OFFSET 4: the rows that win
+    // arrive last, so every one held is pushed out on the way.
+    var scan2 = RowNode{ .seq_scan = .{} };
+    var top = RowNode{ .sort = .{
+        .child = &scan2,
+        .keys = &.{ b_asc, a_desc },
+        .max_rows = 7,
+    } };
+    defer top.deinit();
+    try testing.expect(try top.next(&ctx, &b));
+    try testing.expectEqual(@as(usize, 7), b.sel.count());
+    it = b.selected();
+    want = 2500;
+    while (it.next()) |r| : (want -= 2)
+        try testing.expectEqual(want, sql.key.decodeEgid(r.key.primary).?);
+
+    // A max_rows past the table is the whole sort; LIMIT 0 reads nothing.
+    var scan3 = RowNode{ .seq_scan = .{} };
+    var all = RowNode{ .sort = .{
+        .child = &scan3,
+        .keys = &.{a_desc},
+        .max_rows = 5000,
+    } };
+    defer all.deinit();
+    var total: usize = 0;
+    want = 2500;
+    while (try all.next(&ctx, &b)) {
+        it = b.selected();
+        while (it.next()) |r| : (want -= 1)
+            try testing.expectEqual(want, sql.key.decodeEgid(r.key.primary).?);
+        total += b.sel.count();
+    }
+    try testing.expectEqual(@as(usize, 2500), total);
+
+    // What a sort holds follows its max_rows: the few rows of the
+    // first two against the table of the third.
+    const whole = all.sort.row_arena.?.queryCapacity();
+    try testing.expect(ties.sort.row_arena.?.queryCapacity() < whole / 20);
+    try testing.expect(top.sort.row_arena.?.queryCapacity() < whole / 20);
+
+    var scan4 = RowNode{ .seq_scan = .{} };
+    var none = RowNode{ .sort = .{
+        .child = &scan4,
+        .keys = &.{a_desc},
+        .max_rows = 0,
+    } };
+    defer none.deinit();
+    try testing.expect(!try none.next(&ctx, &b));
+}
+
 test "sql.exec: orderKeys: direction, NULLs, and the first key that differs" {
     const int = struct {
         fn of(n: i32) Value {

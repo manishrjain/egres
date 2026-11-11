@@ -496,7 +496,7 @@ pub const RowNode = union(enum) {
             .seq_scan => |*n| n.deinit(),
             .fetch => |*n| n.deinit(),
             .filter => |*n| n.child.deinit(),
-            .sort => |*n| n.child.deinit(),
+            .sort => |*n| n.deinit(),
             .materialize => |*n| n.child.deinit(),
         }
     }
@@ -884,50 +884,83 @@ pub const SortKey = struct {
 
 /// `SELECT * FROM t ORDER BY n DESC, name`: every row of the child,
 /// sorted by the keys, then handed out by reference. The first `next`
-/// drains the child into the statement arena and evaluates each key
-/// once per row — with the arena as scratch, so a computed text key
-/// outlives the row's scratch — and std.mem.sort keeps equal keys in
-/// the child's order. LIMIT and OFFSET belong to the Materialize above
+/// drains the child, keying each row it holds; equal keys stay in the
+/// child's order. LIMIT and OFFSET belong to the Materialize above
 /// and so apply to the sorted rows.
+///
+/// With no `max_rows` every row is held. With one, rows past the first
+/// `max_rows` of the order are dropped while draining: memory follows
+/// the LIMIT, not the table.
 pub const Sort = struct {
     child: *RowNode,
     keys: []const SortKey,
+    /// LIMIT plus OFFSET: the rows the Materialize above can use.
+    max_rows: ?usize = null,
+    /// Holds the rows and their key cells, apart from the statement
+    /// arena so that the ones dropped give their memory back. Made by
+    /// the first `next`.
+    row_arena: ?std.heap.ArenaAllocator = null,
     sorted: ?[]const Item = null,
     pos: usize = 0,
 
     const Keyed = struct { item: Item, cells: []const Value };
 
+    pub fn deinit(self: *Sort) void {
+        if (self.row_arena) |*arena| arena.deinit();
+        self.child.deinit();
+    }
+
     pub fn next(self: *Sort, ctx: *ExecCtx, batch: *Batch) anyerror!bool {
-        const rows = self.sorted orelse try self.gather(ctx, batch);
+        if (self.sorted == null) self.sorted = try self.gather(ctx, batch);
         batch.reset();
-        const n = batch.appendRefs(rows[self.pos..]);
+        const n = batch.appendRefs(self.sorted.?[self.pos..]);
         self.pos += n;
         return n > 0;
     }
 
-    /// Every row of the child, keyed and sorted. The child's fills take
-    /// the whole cap whatever the caller's row_limit, which is put back
-    /// for the handing out.
+    /// The child's rows, keyed, sorted and cut to `max_rows`.
     fn gather(self: *Sort, ctx: *ExecCtx, batch: *Batch) anyerror![]const Item {
+        const max_rows = self.max_rows orelse std.math.maxInt(usize);
+        if (max_rows == 0) return &.{};
+
         const row_limit = batch.row_limit;
         defer batch.row_limit = row_limit;
+        // The child's fills take the whole cap whatever the caller's
+        // row_limit, which is put back for the handing out.
         batch.row_limit = row_cap;
 
+        self.row_arena = fiber.ctx().newArena();
+
+        var probe = fiber.ctx().newArena();
+        defer probe.deinit();
+
+        const fiber_alloc = fiber.ctx().allocator();
         var keyed: std.ArrayList(Keyed) = .empty;
+        defer keyed.deinit(fiber_alloc);
+
+        // The cells of the last row a prune kept: from then on a row is
+        // keyed where it lies in the batch and copied only when it
+        // comes before them.
+        var cutoff: ?[]const Value = null;
         while (try self.child.next(ctx, batch)) {
             var it = batch.selected();
             while (it.next()) |row| {
-                const item = try row.dupe(ctx.arloc);
-                const cells = try ctx.arloc.alloc(Value, self.keys.len);
-                const r: _expr.Row = .{
-                    .scratch = ctx.arloc,
-                    .tbl = ctx.tbl,
-                    .item = item,
-                };
-                for (self.keys, cells) |key, *cell|
-                    cell.* = try key.node.cell(r);
+                if (cutoff) |last| {
+                    _ = probe.reset(.retain_capacity);
+                    const cells = try self.cellsOf(ctx, probe.allocator(), row);
+                    // A tie loses: this row arrived after the one held.
+                    if (orderKeys(self.keys, cells, last) != .lt) continue;
+                }
 
-                try keyed.append(ctx.arloc, .{ .item = item, .cells = cells });
+                const arloc = self.row_arena.?.allocator();
+                const held = try self.keyedIn(ctx, arloc, row);
+                try keyed.append(fiber_alloc, held);
+
+                // At twice the rows wanted, a prune frees as many rows
+                // as it moves.
+                if (keyed.items.len < max_rows *| 2) continue;
+                try self.prune(ctx, &keyed, max_rows);
+                cutoff = keyed.items[max_rows - 1].cells;
             }
         }
         std.mem.sort(Keyed, keyed.items, self.keys, lessThan);
@@ -936,12 +969,62 @@ pub const Sort = struct {
         // step, charged here so a stop lands before any row goes out.
         try fiber.ctx().maybeYield();
 
-        const rows = try ctx.arloc.alloc(Item, keyed.items.len);
-        for (keyed.items, rows) |k, *slot| slot.* = k.item;
-        self.sorted = rows;
+        const first = keyed.items[0..@min(keyed.items.len, max_rows)];
+        const rows = try ctx.arloc.alloc(Item, first.len);
+        for (first, rows) |k, *slot| slot.* = k.item;
         return rows;
     }
 
+    /// Sorts the rows held and keeps the first `max_rows`, moved to a
+    /// fresh arena so that the rest give their memory back.
+    fn prune(
+        self: *Sort,
+        ctx: *ExecCtx,
+        keyed: *std.ArrayList(Keyed),
+        max_rows: usize,
+    ) !void {
+        std.mem.sort(Keyed, keyed.items, self.keys, lessThan);
+        keyed.shrinkRetainingCapacity(max_rows);
+
+        var arena = fiber.ctx().newArena();
+        errdefer arena.deinit();
+
+        for (keyed.items) |*k|
+            k.* = try self.keyedIn(ctx, arena.allocator(), k.item);
+        self.row_arena.?.deinit();
+        self.row_arena = arena;
+    }
+
+    /// `row` copied into `arloc` with its key cells, which are read off
+    /// the copy since a cell can point into its row.
+    fn keyedIn(
+        self: *Sort,
+        ctx: *ExecCtx,
+        arloc: std.mem.Allocator,
+        row: Item,
+    ) !Keyed {
+        const item = try row.dupe(arloc);
+        return .{ .item = item, .cells = try self.cellsOf(ctx, arloc, item) };
+    }
+
+    fn cellsOf(
+        self: *Sort,
+        ctx: *ExecCtx,
+        arloc: std.mem.Allocator,
+        item: Item,
+    ) ![]const Value {
+        const cells = try arloc.alloc(Value, self.keys.len);
+        const row: _expr.Row = .{
+            .scratch = arloc,
+            .tbl = ctx.tbl,
+            .item = item,
+        };
+        for (self.keys, cells) |key, *cell| cell.* = try key.node.cell(row);
+        return cells;
+    }
+
+    /// Equal keys are not less, which is what leaves them in the
+    /// child's order under the stable std.mem.sort.
     fn lessThan(keys: []const SortKey, a: Keyed, b: Keyed) bool {
         return orderKeys(keys, a.cells, b.cells) == .lt;
     }

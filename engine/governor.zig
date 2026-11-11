@@ -101,7 +101,8 @@ pub const Cfg = struct {
             " room, then its statement is refused. The cache takes" ++
             " what statements leave.",
         .query_bytes = "Bytes one statement may hold before it is" ++
-            " refused, any database. 0 = no cap.",
+            " refused, any database. 0 = as far as the statement pool" ++
+            " has room.",
     };
 };
 

@@ -440,9 +440,16 @@ test "payForMem: waits only while the pool is full" {
     try expect(waited >= 90 and waited <= 2000);
     try expect(t.totals.parked_ms.load(.monotonic) >= 100);
 
-    // Room given back meanwhile: admitted.
+    // The pool full: a statement holding more than the tenant's whole
+    // share is over it, one holding less is not.
+    try expect(t.overShare(1001));
+    try expect(!t.overShare(1000));
+
+    // Room given back meanwhile: admitted, and no statement is over.
     t.releaseMem(box.mem_bytes);
     try t.payForMem();
+    try expect(!t.overShare(1 << 40));
+    try expect(!meter.shared.overShare(1 << 40));
     // The shared tenant never waits.
     try meter.shared.payForMem();
 }

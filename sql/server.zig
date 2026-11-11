@@ -1018,6 +1018,12 @@ pub const Handler = struct {
                     self.endImplicit();
                     return replySnapshotTooOld(state);
                 }
+                // A yield point in a write body stopped the statement
+                // for its memory; the scans answer their own.
+                if (err == error.MemLimit) {
+                    self.endImplicit();
+                    return replyMemLimit(state);
+                }
                 if (err != error.Restart) {
                     self.endImplicit();
                     return err;
@@ -1362,7 +1368,8 @@ fn replyMemShare(state: *pgwire.ConnState) !void {
 }
 
 /// The statement holds more than the per-statement cap
-/// (`--memory query_bytes`): a yield point stopped it.
+/// (`--memory query_bytes`) or, with the statement pool full, more
+/// than its database's share of it: a yield point stopped it.
 pub fn replyMemLimit(state: *pgwire.ConnState) !void {
     return replyErrorCode(
         state,

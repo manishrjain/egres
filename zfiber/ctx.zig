@@ -235,7 +235,8 @@ pub const Ctx = struct {
     /// block of work, and the runtime may pause the statement here or
     /// decline to resume it, which comes back as the error. It asks
     /// whether the process is stopping (`Shutdown.startShutdown`) and
-    /// whether the statement holds more than `query_mem_bytes`, then
+    /// whether the statement holds more than `query_mem_bytes` or,
+    /// with the pool full, than its tenant's share, then
     /// charges the cpu since the last settle to the tenant and pays
     /// its debt: a bucket below zero parks the fiber until the rate
     /// has covered it. Cancel will come through here too. The drain
@@ -247,9 +248,11 @@ pub const Ctx = struct {
         if (_shutdown.installed()) |sd| {
             if (sd.isStopping()) return error.Shutdown;
         }
+        const held = self.root().mem_held.load(.monotonic);
         const cap = _meter.query_mem_bytes.load(.monotonic);
-        if (cap > 0 and self.root().mem_held.load(.monotonic) > cap)
-            return error.MemLimit;
+        if (cap > 0 and held > cap) return error.MemLimit;
+        if (self.tenant.overShare(held)) return error.MemLimit;
+
         if (_rt.currentWorkerOrNull()) |w| {
             if (w.current_fiber) |f| _ = w.chargeCpu(f);
         }
