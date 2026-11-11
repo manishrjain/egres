@@ -32,6 +32,15 @@ test "sql.numeric: parse keeps the scale, format keeps every digit" {
         .{ .in = "1.5e3", .coef = 1500, .scale = 0, .out = "1500" },
         .{ .in = "15e-1", .coef = 15, .scale = 1, .out = "1.5" },
         .{ .in = " 42 ", .coef = 42, .scale = 0, .out = "42" },
+        // Underscores between digits, in every part.
+        .{ .in = "12_000.5_0", .coef = 1200050, .scale = 2, .out = "12000.50" },
+        .{ .in = "2e0_3", .coef = 2000, .scale = 0, .out = "2000" },
+        .{ .in = "1__0", .coef = 10, .scale = 0, .out = "10" },
+        // A whole number in another radix.
+        .{ .in = "0x10", .coef = 16, .scale = 0, .out = "16" },
+        .{ .in = "-0X_ff", .coef = -255, .scale = 0, .out = "-255" },
+        .{ .in = " +0o17 ", .coef = 15, .scale = 0, .out = "15" },
+        .{ .in = "0b1_01", .coef = 5, .scale = 0, .out = "5" },
         .{
             .in = "12345678901234567890123456789012345678",
             .coef = 12345678901234567890123456789012345678,
@@ -48,6 +57,14 @@ test "sql.numeric: parse keeps the scale, format keeps every digit" {
     const bad_texts = [_]String{
         "", "-", "1.2.3", "abc", "1e", "NaN", "Infinity", "1 2",
     };
+    // An underscore at an edge of the digits, and a radix number
+    // with no digits, a point, or a digit past its radix.
+    const bad_separators = [_]String{
+        "_1", "1_", "1_.5", "1._5", "1_e5", "1e_5", "0x", "0x1.5", "0b12",
+    };
+    for (bad_separators) |bad| {
+        try testing.expectError(error.InvalidNumeric, Numeric.parse(bad));
+    }
     for (bad_texts) |bad| {
         try testing.expectError(error.InvalidNumeric, Numeric.parse(bad));
     }

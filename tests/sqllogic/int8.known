@@ -4,7 +4,6 @@
 #             run.py --write-skips, which keeps every other line.
 #   bug       diverges, filed; note = the issue.
 #   accepted  diverges on purpose; note = the reason.
-skip	pg/test_setup.sql:79	INSERT INTO INT8_TBL VALUES	0A000 unsupported value or column type
 skip	pg/test_setup.sql:85	VACUUM INT8_TBL	0A000 unsupported statement
 skip	pg/int8.sql:20	SELECT pg_input_is_valid('34', 'int8')	0A000 function pg_input_is_valid() is not supported
 skip	pg/int8.sql:21	SELECT pg_input_is_valid('asdf', 'int8')	0A000 function pg_input_is_valid() is not supported

@@ -177,15 +177,15 @@ CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (column);
 | Postgres type | Status | Notes |
 |---|---|---|
 | `boolean` | Yes | Literals `t`, `true`, `1`, `yes`, `on` and their opposites. |
-| `smallint`, `integer`, `bigint` | Yes | |
-| `real`, `double precision` | Yes | |
+| `smallint`, `integer`, `bigint` | Yes | Input as Postgres reads it: surrounding whitespace, a sign, `0x` / `0o` / `0b`, underscores between digits. Underscores are taken more freely than in Postgres: a doubled one (`'100__000'`) is accepted. |
+| `real`, `double precision` | Yes | Input and text output as Postgres's: `Infinity`, `-Infinity` and `NaN` in any case on input and spelled so on output; the shortest digits that read back the same, in exponent form (`1e+50`) outside Postgres's plain range. A value past the type's range is `22003`. Input also takes underscores between digits (`'1_000.5'`), which Postgres refuses for floats. |
 | `text`, `varchar`, `varchar(n)`, `char(n)` | Yes | Values are valid UTF-8 (`22021` otherwise); a value longer than `n` returns `22001`. |
 | `bytea` | Yes | Hex form in text, `'\x00ff'`, as `bytea_output = 'hex'`. |
 | `date`, `timestamp`, `timestamptz` | Yes | |
 | `uuid` | Yes | Postgres text input and canonical output; see below. |
 | `time`, `interval` | Partial | Only `NULL`; other values return `0A000`. |
 | `time with time zone` | Not&nbsp;yet | |
-| `numeric`, `decimal`, `numeric(p, s)` | Yes | Exact, up to 38 digits, where Postgres allows more: a longer value is `22003`, and an arithmetic result past 38 digits keeps as many fractional digits as fit, rounded half away from zero. A value is rounded to the column's scale, half away from zero, and must fit its precision. Printed with every digit of its scale (`12.50`). `NaN` and `Infinity` are not accepted. |
+| `numeric`, `decimal`, `numeric(p, s)` | Yes | Exact, up to 38 digits, where Postgres allows more: a longer value is `22003`, and an arithmetic result past 38 digits keeps as many fractional digits as fit, rounded half away from zero. A value is rounded to the column's scale, half away from zero, and must fit its precision. Printed with every digit of its scale (`12.50`). Input takes underscores between digits, more freely than Postgres (`'1.2e3__4'` is accepted), and whole numbers as `0x` / `0o` / `0b`. `NaN` and `Infinity` are not accepted. |
 | `serial`, `bigserial` | Not&nbsp;yet | `egid` gives an insertion-ordered id today. |
 | `json`, `jsonb` | Not&nbsp;yet | |
 | Arrays, `enum`, composite, range, `money`, `inet`, `bit`, `tsvector`, geometric types | Not&nbsp;yet | |

@@ -719,6 +719,24 @@ expect "a column without FROM is undefined" "column does not exist" q \
 expect "an unknown function without FROM" "now() is not supported" q \
     "SELECT now();"
 expect "SELECT * without FROM" "no tables specified" q "SELECT *;"
+# Number input and float output as Postgres's (#29, #30).
+expect "floats print as Postgres prints them" \
+    "Infinity|-Infinity|NaN|1e+50|1.5e-07|0.1|100" v \
+    "SELECT 'inf'::float8, '-Infinity'::float8, 'nan'::float8,
+        1e50::float8, 1.5e-7::float8, 0.1::float8, 100::float8;"
+expect "a float4 prints its own digits" "1e+06|123456.79|Infinity" v \
+    "SELECT 1e6::float4, 123456.79::float4, ' Infinity '::float4;"
+expect "a float as text is that form too" "1e+20" v \
+    "SELECT 1e20::float8::text;"
+expect "numeric input: underscores and radixes" "12000.5|255|-5" v \
+    "SELECT '12_000.5'::numeric, '0xFF'::numeric, '-0b101'::numeric;"
+expect "a float past its range" "out of range\|overflow" q \
+    "SELECT '1e400'::float8;"
+q "CREATE TABLE numin (id int8 PRIMARY KEY, f float8);" >/dev/null
+expect "INSERT takes a unary plus" "INSERT 0 2" q \
+    "INSERT INTO numin VALUES (+1, +1.5), (+2, -0.0);"
+expect "an unquoted -0.0 is zero" "1|1.5,2|0" bash -c \
+    "psql '$E' -X -tA -c 'SELECT id, f FROM numin ORDER BY id' | paste -sd,"
 # Casts (#26): a literal is read as the type, an expression converts.
 expect "a cast reads a literal as its type" "-16|42|2|1.3" v \
     "SELECT '-0x_10'::int4, 42::text, 1.5::int4, '1.25'::numeric(3,1);"

@@ -217,18 +217,9 @@ skip	pg/numeric.sql:1139	INSERT INTO num_input_test(n1) VALUES (' -inf ')	22P02 
 skip	pg/numeric.sql:1140	INSERT INTO num_input_test(n1) VALUES (' Infinity ')	22P02 invalid value for column type
 skip	pg/numeric.sql:1141	INSERT INTO num_input_test(n1) VALUES (' +inFinity ')	22P02 invalid value for column type
 skip	pg/numeric.sql:1142	INSERT INTO num_input_test(n1) VALUES (' -INFINITY ')	22P02 invalid value for column type
-skip	pg/numeric.sql:1143	INSERT INTO num_input_test(n1) VALUES ('12_000_000_000')	22P02 invalid value for column type
-skip	pg/numeric.sql:1144	INSERT INTO num_input_test(n1) VALUES ('12_000.123_456')	22P02 invalid value for column type
-skip	pg/numeric.sql:1145	INSERT INTO num_input_test(n1) VALUES ('23_000_000_000e-1_0')	22P02 invalid value for column type
-skip	pg/numeric.sql:1146	INSERT INTO num_input_test(n1) VALUES ('.000_000_000_123e1_0')	22P02 invalid value for column type
-skip	pg/numeric.sql:1147	INSERT INTO num_input_test(n1) VALUES ('.000_000_000_123e+1_1')	22P02 invalid value for column type
-skip	pg/numeric.sql:1148	INSERT INTO num_input_test(n1) VALUES ('0b10001110111100111100001001010')	22P02 invalid value for column type
-skip	pg/numeric.sql:1149	INSERT INTO num_input_test(n1) VALUES (' -0B_1010_1011_0101_0100_1010_1001_1000_1100_1110_1011_0001_1111_0000_1010_1101_0010 ')	22P02 invalid value for column type
-skip	pg/numeric.sql:1150	INSERT INTO num_input_test(n1) VALUES (' +0o112402761777 ')	22P02 invalid value for column type
-skip	pg/numeric.sql:1151	INSERT INTO num_input_test(n1) VALUES ('-0O0012_5524_5230_6334_3167_0261')	22P02 invalid value for column type
-skip	pg/numeric.sql:1152	INSERT INTO num_input_test(n1) VALUES ('-0x0000000000000000000000000deadbeef')	22P02 invalid value for column type
-skip	pg/numeric.sql:1153	INSERT INTO num_input_test(n1) VALUES (' 0X_30b1_F33a_6DF0_bD4E_64DF_9BdA_7D15 ')	22P02 invalid value for column type
+accepted	pg/numeric.sql:1169	INSERT INTO num_input_test(n1) VALUES ('12__34')	egres accepts underscores in numeric input; Postgres rejects these
 accepted	pg/numeric.sql:1174	INSERT INTO num_input_test(n1) VALUES ('1.2e3__4')	egres accepts underscores in numeric input; Postgres rejects these
+accepted	pg/numeric.sql:1182	INSERT INTO num_input_test(n1) VALUES ('0x12__34')	egres accepts underscores in numeric input; Postgres rejects these
 skip	pg/numeric.sql:1187	SELECT pg_input_is_valid('34.5', 'numeric')	0A000 function pg_input_is_valid() is not supported
 skip	pg/numeric.sql:1188	SELECT pg_input_is_valid('34xyz', 'numeric')	0A000 function pg_input_is_valid() is not supported
 skip	pg/numeric.sql:1189	SELECT pg_input_is_valid('1e400000', 'numeric')	0A000 function pg_input_is_valid() is not supported

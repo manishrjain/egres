@@ -460,6 +460,17 @@ test "sql.parse: INSERT ... VALUES parses rows, columns, and literals" {
     try testing.expect(ts.insert.rows[3][0] == .unsupported);
     try testing.expect(ts.insert.rows[4][0] == .unsupported);
     try testing.expect(ts.insert.rows[5][0] == .unsupported);
+
+    // A unary plus on a number is the number; on anything else it is
+    // an expression.
+    const plus = try parse.statement(
+        alloc,
+        "INSERT INTO t VALUES (+5, + 1.5, +'5', +NULL);",
+    );
+    try testing.expectEqual(@as(i64, 5), plus.insert.rows[0][0].int);
+    try testing.expectEqualStrings("1.5", plus.insert.rows[0][1].float);
+    try testing.expect(plus.insert.rows[0][2] == .unsupported);
+    try testing.expect(plus.insert.rows[0][3] == .unsupported);
 }
 
 test "sql.parse: INSERT rejections carry a reason" {

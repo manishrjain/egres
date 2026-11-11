@@ -543,6 +543,17 @@ fn relname(
 /// constant meets types it, as it does a bare literal.
 fn constant(p: ?*anyopaque) ?*c.A_Const {
     if (parser.cast(c.A_Const, p)) |ac| return ac;
+    // `+5`: a unary plus on a number is the number. (A minus the
+    // grammar has already folded into the constant.)
+    if (parser.cast(c.A_Expr, p)) |ae| {
+        if (ae.kind != c.AEXPR_OP or ae.lexpr != null) return null;
+        if (!std.mem.eql(u8, operatorOf(ae) orelse "", "+")) return null;
+        const ac = parser.cast(c.A_Const, ae.rexpr) orelse return null;
+        const kind = ac.val.node.type;
+        if (ac.isnull or (kind != c.T_Integer and kind != c.T_Float))
+            return null;
+        return ac;
+    }
     const tc = parser.cast(c.TypeCast, p) orelse return null;
     return parser.cast(c.A_Const, tc.arg);
 }
@@ -1118,7 +1129,15 @@ pub fn litToValue(
         .int => |n| try std.fmt.allocPrint(a, "{d}", .{n}),
         .bool_ => |b| if (b) "t" else "f",
     };
-    return _value.textToColumn(a, col, text);
+    const v = try _value.textToColumn(a, col, text);
+    // An unquoted `-0.0` is a numeric, which has no negative zero, so
+    // a float column takes it as 0; only the string '-0' is -0.
+    if (lit == .float) switch (v) {
+        .float4 => |f| if (f == 0) return .{ .float4 = 0 },
+        .float8 => |f| if (f == 0) return .{ .float8 = 0 },
+        else => {},
+    };
+    return v;
 }
 
 /// How much of the fiber's stack a WHERE or an expression may take

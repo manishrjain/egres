@@ -23,6 +23,21 @@ pub const Error = error{ InvalidNumeric, NumericOutOfRange, DivisionByZero };
 /// Postgres's: half away from zero.
 pub const Rounding = enum { round, trunc, floor, ceil };
 
+fn isDigitOrSeparator(ch: u8) bool {
+    return std.ascii.isDigit(ch) or ch == '_';
+}
+
+/// The radix a `0x` / `0o` / `0b` prefix names, either case.
+fn radixOf(text: String) ?u8 {
+    if (text.len < 2 or text[0] != '0') return null;
+    return switch (text[1]) {
+        'x', 'X' => 16,
+        'o', 'O' => 8,
+        'b', 'B' => 2,
+        else => null,
+    };
+}
+
 pub const Numeric = struct {
     // value = coef × 10^-scale
     coef: i128,
@@ -34,47 +49,70 @@ pub const Numeric = struct {
         return .{ .coef = n, .scale = 0 };
     }
 
-    /// Postgres's numeric literal: an optional sign, digits with an
-    /// optional point, an optional exponent. Leading zeros are not
-    /// significant; the scale is the digits after the point, less the
-    /// exponent, and a negative one is multiplied out so a cell's
-    /// scale is never negative.
+    /// Postgres's numeric input: an optional sign, then digits with
+    /// an optional point and an optional exponent, or a whole number
+    /// in another radix (`0x`, `0o`, `0b`). Underscores among the
+    /// digits are separators and are skipped, more freely than
+    /// Postgres allows. Leading zeros are not significant; the
+    /// scale is the digits after the point, less the exponent, and a
+    /// negative one is multiplied out so a cell's scale is never
+    /// negative.
     pub fn parse(raw_text: String) Error!Numeric {
         var text = std.mem.trim(u8, raw_text, " \t\r\n");
-        // `1.5e3`: the exponent only moves the scale, so take it off first.
+        const neg = text.len > 0 and text[0] == '-';
+        if (text.len > 0 and (text[0] == '-' or text[0] == '+'))
+            text = text[1..];
+
+        if (radixOf(text)) |base| {
+            // One underscore may follow the prefix, `0x_FF`.
+            const at: usize = if (text.len > 2 and text[2] == '_') 3 else 2;
+            const mag = std.fmt.parseInt(i256, text[at..], base) catch |err|
+                return switch (err) {
+                    error.Overflow => error.NumericOutOfRange,
+                    error.InvalidCharacter => error.InvalidNumeric,
+                };
+            return .{ .coef = try fit(if (neg) -mag else mag), .scale = 0 };
+        }
+
+        // `1.5e3`: the exponent only moves the scale, so take it off
+        // first.
         var exp: i32 = 0;
         if (std.mem.indexOfAny(u8, text, "eE")) |at| {
             exp = std.fmt.parseInt(i32, text[at + 1 ..], 10) catch
                 return error.InvalidNumeric;
             text = text[0..at];
         }
-        const neg = text.len > 0 and text[0] == '-';
-        if (text.len > 0 and (text[0] == '-' or text[0] == '+'))
-            text = text[1..];
 
         // `12.50`: every digit into the coefficient, the point's place
-        // remembered. A second point, or anything else, is not a number.
+        // remembered by the digits after it. A second point, or
+        // anything else, is not a number.
         var coef: i256 = 0;
         var digits: usize = 0;
-        var point: ?usize = null;
+        var frac: ?i32 = null;
         for (text, 0..) |ch, i| switch (ch) {
             '0'...'9' => {
                 digits += 1;
+                if (frac) |*n| n.* += 1;
                 coef = coef * 10 + (ch - '0');
                 if (coef >= pow10(max_digits + 1))
                     return error.NumericOutOfRange;
             },
-            '.' => if (point == null) {
-                point = i;
+            '.' => if (frac == null) {
+                frac = 0;
             } else return error.InvalidNumeric,
+            // A separator sits among digits, as std reads one in an
+            // integer: a run of them is fine, an edge is not.
+            '_' => if (i == 0 or i + 1 == text.len or
+                !isDigitOrSeparator(text[i - 1]) or
+                !isDigitOrSeparator(text[i + 1]))
+                return error.InvalidNumeric,
             else => return error.InvalidNumeric,
         };
         if (digits == 0) return error.InvalidNumeric;
 
         // The scale is the digits after the point less the exponent,
         // never negative: `15e-1` is 1.5 at scale 1, `1.5e3` is 1500.
-        const frac: i32 = if (point) |p| @intCast(text.len - p - 1) else 0;
-        var scale = frac - exp;
+        var scale = (frac orelse 0) - exp;
         if (scale < 0) {
             if (-scale > max_digits) return error.NumericOutOfRange;
             coef *= pow10(@intCast(-scale));

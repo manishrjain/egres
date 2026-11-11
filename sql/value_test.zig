@@ -81,6 +81,98 @@ test "sql.value: textToValue reads literals and rejects unsupported types" {
     try testing.expectError(error.UnsupportedType, toValue(testing.allocator, .time, "10:00"));
 }
 
+test "sql.value: numbers are read as Postgres's input functions read them" {
+    const a = testing.allocator;
+    const toValue = value.textToValue;
+    // Whitespace around, a sign, underscores between digits (more
+    // freely than Postgres: a doubled one too), the radix prefixes.
+    const ints = [_]struct { in: String, want: i64 }{
+        .{ .in = " 5 ", .want = 5 },
+        .{ .in = "+5", .want = 5 },
+        .{ .in = "1_000", .want = 1000 },
+        .{ .in = "100__000", .want = 100000 },
+        .{ .in = "0x10", .want = 16 },
+        .{ .in = "-0x_1_f", .want = -31 },
+        .{ .in = "0b101", .want = 5 },
+    };
+    for (ints) |case| {
+        const v = try toValue(a, .int8, case.in);
+        try testing.expectEqual(case.want, v.int8);
+    }
+    const bad_ints = [_]String{ "1_", "_1", "1 2", "" };
+    for (bad_ints) |bad| try testing.expectError(
+        error.InvalidCharacter,
+        toValue(a, .int8, bad),
+    );
+
+    // A float the same way, and the specials in any case.
+    try testing.expectEqual(1.5, (try toValue(a, .float8, " 1.5 ")).float8);
+    try testing.expectEqual(16.0, (try toValue(a, .float8, "0x10")).float8);
+    const sep = try toValue(a, .float8, "1_000.5");
+    try testing.expectEqual(1000.5, sep.float8);
+    const inf = std.math.inf(f64);
+    try testing.expectEqual(inf, (try toValue(a, .float8, "Infinity")).float8);
+    try testing.expectEqual(inf, (try toValue(a, .float8, " +inf ")).float8);
+    try testing.expectEqual(-inf, (try toValue(a, .float8, "-INF")).float8);
+    try testing.expect(std.math.isNan((try toValue(a, .float8, "nan")).float8));
+    try testing.expect(std.math.isNan((try toValue(a, .float4, "NaN")).float4));
+    const bad_floats = [_]String{ "", "  ", "infinit", "1 2" };
+    for (bad_floats) |bad| try testing.expectError(
+        error.InvalidCharacter,
+        toValue(a, .float8, bad),
+    );
+    // Past the type's range, or too small to be anything but zero.
+    try testing.expectError(error.Overflow, toValue(a, .float8, "1e400"));
+    try testing.expectError(error.Overflow, toValue(a, .float8, "1e-400"));
+    try testing.expectError(error.Overflow, toValue(a, .float4, "1e39"));
+    try testing.expectError(error.Overflow, toValue(a, .float4, "1e-46"));
+    try testing.expectEqual(0.0, (try toValue(a, .float8, "0e-400")).float8);
+}
+
+test "sql.value: a float prints as Postgres prints it" {
+    var buf: [64]u8 = undefined;
+    const inf = std.math.inf(f64);
+    const cases = [_]struct { v: value.Value, want: String }{
+        .{ .v = .{ .float8 = inf }, .want = "Infinity" },
+        .{ .v = .{ .float8 = -inf }, .want = "-Infinity" },
+        .{ .v = .{ .float8 = std.math.nan(f64) }, .want = "NaN" },
+        .{ .v = .{ .float4 = std.math.inf(f32) }, .want = "Infinity" },
+        .{ .v = .{ .float4 = std.math.nan(f32) }, .want = "NaN" },
+        .{ .v = .{ .float8 = 0 }, .want = "0" },
+        .{ .v = .{ .float8 = -0.0 }, .want = "-0" },
+        .{ .v = .{ .float8 = 100 }, .want = "100" },
+        .{ .v = .{ .float8 = 0.1 }, .want = "0.1" },
+        .{ .v = .{ .float8 = -123456.789 }, .want = "-123456.789" },
+        .{ .v = .{ .float8 = 1.0 / 3.0 }, .want = "0.3333333333333333" },
+        // Plain while the exponent is in [-4, 15), else d.ddde+XX.
+        .{ .v = .{ .float8 = 0.0001 }, .want = "0.0001" },
+        .{ .v = .{ .float8 = 0.00001 }, .want = "1e-05" },
+        .{ .v = .{ .float8 = 999999999999999 }, .want = "999999999999999" },
+        .{ .v = .{ .float8 = 1e15 }, .want = "1e+15" },
+        .{ .v = .{ .float8 = 1e50 }, .want = "1e+50" },
+        .{ .v = .{ .float8 = 1e-50 }, .want = "1e-50" },
+        .{ .v = .{ .float8 = 1.5e300 }, .want = "1.5e+300" },
+        .{ .v = .{ .float8 = -1.5e-7 }, .want = "-1.5e-07" },
+        .{
+            .v = .{ .float8 = 123456789012345678.0 },
+            .want = "1.2345678901234568e+17",
+        },
+        .{ .v = .{ .float8 = 5e-324 }, .want = "5e-324" },
+        // A float4 keeps its own shortest digits, plain in [-4, 6).
+        .{ .v = .{ .float4 = 0.1 }, .want = "0.1" },
+        .{ .v = .{ .float4 = 123456.79 }, .want = "123456.79" },
+        .{ .v = .{ .float4 = 999999 }, .want = "999999" },
+        .{ .v = .{ .float4 = 1e6 }, .want = "1e+06" },
+        .{ .v = .{ .float4 = 16777216 }, .want = "1.6777216e+07" },
+        .{ .v = .{ .float4 = 1.5e-10 }, .want = "1.5e-10" },
+    };
+    for (cases) |c| {
+        var w = std.Io.Writer.fixed(&buf);
+        try value.valueToText(&w, null, c.v);
+        try testing.expectEqualStrings(c.want, w.buffered());
+    }
+}
+
 test "sql.value: textToValue parses UUID text" {
     const expected = [16]u8{
         0x00, 0x11, 0x22, 0x33,

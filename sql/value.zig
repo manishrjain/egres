@@ -253,8 +253,8 @@ pub fn textToValue(alloc: std.mem.Allocator, ty: Type, text: String) !Value {
         .uint2 => .{ .uint2 = try textToInt(u16, text) },
         .uint4 => .{ .uint4 = try textToInt(u32, text) },
         .uint8 => .{ .uint8 = try textToInt(u64, text) },
-        .float4 => .{ .float4 = try std.fmt.parseFloat(f32, text) },
-        .float8 => .{ .float8 = try std.fmt.parseFloat(f64, text) },
+        .float4 => .{ .float4 = try textToFloat(f32, text) },
+        .float8 => .{ .float8 = try textToFloat(f64, text) },
         .text, .bpchar, .varchar => .{ .text = text },
         .bytea => .{ .bytea = try byteaFromText(alloc, text) },
         .timestamp => .{ .timestamp = try date.parseTimestamp(text, false) },
@@ -290,6 +290,28 @@ fn textToInt(comptime T: type, text: String) !T {
         }
     }
     return std.fmt.parseInt(T, s, 0);
+}
+
+/// A float as Postgres's input functions read one: a decimal or hex
+/// number, `Infinity` / `inf` / `NaN` in any case, a sign, whitespace
+/// around it; and underscores between digits, which Postgres takes
+/// in the other number types only. A number too large for the type,
+/// or too small to be anything but zero, is out of range (22003) as
+/// in Postgres, where std rounds it to an infinity or to zero.
+fn textToFloat(comptime T: type, text: String) !T {
+    const s = std.mem.trim(u8, text, " \t\n\r");
+    const f = try std.fmt.parseFloat(T, s);
+    const signed = s[0] == '-' or s[0] == '+';
+    const body = if (signed) s[1..] else s;
+    if (std.math.isInf(f) and std.ascii.toLower(body[0]) != 'i')
+        return error.Overflow;
+    if (f == 0 and !std.ascii.startsWithIgnoreCase(body, "0x")) {
+        const mantissa = body[0 .. std.mem.indexOfAny(u8, body, "eE") orelse
+            body.len];
+        if (std.mem.indexOfAny(u8, mantissa, "123456789") != null)
+            return error.Overflow;
+    }
+    return f;
 }
 
 /// A text literal or parameter as a cell of `col`: parsed as its type
@@ -415,6 +437,49 @@ fn writePadded(w: *std.Io.Writer, s: String, n: u32) !void {
     if (have < n) try w.splatByteAll(' ', n - have);
 }
 
+/// A float as Postgres prints one: the shortest digits that read back
+/// as the same value, written plainly while the decimal exponent is
+/// in [-4, 15) for a float8 and [-4, 6) for a float4, and as
+/// `d.ddde+XX` outside it; `Infinity`, `-Infinity` and `NaN` spelled
+/// out, the forms client libraries parse.
+fn writeFloat(w: *std.Io.Writer, x: anytype) !void {
+    if (std.math.isNan(x)) return w.writeAll("NaN");
+    if (std.math.isInf(x))
+        return w.writeAll(if (x < 0) "-Infinity" else "Infinity");
+
+    // std's scientific form is those shortest digits, `-1.5e300`.
+    var buf: [40]u8 = undefined;
+    const sci = std.fmt.bufPrint(&buf, "{e}", .{x}) catch unreachable;
+    const at = std.mem.indexOfScalar(u8, sci, 'e').?;
+    const exp = std.fmt.parseInt(i32, sci[at + 1 ..], 10) catch unreachable;
+    const neg = sci[0] == '-';
+    const mantissa = sci[@intFromBool(neg)..at];
+    const lead = mantissa[0..1];
+    const rest = if (mantissa.len > 2) mantissa[2..] else "";
+
+    if (neg) try w.writeByte('-');
+    const plain_below: i32 = if (@TypeOf(x) == f32) 6 else 15;
+    if (exp < -4 or exp >= plain_below) {
+        try w.writeAll(lead);
+        if (rest.len > 0) try w.print(".{s}", .{rest});
+        const sign: u8 = if (exp < 0) '-' else '+';
+        return w.print("e{c}{d:0>2}", .{ sign, @abs(exp) });
+    }
+    if (exp < 0) {
+        try w.writeAll("0.");
+        try w.splatByteAll('0', @intCast(-exp - 1));
+        try w.writeAll(lead);
+        return w.writeAll(rest);
+    }
+    const whole: usize = @intCast(exp);
+    try w.writeAll(lead);
+    if (rest.len <= whole) {
+        try w.writeAll(rest);
+        return w.splatByteAll('0', whole - rest.len);
+    }
+    try w.print("{s}.{s}", .{ rest[0..whole], rest[whole..] });
+}
+
 /// Render a non-null cell as its text-format wire representation. `col` is
 /// the cell's column when there is one: it decides the rendering where the
 /// value alone cannot, since a `char(n)` cell is a plain `.text` stored
@@ -441,10 +506,9 @@ pub fn valueToText(w: *std.Io.Writer, col: ?*const Column, v: Value) !void {
         .uint2,
         .uint4,
         .uint8,
-        .float4,
-        .float8,
         .time,
         => |x| try w.print("{d}", .{x}),
+        inline .float4, .float8 => |f| try writeFloat(w, f),
         .date => |days| try date.formatDate(w, days),
         .timestamp => |us| try date.formatTimestamp(w, us, false),
         .timestamptz => |us| try date.formatTimestamp(w, us, true),
