@@ -1121,34 +1121,60 @@ pub const Handler = struct {
         return t;
     }
 
-    /// The txn a DML statement runs in, holding its shared table
-    /// lock (the global lock order is table → row). Null means the
-    /// statement is over: a lock error was already reported, or the
-    /// database was dropped. DROP TABLE and DROP DATABASE queue
-    /// behind the table lock; writer preference then parks new DML
-    /// behind the pending drop. The `dropped` check comes AFTER the
-    /// take: see Database.dropped for why that order is what makes
-    /// the drop's pass over the tables complete.
+    /// A DML statement's txn and the table it resolved to.
+    pub const DmlTxn = struct {
+        tx: *_txn.Txn,
+        table_key: zdb.kv.TableKey,
+    };
+
+    /// Resolve `table` and take its shared table lock in the txn the
+    /// statement runs in (the global lock order is table → row). Null
+    /// means the statement is over: the table does not exist, a lock
+    /// error was already reported, or the database was dropped. DDL
+    /// holds the lock exclusively (CREATE from before the name is
+    /// visible, DROP until it is gone) and writer preference parks new
+    /// DML behind it, so the name is resolved again once the lock is
+    /// held: if it no longer names the table that was locked, the
+    /// table was dropped during the park and the answer is 42P01,
+    /// recreated since or not. The shared hold left on the dropped id
+    /// is inert, ids are never reused. The `dropped` check comes AFTER
+    /// the take (see Database.dropped for why that order is what makes
+    /// the drop's pass over the tables complete) and before the name
+    /// is resolved again, so a dropped database answers 3D000 and not
+    /// 42P01 for its vanished tables.
     pub fn dmlTxn(
         self: *Handler,
         state: *pgwire.ConnState,
-        table_key: zdb.kv.TableKey,
-    ) !?*_txn.Txn {
-        const tx = try self.statementTxn(table_key.namespace);
-        tx.lockTable(table_key.table_id, .shared) catch |err| {
-            try replyLockErr(state, err);
-            return null;
-        };
-        const db = try self.sessionDb(table_key.namespace);
-        if (db.dropped.load(.acquire)) {
-            try replyErrorCode(
-                state,
-                pgwire.sqlstate.invalid_catalog_name,
-                "database does not exist",
-            );
-            return null;
+        ns: u64,
+        table: String,
+    ) !?DmlTxn {
+        const manifest = &self.srv.engine.forest.manifest;
+        if (manifest.lookupTable(ns, table)) |table_id| {
+            const tx = try self.statementTxn(ns);
+            tx.lockTable(table_id, .shared) catch |err| {
+                try replyLockErr(state, err);
+                return null;
+            };
+            const db = try self.sessionDb(ns);
+            if (db.dropped.load(.acquire)) {
+                try replyErrorCode(
+                    state,
+                    pgwire.sqlstate.invalid_catalog_name,
+                    "database does not exist",
+                );
+                return null;
+            }
+            if (manifest.lookupTable(ns, table) == table_id) return .{
+                .tx = tx,
+                .table_key = .{ .namespace = ns, .table_id = table_id },
+            };
         }
-        return tx;
+        try replyErrorCode(
+            state,
+            pgwire.sqlstate.undefined_table,
+            "table does not exist",
+        );
+        return null;
     }
 
     /// End the statement's implicit txn, if that is what's live. The

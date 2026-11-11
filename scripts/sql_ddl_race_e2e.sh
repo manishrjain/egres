@@ -6,7 +6,7 @@
 # concurrent DML. Every table here is (id int primary key, k int), so a
 # statement may see it absent or complete and nothing in between: never
 # XX000, never 42601 or 42703 for a statement that fits the table, and
-# never a result that is not two columns wide. Three legs, in order:
+# never a result that is not two columns wide. Four legs, in order:
 #
 #   drop/create: one session drops and recreates r in a loop while
 #   others INSERT, UPDATE, DELETE and SELECT, one of them through the
@@ -18,6 +18,10 @@
 #   2-value INSERT and shows both columns.
 #
 #   create as: the same, for CREATE TABLE ... AS TABLE.
+#
+#   behind drop: one statement of each kind queued behind a DROP
+#   TABLE, put in that order rather than raced. It must answer 42P01,
+#   not run against the dropped table.
 #
 # Uses a temp data dir unless DATA is set, and wipes it.
 set -euo pipefail
@@ -254,6 +258,48 @@ create_leg "CREATE TABLE" t "$TABLES" "$DDL"
 psql "$E" -X -q -c "CREATE TABLE src $DDL;" \
     -c "INSERT INTO src VALUES (500, 5);" >/dev/null
 create_leg "CREATE TABLE AS" c "$COPIES" "AS TABLE src"
+
+# --- statements queued behind DROP TABLE -----------------------------------
+# behind_drop <what> <statement>: an open block holds r, a DROP TABLE
+# queues behind it and the statement behind the DROP. The block
+# commits, the drop lands first, and the table the statement resolved
+# is gone: it must answer 42P01 whatever holds the name by then.
+behind_drop() {
+    local what=$1 stmt=$2 took hold drop
+    psql "$E" -X -q -c "DROP TABLE IF EXISTS r;" -c "CREATE TABLE r $DDL;" \
+        -c "INSERT INTO r VALUES (1, 1);" >/dev/null
+    psql "$E" -X -q -c "BEGIN" -c "SELECT * FROM r;" -c '\! sleep 2' \
+        -c "COMMIT" >/dev/null 2>"$D/hold.err" &
+    hold=$!
+    sleep 0.5
+    psql "$E" -X -q -c "DROP TABLE r;" 2>"$D/drop.err" &
+    drop=$!
+    sleep 0.5
+    took=$( { time psql "$E" -X -v VERBOSITY=sqlstate -c "$stmt" \
+        >"$D/behind.out" 2>&1 || true; } 2>&1)
+    wait "$hold" "$drop" || true
+    alive "$what behind DROP TABLE"
+    clean "the open block" "$D/hold.err"
+    clean "DROP TABLE" "$D/drop.err"
+    # A statement that did not wait ran before the DROP queued or
+    # after it landed, and the check below would pass either way.
+    if ! awk -v t="$took" 'BEGIN { exit !(t >= 0.5) }'; then
+        echo "FAIL: $what did not queue behind DROP TABLE (${took}s)"
+        exit 1
+    fi
+    if grep -q 'ERROR:  42P01' "$D/behind.out"; then
+        ok "$what queued behind DROP TABLE answers 42P01"
+    else
+        bad "$what queued behind DROP TABLE got: $(tr '\n' ' ' \
+            <"$D/behind.out")"
+    fi
+}
+
+TIMEFORMAT=%R
+behind_drop INSERT "INSERT INTO r VALUES (5, 1);"
+behind_drop SELECT "SELECT * FROM r;"
+behind_drop UPDATE "UPDATE r SET k = 9;"
+behind_drop DELETE "DELETE FROM r;"
 
 echo
 echo "$pass passed, $fail failed"

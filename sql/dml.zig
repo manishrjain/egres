@@ -44,20 +44,15 @@ const replyErrorCode = _server.replyErrorCode;
 const replyLockErr = _server.replyLockErr;
 
 pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !void {
-    const eng = self.srv.engine;
     const ns = try self.sessionNamespace(state) orelse return;
-    const table_id = eng.forest.manifest.lookupTable(ns, ins.table) orelse
-        return replyErrorCode(state, pgwire.sqlstate.undefined_table, "table does not exist");
-    const table_key: zdb.kv.TableKey = .{
-        .namespace = ns,
-        .table_id = table_id,
-    };
 
     var arena = fiber.ctx().newArena();
     defer arena.deinit();
     const arloc = arena.allocator();
 
-    const tx = (try self.dmlTxn(state, table_key)) orelse return;
+    const dml = (try self.dmlTxn(state, ns, ins.table)) orelse return;
+    const tx = dml.tx;
+    const table_key = dml.table_key;
 
     // Open AFTER the table lock: a statement that parked behind
     // DDL holding the table lock exclusively (CREATE/DROP INDEX)
@@ -142,7 +137,7 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
         .scratch = .init(tx.allocator),
         .tx = tx,
         .tbl = tbl,
-        .table_id = table_id,
+        .table_id = table_key.table_id,
         .lock = true,
     };
     defer ctx.deinit();
@@ -197,20 +192,15 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
 }
 
 pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !void {
-    const eng = self.srv.engine;
     const ns = try self.sessionNamespace(state) orelse return;
-    const table_id = eng.forest.manifest.lookupTable(ns, sel.table) orelse
-        return replyErrorCode(state, pgwire.sqlstate.undefined_table, "table does not exist");
-    const table_key: zdb.kv.TableKey = .{
-        .namespace = ns,
-        .table_id = table_id,
-    };
 
     var arena = fiber.ctx().newArena();
     defer arena.deinit();
     const arloc = arena.allocator();
 
-    const tx = (try self.dmlTxn(state, table_key)) orelse return;
+    const dml = (try self.dmlTxn(state, ns, sel.table)) orelse return;
+    const tx = dml.tx;
+    const table_key = dml.table_key;
 
     // Open AFTER the table lock — see insert's comment.
     const tbl = self.openTable(table_key) catch |err| {
@@ -265,7 +255,7 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
         .scratch = .init(tx.allocator),
         .tx = tx,
         .tbl = tbl,
-        .table_id = table_id,
+        .table_id = table_key.table_id,
         .lock = sel.for_update,
     };
     defer ctx.deinit();
@@ -322,24 +312,14 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
 }
 
 pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !void {
-    const eng = self.srv.engine;
-
     const ns = try self.sessionNamespace(state) orelse return;
-    const table_id = eng.forest.manifest.lookupTable(ns, del.table) orelse
-        return replyErrorCode(
-            state,
-            pgwire.sqlstate.undefined_table,
-            "table does not exist",
-        );
-    const table_key: zdb.kv.TableKey = .{
-        .namespace = ns,
-        .table_id = table_id,
-    };
     var arena = fiber.ctx().newArena();
     defer arena.deinit();
     const arloc = arena.allocator();
 
-    const tx = (try self.dmlTxn(state, table_key)) orelse return;
+    const dml = (try self.dmlTxn(state, ns, del.table)) orelse return;
+    const tx = dml.tx;
+    const table_key = dml.table_key;
 
     // Open AFTER the table lock — see insert's comment.
     const tbl = self.openTable(table_key) catch |err| {
@@ -378,7 +358,7 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
         .scratch = .init(tx.allocator),
         .tx = tx,
         .tbl = tbl,
-        .table_id = table_id,
+        .table_id = table_key.table_id,
         .lock = true,
     };
     defer ctx.deinit();
@@ -423,24 +403,14 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
 }
 
 pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void {
-    const eng = self.srv.engine;
-
     const ns = try self.sessionNamespace(state) orelse return;
-    const table_id = eng.forest.manifest.lookupTable(ns, up.table) orelse
-        return replyErrorCode(
-            state,
-            pgwire.sqlstate.undefined_table,
-            "table does not exist",
-        );
-    const table_key: zdb.kv.TableKey = .{
-        .namespace = ns,
-        .table_id = table_id,
-    };
     var arena = fiber.ctx().newArena();
     defer arena.deinit();
     const arloc = arena.allocator();
 
-    const tx = (try self.dmlTxn(state, table_key)) orelse return;
+    const dml = (try self.dmlTxn(state, ns, up.table)) orelse return;
+    const tx = dml.tx;
+    const table_key = dml.table_key;
 
     // Open AFTER the table lock — see insert's comment.
     const tbl = self.openTable(table_key) catch |err| {
@@ -479,7 +449,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
         .scratch = .init(tx.allocator),
         .tx = tx,
         .tbl = tbl,
-        .table_id = table_id,
+        .table_id = table_key.table_id,
         .lock = true,
     };
     defer ctx.deinit();
@@ -1009,10 +979,6 @@ pub fn describeRows(
             pgwire.sqlstate.undefined_table,
             "table does not exist",
         );
-    const table_key: zdb.kv.TableKey = .{
-        .namespace = ns,
-        .table_id = table_id,
-    };
 
     var arena = fiber.ctx().newArena();
     defer arena.deinit();
@@ -1020,14 +986,7 @@ pub fn describeRows(
 
     const db = try self.sessionDb(ns);
     const hold = db.holdTable(table_id) orelse
-        return describeRowsLoad(
-            self,
-            state,
-            arloc,
-            table_key,
-            table,
-            projection,
-        );
+        return describeRowsLoad(self, state, arloc, ns, table, projection);
 
     const resolved = blk: {
         // state.send* can block below. Release the table hold here itself.
@@ -1055,13 +1014,13 @@ fn describeRowsLoad(
     self: *Handler,
     state: *pgwire.ConnState,
     arloc: std.mem.Allocator,
-    table_key: zdb.kv.TableKey,
+    ns: u64,
     table: String,
     projection: _parse.Projection,
 ) !void {
     defer self.endImplicit();
-    _ = (try self.dmlTxn(state, table_key)) orelse return;
-    const tbl = self.openTable(table_key) catch |err| {
+    const dml = (try self.dmlTxn(state, ns, table)) orelse return;
+    const tbl = self.openTable(dml.table_key) catch |err| {
         log.err(
             "describe '{s}': load schema: {s}",
             .{ table, @errorName(err) },
