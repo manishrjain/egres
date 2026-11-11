@@ -72,13 +72,15 @@ pub const Store = union(enum) {
     }
 
     /// Durability barrier for prior puts. put fsyncs each object's BYTES;
-    /// the file backend's rename leaves the NAME's durability to a depot
+    /// the file backend leaves the NAME's durability to a depot
     /// directory fsync — done here, once per batch, instead of per put.
     /// s3: no-op, every PUT is durable when the response arrives. Call
     /// after a batch of puts, before proposing changes that reference them.
+    /// On an error no name of the batch is known durable: the caller
+    /// puts the batch again.
     pub fn sync(self: *Store) !void {
         switch (self.*) {
-            .file => |*f| f.sync(),
+            .file => |*f| try f.sync(),
             .s3 => {},
         }
     }
@@ -121,9 +123,9 @@ pub const Store = union(enum) {
     /// modification time. Caller releases the result with
     /// `_vfs.freeObjectInfos`.
     ///
-    /// The file backend lists only the regular files at the top of the
-    /// depot, so the `tmp/` staging directory (a directory, not a file)
-    /// and the partial puts inside it are skipped. The s3 backend pages
+    /// The file backend lists the regular files at the top of the
+    /// depot. A put that a crash cut short is one of them, under its
+    /// final name and with part of its bytes. The s3 backend pages
     /// through ListObjectsV2 under the configured prefix.
     pub fn list(
         self: *Store,
@@ -265,10 +267,12 @@ const S3Object = struct {
     sz: u64,
 };
 
-/// A write-once blob store on a filesystem: a local directory or a
-/// shared mount (NFS). put() is tmp+rename so a reader can never observe
-/// a partial object, and only the creating node ever writes a given
-/// name, so tmp names cannot collide across nodes.
+/// A write-once blob store in a local directory, for one node. put()
+/// writes an object under its final name, so a name can hold part of
+/// an object while the put runs or after a crash cut it short. No
+/// reader opens a name before the manifest lists it, which is after
+/// the put and `sync` returned, and `Forest.removeOrphans` deletes
+/// the ones no manifest change ever named.
 pub const FileStore = struct {
     a: std.mem.Allocator,
     depot: String,
@@ -279,9 +283,7 @@ pub const FileStore = struct {
         depot: String,
         vfs: *const _vfs.VFS,
     ) !FileStore {
-        const tmp_dir = try std.fmt.allocPrint(a, "{s}/tmp", .{depot});
-        defer a.free(tmp_dir);
-        try _vfs.createDirPath(tmp_dir);
+        try _vfs.createDirPath(depot);
         return .{ .a = a, .depot = try a.dupe(u8, depot), .vfs = vfs };
     }
 
@@ -300,33 +302,26 @@ pub const FileStore = struct {
         if (@intFromPtr(data.ptr) % _vfs.page_size != 0 or data.len % _vfs.page_size != 0)
             return error.UnalignedPut;
 
-        const tmp = try std.fmt.allocPrint(
-            self.a,
-            "{s}/tmp/{s}",
-            .{ self.depot, name },
-        );
-        defer self.a.free(tmp);
-        const final = try self.objectPath(name);
-        defer self.a.free(final);
-        // fsync-before-rename (inside writeAndSync): uploads must be
-        // durable before the manifest change referencing them is proposed.
-        // Direct I/O — a fresh SST is read back through its own direct
-        // handle; the write must not churn the page cache. truncate — a
-        // crashed put can leave a partial tmp file; re-putting must
-        // overwrite it. The write runs at the caller's I/O class: the
-        // flush or compaction whose output this is. The NAME's
-        // durability (dir entry) is the caller's batch-level barrier:
-        // one Store.sync after all puts.
+        const path = try self.objectPath(name);
+        defer self.a.free(path);
+        // The bytes are synced here: an upload must be durable before
+        // the manifest change that names it is proposed. The name is
+        // the caller's barrier, one `Store.sync` after all its puts.
+        // Direct I/O: a fresh SST is read back through its own direct
+        // handle, and the write must not churn the page cache.
+        // truncate: a put that a crash cut short left part of the file
+        // under this name, and putting it again overwrites that. The
+        // write runs at the caller's I/O class, the flush or compaction
+        // whose output this is.
         try _vfs.writeAndSync(
-            tmp,
+            path,
             data,
             .{ .mode = .direct, .flags = .{ .truncate = true } },
         );
-        try _vfs.renameFile(tmp, final);
     }
 
-    fn sync(self: *FileStore) void {
-        _vfs.syncDir(self.depot);
+    fn sync(self: *FileStore) !void {
+        try _vfs.syncDir(self.depot);
     }
 
     fn exists(self: *FileStore, name: String) !bool {

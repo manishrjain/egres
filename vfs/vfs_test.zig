@@ -396,3 +396,32 @@ test "deviceOfPath: a directory and one under it are on one device" {
         try vfs.deviceOfPath(dir),
     );
 }
+
+test "sync and syncDir: a failure reaches the caller" {
+    const sim = fiber.simDisk() orelse return error.SkipZigTest;
+    var tmp = try vfs.TmpDir.init(testing.allocator);
+    defer tmp.deinit();
+    defer sim.setFaults(tmp.path, .{}) catch {};
+    const path = try std.fmt.allocPrint(
+        testing.allocator,
+        "{s}/file",
+        .{tmp.path},
+    );
+    defer testing.allocator.free(path);
+
+    const handle = try vfs.g().createFile(path, .{});
+    defer handle.close();
+    try handle.write("x", 0);
+
+    try sim.setFaults(tmp.path, .{ .sync = 1000 });
+    try testing.expectError(error.InputOutput, handle.sync());
+    try testing.expectError(error.InputOutput, vfs.syncDir(tmp.path));
+
+    // The directory cannot be opened, so its sync never runs.
+    try sim.setFaults(tmp.path, .{ .path_ops = 1000 });
+    try testing.expectError(error.InputOutput, vfs.syncDir(tmp.path));
+
+    try sim.setFaults(tmp.path, .{});
+    try handle.sync();
+    try vfs.syncDir(tmp.path);
+}

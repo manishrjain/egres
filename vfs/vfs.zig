@@ -199,9 +199,12 @@ pub const FileHandle = struct {
         if (written != data.len) return error.ShortWrite;
     }
 
+    /// fsync. After a failure the bytes written since the last sync
+    /// may never reach the device, and a second sync can report success
+    /// without them: the caller writes them again or gives the file up.
     pub fn sync(self: FileHandle) !void {
         const file = self.file orelse return;
-        fs.submit(.sync, .{ .file = file, .data_only = false }) catch {};
+        try fs.submit(.sync, .{ .file = file, .data_only = false });
     }
 
     /// fdatasync, errors propagated: the data and the metadata needed
@@ -511,16 +514,17 @@ pub fn setMtime(path: String, mtime_s: i64) !void {
     try fs.submit(.set_mtime, .{ .path = path, .mtime_s = mtime_s });
 }
 
-/// Best-effort directory fsync so newly created filenames are durable.
-/// Silently ignores errors (tmpfs, some network mounts don't support dir fsync).
-pub fn syncDir(path: String) void {
-    const file = fs.submit(.open, .{
+/// Directory fsync: the names made, renamed and deleted in `path`
+/// are durable on return. On an error they may not be, and a caller
+/// that goes on would lose a file to a power cut.
+pub fn syncDir(path: String) !void {
+    const file = try fs.submit(.open, .{
         .path = path,
         .flags = .{ .ACCMODE = .RDONLY, .DIRECTORY = true },
         .mode = 0,
-    }) catch return;
+    });
     defer fs.submit(.close, file);
-    fs.submit(.sync, .{ .file = file, .data_only = false }) catch {};
+    try fs.submit(.sync, .{ .file = file, .data_only = false });
 }
 
 /// Filesystem magic numbers (statfs `f_type`) that decide how a file is
@@ -633,11 +637,10 @@ pub fn freeObjectInfos(alloc: std.mem.Allocator, infos: []const ObjectInfo) void
 }
 
 /// Every regular file directly in `dir`. Anything that is not a regular
-/// file — a subdirectory, a symlink — is skipped, so a depot's `tmp/`
-/// staging directory never shows up. The one way to list a directory
-/// above zfiber: `fiber.fs`'s `list` is the readdir underneath, and only
-/// this function calls it. Caller releases the result with
-/// `freeObjectInfos`.
+/// file, a subdirectory or a symlink, is skipped. The one way to list a
+/// directory above zfiber: `fiber.fs`'s `list` is the readdir
+/// underneath, and only this function calls it. Caller releases the
+/// result with `freeObjectInfos`.
 ///
 /// With `.stat`, an entry that vanishes between the listing and its stat
 /// is dropped, not an error: a concurrent writer is allowed.

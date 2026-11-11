@@ -912,6 +912,11 @@ pub fn mergeAndWrite(
         spawned += 1;
     }
     const results = group.wait();
+    // Copied into `changes` below, or dropped when the job fails.
+    defer for (results) |r_opt| {
+        var r = r_opt orelse continue;
+        r.changes.deinit(self.allocator);
+    };
 
     // Every partition's puts are done; this makes their names durable.
     try self.cache.store.sync();
@@ -926,11 +931,10 @@ pub fn mergeAndWrite(
     var stats: Metrics = .{};
     var failed = false;
     for (results) |r_opt| {
-        var r = r_opt orelse {
+        const r = r_opt orelse {
             failed = true;
             continue;
         };
-        defer r.changes.deinit(self.allocator);
         for (r.changes.items) |create| {
             var tc = create;
             tc.raft_index = job.out_raft_index;

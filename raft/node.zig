@@ -126,6 +126,8 @@ pub const CommitStatus = enum {
     existing_node,
     invalid_addr,
     invalid_req,
+    /// This node's log did not take the entry.
+    log_failed,
 };
 
 /// What a proposer holds while its proposal is in flight, and where the
@@ -1688,16 +1690,16 @@ pub const Node = struct {
         self.event_notify.notify();
     }
 
-    /// Append the successful subset of `requests` to the leader's log,
-    /// assigning each a fresh HLC timestamp under the propose lock so log
-    /// order equals timestamp order. Each successfully-appended request's
-    /// waiter is queued (`commit_waiters` or `apply_waiters`);
-    /// rejected conf changes are finished inline and are NOT queued. If
-    /// the queueing fails (channel closed during shutdown), the waiter
-    /// is finished inline with `.shutdown`.
+    /// Append `requests` to the leader's log, assigning each a fresh HLC
+    /// timestamp under the propose lock so log order equals timestamp
+    /// order. A request whose entry the log took has its waiter queued
+    /// (`commit_waiters` or `apply_waiters`). Every other one is refused
+    /// here and loses its waiter (`reject`): a conf change that cannot
+    /// be proposed, and on a failure the ones the log does not hold.
+    /// NotLeader is returned before any of that.
     fn appendProposalsToLeaderLog(
         self: *Node,
-        requests: []const ProposalRequest,
+        requests: []ProposalRequest,
     ) RaftError!void {
         if (self.state != .leader) return RaftError.NotLeader;
         if (requests.len == 0) return;
@@ -1712,126 +1714,59 @@ pub const Node = struct {
             for (entries.items) |*entry| entry.deinit();
             entries.deinit(self.allocator);
         }
+        // A waiter is queued only once the log holds its entry. Queued
+        // under an index the log never took, it would be finished as
+        // committed by the next entry at that index. On a failure here
+        // every request that still has its waiter is refused instead.
+        errdefer for (requests) |*req| self.reject(req, .log_failed);
         try entries.ensureTotalCapacity(self.allocator, requests.len);
 
         var index = self.log.lastIndex() + 1;
-        var has_conf = false;
-        for (requests) |req| {
+        // The index of the batch's conf change: there is at most one.
+        var conf_index: ?u64 = null;
+        for (requests) |*req| {
+            var conf: ?zen.ConfChangeStruct = null;
+            defer if (conf) |*cc| cc.deinit(self.allocator);
+
             const is_conf = req.proposal_type == .conf;
             if (is_conf) {
-                if (self.pending_conf_change or has_conf) {
-                    self.reject(req, .pending_conf_change);
-                    continue;
-                }
-                // Its bytes are parsed below as they are. A conf change
-                // is a few dozen bytes, far under what `propose`
-                // compresses; one that arrives compressed is not one.
-                if (req.codec != .none) {
-                    self.reject(req, .invalid_req);
-                    continue;
-                }
+                if (self.rejectConf(req, conf_index != null)) continue;
 
-                const cc = try zen.ConfChangeReader.init(req.data, 0);
-                const ct = cc.changeType();
-                // Reject the uninitialized default and any unknown variant from
-                // a future schema (forward-compat catch-all).
-                switch (ct) {
-                    .add_voter, .add_learner, .to_voter, .to_learner, .remove_node, .update_addr => {},
-                    .unknown, _ => {
-                        self.reject(req, .invalid_req);
-                        continue;
-                    },
-                }
-                // Reject add if addr is missing or unparseable.
-                if (ct == .add_voter or ct == .add_learner) {
-                    _ = fiber.net.IpAddress.parseIpAndPort(cc.addr()) catch {
-                        self.reject(req, .invalid_addr);
-                        continue;
-                    };
-                    // Allow self-add (bootstrap), reject if peer already exists.
-                    // Use update_addr to change an existing peer's address.
-                    if (cc.nodeId() != self.id and self.peers.contains(cc.nodeId())) {
-                        self.reject(req, .existing_node);
-                        continue;
-                    }
-                }
-
-                if (ct == .update_addr) {
-                    _ = fiber.net.IpAddress.parseIpAndPort(cc.addr()) catch {
-                        self.reject(req, .invalid_addr);
-                        continue;
-                    };
-                    if (cc.nodeId() != self.id and !self.peers.contains(cc.nodeId())) {
-                        self.reject(req, .unknown_node);
-                        continue;
-                    }
-                }
-
-                // Reject if the target peer doesn't exist for changes that require it.
-                if (ct == .to_voter or ct == .to_learner or ct == .remove_node) {
-                    if (cc.nodeId() != self.id and !self.peers.contains(cc.nodeId())) {
-                        self.reject(req, .unknown_node);
-                        continue;
-                    }
-                }
-
-                // Reject if this would remove the last voter.
-                if (self.quorum_size <= 1 and (ct == .to_learner or ct == .remove_node)) {
-                    self.reject(req, .last_voter);
-                    continue;
-                }
-                has_conf = true;
-            }
-
-            var buf = std.ArrayList(u8).empty;
-            defer buf.deinit(self.allocator);
-
-            var writer = try zen.LogEntryWriter.initWithBuf(self.allocator, &buf);
-            defer writer.deinit();
-
-            var cc_offset: u32 = zen.NullOffset;
-            if (is_conf) {
-                // req.data is a serialized ConfChange. Clone it into buf and get the offset.
-                const cc_reader = try zen.ConfChangeReader.parseRoot(req.data);
-                cc_offset = try cc_reader.cloneInto(self.allocator, &buf);
+                const cc = try zen.ConfChangeReader.parseRoot(req.data);
+                conf = try cc.toStructValue(self.allocator);
+                conf_index = index;
             }
 
             // Assign the HLC inside this critical section so log order matches
             // timestamp order — the invariant that makes applied_timestamp a
             // safe bound for consistent follower reads.
             const ts = utils.hlc.g().next().asU64();
-            try writer.set(.{
+            const data = try zen.marshalRoot(self.allocator, zen.LogEntryStruct{
                 .index = index,
                 .term = self.current_term,
                 .timestamp = ts,
-                .data = if (is_conf) &[_]u8{} else req.data,
+                .data = if (is_conf) &.{} else req.data,
                 .entry_type = req.proposal_type,
-                .conf_change = cc_offset,
+                .conf_change = conf,
                 .codec = @intFromEnum(req.codec),
             });
-            _ = try writer.finishWithTail();
+            entries.appendAssumeCapacity(zen.LogEntryBuffer.initWithTail(
+                self.allocator,
+                data,
+                .owned,
+            ) catch |err| {
+                self.allocator.free(data);
+                return err;
+            });
 
-            const data = try buf.toOwnedSlice(self.allocator);
-            var entry = try zen.LogEntryBuffer.initWithTail(self.allocator, data, .owned);
-            errdefer entry.deinit();
-
-            try entries.append(self.allocator, entry);
-
-            // Enqueue the pending apply callback. send() blocks on full channel
-            // (backpressure if state-machine apply is lagging) and fails only
-            // on channel closed (shutdown) or fiber cancellation — in either
-            // case we fire the callback inline with .shutdown so the client
-            // isn't left hanging.
             const tl = _metrics.timeline();
             tl.record(index, .proposed, req.proposed_us);
             tl.record(index, .buffered, nowUs());
-            if (req.waiter) |w| {
-                w.entry = .{ .index = index, .term = self.current_term, .timestamp = ts };
-                switch (w.wait_for) {
-                    .commit => self.commit_waiters.append(self.allocator, w) catch w.finish(.shutdown),
-                    .apply => self.apply_waiters.send(w) catch w.finish(.shutdown),
-                }
-            }
+            if (req.waiter) |w| w.entry = .{
+                .index = index,
+                .term = self.current_term,
+                .timestamp = ts,
+            };
 
             index += 1;
         }
@@ -1841,11 +1776,91 @@ pub const Node = struct {
         // Sub-phase: propose_persist — DiskWAL.append batches the framed
         // records into one pwrite. The fdatasync is no longer issued here;
         // mainLoop spawns it in a fiber so it can overlap with broadcast.
+        // A failed append is settled here, by what the log then holds:
+        // nothing past this line returns an error.
         const t_persist = utils.coarseMs();
-        try self.log.addEntries(entries.items);
+        self.log.addEntries(entries.items) catch |err| utils.logEvery(
+            .err,
+            1,
+            "node {d}: log append stopped at index {d}: {s}",
+            .{ self.id, self.log.lastIndex(), @errorName(err) },
+        );
         _metrics.g().observePhase("log_append", t_persist);
 
-        if (has_conf) self.pending_conf_change = true;
+        // The log holds the entries through its last index, also when
+        // the append failed part way. send() blocks on a full channel
+        // (the apply is behind) and fails only at shutdown.
+        const last = self.log.lastIndex();
+        for (requests) |*req| {
+            const w = req.waiter orelse continue;
+            if (w.entry.index > last) {
+                self.reject(req, .log_failed);
+                continue;
+            }
+            // The queue owns the waiter from here.
+            req.waiter = null;
+            const queued = switch (w.wait_for) {
+                .commit => self.commit_waiters.append(self.allocator, w),
+                .apply => self.apply_waiters.send(w),
+            };
+            queued catch w.finish(.shutdown);
+        }
+        if (conf_index) |idx| self.pending_conf_change = idx <= last;
+    }
+
+    /// Rejects a conf change that cannot be proposed now, with the
+    /// status that says why. `in_batch`: the batch already holds one.
+    fn rejectConf(self: *Node, req: *ProposalRequest, in_batch: bool) bool {
+        const status = self.confProblem(req.*, in_batch) orelse return false;
+        self.reject(req, status);
+        return true;
+    }
+
+    /// What is wrong with a conf change, null when it can be proposed.
+    fn confProblem(
+        self: *Node,
+        req: ProposalRequest,
+        in_batch: bool,
+    ) ?CommitStatus {
+        if (self.pending_conf_change or in_batch) return .pending_conf_change;
+
+        // A conf change is a few dozen bytes, far under what `propose`
+        // compresses; one that arrives compressed is not one, and
+        // neither is one whose bytes do not parse.
+        if (req.codec != .none) return .invalid_req;
+        const cc = zen.ConfChangeReader.parseRoot(req.data) catch
+            return .invalid_req;
+
+        const ctype = cc.changeType();
+        const known = cc.nodeId() == self.id or
+            self.peers.contains(cc.nodeId());
+        switch (ctype) {
+            // The node may add itself (bootstrap). A peer that exists
+            // gets a new address through update_addr.
+            .add_voter, .add_learner => {
+                if (!addrParses(cc.addr())) return .invalid_addr;
+                const is_peer = self.peers.contains(cc.nodeId());
+                if (cc.nodeId() != self.id and is_peer) return .existing_node;
+            },
+            .update_addr => {
+                if (!addrParses(cc.addr())) return .invalid_addr;
+                if (!known) return .unknown_node;
+            },
+            .to_voter, .to_learner, .remove_node => {
+                if (!known) return .unknown_node;
+            },
+            // The uninitialized value, or a variant from a later schema.
+            .unknown, _ => return .invalid_req,
+        }
+
+        const leaves = ctype == .to_learner or ctype == .remove_node;
+        if (self.quorum_size <= 1 and leaves) return .last_voter;
+        return null;
+    }
+
+    fn addrParses(addr: String) bool {
+        _ = fiber.net.IpAddress.parseIpAndPort(addr) catch return false;
+        return true;
     }
 
     // processProposalRequests is just checking for proposals in proposal_requests queue, and
@@ -1871,15 +1886,14 @@ pub const Node = struct {
 
         defer for (batch.items) |req| self.allocator.free(req.data);
 
-        // appendProposalsToLeaderLog queues each successful entry's
-        // waiter with the assigned HLC timestamp. Rejected conf changes
-        // were finished inline from within the function, so there's no
-        // per-request loop here.
+        // appendProposalsToLeaderLog queues each waiter whose entry the
+        // log took, with the assigned HLC timestamp, and finishes every
+        // other one itself: rejected conf changes inline, and on an
+        // error the ones the log does not hold. NotLeader is returned
+        // before any of that.
         self.appendProposalsToLeaderLog(batch.items) catch |err| switch (err) {
             error.NotLeader => {
-                for (batch.items) |req| {
-                    self.reject(req, .not_leader);
-                }
+                for (batch.items) |*req| self.reject(req, .not_leader);
                 return batch.items.len;
             },
             else => return err,
@@ -2168,7 +2182,14 @@ pub const Node = struct {
             // register apply callbacks. Sub-phases ("propose_build" and
             // "propose_persist") are observed inside appendProposalsToLeaderLog.
             t = utils.coarseMs();
-            _ = self.processProposalRequests() catch {};
+            // The proposers were told; the loop goes on, and the next
+            // batch tries the log again.
+            _ = self.processProposalRequests() catch |err| utils.logEvery(
+                .err,
+                1,
+                "node {d}: proposals not appended: {s}",
+                .{ self.id, @errorName(err) },
+            );
             _metrics.g().observePhase("propose", t);
             const log_grew = self.log.lastIndex() > last_before;
 
@@ -2680,9 +2701,10 @@ pub const Node = struct {
     /// Reject every proposal still in the queue: none will reach the
     /// log. Main loop only while it runs; abortPending once it is gone.
     fn rejectQueued(self: *Node, status: CommitStatus) void {
-        while (self.proposal_ch.tryReceive()) |req| {
+        while (self.proposal_ch.tryReceive()) |received| {
+            var req = received;
             self.allocator.free(req.data);
-            self.reject(req, status);
+            self.reject(&req, status);
         } else |_| {}
     }
 
@@ -2702,8 +2724,11 @@ pub const Node = struct {
     }
 
     /// A proposal that never reached the log: no index, this term.
-    fn reject(self: *Node, req: ProposalRequest, status: CommitStatus) void {
+    /// The request loses its waiter, which its proposer may free from
+    /// here on, so a request that still has one is not settled yet.
+    fn reject(self: *Node, req: *ProposalRequest, status: CommitStatus) void {
         const w = req.waiter orelse return;
+        req.waiter = null;
         w.entry = .{ .term = self.current_term, .index = 0 };
         w.finish(status);
     }

@@ -679,12 +679,15 @@ pub const wal = struct {
     /// Queue the current file's last records and header for the writer
     /// and swap the prepared next one in. The outgoing file's cut and
     /// fsync happen on the writer with no lock held; until they land
-    /// the file opens from a scan of its records (`openScanned`).
+    /// the file opens from a scan of its records (`openScanned`). The
+    /// next file comes first: when there is none, the current one is
+    /// left as it was and the next append asks again.
     fn rotate(self: *wal) !void {
+        var nf = try self.next.swapIn();
+        errdefer nf.deinit();
+
         try self.buf.pushToPending(self.current);
         self.current.is_current = false;
-
-        const nf = try self.next.swapIn();
         try self.files.append(self.allocator, nf);
         self.current = &self.files.items[self.files.items.len - 1];
     }
@@ -710,6 +713,12 @@ pub const wal = struct {
         // sync(). Cache + slot table get updated immediately so reads see
         // the new entries before they hit disk.
         var expected_index = first_index;
+        // A batch cut short, by a rotation that found no file: the
+        // entries before it are in the log, which the caller reads off
+        // `lastIndex`, and the writer is woken for them.
+        errdefer if (self.lastIndex() >= first_index)
+            self.buf.advance(self.lastIndex());
+
         for (entries) |entry_buf| {
             const reader = try entry_buf.initReader();
             if (reader.index() != expected_index) return RaftLogError.Invalid;

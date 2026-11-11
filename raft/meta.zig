@@ -115,7 +115,7 @@ pub const MetaStore = struct {
         if (fresh) {
             try state_file.truncate(state_file_size);
             // O_DSYNC makes the file's bytes durable, not its name.
-            _vfs.syncDir(path);
+            try _vfs.syncDir(path);
         }
 
         // Allocate a default-empty Snapshot pointer up front so subsequent
@@ -241,9 +241,10 @@ pub const MetaStore = struct {
         // either fully to the new inode or stays at the old one.
         try _vfs.renameFile(tmp_path, final_path);
 
-        // dir-fsync so the rename itself is durable across power loss.
-        // VFS.syncDir is best-effort (some filesystems don't support it).
-        _vfs.syncDir(self.dir_path);
+        // The rename is durable only after the directory's sync. Until
+        // it is, the caller must not act on the new snapshot: a power
+        // cut can bring the old one back, and it needs its files.
+        try _vfs.syncDir(self.dir_path);
 
         // Replace the in-memory snapshot. clone returns a heap-allocated
         // *SnapshotStruct that deeply owns its data + conf_state, so after

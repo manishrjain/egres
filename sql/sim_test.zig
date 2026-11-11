@@ -203,14 +203,18 @@ const Resource = struct {
     }
 
     /// Whether its faults may have a statement answered with an error.
-    /// The server retries a write or a sync that failed. A failed
-    /// read, resize or path op may fail the statement that needed it,
-    /// and so may an outage.
+    /// The server retries a failed write. A failed read, sync, resize
+    /// or path op may fail the statement that needed it, as the sync
+    /// of the WAL's directory at a rotation does, and so may an outage.
     fn refuses(self: Resource) bool {
         if (self.outages) return true;
         switch (self.target) {
-            .dir => |dir| return dir.rates.read != 0 or
-                dir.rates.set_size != 0 or dir.rates.path_ops != 0,
+            .dir => |dir| {
+                const rates = dir.rates;
+                return rates.read != 0 or rates.sync != 0 or
+                    rates.sync_drop != 0 or rates.set_size != 0 or
+                    rates.path_ops != 0;
+            },
         }
     }
 };
@@ -231,9 +235,7 @@ const Resources = struct {
     /// meanwhile is the crash's, not a failed run.
     down: bool = false,
 
-    /// The WAL's directory and the store's, each a resource. The store
-    /// gets no failed syncs until issue 46 is fixed: a failed fsync of
-    /// an SST is ignored, and every seed would end on that.
+    /// The WAL's directory and the store's, each a resource.
     fn drawDirs(
         self: *Resources,
         alloc: std.mem.Allocator,
@@ -241,11 +243,7 @@ const Resources = struct {
         store_dir: String,
     ) !void {
         try self.addDir(alloc, "wal", wal_dir, drawFaults());
-
-        var store = drawFaults();
-        store.sync = 0;
-        store.sync_drop = 0;
-        try self.addDir(alloc, "store", store_dir, store);
+        try self.addDir(alloc, "store", store_dir, drawFaults());
     }
 
     fn addDir(
@@ -421,9 +419,12 @@ const Instance = struct {
         return self;
     }
 
-    /// Every connection is one of the test's and closed by now, which
-    /// the server's side of each has seen (`pgwire.Client.close`).
+    /// Every connection is one of the test's and closed by now. The
+    /// sleep lets the server's side of each see that and end before
+    /// what it uses is freed: virtual time moves only once nothing is
+    /// runnable. The engine may have been stopped already.
     fn close(self: *Instance) void {
+        fiber.sleepMs(1);
         self.eng.stop();
         self.sqlsrv.deinit();
         self.eng.deinit();
@@ -940,8 +941,9 @@ fn seqOf(
     return seq;
 }
 
-/// Run every writer for `ms` virtual milliseconds, then, with them
-/// still writing, call `at_end` and stop them.
+/// Run every writer for `ms` virtual milliseconds, then tell them to
+/// stop and call `at_end`. Returns once each has had the statement it
+/// was in answered.
 fn runWriters(
     alloc: std.mem.Allocator,
     writers: []Writer,
@@ -957,6 +959,9 @@ fn runWriters(
 
     for (writers) |*w| try group.spawn(.{}, Writer.run, .{ w, &stop });
     try resources.injectFaults(ms);
+    // Before `at_end`, which may park: no writer starts a statement
+    // after the first thing it does.
+    stop = true;
     try at_end(ctx);
 }
 
@@ -964,11 +969,17 @@ const CrashAt = struct {
     inst: *Instance,
     mode: fiber.simdisk.Crash,
 
-    /// The power cut. The caller stops the writers in the same step
-    /// of its fiber: none starts a statement the crash did not see.
+    /// The power cut, which no statement starts after. The server
+    /// runs on for a while on its dead disk, long enough one time in
+    /// two for the log to give up, and is then stopped with statements
+    /// still waiting. An apply that reads the store fails for as long
+    /// as the disk is dead, and only the stop answers a COMMIT queued
+    /// behind it.
     fn take(self: *const CrashAt) anyerror!void {
         try stillUp(self.inst);
         try resources.powerCut(self.mode);
+        fiber.sleepMs(fiber.random().uintLessThan(u64, 2 * retry_ms));
+        self.inst.eng.stop();
     }
 };
 
@@ -1056,10 +1067,7 @@ fn run(shape: Shape) !void {
         try runWriters(alloc, &writers, ms, &crash, CrashAt.take);
         try firstFailure(&writers);
 
-        // The server runs on for a while on its dead disk, long enough
-        // one time in two for the log to give up, and is stopped
-        // there. Then the disk works again.
-        fiber.sleepMs(fiber.random().uintLessThan(u64, 2 * retry_ms));
+        // The next boot is on a disk that works again.
         booted.?.close();
         booted = null;
         try resources.clear();

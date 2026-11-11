@@ -428,10 +428,15 @@ pub const LogFile = struct {
     ) !LogFile {
         var name_buf: LogFile.NameBuf = undefined;
         const name = try fname(fid, &name_buf);
-        const lf = try createNamed(vfs, alloc, dir_path, name, fid, opts);
+        var lf = try createNamed(vfs, alloc, dir_path, name, fid, opts);
         // Under its final name: O_DSYNC covers the file's bytes, the
-        // directory's sync its name, before anything is appended.
-        _vfs.syncDir(dir_path);
+        // directory's sync its name, before anything is appended. A
+        // file whose name may not be durable is not used.
+        _vfs.syncDir(dir_path) catch |err| {
+            lf.deinit();
+            deleteFileByName(alloc, dir_path, name);
+            return err;
+        };
         return lf;
     }
 
@@ -1018,7 +1023,8 @@ pub const NextLog = struct {
 
     /// <tmp_fid>.wal.tmp becomes <fid>.wal, and the name is made durable
     /// before anything is appended under it. The two differ for a
-    /// spare, and when a rotation went by during the prepare.
+    /// spare, and when a rotation went by during the prepare. A file
+    /// whose name may not be durable is not used.
     fn rename(self: *NextLog, tmp_fid: u64, fid: u64) !void {
         const tmp_path = try self.fullPath(tmp_fid, .tmp);
         defer self.allocator.free(tmp_path);
@@ -1026,7 +1032,10 @@ pub const NextLog = struct {
         defer self.allocator.free(path);
 
         try _vfs.renameFile(tmp_path, path);
-        _vfs.syncDir(self.dir_path);
+        _vfs.syncDir(self.dir_path) catch |err| {
+            _vfs.deleteFile(path) catch {};
+            return err;
+        };
     }
 };
 
