@@ -1,0 +1,105 @@
+# The simulation on seeds nobody has run, nightly and by hand
+# (scripts/sim_soak.sh): the SQL harness of sql/sim_test.zig, a whole
+# node on a simulated disk and network with power cuts and disk
+# errors, one process per seed on every core for some hours, in a
+# ReleaseSafe build. ci.yml runs the same tests on ten fixed seeds per
+# push; this is where a new failure is found.
+#
+# Each night starts where no earlier night has been: the first seed
+# comes from the run number, and each shard of the matrix has its own
+# range under it. A failing seed fails the job and replays on any
+# machine at the same commit:
+#
+#   zig build test -Doptimize=ReleaseSafe -- --bigtest \
+#       --sim-seed N --sim-sched S --filter "<the variant's filter>"
+#
+# The seed, its scheduler and its error are in fail.txt, and the
+# failing seeds' logs are in the job's artifact.
+name: sim
+
+on:
+  schedule:
+    # 1 am PST; an hour later on the clock during PDT.
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: >-
+          Whole hours of seeds per job, at most 3. Empty: each
+          variant's own.
+        default: ''
+
+jobs:
+  soak:
+    name: ${{ matrix.variant }} ${{ matrix.shard }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [errors, many-crashes]
+        shard: [0, 1]
+        include:
+          # Four crashes, with disk errors while the writers run.
+          - variant: errors
+            filter: 'BIG: sim: sql rides'
+            hours: 4
+            limit_s: 3600
+          # Forty crashes and larger rows, with disk errors. One seed
+          # takes half an hour on a fast machine, so each gets two
+          # hours and the job an hour less of them.
+          - variant: many-crashes
+            filter: 'BIG: sim: sql keeps'
+            hours: 3
+            limit_s: 7200
+    runs-on: ubuntu-latest
+    # The build, the hours, and the last seeds in flight, each up to
+    # its limit: five hours of seeds either way. Under the runner's 6
+    # hours.
+    timeout-minutes: 345
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # The same key as ci.yml, so the allocator archive is a cache hit.
+      - uses: actions/cache@v6
+        with:
+          path: .deps
+          key: >-
+            deps-${{ runner.os }}-${{
+            hashFiles('build.zig', 'scripts/bootstrap-*.sh') }}
+
+      # A million seeds per run and a hundred thousand per shard: far
+      # more than a job gets through, so no two jobs of any night
+      # share a seed.
+      - name: Soak
+        env:
+          HOURS: ${{ inputs.hours || matrix.hours }}
+          FILTER: ${{ matrix.filter }}
+          SHARD: ${{ matrix.shard }}
+          LIMIT_S: ${{ matrix.limit_s }}
+        run: |
+          first=$((GITHUB_RUN_NUMBER * 1000000 + SHARD * 100000 + 1))
+          scripts/sim_soak.sh "$RUNNER_TEMP/sim" "$HOURS" "$(nproc)" \
+              "$FILTER" "$first" "$LIMIT_S"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+              echo '```'
+              cat "$RUNNER_TEMP/sim/run.txt" "$RUNNER_TEMP/sim/fail.txt"
+              echo '```'
+          } >>"$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      # The results and the failing seeds' logs, without the test
+      # binary that sits beside them.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sim-${{ matrix.variant }}-${{ matrix.shard }}
+          path: |
+            ${{ runner.temp }}/sim
+            !${{ runner.temp }}/sim/test-ReleaseSafe
+          if-no-files-found: ignore

@@ -50,6 +50,53 @@ jobs:
       - name: prepush (builds + full test suite incl. big tests)
         run: ./scripts/prepush.sh
 
+  # The SQL harness under the simulation (scripts/sim_sql.sh): a whole
+  # node on a simulated disk and network, pgwire clients, power cuts
+  # and, in the second step, disk errors. Its tests skip without a
+  # seed, so the test job above does not run them. The seeds are
+  # fixed: a failure is a regression, and it replays on any machine
+  # with the command the script prints. Linux only: the simulation
+  # stands in for the disk, the network and the clock. Fresh seeds
+  # every night are sim.yml's.
+  sim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - uses: actions/cache@v6
+        with:
+          path: .deps
+          key: >-
+            deps-${{ runner.os }}-${{
+            hashFiles('build.zig', 'scripts/bootstrap-*.sh') }}
+
+      # sim_sql.sh keeps a failing seed's log under $TMPDIR.
+      - name: Crashes, seeds 1 to 10
+        env:
+          TMPDIR: ${{ runner.temp }}/sim-logs
+        run: |
+          mkdir -p "$TMPDIR"
+          scripts/sim_sql.sh 1 10
+
+      - name: Crashes and disk errors, seeds 1 to 10
+        env:
+          TMPDIR: ${{ runner.temp }}/sim-logs
+        run: |
+          mkdir -p "$TMPDIR"
+          scripts/sim_sql.sh 1 10 random "BIG: sim: sql rides"
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: sim-logs
+          path: ${{ runner.temp }}/sim-logs
+          if-no-files-found: ignore
+
   # The end-to-end scripts (scripts/e2e.sh): a real server driven over
   # pgwire by psql, then on Linux the Postgres conformance replay
   # (scripts/sqllogic_e2e.sh). A job of its own, beside the tests, so a

@@ -7,9 +7,12 @@
 # log is kept, and the run stops early once enough have failed.
 #
 # Usage: scripts/sim_soak.sh <dir> [hours] [jobs] [filter] [first_seed]
+#            [limit_s]
 #   dir         where the binary, the results and the logs go
 #   filter      a test name filter; "" runs the whole suite per seed,
 #               and one that starts with "BIG:" runs the slow tests
+#   limit_s     real seconds one seed may take before it is ended and
+#               counted as failed; without it, by the filter
 #
 # $SIM_SOAK_FLAGS, if set, is more flags for the test runner, such as
 # --exclude for a test that needs the source tree around it.
@@ -18,7 +21,8 @@
 # <dir>/logs/<seed>.log for each failure. `touch <dir>/stop` ends the
 # run after the seeds in flight.
 set -uo pipefail
-dir=${1:?usage: sim_soak.sh <dir> [hours] [jobs] [filter] [first_seed]}
+dir=${1:?usage: sim_soak.sh <dir> [hours] [jobs] [filter] [first_seed] \
+[limit_s]}
 # Relative to where the caller is, so before the move to the tree.
 mkdir -p "$dir/logs"
 dir=$(cd "$dir" && pwd)
@@ -31,7 +35,8 @@ max_fail=25
 scheds=(random priority_random priority_fifo)
 # The slow tests are skipped unless asked for, and get an hour a seed
 # where the others get half: with every core busy a slow one takes
-# several times what it does alone.
+# several times what it does alone. The caller gives the limit for a
+# test that needs more still.
 big=()
 limit_s=1800
 case "$filter" in BIG:*)
@@ -39,6 +44,7 @@ case "$filter" in BIG:*)
     limit_s=3600
     ;;
 esac
+limit_s=${6:-$limit_s}
 read -ra more <<<"${SIM_SOAK_FLAGS:-}"
 
 bin="$dir/test-ReleaseSafe"
