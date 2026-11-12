@@ -76,6 +76,9 @@ pub const Server = struct {
     /// txn's read_ts.
     databases_mu: fiber.Mutex(.tracked) = .{},
     databases: std.AutoHashMap(u64, *Database),
+    /// The commit oracle of every database (see oracle.zig for why
+    /// there is one). Each Database holds its address.
+    oracle: Oracle,
     next_txn_id: std.atomic.Value(u64) = .init(1),
 
     /// Before `eng.start`: this hands the engine the commit-stream
@@ -94,17 +97,20 @@ pub const Server = struct {
         );
         errdefer catalog_ps.deinit(alloc);
 
-        const index_catalog_ps = try _schema.compile(
+        var index_catalog_ps = try _schema.compile(
             alloc,
             _catalog.index_logical_schema,
             _catalog.index_logical_schema.current_version,
         );
+        errdefer index_catalog_ps.deinit(alloc);
+        const oracle = try Oracle.init(alloc, Oracle.default_max_keys);
         self.* = .{
             .engine = eng,
             .listen_addr = listen_addr,
             .catalog_ps = catalog_ps,
             .index_catalog_ps = index_catalog_ps,
             .databases = std.AutoHashMap(u64, *Database).init(alloc),
+            .oracle = oracle,
         };
         eng.setApplyObserver(.{ .ctx = self, .onData = onDataApplied });
         return self;
@@ -128,6 +134,7 @@ pub const Server = struct {
             alloc.destroy(d.*);
         }
         self.databases.deinit();
+        self.oracle.deinit();
         self.ddl_mu.deinit();
         self.databases_mu.deinit();
         alloc.destroy(self);
@@ -136,9 +143,10 @@ pub const Server = struct {
     /// The Database for `ns`, created on first use and never deleted
     /// after — callers may hold the pointer without `databases_mu`. A
     /// txn must resolve this BEFORE reading its read_ts: once the
-    /// Database exists, every later-applying commit lands in its oracle
-    /// (the apply observer only updates existing Databases), so no
-    /// commit a live txn could conflict with is ever missed.
+    /// Database exists, every later-applying commit of its namespace
+    /// is recorded in the oracle (the apply observer only records for
+    /// existing Databases), so no commit a live txn could conflict
+    /// with is ever missed.
     pub fn database(self: *Server, ns: u64) !*Database {
         self.databases_mu.lock(@src());
         defer self.databases_mu.unlock();
@@ -148,7 +156,8 @@ pub const Server = struct {
                 _ = self.databases.remove(ns);
                 return err;
             };
-            d.* = Database.init(self.engine.allocator, ns) catch |err| {
+            const alloc = self.engine.allocator;
+            d.* = Database.init(alloc, ns, &self.oracle) catch |err| {
                 self.engine.allocator.destroy(d);
                 _ = self.databases.remove(ns);
                 return err;
@@ -158,23 +167,18 @@ pub const Server = struct {
         return gop.value_ptr.*;
     }
 
-    /// Age the per-database conflict oracles (see Oracle.rotate) on a
-    /// fixed cadence: an oracle entry then lives one to two periods —
-    /// the bound on oracle memory AND on how long a txn can run before
-    /// horizon conservatism may force a bump or abort. Runs until
-    /// shutdown; `waitTimeout` doubles as the sleep.
+    /// Age the conflict oracle (see Oracle.rotate) on a fixed cadence:
+    /// an entry then lives one to two periods at most, which bounds
+    /// how long a txn can run before horizon conservatism may force a
+    /// bump or abort. Runs until shutdown; `waitForStart` doubles as
+    /// the sleep.
     fn runOracleRotation(self: *Server) void {
         const period_ms: u64 = 10 * 60 * 1000;
 
         while (!self.engine.node.isShuttingDown()) {
             const shutdown = &self.engine.node.shutdown;
             if (shutdown.waitForStart(.shutdown, period_ms)) return;
-
-            self.databases_mu.lock(@src());
-            defer self.databases_mu.unlock();
-
-            var it = self.databases.valueIterator();
-            while (it.next()) |d| d.*.oracle.rotate(period_ms - 1000);
+            self.oracle.rotate(period_ms - 1000);
         }
     }
 
@@ -1094,8 +1098,9 @@ pub const Handler = struct {
         // ddlReady instead.
         eng.catchUp() catch {};
         // Database first, read_ts second: a commit applying between
-        // the two lands in this database's now-existing oracle, so a
-        // conflict newer than our snapshot can never go unrecorded.
+        // the two is recorded in the oracle, as the database now
+        // exists, so a conflict newer than our snapshot can never go
+        // unrecorded.
         const db = try self.sessionDb(ns);
         const t = try eng.allocator.create(_txn.Txn);
         errdefer eng.allocator.destroy(t);

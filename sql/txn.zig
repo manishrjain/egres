@@ -23,7 +23,6 @@ const Item = zdb.kv.Item;
 const Key = zdb.kv.Key;
 const Forest = zdb.forest.Forest;
 const Meta = zdb.kv.Meta;
-const Oracle = @import("oracle.zig").Oracle;
 const Database = @import("database.zig").Database;
 const RWMutex = @import("database.zig").RWMutex;
 const String = @import("value.zig").String;
@@ -63,9 +62,9 @@ const ReadSet = struct {
     /// a point read conflicts iff its key committed above the snapshot
     /// (oracle floor > read_ts). Conservative: a commit even above the
     /// new snapshot still aborts.
-    fn aboveReadTs(self: ReadSet, oracle: *Oracle, read_ts: u64) bool {
+    fn aboveReadTs(self: ReadSet, db: *Database, read_ts: u64) bool {
         if (self.ran_scan) return true;
-        return oracle.maxCommitTs(self.reads.items) > read_ts;
+        return db.oracle.maxCommitTs(db.ns, self.reads.items) > read_ts;
     }
 };
 
@@ -442,7 +441,7 @@ pub const Txn = struct {
             &self.held_rows,
         );
         fiber.ctx().record("{d} row locks taken", .{hashes.len});
-        const newest = self.db.oracle.maxCommitTs(hashes);
+        const newest = self.db.oracle.maxCommitTs(self.db.ns, hashes);
         fiber.ctx().record("oracle newest ts: {d}", .{newest});
         return self.bumpTo(newest);
     }
@@ -457,7 +456,7 @@ pub const Txn = struct {
     /// names locally applied state, which cannot regress.
     pub fn bumpTo(self: *Txn, ts: u64) error{ Conflict, Restart }!void {
         if (ts <= self.read_ts) return;
-        if (self.prev.aboveReadTs(&self.db.oracle, self.read_ts))
+        if (self.prev.aboveReadTs(self.db, self.read_ts))
             return error.Conflict;
         // Counted at the new timestamp before the old count is given
         // up, so the floor never sees this txn as gone.

@@ -34,6 +34,9 @@ const Fixture = struct {
     /// The forest's SSTs; heap-held so its address survives the move out
     /// of setup. Freed after the forest.
     store: *zdb.vfs.Store,
+    /// The database's commit oracle, the server's in a real one;
+    /// heap-held for the same reason as the store. Freed after `db`.
+    oracle: *sql.oracle.Oracle,
     db: sql.database.Database,
     arena: std.heap.ArenaAllocator,
     tbl: sql.table.Table,
@@ -82,12 +85,22 @@ const Fixture = struct {
         const f = try Forest.open(testing.allocator, f_live, store);
         errdefer f.close();
 
+        const oracle = try testing.allocator.create(sql.oracle.Oracle);
+        errdefer testing.allocator.destroy(oracle);
+        oracle.* = try sql.oracle.Oracle.init(testing.allocator, 1024);
+        errdefer oracle.deinit();
+
         return .{
             .tmp = tmp,
             .forest = f,
             .live = f_live,
             .store = store,
-            .db = try sql.database.Database.init(testing.allocator, ns),
+            .oracle = oracle,
+            .db = try sql.database.Database.init(
+                testing.allocator,
+                ns,
+                oracle,
+            ),
             .arena = arena,
             .tbl = .{
                 .columns = columns,
@@ -102,6 +115,8 @@ const Fixture = struct {
     fn teardown(self: *Fixture) void {
         self.tbl.deinit();
         self.db.deinit();
+        self.oracle.deinit();
+        testing.allocator.destroy(self.oracle);
         self.forest.close();
         self.live.destroy();
         self.store.deinit();

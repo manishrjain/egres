@@ -36,6 +36,9 @@ const Fixture = struct {
     /// The forest's SSTs; heap-held so its address survives the move out
     /// of setup. Freed after the forest.
     store: *zdb.vfs.Store,
+    /// The database's commit oracle, the server's in a real one;
+    /// heap-held for the same reason as the store. Freed after `db`.
+    oracle: *sql.oracle.Oracle,
     db: sql.database.Database,
 
     fn setup(rows: []const zdb.kv.Item) !Fixture {
@@ -63,17 +66,29 @@ const Fixture = struct {
         }, .{}, .posting_index);
         try f.put(rows);
 
+        const oracle = try testing.allocator.create(sql.oracle.Oracle);
+        errdefer testing.allocator.destroy(oracle);
+        oracle.* = try sql.oracle.Oracle.init(testing.allocator, 1024);
+        errdefer oracle.deinit();
+
         return .{
             .tmp = tmp,
             .forest = f,
             .live = f_live,
             .store = store,
-            .db = try sql.database.Database.init(testing.allocator, ns),
+            .oracle = oracle,
+            .db = try sql.database.Database.init(
+                testing.allocator,
+                ns,
+                oracle,
+            ),
         };
     }
 
     fn teardown(self: *Fixture) void {
         self.db.deinit();
+        self.oracle.deinit();
+        testing.allocator.destroy(self.oracle);
         self.forest.close();
         self.live.destroy();
         self.store.deinit();
@@ -99,7 +114,7 @@ const Fixture = struct {
     /// Record a commit of `primary` at `ts` in the oracle, the way apply
     /// does — a one-item run through updateItems.
     fn commit(self: *Fixture, primary: String, ts: u64) !void {
-        try self.db.oracle.updateItems(&.{.{
+        try self.db.oracle.updateItems(ns, &.{.{
             .key = rowKey(primary),
             .versions = .{ .one = .{ .ts = ts, .meta = .{}, .value = "" } },
         }});
@@ -326,7 +341,7 @@ test "txn: bump revalidates a recorded posting read by its index key" {
         try tx.recordRead(blue);
         try tx.beginStatement();
 
-        try fx.db.oracle.updateItems(&.{.{
+        try fx.db.oracle.updateItems(ns, &.{.{
             .key = blue,
             .versions = .{ .one = .{ .ts = 550, .meta = .{}, .value = "" } },
         }});

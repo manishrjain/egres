@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! One SQL database's per-namespace state: the row lock table, the
-//! table locks, the commit oracle, and the compiled-schema
-//! cache. A Txn holds a pointer to its Database and takes what it
-//! needs from it; the Server owns the map of Databases.
+//! table locks and the compiled-schema cache, plus the server's
+//! commit oracle, which every database shares. A Txn holds a pointer
+//! to its Database and takes what it needs from it; the Server owns
+//! the map of Databases.
 
 const std = @import("std");
 const fiber = @import("zfiber");
@@ -35,11 +36,13 @@ const log = std.log.scoped(.sql);
 /// which holds nothing else and can safely withdraw.
 pub const RWMutex = fiber.RWMutex(.tracked);
 
-/// One database's transaction machinery: the lock table and the commit
-/// oracle. A SQL txn is connection-bound to one database, so wait-for
-/// graphs and conflict tracking are naturally namespace-local — per-ns
-/// instances keep tenants off each other's mutexes and give DROP
-/// DATABASE one object to tear down (teardown itself is deferred).
+/// One database's transaction machinery: the lock table, and its view
+/// of the commit oracle. A SQL txn is connection-bound to one
+/// database, so wait-for graphs are naturally namespace-local —
+/// per-ns lock tables keep tenants off each other's mutexes and give
+/// DROP DATABASE one object to tear down (teardown itself is
+/// deferred). The oracle is the server's: its maps are too large to
+/// have one per database (see oracle.zig).
 pub const Database = struct {
     /// This database's namespace id (implied by every key it owns).
     ns: u64,
@@ -64,7 +67,8 @@ pub const Database = struct {
     /// by `tableLock` and never freed (table ids are
     /// never reused; a dropped table's entry is a few bytes).
     table_locks: fiber.SafeHashMap(u32, *RWMutex),
-    oracle: Oracle,
+    /// The server's, shared by every database; asked with `ns`.
+    oracle: *Oracle,
     /// Per-table cache: compiled schema + egid counter, keyed by table_id
     /// (the namespace is this database's). Guards the map; each table's
     /// `next_egid` is atomic and needs only a shared hold to reach it.
@@ -78,13 +82,17 @@ pub const Database = struct {
     tables_mu: fiber.RWMutex(.tracked) = .{},
     tables: std.AutoHashMap(u32, *_table.Table),
 
-    pub fn init(allocator: std.mem.Allocator, ns: u64) !Database {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        ns: u64,
+        oracle: *Oracle,
+    ) !Database {
         return .{
             .ns = ns,
             .allocator = allocator,
             .row_locks = try fiber.SemaphoreMap.init(allocator),
             .table_locks = fiber.SafeHashMap(u32, *RWMutex).init(allocator),
-            .oracle = try Oracle.init(allocator, Oracle.default_max_keys),
+            .oracle = oracle,
             .tables = std.AutoHashMap(u32, *_table.Table).init(allocator),
         };
     }
@@ -101,7 +109,6 @@ pub const Database = struct {
             self.allocator.destroy(m.*);
         }
         self.table_locks.deinit();
-        self.oracle.deinit();
     }
 
     /// The lock of `table_id`, created on first use. Two
@@ -258,7 +265,7 @@ pub const Database = struct {
                     cached.raiseNextEgid(egid + 1);
             }
         }
-        self.oracle.updateItems(items) catch |err|
+        self.oracle.updateItems(self.ns, items) catch |err|
             log.err("oracle ns={d}: {s}", .{ self.ns, @errorName(err) });
     }
 };
