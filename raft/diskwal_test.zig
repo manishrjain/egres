@@ -421,6 +421,63 @@ test "diskwal: a crash keeps every synced entry and the hardstate" {
     try std.testing.expectEqual(@as(u64, 2), hs.voted_for);
 }
 
+test "diskwal: no entry goes into a file whose name is not durable" {
+    // Only the simulated disk fails and loses power on purpose.
+    const disk = fiber.simDisk() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+    // 17 MiB log files: 1 MiB of records past the header.
+    const opts: raft.diskwal.OpenOptions = .{
+        .log_file_size = 17 << 20,
+        .prezero = .true,
+    };
+    const payload = try alloc.alloc(u8, 300 * 1024);
+    defer alloc.free(payload);
+
+    {
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
+        defer ds.deinit();
+        ds.wal_store.next.prepare();
+        awaitReady(&ds.wal_store.next);
+        for (1..4) |i| {
+            fillLargePayload(payload, @intCast(i));
+            try appendEntry(alloc, &ds, @intCast(i), 1, payload);
+        }
+        try ds.sync();
+
+        // The fourth record rotates: the prepared file is renamed in
+        // and the directory's sync fails. A power cut would bring the
+        // file back under its tmp name, so the record is refused.
+        try disk.setFaults(wal_dir, .{ .sync = 1000 });
+        defer disk.setFaults(wal_dir, .{}) catch {};
+        fillLargePayload(payload, 4);
+        try std.testing.expectError(
+            error.Unavailable,
+            appendEntry(alloc, &ds, 4, 1, payload),
+        );
+        try disk.setFaults(wal_dir, .{});
+        try std.testing.expectEqual(@as(u64, 3), ds.lastIndex());
+
+        // Asked again on a disk that works, it goes into a new file
+        // whose name is durable first.
+        try appendEntry(alloc, &ds, 4, 1, payload);
+        try ds.sync();
+        disk.crash(wal_dir, .lose_all);
+    }
+
+    var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
+    defer ds2.deinit();
+    try std.testing.expectEqual(@as(u64, 4), ds2.lastIndex());
+    for (1..5) |i| {
+        const term = try ds2.term(@intCast(i));
+        try std.testing.expectEqual(@as(?u64, 1), term);
+    }
+}
+
 test "diskwal: the writer retries through disk faults" {
     // Only the simulated disk fails on purpose.
     const disk = fiber.simDisk() orelse return error.SkipZigTest;
@@ -1776,6 +1833,75 @@ test "diskwal prepared log file: renamed in at rotation, a spare at open" {
         defer ds.deinit();
         try std.testing.expectEqual(@as(u64, 5), ds.lastIndex());
         for (1..6) |i| try std.testing.expectEqual(@as(?u64, 1), try ds.term(@intCast(i)));
+    }
+}
+
+test "diskwal open: a log file with nothing past its header is dropped" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+    // Not filled, as the file a rotation creates when none is ready.
+    const opts: raft.diskwal.OpenOptions = .{
+        .log_file_size = 17 << 20,
+        .prezero = .false,
+    };
+    const payload = try alloc.alloc(u8, 300 * 1024);
+    defer alloc.free(payload);
+
+    {
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
+        defer ds.deinit();
+        for (1..3) |i| {
+            fillLargePayload(payload, @intCast(i));
+            try appendEntry(alloc, &ds, @intCast(i), 1, payload);
+        }
+        try ds.sync();
+    }
+    // What rotations leave below the current file when creating theirs
+    // failed: a file with no byte, and one with its header only.
+    {
+        const no_byte = try std.fmt.allocPrint(
+            alloc,
+            "{s}/00002.wal",
+            .{wal_dir},
+        );
+        defer alloc.free(no_byte);
+        try vfs.writeFile(no_byte, "");
+        const LogFile = raft.diskwal.LogFile;
+        var header_only = try LogFile.createNamed(
+            vfs.g(),
+            alloc,
+            wal_dir,
+            "00003.wal",
+            3,
+            opts,
+        );
+        header_only.deinit();
+        var current =
+            try LogFile.createCurrent(vfs.g(), alloc, wal_dir, 4, opts);
+        current.deinit();
+    }
+    {
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
+        defer ds.deinit();
+        try std.testing.expect(!try dirHas(wal_dir, "00002.wal"));
+        try std.testing.expect(!try dirHas(wal_dir, "00003.wal"));
+        try std.testing.expectEqual(@as(u64, 2), ds.lastIndex());
+        fillLargePayload(payload, 3);
+        try appendEntry(alloc, &ds, 3, 1, payload);
+        try ds.sync();
+    }
+    {
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
+        defer ds.deinit();
+        try std.testing.expectEqual(@as(u64, 3), ds.lastIndex());
+        for (1..4) |i| {
+            const term = try ds.term(@intCast(i));
+            try std.testing.expectEqual(@as(?u64, 1), term);
+        }
     }
 }
 

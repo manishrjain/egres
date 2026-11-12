@@ -209,7 +209,10 @@ pub const LogFile = struct {
         alloc: std.mem.Allocator,
         handle: _vfs.FileHandle,
     ) !std.ArrayList(entry) {
-        const page = try handle.readAligned(alloc, 0, _vfs.page_size);
+        // A file with no byte answers the read with EOF: a creation
+        // that failed before its header write.
+        const page = handle.readAligned(alloc, 0, _vfs.page_size) catch |err|
+            return if (err == error.EOF) error.InvalidLogHeader else err;
         defer page.free();
 
         const prefix = zbuf.Frame.readPrefix(page.data) catch
@@ -303,31 +306,35 @@ pub const LogFile = struct {
     /// Index the current log file from its frames: every well-formed
     /// record up to the first zero or torn frame. Reads the entire
     /// payload region in one read, then scans in memory. Rotated
-    /// log files carry their slot list in the header instead.
+    /// log files carry their slot list in the header instead. A read
+    /// that fails is returned: the records are there, and a file taken
+    /// for empty would have them written over.
     fn scanFrames(
         fid: u64,
         handle: _vfs.FileHandle,
         alloc: std.mem.Allocator,
     ) !LogFile {
-        var slots_list = std.ArrayList(entry).empty;
-        errdefer slots_list.deinit(alloc);
+        var lf = LogFile{
+            .fid = fid,
+            .handle = handle,
+            .allocator = alloc,
+            .slots = std.ArrayList(entry).empty,
+            .write_offset = log_file_offset,
+            .is_current = true,
+        };
+        errdefer lf.slots.deinit(alloc);
+
+        // A file that ends inside its header region has no record:
+        // one created without a fill and never appended to, or one
+        // whose creation failed part way.
+        if (handle.file_size <= log_file_offset) return lf;
 
         // Single read of entire payload region.
-        const payload_region_size: usize = @intCast(handle.file_size - log_file_offset);
-        const result = handle.readAligned(
+        const result = try handle.readAligned(
             alloc,
             log_file_offset,
-            payload_region_size,
-        ) catch {
-            return .{
-                .fid = fid,
-                .handle = handle,
-                .allocator = alloc,
-                .slots = slots_list,
-                .write_offset = log_file_offset,
-                .is_current = true,
-            };
-        };
+            @intCast(handle.file_size - log_file_offset),
+        );
         defer result.free();
         const data = result.data;
 
@@ -354,10 +361,10 @@ pub const LogFile = struct {
             // A reused file's old records are intact frames past the
             // new ones. Their indexes are below the snapshot that
             // freed the file, so one never follows the record before.
-            if (slots_list.getLastOrNull()) |prev| {
+            if (lf.slots.getLastOrNull()) |prev| {
                 if (reader.index() != prev.index + 1) break;
             }
-            try slots_list.append(alloc, .{
+            try lf.slots.append(alloc, .{
                 .term = reader.term(),
                 .index = reader.index(),
                 .timestamp = reader.timestamp(),
@@ -368,14 +375,8 @@ pub const LogFile = struct {
 
             pos += zbuf.Frame.hdr_size + payload.len;
         }
-        return .{
-            .fid = fid,
-            .handle = handle,
-            .allocator = alloc,
-            .slots = slots_list,
-            .write_offset = log_file_offset + pos,
-            .is_current = true,
-        };
+        lf.write_offset = log_file_offset + pos;
+        return lf;
     }
 
     /// Open the current (highest fid) log file: its entries come from
@@ -464,6 +465,9 @@ pub const LogFile = struct {
             .mode = .default,
             .flags = .{ .writable = true, .truncate = true, .dsync = true },
         });
+        // A creation that fails leaves no file under the name. One
+        // that stays, when the delete fails too, scans as empty.
+        errdefer _vfs.deleteFile(path) catch {};
 
         // Build the LogFile up front so a single deinit covers both the
         // handle and the (initially empty) slots list. Struct construction

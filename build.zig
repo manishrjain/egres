@@ -486,11 +486,7 @@ const extra_test_files = [_][]const u8{};
 //
 // (The Mux multiplexer + its mux_test/transport_test moved to `unused/`,
 //  which isSkippedPath excludes wholesale — no entries needed here.)
-//
-// - raft/meta_test.zig:      uses `next_seq` and integer enum literals
-//                            that no longer match raft.MetaStore / RoleEnum
 const skip_test_files = [_][]const u8{
-    "raft/meta_test.zig",
     // Legacy thread-vs-fiber benchmark. Uses std.Thread.spawn (removed
     // elsewhere) and produces a multi-cell sweep + p50/p99 latencies that
     // don't fit the simple `b.n` framework. Conclusion is captured in

@@ -14,19 +14,16 @@ const vfs = @import("vfs");
 const zen = raft.buffers;
 const meta = raft.meta;
 
+/// Named from the seed's random bytes, not the clock: under the
+/// simulation every test in one virtual ms reads the same time.
 fn makeTempMetaDir(alloc: std.mem.Allocator) ![]u8 {
     var path_buf: [160]u8 = undefined;
-    const ts = std.time.nanoTimestamp();
-    const path = try std.fmt.bufPrint(&path_buf, "/tmp/egres-meta-{d}", .{ts});
+    const path = try std.fmt.bufPrint(
+        &path_buf,
+        "/tmp/egres-meta-{x:0>16}",
+        .{fiber.random().int(u64)},
+    );
     return alloc.dupe(u8, path);
-}
-
-/// Read `state.bin` from disk after MetaStore has been deinited so we can
-/// inspect on-disk slot bytes directly. Caller frees.
-fn readStateBytes(alloc: std.mem.Allocator, dir: []const u8) ![]u8 {
-    const path = try std.fs.path.join(alloc, &.{ dir, "state.bin" });
-    defer alloc.free(path);
-    return vfs.readFile(path, alloc);
 }
 
 /// Flip one byte of the file at `offset`, through vfs: the test reaches
@@ -69,7 +66,6 @@ test "meta: fresh open creates two valid slots with default HardState" {
 
     // Slot B (the higher seq from initialisation) should be active.
     try std.testing.expectEqual(@as(u8, 1), ms.active_slot);
-    try std.testing.expectEqual(@as(u64, 2), ms.next_seq);
 }
 
 test "meta: a crash keeps the last hardstate and snapshot" {
@@ -130,6 +126,49 @@ test "meta: a failed write leaves the last hardstate in place" {
     try std.testing.expectEqual(@as(u64, 4), ms2.hardState().current_term);
 }
 
+test "meta: a snapshot whose directory sync fails is not installed" {
+    // Only the simulated disk fails on purpose.
+    const disk = fiber.simDisk() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const dir = try makeTempMetaDir(alloc);
+    defer {
+        vfs.deleteTree(dir) catch {};
+        alloc.free(dir);
+    }
+
+    {
+        var ms = try meta.MetaStore.openPath(vfs.g(), dir, alloc);
+        defer ms.deinit();
+        try ms.setSnapshot(.{
+            .index = 5,
+            .term = 1,
+            .data = "abc",
+            .conf_state = null,
+        });
+
+        // The tmp file is O_DSYNC, so the one sync here is the
+        // directory's, after the rename.
+        try disk.setFaults(dir, .{ .sync = 1000 });
+        defer disk.setFaults(dir, .{}) catch {};
+        try std.testing.expectError(error.InputOutput, ms.setSnapshot(.{
+            .index = 9,
+            .term = 1,
+            .data = "defg",
+            .conf_state = null,
+        }));
+        try disk.setFaults(dir, .{});
+        // The store still has the snapshot a power cut brings back, so
+        // nothing that one needs is deleted for the new one.
+        try std.testing.expectEqual(@as(u64, 5), ms.snapshotState().index);
+        disk.crash(dir, .lose_all);
+    }
+
+    var ms2 = try meta.MetaStore.openPath(vfs.g(), dir, alloc);
+    defer ms2.deinit();
+    try std.testing.expectEqual(@as(u64, 5), ms2.snapshotState().index);
+    try std.testing.expectEqualSlices(u8, "abc", ms2.snapshotState().data);
+}
+
 test "meta: setHardState round-trip survives reopen" {
     const alloc = std.testing.allocator;
     const dir = try makeTempMetaDir(alloc);
@@ -181,17 +220,14 @@ test "meta: setHardState alternates slots" {
             });
             try std.testing.expectEqual(want, ms.active_slot);
         }
+        // The fresh open wrote seqs 0 and 1; five writes took 2 to 6.
+        try std.testing.expectEqual(@as(u64, 6), ms.hardState().seq);
     }
 
-    // Inspect raw bytes to confirm slot seq numbers monotonically increase.
-    const bytes = try readStateBytes(alloc, dir);
-    defer alloc.free(bytes);
-    const seq_a = std.mem.readInt(u64, bytes[4..12], .little);
-    const seq_b = std.mem.readInt(u64, bytes[4096 + 4 .. 4096 + 12], .little);
-    // Last write was to slot A → its seq is the highest (6: fresh init wrote
-    // seqs 0+1, then 5 setHardState calls bumped seq through 2..6).
-    try std.testing.expectEqual(@as(u64, 6), seq_a);
-    try std.testing.expectEqual(@as(u64, 5), seq_b);
+    var ms2 = try meta.MetaStore.openPath(vfs.g(), dir, alloc);
+    defer ms2.deinit();
+    try std.testing.expectEqual(@as(u64, 6), ms2.hardState().seq);
+    try std.testing.expectEqual(@as(u8, 0), ms2.active_slot);
 }
 
 test "meta: torn write to newer slot recovers older value" {
@@ -265,8 +301,8 @@ test "meta: setSnapshot round-trip survives reopen" {
 
     const peers = try alloc.alloc(zen.ConfStatePeerStruct, 2);
     defer alloc.free(peers);
-    peers[0] = .{ .id = 1, .role = 0 };
-    peers[1] = .{ .id = 2, .role = 1 };
+    peers[0] = .{ .id = 1, .role = .unknown };
+    peers[1] = .{ .id = 2, .role = .voter };
     const conf: zen.ConfStateStruct = .{ .peers = peers };
 
     {
