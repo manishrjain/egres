@@ -1073,13 +1073,14 @@ pub const Cursor = struct {
 
 /// The largest stored key for (namespace, table_id), or null if the table
 /// has no keys. Assumes a monotonically-increasing row id (SQL's egid), so
-/// the max lives in the rightmost tree and, within it, the rightmost SST of
-/// each level: last in L0 (newest flush = highest raft_index) or last-by-
-/// smallest in L≥1 (highest range). Those SSTs' in-memory `biggest` keys
-/// give a floor — O(#levels), no I/O — and every key above it is an
-/// unflushed memtable row, so the memtables are the only thing seeked:
-/// each one from the floor to the table end, keeping the last key. No SST
-/// is opened.
+/// the max lives in the rightmost tree. Within it, any L0 SST can hold
+/// it: L0 tables overlap and sort by age, and a flush of updates alone
+/// carries no new id, so the newest need not have the largest key. In
+/// L≥1 the last SST does (highest range). Those SSTs' in-memory `biggest`
+/// keys give a floor — no I/O — and every key above it is an unflushed
+/// memtable row, so the memtables are the only thing seeked: each one
+/// from the floor to the table end, keeping the last key. No SST is
+/// opened.
 ///
 /// Order matters: the memtables are pinned BEFORE the tree is read. A
 /// flush completing between the two moves rows from a memtable into a
@@ -1114,26 +1115,30 @@ pub fn maxKey(
         allocator.free(iters);
     }
 
-    // Step 2: floor = max `biggest` over the rightmost SST of each level in
-    // the rightmost tree. Owned by `allocator`; null if no SSTs (or no
-    // tree yet — the memtables may still hold rows).
+    // Step 2: floor = max `biggest` over every L0 SST and the last SST
+    // of each deeper level in the rightmost tree. Owned by `allocator`;
+    // null if no SSTs (or no tree yet — the memtables may still hold
+    // rows).
     var floor: ?Key = null;
     errdefer if (floor) |f| f.free(allocator);
+
     if (self.getTable(table_key)) |trees| {
         if (trees.getRightmostTree()) |tree| {
             defer tree.release();
+
             var best_sst: ?Key = null;
             const held = tree.mu.hold(.shared, @src());
             defer held.release();
-            for (tree.levels) |*lv| {
+
+            for (tree.levels, 0..) |*lv, depth| {
                 const items = lv.entries(held);
-                if (items.len == 0) continue;
-
-                const b = items[items.len - 1].table.biggest; // rightmost
-                if (b.primary.len == 0) continue;
-
-                if (best_sst == null or b.gtPrimary(best_sst.?)) {
-                    best_sst = b;
+                const from = if (depth == 0) 0 else items.len -| 1;
+                for (items[from..]) |entry| {
+                    const b = entry.table.biggest;
+                    if (b.primary.len == 0) continue;
+                    if (best_sst == null or b.gtPrimary(best_sst.?)) {
+                        best_sst = b;
+                    }
                 }
             }
             // Dupe out from under the tables — they may close once locks

@@ -1635,6 +1635,63 @@ test "forest: maxKey counts a tombstoned max key" {
     try std.testing.expectEqual(@as(u64, 5), got);
 }
 
+test "forest: maxKey finds the largest row id in an older L0 table" {
+    const alloc = std.testing.allocator;
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+
+    const f_live = try flags.Live(Config).create(alloc, .{});
+    defer f_live.destroy();
+
+    var store = try vfs.Store.initFile(alloc, tmp.path, vfs.g());
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
+    defer f.close();
+
+    const ns: u64 = 16;
+    const tid: u32 = 16;
+    _ = try createTree(f, .{
+        .namespace = ns,
+        .table_id = tid,
+    }, .{}, .posting_index);
+
+    // Rows 1 and 5 flush into one L0 table. An UPDATE of row 1 then
+    // flushes alone into a newer one, whose largest key is 1. Seeding
+    // next_egid from the newer table would hand out 2 to 5 again, 5
+    // onto a live row.
+    const k1 = beKey(1);
+    const k5 = beKey(5);
+    try f.newMemtable(1);
+    try f.put(&.{
+        .{
+            .key = .{ .namespace = ns, .table_id = tid, .primary = &k1 },
+            .versions = .{ .one = .{ .ts = 1, .meta = .{}, .value = "a" } },
+        },
+        .{
+            .key = .{ .namespace = ns, .table_id = tid, .primary = &k5 },
+            .versions = .{ .one = .{ .ts = 1, .meta = .{}, .value = "b" } },
+        },
+    });
+    try f.newMemtable(2);
+    var older = (try f.buildFlush()) orelse return error.TestExpectedFlush;
+    defer older.changes.deinit(alloc);
+    try f.applyFlush(3, older.changes.items, older.newest_memtable_id);
+
+    try f.put(&.{.{
+        .key = .{ .namespace = ns, .table_id = tid, .primary = &k1 },
+        .versions = .{ .one = .{ .ts = 2, .meta = .{}, .value = "c" } },
+    }});
+    try f.newMemtable(4);
+    var newer = (try f.buildFlush()) orelse return error.TestExpectedFlush;
+    defer newer.changes.deinit(alloc);
+    try f.applyFlush(5, newer.changes.items, newer.newest_memtable_id);
+
+    const mk = (try f.maxKey(alloc, .{ .namespace = ns, .table_id = tid })).?;
+    defer mk.free(alloc);
+    const got = std.mem.readInt(u64, mk.primary[0..8], .big);
+    try std.testing.expectEqual(@as(u64, 5), got);
+}
+
 // ---------------------------------------------------------------------------
 // Meta byte: survives the whole write path
 // ---------------------------------------------------------------------------
