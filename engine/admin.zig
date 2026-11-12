@@ -1460,7 +1460,7 @@ pub const AdminServer = struct {
         const w = &sw.interface;
         const counting = utils.context.counting();
         const live = counting.live_bytes.load(.monotonic);
-        const cache: u64 = if (zdb.table.table.block_cache) |bc|
+        const cache: u64 = if (self.engine.forest.store.blockCache()) |bc|
             bc.totalCost()
         else
             0;

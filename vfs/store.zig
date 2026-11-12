@@ -141,17 +141,17 @@ pub const Store = union(enum) {
     /// Open an object for ranged reads; `size` is its size, which the
     /// caller knows (the manifest records every SST's; `stat` for the
     /// rest), so no request goes out here. error.FileNotFound if absent,
-    /// from the file backend; s3 reports it on the first read. `opts` is
-    /// how the file backend opens the file (direct, mmap, ...); s3
-    /// ignores it.
+    /// from the file backend; s3 reports it on the first read. The
+    /// file backend opens the file in its `read_mode` with `flags`;
+    /// s3 ignores both.
     pub fn open(
         self: *Store,
         name: String,
         size: u64,
-        opts: _vfs.FileOptions,
+        flags: _vfs.Flags,
     ) !Object {
         switch (self.*) {
-            .file => |*f| return f.open(name, opts),
+            .file => |*f| return f.open(name, flags),
             .s3 => |*s| return .{ .s3 = .{
                 .store = s,
                 .name = try s.a.dupe(u8, name),
@@ -178,6 +178,35 @@ pub const Store = union(enum) {
         switch (self.*) {
             .file => return null,
             .s3 => |*s| return &s.cache,
+        }
+    }
+
+    /// How a file store opens its objects from here on (see
+    /// `FileStore.read_mode`). An s3 store has no such choice.
+    pub fn setReadMode(self: *Store, mode: _vfs.Mode) void {
+        switch (self.*) {
+            .file => |*f| f.read_mode = mode,
+            .s3 => {},
+        }
+    }
+
+    /// Where the readers of this store's objects keep their decoded
+    /// blocks, or null for nowhere. The store holds the pointer and
+    /// never reads through it. Borrowed: its owner frees it after
+    /// the last reader is gone.
+    pub fn blockCache(self: *const Store) ?*_vfs.BlockCache {
+        switch (self.*) {
+            .file => |*f| return f.block_cache,
+            .s3 => |*s| return s.block_cache,
+        }
+    }
+
+    /// Set before the first object is opened: a reader takes the
+    /// pointer once, at its open.
+    pub fn setBlockCache(self: *Store, cache: ?*_vfs.BlockCache) void {
+        switch (self.*) {
+            .file => |*f| f.block_cache = cache,
+            .s3 => |*s| s.block_cache = cache,
         }
     }
 };
@@ -277,6 +306,13 @@ pub const FileStore = struct {
     a: std.mem.Allocator,
     depot: String,
     vfs: *const _vfs.VFS,
+    /// How `open` opens an object. `.direct` goes with a block cache:
+    /// blocks are cached decompressed there, so the page cache would
+    /// hold the same data twice. Buffered (`.default`) is for tests
+    /// and tools.
+    read_mode: _vfs.Mode = .default,
+    /// See `Store.blockCache`.
+    block_cache: ?*_vfs.BlockCache = null,
 
     pub fn init(
         a: std.mem.Allocator,
@@ -339,10 +375,13 @@ pub const FileStore = struct {
         try _vfs.deleteFile(path);
     }
 
-    fn open(self: *FileStore, name: String, opts: _vfs.FileOptions) !Object {
+    fn open(self: *FileStore, name: String, flags: _vfs.Flags) !Object {
         const path = try self.objectPath(name);
         defer self.a.free(path);
-        return .{ .file = try self.vfs.openFile(self.a, path, opts) };
+        return .{ .file = try self.vfs.openFile(self.a, path, .{
+            .mode = self.read_mode,
+            .flags = flags,
+        }) };
     }
 
     /// Object size in bytes; errors if absent.

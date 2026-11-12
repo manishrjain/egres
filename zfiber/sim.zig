@@ -70,6 +70,9 @@ pub const Options = struct {
     /// expects a disk that works; a harness that tests the error paths
     /// sets them.
     disk_faults: _simdisk.Faults = .{},
+    /// Virtual ms from `epoch_ms` the run may take; past it the run
+    /// ends as `stuck`. Null is no bound.
+    until_ms: ?u64 = null,
 };
 
 /// How a run ended. `running` until `Runtime.run` returns.
@@ -83,6 +86,10 @@ pub const Outcome = enum {
     /// As `deadlock`, but no fiber is parked either: the program ran
     /// out of work without calling `stop`.
     idle,
+    /// The clock passed `Options.until_ms`. On a node `deadlock` never
+    /// comes: its timers always leave a deadline, so a fiber that waits
+    /// for what never arrives shows only as a run that does not end.
+    stuck,
 };
 
 pub const Sim = struct {
@@ -257,6 +264,27 @@ pub const Sim = struct {
         _ = self.now_ms.fetchMax(to_ms, .release);
     }
 
+    /// Virtual ms since the run began.
+    pub fn elapsedMs(self: *const Sim) u64 {
+        return @intCast(self.now() - self.opts.epoch_ms);
+    }
+
+    /// Whether a jump to `to_ms` would pass the run's bound. If so the
+    /// clock stops at the bound, so each fiber's time parked is what
+    /// it waited, and the run ends.
+    fn pastBound(self: *Sim, rt: *_rt.Runtime, to_ms: i64) bool {
+        const until_ms = self.opts.until_ms orelse return false;
+
+        const bound_ms = self.opts.epoch_ms + @as(i64, @intCast(until_ms));
+        if (to_ms <= bound_ms) return false;
+
+        self.advance(bound_ms);
+        _coarse.update();
+        self.outcome = .stuck;
+        rt.stop();
+        return true;
+    }
+
     /// The loop, in place of the worker's `runMain`: one worker, `pick`
     /// over both rings, a virtual clock the deadlines read. With nothing
     /// runnable it jumps the clock to the next deadline. While a real
@@ -264,7 +292,8 @@ pub const Sim = struct {
     /// a name lookup is not) the clock cannot jump past it, so it tracks
     /// real time instead, 1 ms per 1 ms, until the I/O is done; an idle
     /// runtime with nothing pending is a deadlock after `idle_grace_ms`,
-    /// reported through `outcome`, and the run stops.
+    /// and a clock past `until_ms` is a stuck run. Both are reported
+    /// through `outcome`, and the run stops.
     pub fn run(self: *Sim, w: *_rt.Worker) void {
         const prev = _rt.Worker.current_do_not_use_directly;
         _rt.Worker.current_do_not_use_directly = w;
@@ -312,6 +341,7 @@ pub const Sim = struct {
             const io_in_flight = w.loop.active > 1;
             if (!io_in_flight) {
                 if (min_deadline) |d| {
+                    if (self.pastBound(rt, d)) break;
                     self.advance(d);
                     continue;
                 }
@@ -339,6 +369,7 @@ pub const Sim = struct {
             if (io_in_flight) {
                 // A real ms passed with the I/O still out: so does a
                 // virtual one, and a deadline due by then fires.
+                if (self.pastBound(rt, self.now() + 1)) break;
                 self.advance(self.now() + 1);
                 continue;
             }

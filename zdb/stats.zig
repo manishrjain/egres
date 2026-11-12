@@ -48,7 +48,7 @@ pub fn writeForestStats(self: *Forest, w: *std.Io.Writer) !void {
     try writeBytes(w, mt.immutable_bytes);
     try w.print(" pending flush)\n", .{});
     try w.print("  flush_pending: {d}\n", .{mt.immutable_count});
-    if (_table.table.block_cache) |bc| {
+    if (self.store.blockCache()) |bc| {
         try w.print("  block_cache: entries={d} bytes=", .{bc.count()});
         try writeBytes(w, bc.totalCost());
         const hits = bc.hits.load(.monotonic);

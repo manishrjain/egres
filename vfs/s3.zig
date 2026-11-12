@@ -94,6 +94,8 @@ pub const S3Store = struct {
     conns: fiber.Channel(Slot),
     /// Local-disk chunk cache in front of every read (chunkcache.zig).
     cache: _chunkcache.ChunkCache,
+    /// See `Store.blockCache`.
+    block_cache: ?*_vfs.BlockCache = null,
 
     const Conn = fiber.net.Conn;
 

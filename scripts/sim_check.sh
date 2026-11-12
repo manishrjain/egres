@@ -9,6 +9,8 @@
 #      node across crashes).
 #   2. Deadlock detection: a fiber parked with nothing left to wake it
 #      ends the run with outcome=deadlock and exit code 3.
+#   3. The bound on virtual time: a run still going at --sim-until
+#      ends with outcome=stuck and exit code 3.
 #
 # Usage: scripts/sim_check.sh [seed] [filter]
 # A filter given here replaces the default set.
@@ -55,3 +57,14 @@ grep -E '^sim: .*outcome=deadlock' <<<"$out" ||
 # line above is the check, the code only confirms the run failed.
 [ "$code" -ne 0 ] || { echo "FAIL: deadlock run exited 0"; exit 1; }
 echo "deadlock detection: ok"
+
+# The test sleeps six virtual minutes; the bound is one.
+set +e
+out=$(zig build test -- --sim-seed "$seed" --sim-until 60000 --run-hang \
+    --filter "hangs for 6 minutes" 2>&1)
+code=$?
+set -e
+grep -E '^sim: .*outcome=stuck' <<<"$out" ||
+    { echo "FAIL: no stuck outcome"; echo "$out" | tail -20; exit 1; }
+[ "$code" -ne 0 ] || { echo "FAIL: stuck run exited 0"; exit 1; }
+echo "virtual time bound: ok"

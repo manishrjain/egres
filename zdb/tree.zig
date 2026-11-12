@@ -75,8 +75,14 @@ pub const TableCache = struct {
 
     pub fn deinit(self: *TableCache) void {
         // Release the cache's ref on each table; the last ref frees it.
+        // The tables' blocks stay in the block cache, which its owner
+        // frees after the forest: no use dropping them one by one.
         var it = self.tables.iterator();
-        while (it.next()) |kv| kv.value_ptr.*.decrRef();
+        while (it.next()) |kv| {
+            const tbl = kv.value_ptr.*;
+            tbl.block_cache = null;
+            tbl.decrRef();
+        }
         self.tables.deinit();
         self.mu.deinit();
     }

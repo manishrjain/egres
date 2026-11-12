@@ -8,11 +8,17 @@ const fiber = @import("zfiber");
 const fs = fiber.fs;
 const utils = @import("utils");
 const String = utils.String;
+const cache = @import("cache");
 pub const bandwidth = @import("bandwidth.zig");
 pub const store = @import("store.zig");
 pub const Store = store.Store;
 pub const ChunkCache = @import("chunkcache.zig").ChunkCache;
 pub const Chunk = @import("chunkcache.zig").Chunk;
+/// Decoded blocks of a store's objects, kept in memory by their
+/// readers: the key and what a value holds are the reader's. A key
+/// names an object of one store, so a cache serves one `Store`.
+pub const BlockCache =
+    cache.ShardedCache(u128, *utils.RefValue, .cost_and_overhead);
 pub const Object = store.Object;
 pub const sigv4 = @import("sigv4.zig");
 pub const s3 = @import("s3.zig");

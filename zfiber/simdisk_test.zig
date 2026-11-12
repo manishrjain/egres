@@ -607,6 +607,86 @@ test "simdisk: writing the bytes again after a failed sync lands them" {
     try expectFile(&d, "/tmp/again", "all of it");
 }
 
+// What ext4 and XFS did in the test of vfs/README.md.
+test "simdisk: a failed directory sync shuts the filesystem until a crash" {
+    const expectError = std.testing.expectError;
+    const Shut = fiber.simdisk.Shut;
+    var seen = std.EnumSet(Shut).initEmpty();
+
+    // The seed decides which of the two filesystems it is.
+    var seed: u64 = 1;
+    while (seed <= 16) : (seed += 1) {
+        var d = try SimDisk.init(std.testing.allocator, seed);
+        defer d.deinit();
+        try d.apply(.create_dir_path, "/data/node");
+        try d.apply(.create_dir_path, "/data/other");
+        try d.setFaults("/data/node", .{});
+        const f = try open(&d, "/data/node/a", rdwr_creat);
+        defer d.apply(.close, f);
+        _ = try write(&d, f, "kept", 0);
+        try sync(&d, f);
+        try syncDir(&d, "/data/node");
+        var dir_flags = rdonly;
+        dir_flags.DIRECTORY = true;
+        const dir = try open(&d, "/data/node", dir_flags);
+        defer d.apply(.close, dir);
+
+        // A new name, and the directory sync that fails.
+        d.apply(.close, try open(&d, "/data/node/b", rdwr_creat));
+        try d.setFaults("/data/node", .{ .shutdown = 1000 });
+        try expectError(error.InputOutput, sync(&d, dir));
+        try d.setFaults("/data/node", .{});
+        const shut = d.shutAt("/data/node/a").?;
+        seen.insert(shut);
+
+        // The sync asked again reports success.
+        try sync(&d, dir);
+        // No change is taken, whatever the kind.
+        const refused: anyerror = switch (shut) {
+            .read_only => error.ReadOnlyFileSystem,
+            .no_io => error.InputOutput,
+        };
+        try expectError(refused, write(&d, f, "more", 4));
+        try expectError(refused, sync(&d, f));
+        try expectError(refused, open(&d, "/data/node/c", rdwr_creat));
+        try expectError(refused, d.apply(.delete_file, "/data/node/a"));
+        try expectError(refused, d.apply(.create_dir_path, "/data/node/s"));
+        try expectError(refused, d.apply(.rename, .{
+            .old_path = "/data/node/a",
+            .new_path = "/data/other/a",
+        }));
+        try expectError(
+            refused,
+            d.apply(.set_size, .{ .file = f, .length = 0 }),
+        );
+        // Reads go on for the one and fail for the other.
+        var buf: [8]u8 = undefined;
+        switch (shut) {
+            .read_only => {
+                try expectFile(&d, "/data/node/a", "kept");
+                try d.apply(.access, "/data/node/b");
+            },
+            .no_io => {
+                try expectError(refused, read(&d, f, &buf, 0));
+                try expectError(refused, open(&d, "/data/node/a", rdonly));
+                try expectError(refused, d.apply(.access, "/data/node/a"));
+            },
+        }
+        // The other tree is another filesystem.
+        try std.testing.expect(d.shutAt("/data/other") == null);
+        d.apply(.close, try open(&d, "/data/other/x", rdwr_creat));
+
+        // Mounted again it works, without the name that sync did not
+        // land, though the second one had reported success.
+        d.crash("/data/node", .lose_all);
+        try std.testing.expect(d.shutAt("/data/node") == null);
+        try expectFile(&d, "/data/node/a", "kept");
+        try expectGone(&d, "/data/node/b");
+        d.apply(.close, try open(&d, "/data/node/c", rdwr_creat));
+    }
+    try std.testing.expectEqual(@as(usize, 2), seen.count());
+}
+
 test "simdisk: a short write on an O_DIRECT handle is whole pages" {
     // macOS has no O_DIRECT to open the handle with.
     if (!@hasField(std.posix.O, "DIRECT")) return error.SkipZigTest;

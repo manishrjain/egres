@@ -545,12 +545,8 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
         16,
     );
     defer block_cache.deinit();
-    zdb.table.table.block_cache = &block_cache;
-    zdb.table.table.read_mode = .direct;
-    defer {
-        zdb.table.table.block_cache = null;
-        zdb.table.table.read_mode = .default;
-    }
+    store.setReadMode(.direct);
+    store.setBlockCache(&block_cache);
     engine.governor.init(total, &block_cache, live_memory);
     log.info(
         "block cache governed under total {d} MiB resident (host " ++
@@ -588,13 +584,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
         .snapshot_cfg = live_snapshot,
         .runtime_cfg = live_runtime,
     });
-    defer {
-        // Closing the forest frees every table, and a table drops its
-        // blocks from the block cache as it goes. The whole cache is
-        // freed right after, so skip that per-block work.
-        zdb.table.table.block_cache = null;
-        deinitWithLog("engine", eng);
-    }
+    defer deinitWithLog("engine", eng);
 
     // The admin protocol front-end over the engine.
     var admin_srv = try engine.AdminServer.init(eng, args.client_addr);

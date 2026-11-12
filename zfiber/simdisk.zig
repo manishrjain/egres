@@ -101,10 +101,15 @@ pub const Faults = struct {
     /// nothing changed: open, access, rename, delete, list, and a
     /// make that has a directory to make.
     path_ops: u16 = 0,
+    /// A directory's sync fails with `InputOutput` and its filesystem
+    /// shuts (`Shut`): the tree these rates are set on, until its
+    /// `crash`.
+    shutdown: u16 = 0,
 
-    /// Every kind on an open file at one rate. `path_ops` stays off: the
-    /// suite runs under this, and its setup does not expect a
-    /// directory that cannot be made.
+    /// Every kind on an open file at one rate. `path_ops` and
+    /// `shutdown` stay off: the suite runs under this, and its setup
+    /// does not expect a directory that cannot be made or a disk that
+    /// stops for good.
     pub fn all(per_mille: u16) Faults {
         return .{
             .read = per_mille,
@@ -113,6 +118,23 @@ pub const Faults = struct {
             .sync = per_mille,
             .sync_drop = per_mille,
             .set_size = per_mille,
+        };
+    }
+};
+
+/// What a filesystem does once a directory's sync has failed, until
+/// it is mounted again. Both as measured, vfs/README.md.
+pub const Shut = enum {
+    /// ext4: reads go on, every change fails with `ReadOnlyFileSystem`.
+    read_only,
+    /// XFS: every op fails with `InputOutput`, reads included.
+    no_io,
+
+    /// The error an op gets, or null where it is still served.
+    fn refusal(shut: Shut, changes: bool) ?anyerror {
+        return switch (shut) {
+            .read_only => if (changes) error.ReadOnlyFileSystem else null,
+            .no_io => error.InputOutput,
         };
     }
 };
@@ -158,6 +180,9 @@ pub const SimDisk = struct {
         /// Directory: the error rates for everything under it, until a
         /// directory below sets its own (`setFaults`).
         faults: ?Faults = null,
+        /// Directory: the filesystem under it has shut. Set where the
+        /// rates that drew it are, cleared by a crash.
+        shut: ?Shut = null,
         /// The crash this node was last found under (`crash_seq`), so
         /// the handles into a tree are told apart from the others.
         crash_mark: u32 = 0,
@@ -228,6 +253,19 @@ pub const SimDisk = struct {
             else => {},
         }
         switch (tag) {
+            .write,
+            .set_size,
+            .open,
+            .list,
+            .set_mtime,
+            .access,
+            .delete_file,
+            .delete_tree,
+            .rename,
+            => if (self.shutError(tag, args)) |err| return err,
+            else => {},
+        }
+        switch (tag) {
             .read => return self.read(args),
             .write => return self.write(args),
             .read_batch => {
@@ -240,7 +278,20 @@ pub const SimDisk = struct {
             .sync => {
                 const o = self.open(args.file);
                 if (o.dead) return error.InputOutput;
+                const is_dir = o.node.kind == .directory;
+                if (shutOf(o.node)) |shut| {
+                    // A directory's sync after the one that failed
+                    // reports success, and the names stay off the device.
+                    if (is_dir) return;
+                    return shut.refusal(true).?;
+                }
                 const faults = faultsOf(o.node);
+                if (is_dir and self.fault(faults.shutdown)) {
+                    const flip = self.prng.random().boolean();
+                    self.deviceOf(o.node).shut =
+                        if (flip) .read_only else .no_io;
+                    return error.InputOutput;
+                }
                 if (self.fault(faults.sync)) return error.InputOutput;
                 if (self.fault(faults.sync_drop)) {
                     self.losePending(o.node);
@@ -344,6 +395,56 @@ pub const SimDisk = struct {
         return .{};
     }
 
+    /// The directory whose rates are in force for `node`: what stands
+    /// for its filesystem.
+    fn deviceOf(self: *SimDisk, node: *Node) *Node {
+        var at: ?*Node = node;
+        while (at) |n| : (at = n.parent) {
+            if (n.faults != null) return n;
+        }
+        return self.root;
+    }
+
+    fn shutOf(node: *const Node) ?Shut {
+        var at: ?*const Node = node;
+        while (at) |n| : (at = n.parent) {
+            if (n.shut) |shut| return shut;
+        }
+        return null;
+    }
+
+    /// How the filesystem `path` is on has shut, or null: it has not.
+    /// For a name still to be made, the directory it would go in.
+    pub fn shutAt(self: *SimDisk, path: String) ?Shut {
+        const place = self.placeOf(path) catch return null;
+        return shutOf(place.dir.children.get(place.name) orelse place.dir);
+    }
+
+    /// The error `tag` gets from a filesystem that has shut, or null:
+    /// it has not, or it still serves the op. For the ops `apply` asks
+    /// it for: a read, a sync and `create_dir_path` check where they
+    /// have the node.
+    fn shutError(
+        self: *SimDisk,
+        comptime tag: Op.Tag,
+        args: Op.Args(tag),
+    ) ?anyerror {
+        const shut: Shut = switch (tag) {
+            .write, .set_size => shutOf(self.open(args.file).node),
+            .open, .list, .set_mtime => self.shutAt(args.path),
+            .access, .delete_file, .delete_tree => self.shutAt(args),
+            .rename => self.shutAt(args.old_path) orelse
+                self.shutAt(args.new_path),
+            else => comptime unreachable,
+        } orelse return null;
+        const changes = switch (tag) {
+            .list, .access => false,
+            .open => args.flags.ACCMODE != .RDONLY or args.flags.CREAT,
+            else => true,
+        };
+        return shut.refusal(changes);
+    }
+
     /// One draw at the `path_ops` rate in force at `path`, or for a name
     /// still to be made at the directory it would go in. A path that
     /// does not resolve draws nothing: the op fails by itself.
@@ -365,7 +466,8 @@ pub const SimDisk = struct {
     /// The power cut under the directory `path`. Every open handle into
     /// it is dead from here: the process that held it is gone, and a
     /// test's old objects fail on it rather than write into the
-    /// restarted disk. Every directory under it shows its durable names
+    /// restarted disk. A filesystem under it that had shut works
+    /// again. Every directory under it shows its durable names
     /// again, which drops what was created or renamed in since its last
     /// sync and brings back what was deleted since. Every file shows
     /// its durable bytes, with `mode`'s share of its pending writes
@@ -397,6 +499,8 @@ pub const SimDisk = struct {
             self.crashFile(node, mode);
             return;
         }
+        // The restart mounts the filesystem again.
+        node.shut = null;
         // The visible map goes first: a child only it named is released,
         // and with it everything under that child.
         self.clearNames(&node.children);
@@ -630,6 +734,9 @@ pub const SimDisk = struct {
     fn read(self: *SimDisk, op: Op.Read) !usize {
         const o = self.open(op.file);
         if (o.dead) return error.InputOutput;
+        if (shutOf(o.node)) |shut| {
+            if (shut.refusal(false)) |err| return err;
+        }
         if (self.fault(faultsOf(o.node).read)) return error.InputOutput;
 
         if (o.direct) assertDirect(op.buf.ptr, op.buf.len, op.offset);
@@ -770,6 +877,7 @@ pub const SimDisk = struct {
                 continue;
             }
             if (self.fault(faultsOf(dir).path_ops)) return error.InputOutput;
+            if (shutOf(dir)) |shut| return shut.refusal(true).?;
             try self.makeDir(dir, name);
             dir = dir.children.get(name).?;
         }

@@ -18,6 +18,13 @@
 //! half a transaction, fails the run. The rows read through the
 //! secondary index must be the same rows.
 //!
+//! No two writers touch one row, so beside them run tellers, after
+//! Jepsen's bank tests: they move money between accounts that any of
+//! them may touch, and their transactions wait on each other, conflict
+//! and deadlock. An account at zero has no row, so a transfer also
+//! inserts and deletes. Every read of all accounts must add up to the
+//! same total, at any time and after any crash.
+//!
 //! At the end the WAL's disk stops taking writes: the statement then
 //! in flight must fail, the node must stop by itself once the log
 //! gives up, and a restart must have every acknowledged row.
@@ -51,6 +58,20 @@ const log = std.log.scoped(.sim_test);
 
 const num_writers = 4;
 const rows_per_writer = 48;
+
+const num_tellers = 3;
+const num_accounts = 8;
+/// Account `a` is a row of table `a % bank_tables`, so most transfers
+/// span two tables.
+const bank_tables = 2;
+/// What all accounts hold between them, for the whole run. It starts
+/// in account 0.
+const bank_total = 300;
+/// The most one transfer moves.
+const max_transfer = 10;
+/// What a transfer that backs out writes first. No account ever
+/// holds a balance this far under zero.
+const poison = 1000;
 /// What one run of the test does. The values here are the test every
 /// run of the suite includes: seconds per seed.
 const Shape = struct {
@@ -213,7 +234,7 @@ const Resource = struct {
                 const rates = dir.rates;
                 return rates.read != 0 or rates.sync != 0 or
                     rates.sync_drop != 0 or rates.set_size != 0 or
-                    rates.path_ops != 0;
+                    rates.path_ops != 0 or rates.shutdown != 0;
             },
         }
     }
@@ -231,9 +252,8 @@ const Resources = struct {
     /// with an error meanwhile, also when the resource that failed it
     /// works again by then.
     active: bool = false,
-    /// True from a power cut until `clear`. A statement that fails
-    /// meanwhile is the crash's, not a failed run.
-    down: bool = false,
+    /// True from a power cut until `clear`.
+    cut: bool = false,
 
     /// The WAL's directory and the store's, each a resource.
     fn drawDirs(
@@ -243,7 +263,11 @@ const Resources = struct {
         store_dir: String,
     ) !void {
         try self.addDir(alloc, "wal", wal_dir, drawFaults());
-        try self.addDir(alloc, "store", store_dir, drawFaults());
+        // The store's filesystem never shuts: a flush that fails is
+        // tried again for ever (#45), so the node would not stop.
+        var store_rates = drawFaults();
+        store_rates.shutdown = 0;
+        try self.addDir(alloc, "store", store_dir, store_rates);
     }
 
     fn addDir(
@@ -315,7 +339,7 @@ const Resources = struct {
         }
         try self.sim.setFaults(self.data_dir, .{});
         self.active = false;
-        self.down = false;
+        self.cut = false;
     }
 
     /// The power cut. Every op under the data directory fails from
@@ -327,7 +351,31 @@ const Resources = struct {
         for (self.list.items) |*res| switch (res.target) {
             .dir => try res.set(.outage),
         };
-        self.down = true;
+        self.cut = true;
+    }
+
+    /// Whether a resource's filesystem has shut. It takes no write
+    /// until the restart, so the log gives up and the node stops.
+    fn shut(self: *const Resources) bool {
+        for (self.list.items) |res| switch (res.target) {
+            .dir => |dir| if (dir.sim.shutAt(dir.path) != null) return true,
+        };
+        return false;
+    }
+
+    /// Whether the server is on its way to a restart: after a power
+    /// cut, or with a filesystem shut. A statement that fails
+    /// meanwhile is that event's, not a failed run.
+    fn down(self: *const Resources) bool {
+        return self.cut or self.shut();
+    }
+
+    /// No filesystem shuts from here: the stretch that follows ends
+    /// without the restart a shut one needs.
+    fn endShutdowns(self: *Resources) void {
+        for (self.list.items) |*res| switch (res.target) {
+            .dir => |*dir| dir.rates.shutdown = 0,
+        };
     }
 
     fn mayRefuse(self: *const Resources) bool {
@@ -349,6 +397,8 @@ const Instance = struct {
     wal_dir: []u8,
     store_dir: []u8,
     store: vfs.Store,
+    /// Null when this boot drew none.
+    block_cache: ?zdb.cache.ShardedCache(u128),
     zdb_live: *flags.Live(zdb.config.Config),
     snapshot_live: *flags.Live(engine.SnapshotCfg),
     runtime_live: *flags.Live(fiber.Runtime.Cfg),
@@ -387,6 +437,26 @@ const Instance = struct {
             .{},
         );
         errdefer self.runtime_live.destroy();
+
+        // A restart has an empty cache. Each boot draws one that
+        // evicts within the run, one that holds every block or none,
+        // and direct or buffered reads.
+        const cache_sizes = [_]usize{ 0, 256 << 10, 16 << 20 };
+        const cache_bytes =
+            cache_sizes[fiber.random().uintLessThan(usize, cache_sizes.len)];
+        const mode: vfs.Mode =
+            if (fiber.random().boolean()) .direct else .default;
+        log.info("block cache {d} KiB, {s} reads", .{
+            cache_bytes >> 10, @tagName(mode),
+        });
+        self.block_cache = null;
+        if (cache_bytes > 0) self.block_cache =
+            try zdb.cache.ShardedCache(u128).init(alloc, cache_bytes, 4);
+        errdefer if (self.block_cache) |*cache| cache.deinit();
+        self.store.setReadMode(mode);
+        self.store.setBlockCache(
+            if (self.block_cache) |*cache| cache else null,
+        );
 
         self.eng = try engine.Engine.open(alloc, .{
             .wal_dir = self.wal_dir,
@@ -428,6 +498,12 @@ const Instance = struct {
         self.eng.stop();
         self.sqlsrv.deinit();
         self.eng.deinit();
+        if (self.block_cache) |*cache| {
+            log.info("block cache: {d} hits, {d} misses", .{
+                cache.hits.load(.monotonic), cache.misses.load(.monotonic),
+            });
+            cache.deinit();
+        }
         self.store.deinit();
         self.runtime_live.destroy();
         self.snapshot_live.destroy();
@@ -467,8 +543,14 @@ fn ask(
     text: String,
 ) !pgwire.client.Reply {
     const reply = try client.query(arloc, text);
-    const refused = reply.err orelse return reply;
-    const faults = resources.down or resources.mayRefuse();
+    return refusal(reply.err orelse return reply, text);
+}
+
+fn refusal(
+    refused: pgwire.client.ServerError,
+    text: String,
+) error{StatementRefused} {
+    const faults = resources.down() or resources.mayRefuse();
     if (!faults) log.err("{s} {s}: {s}", .{
         &refused.code,
         refused.message,
@@ -484,7 +566,10 @@ fn exec(
     text: String,
     tag: String,
 ) !void {
-    const reply = try ask(client, arloc, text);
+    try expectTag(try ask(client, arloc, text), tag, text);
+}
+
+fn expectTag(reply: pgwire.client.Reply, tag: String, text: String) !void {
     if (std.mem.eql(u8, reply.tag, tag)) return;
     log.err("want {s}, answered {s}: {s}", .{
         tag,
@@ -513,6 +598,29 @@ fn createTable(alloc: std.mem.Allocator) !void {
         "CREATE INDEX kv_seq ON kv (seq)",
         "CREATE INDEX",
     );
+    try createBank(&client, arena.allocator());
+}
+
+/// The tellers' tables, each with an index that moves with every
+/// transfer, and all the money in account 0.
+fn createBank(client: *pgwire.Client, arloc: std.mem.Allocator) !void {
+    for (0..bank_tables) |tbl| {
+        try exec(client, arloc, try std.fmt.allocPrint(
+            arloc,
+            "CREATE TABLE bank{d} (id int8 PRIMARY KEY, balance int8)",
+            .{tbl},
+        ), "CREATE TABLE");
+        try exec(client, arloc, try std.fmt.allocPrint(
+            arloc,
+            "CREATE INDEX bank{d}_balance ON bank{d} (balance)",
+            .{ tbl, tbl },
+        ), "CREATE INDEX");
+    }
+    try exec(client, arloc, try std.fmt.allocPrint(
+        arloc,
+        "INSERT INTO bank0 (id, balance) VALUES (0, {d})",
+        .{bank_total},
+    ), "INSERT 0 1");
 }
 
 /// One row's write in a statement; `seq` null is a delete.
@@ -551,9 +659,10 @@ const Writer = struct {
     /// The writer's fiber: sessions of statements until `stop`.
     fn run(self: *Writer, stop: *const bool) void {
         self.sessions(stop) catch |err| {
-            // The crash took the step in flight: an error, or the
-            // connection gone. `recover` decides what became of it.
-            if (!resources.down) self.failed = err;
+            // The crash or the shut filesystem took the step in
+            // flight: an error, or the connection gone. `recover`
+            // decides what became of it.
+            if (!resources.down()) self.failed = err;
         };
     }
 
@@ -565,7 +674,7 @@ const Writer = struct {
             defer self.client.close();
             self.session(stop) catch |err| {
                 if (err != error.StatementRefused) return err;
-                if (resources.down or !resources.mayRefuse()) return err;
+                if (resources.down() or !resources.mayRefuse()) return err;
                 self.refused += 1;
                 log.debug("writer {d}: refused, in flight {any}", .{
                     self.id, self.pending.items,
@@ -623,7 +732,7 @@ const Writer = struct {
         while (true) {
             return self.get(arloc, row) catch |err| {
                 if (err != error.StatementRefused) return err;
-                if (stop.* or resources.down) return err;
+                if (stop.* or resources.down()) return err;
                 if (!resources.mayRefuse()) return err;
                 fiber.sleepMs(5);
                 continue;
@@ -885,6 +994,288 @@ const Writer = struct {
     }
 };
 
+/// What each account holds: null for no row.
+const Balances = [num_accounts]?i64;
+
+/// The SQLSTATEs the server ends a transaction with for meeting
+/// another one: a serialization failure, a deadlock, a key the other
+/// inserted first, a snapshot grown too old. Nothing of it applied.
+const conflict_codes = [_]String{ "40001", "40P01", "23505", "72000" };
+
+/// Which of `conflict_codes` it is, or null for any other error.
+fn conflictOf(code: [5]u8) ?usize {
+    for (conflict_codes, 0..) |conflict, nth| {
+        if (std.mem.eql(u8, &code, conflict)) return nth;
+    }
+    return null;
+}
+
+/// A bank client. Its transfers read two accounts and write both, in
+/// either order, so two tellers lock the same rows and in opposite
+/// orders. What a crash or a refusal left in flight needs no
+/// settling: the accounts add up with the transfer or without it.
+const Teller = struct {
+    id: u32,
+    alloc: std.mem.Allocator,
+    prng: std.Random.DefaultPrng,
+    /// Open during a session and an audit, not between them.
+    client: pgwire.Client = undefined,
+    transfers: u64 = 0,
+    /// Transfers that found their account empty and backed out.
+    short: u64 = 0,
+    /// Transactions that another one ended, by `conflict_codes`.
+    conflicts: [conflict_codes.len]u64 = @splat(0),
+    reads: u64 = 0,
+    /// Sessions the disk's errors ended.
+    refused: u64 = 0,
+    /// A read of the accounts was wrong.
+    wrong: bool = false,
+    failed: ?anyerror = null,
+
+    /// The teller's fiber: sessions of transfers and reads until `stop`.
+    fn run(self: *Teller, stop: *const bool) void {
+        self.sessions(stop) catch |err| {
+            // A statement the crash or a shut filesystem failed is not
+            // a failed run. Accounts read wrong are, whenever read.
+            if (self.wrong or !resources.down()) self.failed = err;
+        };
+    }
+
+    /// One session until the disk's errors fail a statement, then the
+    /// next: closing the first ends the block it had open.
+    fn sessions(self: *Teller, stop: *const bool) !void {
+        while (!stop.*) {
+            self.client = try connect(self.alloc);
+            defer self.client.close();
+            self.session(stop) catch |err| {
+                if (err != error.StatementRefused) return err;
+                if (resources.down() or !resources.mayRefuse()) return err;
+                self.refused += 1;
+            };
+        }
+    }
+
+    fn session(self: *Teller, stop: *const bool) !void {
+        while (!stop.*) {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const read = self.prng.random().uintLessThan(u32, 4) == 0;
+            const step = if (read)
+                self.readAll(arena.allocator())
+            else
+                self.transfer(arena.allocator());
+            step catch |err| {
+                if (err != error.Conflict) return err;
+            };
+        }
+    }
+
+    /// After a restart: the accounts add up, whatever was in flight.
+    fn audit(self: *Teller) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        self.client = try connect(self.alloc);
+        defer self.client.close();
+        try self.readAll(arena.allocator());
+    }
+
+    /// One statement of a transaction that another may end. The block
+    /// then takes only its ROLLBACK.
+    fn query(
+        self: *Teller,
+        arloc: std.mem.Allocator,
+        text: String,
+    ) !pgwire.client.Reply {
+        const reply = try self.client.query(arloc, text);
+        const refused = reply.err orelse return reply;
+        const conflict = conflictOf(refused.code) orelse
+            return refusal(refused, text);
+        self.conflicts[conflict] += 1;
+        if (reply.status == .failed_tx)
+            try exec(&self.client, arloc, "ROLLBACK", "ROLLBACK");
+        return error.Conflict;
+    }
+
+    fn execute(
+        self: *Teller,
+        arloc: std.mem.Allocator,
+        text: String,
+        tag: String,
+    ) !void {
+        try expectTag(try self.query(arloc, text), tag, text);
+    }
+
+    /// BEGIN, read both accounts, write both, COMMIT. It moves up to
+    /// `max_transfer`, or all the account has when that is less, which
+    /// deletes its row. From an account with no row it is `backOut`.
+    fn transfer(self: *Teller, arloc: std.mem.Allocator) !void {
+        const rand = self.prng.random();
+        const from = rand.uintLessThan(u32, num_accounts);
+        const others = rand.uintLessThan(u32, num_accounts - 1);
+        const to = (from + 1 + others) % num_accounts;
+
+        try self.execute(arloc, "BEGIN", "BEGIN");
+        var from_has: i64 = undefined;
+        var to_has: i64 = undefined;
+        if (rand.boolean()) {
+            from_has = try self.balance(arloc, from);
+            to_has = try self.balance(arloc, to);
+        } else {
+            to_has = try self.balance(arloc, to);
+            from_has = try self.balance(arloc, from);
+        }
+
+        if (from_has == 0) return self.backOut(arloc, from, to, to_has);
+        const drawn: i64 = 1 + rand.uintLessThan(u32, max_transfer);
+        const amount = @min(drawn, from_has);
+
+        if (rand.boolean()) {
+            try self.set(arloc, from, from_has, from_has - amount);
+            try self.set(arloc, to, to_has, to_has + amount);
+        } else {
+            try self.set(arloc, to, to_has, to_has + amount);
+            try self.set(arloc, from, from_has, from_has - amount);
+        }
+        try self.execute(arloc, "COMMIT", "COMMIT");
+        self.transfers += 1;
+    }
+
+    /// `from` has nothing, so the transfer does not happen. One time
+    /// in two it first writes balances no account may show, so a
+    /// ROLLBACK that leaves any of its writes behind is seen by the
+    /// next read.
+    fn backOut(
+        self: *Teller,
+        arloc: std.mem.Allocator,
+        from: u32,
+        to: u32,
+        to_has: i64,
+    ) !void {
+        self.short += 1;
+        if (self.prng.random().boolean()) {
+            try self.set(arloc, from, 0, -poison);
+            try self.set(arloc, to, to_has, to_has - poison);
+        }
+        try self.execute(arloc, "ROLLBACK", "ROLLBACK");
+    }
+
+    /// What account `id` holds: zero when it has no row.
+    fn balance(self: *Teller, arloc: std.mem.Allocator, id: u32) !i64 {
+        const reply = try self.query(arloc, try std.fmt.allocPrint(
+            arloc,
+            "SELECT balance FROM bank{d} WHERE id = {d}",
+            .{ id % bank_tables, id },
+        ));
+        if (reply.rows.len == 0) return 0;
+        if (reply.rows.len > 1) return error.RowReadTwice;
+        const cols = reply.rows[0];
+        if (cols.len != 1) return error.WrongColumnCount;
+        return balanceOf(cols[0]);
+    }
+
+    /// Takes account `id` from `has` to `now`. A balance of zero is no
+    /// row, so this inserts or deletes at that end. An UPDATE has the
+    /// server do the sum one time in two.
+    fn set(
+        self: *Teller,
+        arloc: std.mem.Allocator,
+        id: u32,
+        has: i64,
+        now: i64,
+    ) !void {
+        const tbl = id % bank_tables;
+        if (now == 0) return self.execute(arloc, try std.fmt.allocPrint(
+            arloc,
+            "DELETE FROM bank{d} WHERE id = {d}",
+            .{ tbl, id },
+        ), "DELETE 1");
+        if (has == 0) return self.execute(arloc, try std.fmt.allocPrint(
+            arloc,
+            "INSERT INTO bank{d} (id, balance) VALUES ({d}, {d})",
+            .{ tbl, id, now },
+        ), "INSERT 0 1");
+
+        const text = if (self.prng.random().boolean())
+            try std.fmt.allocPrint(
+                arloc,
+                "UPDATE bank{d} SET balance = {d} WHERE id = {d}",
+                .{ tbl, now, id },
+            )
+        else
+            try std.fmt.allocPrint(
+                arloc,
+                "UPDATE bank{d} SET balance = balance {s} {d} WHERE id = {d}",
+                .{ tbl, if (now < has) "-" else "+", @abs(now - has), id },
+            );
+        try self.execute(arloc, text, "UPDATE 1");
+    }
+
+    /// Every account in one transaction, each table by its primary
+    /// key and by its index on the balance. The two must show the same
+    /// rows, each with a balance over zero, and `bank_total` in all.
+    fn readAll(self: *Teller, arloc: std.mem.Allocator) !void {
+        var by_key: Balances = @splat(null);
+        var by_index: Balances = @splat(null);
+        try self.execute(arloc, "BEGIN", "BEGIN");
+        for (0..bank_tables) |tbl| {
+            try self.readTable(arloc, &by_key, try std.fmt.allocPrint(
+                arloc,
+                "SELECT id, balance FROM bank{d}",
+                .{tbl},
+            ));
+            // Wide enough for a balance `backOut` wrote, if one leaks.
+            try self.readTable(arloc, &by_index, try std.fmt.allocPrint(
+                arloc,
+                "SELECT id, balance FROM bank{d}" ++
+                    " WHERE balance >= {d} AND balance <= {d}",
+                .{ tbl, -2 * poison, bank_total },
+            ));
+        }
+        try self.execute(arloc, "COMMIT", "COMMIT");
+        self.reads += 1;
+
+        expectBank(by_key, by_index) catch |err| {
+            self.wrong = true;
+            log.err("teller {d}: by key {any}, by index {any}", .{
+                self.id, by_key, by_index,
+            });
+            return err;
+        };
+    }
+
+    fn readTable(
+        self: *Teller,
+        arloc: std.mem.Allocator,
+        found: *Balances,
+        text: String,
+    ) !void {
+        const reply = try self.query(arloc, text);
+        for (reply.rows) |cols| {
+            if (cols.len != 2) return error.WrongColumnCount;
+            const id = try intOf(cols[0]);
+            if (id >= num_accounts) return error.UnknownAccount;
+            if (found[id] != null) return error.RowReadTwice;
+            found[id] = try balanceOf(cols[1]);
+        }
+    }
+};
+
+fn balanceOf(text: ?String) !i64 {
+    return std.fmt.parseInt(i64, text orelse return error.NullColumn, 10);
+}
+
+/// One read of all accounts, by key and by index.
+fn expectBank(by_key: Balances, by_index: Balances) !void {
+    if (!std.meta.eql(by_key, by_index)) return error.BankIndexDiffers;
+    var total: i64 = 0;
+    for (by_key) |held| {
+        const amount = held orelse continue;
+        if (amount <= 0) return error.BankBalanceNotPositive;
+        total += amount;
+    }
+    if (total != bank_total) return error.BankTotalWrong;
+}
+
 fn apply(rows: *Rows, writes: []const Write) void {
     for (writes) |write| rows[write.row] = write.seq;
 }
@@ -941,23 +1332,26 @@ fn seqOf(
     return seq;
 }
 
-/// Run every writer for `ms` virtual milliseconds, then tell them to
-/// stop and call `at_end`. Returns once each has had the statement it
-/// was in answered.
-fn runWriters(
+/// Run every writer and teller for `ms` virtual milliseconds, then
+/// tell them to stop and call `at_end`. Returns once each has had the
+/// statement it was in answered.
+fn runClients(
     alloc: std.mem.Allocator,
     writers: []Writer,
+    tellers: []Teller,
     ms: u64,
     ctx: anytype,
     comptime at_end: fn (@TypeOf(ctx)) anyerror!void,
 ) !void {
     var stop = false;
-    var group = try fiber.Group(void).initCapacity(alloc, writers.len);
+    const clients = writers.len + tellers.len;
+    var group = try fiber.Group(void).initCapacity(alloc, clients);
     defer group.deinit();
     defer group.wait();
     defer stop = true;
 
     for (writers) |*w| try group.spawn(.{}, Writer.run, .{ w, &stop });
+    for (tellers) |*t| try group.spawn(.{}, Teller.run, .{ t, &stop });
     try resources.injectFaults(ms);
     // Before `at_end`, which may park: no writer starts a statement
     // after the first thing it does.
@@ -976,7 +1370,12 @@ const CrashAt = struct {
     /// as the disk is dead, and only the stop answers a COMMIT queued
     /// behind it.
     fn take(self: *const CrashAt) anyerror!void {
-        try stillUp(self.inst);
+        // With a filesystem shut the node is right to have stopped,
+        // and the cut is the restart that mounts it again.
+        if (resources.shut()) {
+            const gave_up = self.inst.eng.node.shutdown.hasFailed();
+            log.info("a filesystem shut, node gave up: {}", .{gave_up});
+        } else try stillUp(self.inst);
         try resources.powerCut(self.mode);
         fiber.sleepMs(fiber.random().uintLessThan(u64, 2 * retry_ms));
         self.inst.eng.stop();
@@ -997,8 +1396,9 @@ fn endWithoutCrash(inst: *Instance) anyerror!void {
     try resources.endOutages();
 }
 
-fn firstFailure(writers: []const Writer) !void {
+fn firstFailure(writers: []const Writer, tellers: []const Teller) !void {
     for (writers) |w| if (w.failed) |err| return err;
+    for (tellers) |t| if (t.failed) |err| return err;
 }
 
 test "sim: sql keeps acknowledged statements across crashes" {
@@ -1028,6 +1428,18 @@ fn run(shape: Shape) !void {
     const alloc = testing.allocator;
     body_max = shape.body_max;
 
+    // Four times what the waits of this shape add up to at their
+    // longest. A run past it is stuck and ends with its fibers
+    // printed. The runner's `--sim-until` is used when given.
+    const run_state = fiber.runtime().simState().?;
+    const own_bound = run_state.opts.until_ms == null;
+    const stretch_max_ms = shape.stretch_ms + shape.stretch_more_ms;
+    if (own_bound) run_state.opts.until_ms = run_state.elapsedMs() +
+        4 * (shape.crashes + 2) * (stretch_max_ms + 2 * retry_ms);
+    defer if (own_bound) {
+        run_state.opts.until_ms = null;
+    };
+
     var tmp = try vfs.TmpDir.init(alloc);
     defer tmp.deinit();
 
@@ -1038,6 +1450,12 @@ fn run(shape: Shape) !void {
         .prng = std.Random.DefaultPrng.init(fiber.random().int(u64)),
     };
     defer for (&writers) |*w| w.deinit();
+    var tellers: [num_tellers]Teller = undefined;
+    for (&tellers, 0..) |*t, id| t.* = .{
+        .id = @intCast(id),
+        .alloc = alloc,
+        .prng = std.Random.DefaultPrng.init(fiber.random().int(u64)),
+    };
 
     const dir = try std.fmt.allocPrint(alloc, "{s}/data", .{tmp.path});
     defer alloc.free(dir);
@@ -1064,8 +1482,8 @@ fn run(shape: Shape) !void {
         const ms = shape.stretch_ms +
             fiber.random().uintLessThan(u64, shape.stretch_more_ms);
         try resources.start();
-        try runWriters(alloc, &writers, ms, &crash, CrashAt.take);
-        try firstFailure(&writers);
+        try runClients(alloc, &writers, &tellers, ms, &crash, CrashAt.take);
+        try firstFailure(&writers, &tellers);
 
         // The next boot is on a disk that works again.
         booted.?.close();
@@ -1073,24 +1491,34 @@ fn run(shape: Shape) !void {
         try resources.clear();
         booted = try Instance.open(alloc, dir);
         for (&writers) |*w| try w.recover();
+        try tellers[0].audit();
     }
 
     // A last stretch, a clean stop, and a restart that must lose nothing.
+    resources.endShutdowns();
     try resources.start();
-    try runWriters(alloc, &writers, 1000, booted.?, endWithoutCrash);
-    try firstFailure(&writers);
+    try runClients(
+        alloc,
+        &writers,
+        &tellers,
+        1000,
+        booted.?,
+        endWithoutCrash,
+    );
+    try firstFailure(&writers, &tellers);
     try stillUp(booted.?);
     try resources.clear();
     if (shape.faults) {
         // The faults are over: every statement is answered again, the
         // first of each writer the read of what it had in flight.
-        try runWriters(alloc, &writers, 500, booted.?, stillUp);
-        try firstFailure(&writers);
+        try runClients(alloc, &writers, &tellers, 500, booted.?, stillUp);
+        try firstFailure(&writers, &tellers);
     }
     booted.?.close();
     booted = null;
     booted = try Instance.open(alloc, dir);
     for (&writers) |*w| try w.expectAcked();
+    try tellers[0].audit();
 
     // The WAL's disk stops taking writes. The statement in flight
     // fails once the log gives up, the node stops by itself, and a
@@ -1106,6 +1534,7 @@ fn run(shape: Shape) !void {
     try sim.setFaults(wal_dir, .{});
     booted = try Instance.open(alloc, dir);
     for (&writers) |*w| try w.expectAcked();
+    try tellers[0].audit();
 
     var ops: u64 = 0;
     var kept: u32 = 0;
@@ -1120,5 +1549,25 @@ fn run(shape: Shape) !void {
             " {d} of them in flight at a crash and kept," ++
             " {d} refused under disk errors",
         .{ ops, shape.crashes, kept, refused },
+    );
+
+    var transfers: u64 = 0;
+    var short: u64 = 0;
+    var reads: u64 = 0;
+    var conflicts: [conflict_codes.len]u64 = @splat(0);
+    for (tellers) |t| {
+        transfers += t.transfers;
+        short += t.short;
+        reads += t.reads;
+        for (&conflicts, t.conflicts) |*sum, count| sum.* += count;
+    }
+    log.info(
+        "bank: {d} transfers, {d} more from an empty account, {d} reads" ++
+            " of all accounts, ended by another transaction: {d} with 40001," ++
+            " {d} with 40P01, {d} with 23505, {d} with 72000",
+        .{
+            transfers,    short,        reads,        conflicts[0],
+            conflicts[1], conflicts[2], conflicts[3],
+        },
     );
 }

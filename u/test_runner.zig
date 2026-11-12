@@ -244,6 +244,9 @@ const Args = struct {
     sim_sched: fiber.sim.Sched = .random,
     /// `--sim-faults`: every disk fault kind at this rate per thousand.
     sim_faults: u16 = 0,
+    /// `--sim-until`: virtual ms the run may take before it ends as
+    /// stuck, with every parked fiber printed.
+    sim_until_ms: ?u64 = null,
     /// Watchdog tunables. `wd_stuck_tick_s` is one knob serving two
     /// purposes — dump threshold AND tick interval — so cadence is
     /// always one-dump-per-window. `wd_kill_s = 0` disables the kill.
@@ -380,6 +383,8 @@ const help_text =
     \\                      priority_fifo.
     \\  --sim-faults <N>    Every simulated disk fault at N per thousand
     \\                      ops; the unit suite expects 0.
+    \\  --sim-until <MS>    End the run as stuck, exit code 3, once it has
+    \\                      taken MS virtual ms. Prints every parked fiber.
     \\  --verbose           Print "STARTING <name>" before each test (debug wedges).
     \\  --workers           Print the per-worker CPU / wake-path dump after the summary.
     \\  --wd-stuck-tick-s <N> Watchdog: dump threshold AND tick interval, seconds (default 20).
@@ -435,6 +440,9 @@ fn parseArgs(alloc: std.mem.Allocator) !Args {
             i += 1;
         } else if (std.mem.eql(u8, a, "--sim-faults") and i + 1 < argv.len) {
             args.sim_faults = try std.fmt.parseInt(u16, argv[i + 1], 10);
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--sim-until") and i + 1 < argv.len) {
+            args.sim_until_ms = try std.fmt.parseInt(u64, argv[i + 1], 10);
             i += 1;
         } else if (std.mem.eql(u8, a, "--guard")) {
             args.guard = true;
@@ -1279,6 +1287,7 @@ pub fn main(init: std.process.Init) !void {
             .seed = seed,
             .sched = args.sim_sched,
             .disk_faults = fiber.simdisk.Faults.all(args.sim_faults),
+            .until_ms = args.sim_until_ms,
         } else null,
     });
     defer fiber_rt.deinit();
@@ -1305,8 +1314,8 @@ pub fn main(init: std.process.Init) !void {
         fiber_rt.run();
     }
 
-    // The simulation's fingerprint, and a deadlock is a failed run even
-    // when every test that got to run passed.
+    // The simulation's fingerprint. A deadlock or a stuck run is a
+    // failed run even when every test that got to run passed.
     if (fiber_rt.simState()) |sim| {
         out.print(
             "sim: seed={d} sched={s} dispatches={d} trace={x:0>16}" ++

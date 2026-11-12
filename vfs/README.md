@@ -53,18 +53,59 @@ has been tested.
 | overwrite a durable file, then:        |                 |                |
 | fdatasync while writes fail            | EIO             | EIO            |
 | fdatasync again, writes work           | success         | success        |
+| a read of those bytes from the cache   | new bytes       | new bytes      |
+| the same read, the cache dropped       | old bytes       | old bytes      |
 | after a cut the file has               | old bytes       | old bytes      |
 | tmp, fsync(tmp), rename, then:         |                 |                |
 | fsync(directory) while writes fail     | EIO             | EIO            |
 | fsync(directory) again, writes work    | success         | success        |
-| a new file after that                  | EROFS           | EIO            |
 | after a cut the directory has          | tmp only        | tmp only       |
 
 - The sync after a failed one reports success, and what the first one
   failed to write is not on the device. This holds for a file's bytes
   and for a directory's names.
-- After a failed directory sync the filesystem takes no more changes
-  until it is mounted again: ext4 is read-only, XFS has shut down.
+- After a failed sync a read returns the new bytes while the kernel
+  still has the page and the old ones once it has let the page go.
+- A new file whose sync failed can be on the device later with its
+  name and size and without its bytes, once another sync has written
+  the journal: 8192 bytes that are not the ones written on ext4, an
+  empty file on XFS.
+
+## Which failed sync stops the filesystem
+
+Each step below failed once with EIO on a device that failed every
+write. The device then worked again and every kind of op was tried.
+These cases were not run on overlayfs.
+
+| The step that failed                              | ext4      | XFS       |
+|---------------------------------------------------|-----------|-----------|
+| fsync of a new file                               | works on  | works on  |
+| fdatasync after an append or an overwrite         | works on  | works on  |
+| O_DSYNC write inside a file or past its end       | works on  | works on  |
+| the same writes with O_DIRECT                     | works on  | works on  |
+| fsync(directory) after a rename                   | read-only | shut down |
+| fsync(directory) after a create                   | read-only | shut down |
+| fsync(directory) after a delete                   | read-only | shut down |
+
+A failed write of a file's bytes fails that sync and nothing else. A
+failed write of the journal, which is what a directory's sync is,
+stops the whole filesystem: ext4 aborts its journal and goes
+read-only, XFS shuts down. From then until it is unmounted and
+mounted again:
+
+| Op on the stopped filesystem                      | ext4      | XFS       |
+|---------------------------------------------------|-----------|-----------|
+| fsync(directory), the next op after the failure   | success   | success   |
+| fsync(directory), later                           | EROFS     | success   |
+| read, list a directory, stat                      | works     | EIO       |
+| open a file for reading                           | works     | EIO       |
+| write, also with O_DSYNC or O_DIRECT              | EROFS     | EIO       |
+| fdatasync                                         | EROFS     | EIO       |
+| create, open for writing, mkdir                   | EROFS     | EIO       |
+| rename, delete, truncate, fallocate, set mtime    | EROFS     | EIO       |
+
+After the unmount and the mount both work again. They have the names
+and bytes from before the failed sync and nothing from after it.
 
 ## The rules in the code
 
@@ -92,11 +133,17 @@ has been tested.
 
 `zfiber/simdisk.zig` is stricter than both filesystems on names: only
 a directory's sync makes a name durable, a file's own sync never does.
-`Faults.sync_drop` is the failed sync above: the pending writes still
-read back, the device does not have them, and a later sync does not
-write them.
 
-It is kinder in one way. A directory sync that failed can be asked
-again and then lands the names, and the disk goes on working. On ext4
-and XFS the second sync would report success without the names, and
-the filesystem would take no more writes.
+`Faults.sync_drop` is the failed sync of a file above: the pending
+writes still read back, the device does not have them, and a later
+sync does not write them. The disk never gives the old bytes back to
+a read before a crash, which the kernel may.
+
+`Faults.shutdown` is the failed sync of a directory: the filesystem
+stops as one of the two did, drawn from the seed (`Shut`), for the
+tree the rates are set on and until its `crash`. A directory's sync
+on it reports success and lands nothing.
+
+`Faults.sync` on a directory is kinder than either: the names stay
+pending, a second sync lands them, and the disk goes on working.
+Neither filesystem did that for a failed write of the journal.

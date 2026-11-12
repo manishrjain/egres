@@ -22,13 +22,11 @@ const vfs = @import("vfs");
 const fiber = @import("zfiber");
 const _cache = @import("../cache.zig");
 
-/// Module-level block cache singleton. Set before opening tables to enable
-/// caching. When null (default), readBlock always reads from disk.
-///
-/// Key layout: high 64 bits = file_id, low 64 bits = block_idx. Storing
-/// both fields in their own halves of a u128 means no hash combine and
-/// zero collision risk across the node_id-namespaced file_id space.
-pub var block_cache: ?*_cache.ShardedCache(u128) = null;
+/// Decoded blocks by key: the file id in the high 64 bits, the block
+/// index in the low ones. Each in its own half means no hash combine
+/// and no collision across the node_id-namespaced file ids. A table
+/// gets its cache from its store (`Store.blockCache`).
+pub const BlockCache = vfs.BlockCache;
 
 /// What an open table pins in memory for its lifetime, in bytes: the
 /// block index (its serialized size less the filter and bitmap it
@@ -72,12 +70,6 @@ pub fn sstName(allocator: std.mem.Allocator, file_id: u64) ![]u8 {
     return std.fmt.allocPrint(allocator, "{x:0>16}.sst", .{file_id});
 }
 
-/// How `Table.open` opens an SST in a file store. `.direct` goes with a
-/// block cache: blocks are cached decompressed there, so the page cache
-/// would hold the same data twice. Buffered (`.default`, for tests and
-/// tools) reads with readahead off. An s3 store ignores it.
-pub var read_mode: vfs.Mode = .default;
-
 pub const Error = _idx.Error || _buffers.Error || compress.Error ||
     std.mem.Allocator.Error || error{
     ChecksumMismatch,
@@ -117,8 +109,12 @@ pub const Table = struct {
     /// What the manifest records for the file; a re-list of this table
     /// (move, split, branch) copies it into the new CREATE.
     extent: Extent,
+    /// Where `readBlock` keeps this table's blocks, or null for
+    /// nowhere. The store's, taken at `open`; a forest clears it as
+    /// it closes.
+    block_cache: ?*BlockCache,
     /// One bit per block: set when this table put the block into the
-    /// global block cache, so `purgeCachedBlocks` can drop exactly this
+    /// block cache, so `purgeCachedBlocks` can drop exactly this
     /// file's entries without walking the cache. A set bit for a block
     /// the cache has since evicted on its own only costs a no-op remove.
     /// Atomic words, since readers on different workers insert
@@ -133,9 +129,11 @@ pub const Table = struct {
 
     pub const Extent = _idx.Extent;
 
-    /// Open SST `file_id` from the store, in `read_mode`. `extent` is
-    /// what the manifest recorded at create: the open is then one read
-    /// of the index and trailer, no stat and no trailer round trip.
+    /// Open SST `file_id` from the store, with the store's block
+    /// cache. A file store reads it in its own mode, readahead off.
+    /// `extent` is what the manifest recorded at create: the open is
+    /// then one read of the index and trailer, no stat and no trailer
+    /// round trip.
     pub fn open(
         allocator: std.mem.Allocator,
         store: *vfs.Store,
@@ -144,12 +142,10 @@ pub const Table = struct {
     ) !*Table {
         const name = try sstName(allocator, file_id);
         defer allocator.free(name);
-        const obj = try store.open(name, extent.size, .{
-            .mode = read_mode,
-            .flags = .{ .random = true },
-        });
+        const obj = try store.open(name, extent.size, .{ .random = true });
         const t = try openObject(allocator, obj, extent);
         t.file_id = file_id;
+        t.block_cache = store.blockCache();
         return t;
     }
 
@@ -287,6 +283,7 @@ pub const Table = struct {
             .ref = std.atomic.Value(i32).init(1),
             .file_id = 0,
             .extent = extent,
+            .block_cache = null,
             .cached = cached,
         };
         resident.add(res);
@@ -298,7 +295,7 @@ pub const Table = struct {
         // table put into the block cache, and they go with the table.
         // Nobody can reach the table any more, so its blocks are dead
         // weight: drop them now, while the bits still say which they are.
-        if (block_cache) |cache| _ = self.purgeCachedBlocks(cache);
+        if (self.block_cache) |cache| _ = self.purgeCachedBlocks(cache);
 
         resident.sub(self.resident);
         self.allocator.free(self.cached);
@@ -484,10 +481,10 @@ pub const Table = struct {
     }
 
     pub fn readBlock(self: *const Table, block_idx: usize) Error!*_cache.Value {
-        return self.readBlock_(block_cache, block_idx);
+        return self.readBlock_(self.block_cache, block_idx);
     }
 
-    /// `readBlock` through `cache` instead of the process's block cache.
+    /// `readBlock` through `cache` instead of the table's own.
     pub fn readBlock_(
         self: *const Table,
         cache: ?*_cache.ShardedCache(u128),

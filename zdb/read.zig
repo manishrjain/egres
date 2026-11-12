@@ -521,7 +521,7 @@ pub const MultiGet = struct {
     /// then hits. Keys ascend, so the block indices do too and a repeat
     /// is the previous entry.
     fn prefetch(self: *MultiGet, tbl: *Table) !void {
-        const cache = _table.table.block_cache orelse return;
+        const cache = tbl.block_cache orelse return;
         const arloc = self.arena.allocator();
         utils.clearRetainCap(&self.blocks);
         for (self.accepted.items) |node| {
