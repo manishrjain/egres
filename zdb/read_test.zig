@@ -673,6 +673,31 @@ test "multiget: postings fold across memtable, L0, tombstones and history" {
     try std.testing.expectError(error.NotRoaring, row.bitmap(alloc, "t"));
 }
 
+test "cursor: a posting folds from its newest state, not under it" {
+    const alloc = std.testing.allocator;
+    var fx: Fixture = undefined;
+    try fx.setup(alloc);
+    defer fx.teardown();
+
+    // p as a rollup leaves it: a state at 20 in place of the delta
+    // that added 3, the older delta kept under it, a delta above it.
+    try roar.putDelta(&fx, "p", 10, &.{ 1, 2 }, &.{});
+    try roar.putState(&fx, "p", 20, &.{ 1, 2, 3 });
+    try fx.flush();
+    try roar.putDelta(&fx, "p", 30, &.{4}, &.{1});
+
+    var cur = try fx.f.openCursor(alloc, table_key, .all, .{
+        .num_versions = std.math.maxInt(u32),
+    });
+    defer cur.deinit();
+    const item = (try cur.next()) orelse return error.TestExpectedItem;
+    try std.testing.expectEqual(3, item.versions.len());
+    var bm = try cur.bitmap(alloc, &item);
+    defer bm.deinit();
+    try std.testing.expectEqual(3, bm.getCardinality());
+    for ([_]u64{ 2, 3, 4 }) |v| try std.testing.expect(bm.contains(v));
+}
+
 const WantRow = struct { key: String, value: String };
 
 /// A reverse cursor over `range` at read_ts 100 with `pending` merged

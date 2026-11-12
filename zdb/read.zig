@@ -582,33 +582,28 @@ pub const MultiGet = struct {
     }
 };
 
-/// The bitmap a roaring chain folds from: empty for a tombstone
-/// terminal, the state's bitmap for a state terminal (copied: SST
-/// values sit at arbitrary offsets, so zroar's aligned zero-copy path
-/// is not usable), else `external` cloned (compaction's read-below),
-/// else empty. Reads (`MultiGet.bitmap`) and compaction
-/// (`VersionTracker.foldChain`) both fold through this
-/// and `applyDelta`, which is what keeps rollup read-invariant.
-/// A posting chain, newest first, folded into a bitmap owned by
-/// `alloc`: the oldest version is the base when it is a state or a
-/// tombstone, else the chain folds from empty; the deltas apply oldest
-/// first. NotRoaring when a version is not roaring (a tombstone's
-/// encoding is not looked at, as in compaction).
+/// A posting's versions, newest first, folded into a bitmap owned by
+/// `alloc`. The base is the newest version that is not a delta, a
+/// state or a tombstone, and the fold starts empty when there is
+/// none. Only the deltas above the base apply, oldest first. What is
+/// under the base is history and is not read: a rollup puts its state
+/// in place of the newest delta, so folding from under it loses that
+/// delta. NotRoaring when a version the fold reads is not roaring (a
+/// tombstone's encoding is not looked at, as in compaction).
 pub fn foldBitmap(
     alloc: std.mem.Allocator,
     vers: []const kv.Version,
 ) !zroar.Bitmap {
     var terminal: ?kv.Version = null;
     var deltas = vers;
-    if (vers.len > 0) {
-        const oldest = vers[vers.len - 1];
-        if (!oldest.meta.isDeleted() and !oldest.meta.isRoaring()) {
+    for (vers, 0..) |ver, i| {
+        if (ver.meta.isDelta()) continue;
+        if (!ver.meta.isDeleted() and !ver.meta.isRoaring()) {
             return error.NotRoaring;
         }
-        if (!oldest.meta.isDelta()) {
-            terminal = oldest;
-            deltas = vers[0 .. vers.len - 1];
-        }
+        terminal = ver;
+        deltas = vers[0..i];
+        break;
     }
     var bm = try baseBitmap(alloc, terminal, null);
     errdefer bm.deinit();
@@ -621,6 +616,13 @@ pub fn foldBitmap(
     return bm;
 }
 
+/// The bitmap a roaring chain folds from: empty for a tombstone
+/// terminal, the state's bitmap for a state terminal (copied: SST
+/// values sit at arbitrary offsets, so zroar's aligned zero-copy path
+/// is not usable), else `external` cloned (compaction's read-below),
+/// else empty. Reads (`foldBitmap`) and compaction
+/// (`VersionTracker.foldChain`) both fold through this
+/// and `applyDelta`, which is what keeps rollup read-invariant.
 pub fn baseBitmap(
     alloc: std.mem.Allocator,
     terminal: ?kv.Version,
