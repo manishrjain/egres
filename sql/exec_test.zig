@@ -514,6 +514,47 @@ test "sql.exec: seq_scan: full ascending batches; pred skips without copying" {
     }
 }
 
+test "sql.exec: seq_scan: count_only counts past its yield points" {
+    var fx = try Fixture.setup(&alternatingRows);
+    defer fx.teardown();
+    var tx = fx.txn();
+    defer tx.deinit();
+    var ctx = fx.ctx(&tx, false);
+    var b = try Batch.init(testing.allocator);
+    defer b.deinit();
+
+    // 2500 rows: the count yields twice on the way and hands no row over.
+    {
+        var node = RowNode{ .seq_scan = .{
+            .keep_value = false,
+            .count_only = true,
+        } };
+        defer node.deinit();
+        try testing.expect(try node.next(&ctx, &b));
+        try testing.expectEqual(@as(u64, 2500), b.counted);
+        try testing.expectEqual(@as(usize, 0), b.numRows());
+        try testing.expect(!try node.next(&ctx, &b)); // sticky
+    }
+
+    // b = 'x': a row the predicate skips still counts toward the yield.
+    {
+        const pred = try sql.pred.colCmp(
+            fx.arena.allocator(),
+            fx.col("b"),
+            .eq,
+            .{ .text = "x" },
+        );
+        var node = RowNode{ .seq_scan = .{
+            .pred = &pred,
+            .keep_value = false,
+            .count_only = true,
+        } };
+        defer node.deinit();
+        try testing.expect(try node.next(&ctx, &b));
+        try testing.expectEqual(@as(u64, 1250), b.counted);
+    }
+}
+
 test "sql.exec: seq_scan: borrowed values outlive the blocks the walk left" {
     var fx = try Fixture.setupOnDisk(&wideRows);
     defer fx.teardown();

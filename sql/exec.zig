@@ -548,7 +548,13 @@ pub const SeqScan = struct {
         if (self.count_only) {
             // Nothing is handed over: the whole range is counted in one
             // call, and the batch carries only the count.
-            while (try cursor.next()) |item| {
+            var seen: usize = 0;
+            while (try cursor.next()) |item| : (seen += 1) {
+                // One yield point per batch's worth of rows. No batch
+                // boundary gives one here, and a count with none is a
+                // single step as long as the table: nothing can pause
+                // or stop it, and its worker serves nobody else.
+                if (seen % row_cap == 0) try fiber.ctx().maybeYield();
                 if (self.pred) |pred| {
                     // The whole range in one fill: no batch bounds the
                     // scratch, so each row starts it empty.
