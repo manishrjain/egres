@@ -213,6 +213,19 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
             return replyError(state, "create table failed");
         },
     };
+    // Exclusive table lock from before the name is visible until the
+    // column rows are in: a statement that resolves the name parks on
+    // its shared hold (dmlTxn) and loads the whole schema, never the
+    // gap between the two proposals. Uncontended, no one else knows
+    // the id yet; parking under ddl_mu is safe as in dropTable.
+    const table_id = created.table_ids[0];
+    const db = self.srv.database(ns) catch
+        return replyError(state, "internal error: database state");
+    const table_lock = db.tableLock(table_id) catch
+        return replyError(state, "internal error: lock state");
+    table_lock.lock(@src());
+    defer table_lock.unlock();
+
     eng.proposeMC(created.change, .apply) catch |err| {
         log.err("create table '{s}': propose: {s}", .{ ct.name, @errorName(err) });
         return replyError(state, "create table proposal failed");
@@ -222,7 +235,6 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
     // between the two proposals leaves a named, column-less table (DROP
     // TABLE cleans it up) — acceptable pre-production. An index made
     // with its table is valid from ts 0: no row precedes it.
-    const table_id = created.table_ids[0];
     const indexes = try a.alloc(_catalog.IndexDef, unique_cols.items.len);
     for (unique_cols.items, created.table_ids[1..], indexes) |col, tid, *def| {
         def.* = .{
@@ -355,6 +367,15 @@ pub fn createTableAs(
             return replyError(state, "create table failed");
         },
     };
+    // Exclusive table lock across both proposals, as createTable.
+    const table_id = created.table_ids[0];
+    const db = self.srv.database(ns) catch
+        return replyError(state, "internal error: database state");
+    const table_lock = db.tableLock(table_id) catch
+        return replyError(state, "internal error: lock state");
+    table_lock.lock(@src());
+    defer table_lock.unlock();
+
     eng.proposeMC(created.change, .apply) catch |err| {
         log.err("create table as '{s}': propose: {s}", .{
             cta.name, @errorName(err),
@@ -366,7 +387,6 @@ pub fn createTableAs(
     // column ids stay the source's, so the index descriptors and the
     // shared rows keep naming the same columns. A branched index is
     // valid from when its source was; an empty one from the start.
-    const table_id = created.table_ids[0];
     const indexes = try arloc.alloc(_catalog.IndexDef, src_indexes.items.len);
     for (src_indexes.items, created.table_ids[1..], indexes) |idx, tid, *def| {
         def.* = .{
