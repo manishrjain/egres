@@ -336,6 +336,10 @@ pub const Fiber = struct {
 
     state: std.atomic.Value(u8),
     intent: YieldIntent,
+    /// The fiber's last step ended at its time slice
+    /// (`yieldIfSliceDue`), so the next is expected to take a whole
+    /// slice too. Cleared by the worker that dispatches it.
+    gave_way: bool = false,
 
     /// Concurrency guard: count of workers currently stepping this
     /// fiber. Must never exceed 1 — a fiber is single-owner and only

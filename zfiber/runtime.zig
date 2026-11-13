@@ -117,6 +117,28 @@ pub const Worker = struct {
     /// `Worker.run` writes it.
     pub threadlocal var current_do_not_use_directly: ?*Worker = null;
 
+    /// TSC readings this worker keeps of its own run loop.
+    const Ticks = struct {
+        /// The last libxev pump (see `dispatch`). Lets a
+        /// continuously-busy worker still service timers / async wakes
+        /// about once per millisecond without blocking.
+        last_pump: u64 = 0,
+        /// This worker's last coarse-clock tick. Gates the once-per-ms
+        /// `clock.update()` at the top of the run loop. Every worker
+        /// drives the clock, so every worker carries this.
+        last_coarse_clock: u64 = 0,
+        /// When this worker last finished a fiber step; the pre-park
+        /// poll runs only within a millisecond of it.
+        last_step_end: u64 = 0,
+        /// When the running step began. `charged` moves with every
+        /// charge; this stays, so `sliceDue` knows how long the step
+        /// has kept the worker from its loop.
+        step_start: u64 = 0,
+        /// Up to where the running step is charged to its fiber's
+        /// tenant: the step's start, moved by each `chargeCpu`.
+        charged: u64 = 0,
+    };
+
     id: u8,
     /// Index into `Runtime.lane_ranges` / `.idle` for the lane this worker
     /// belongs to. Set in `Runtime.init`.
@@ -132,14 +154,7 @@ pub const Worker = struct {
     /// Track the total cpu time spent processing fibers on this worker. Helps
     /// identify if the work is getting distributed evenly across workers.
     cpu_total_ns: u64 = 0,
-    /// TSC reading at the last libxev pump (see `dispatch`). Lets a
-    /// continuously-busy worker still service timers / async wakes about
-    /// once per millisecond without blocking.
-    last_pump_ticks: u64 = 0,
-    /// TSC reading at this worker's last coarse-clock tick. Gates the
-    /// once-per-ms `clock.update()` at the top of the run loop. Every
-    /// worker drives the clock now, so every worker carries this.
-    last_coarse_clock_ticks: u64 = 0,
+    ticks: Ticks = .{},
     /// Whether this worker holds a +1 in its lane's `num_thieves` — it is
     /// out stealing, or was woken by a producer to steal. Spans from the
     /// wake (or running dry) until work is found, NOT just the steal scan:
@@ -150,12 +165,6 @@ pub const Worker = struct {
     is_thief: bool = false,
     /// xorshift64 state for steal-victim randomization; seeded in `run`.
     rng_state: u64 = 1,
-    /// TSC reading when this worker last finished a fiber step; the
-    /// pre-park poll runs only within a millisecond of it.
-    last_work_ticks: u64 = 0,
-    /// TSC reading up to which the running step is charged to its
-    /// fiber's tenant: the step's start, moved by each `settleCpu`.
-    charged_ticks: u64 = 0,
     /// Wake-path counters, worker-private (only this worker writes them;
     /// `dumpWorkerCpu` reads them racily). Together they say whether an
     /// idle peer is actually told about work — see `WakeStats`.
@@ -635,7 +644,7 @@ pub const Worker = struct {
         return false;
     }
 
-    /// Charges the step's ticks since `charged_ticks` to the fiber's
+    /// Charges the step's ticks since `ticks.charged` to the fiber's
     /// tenant, in the tick counter's unit its cpu limit was converted
     /// to, and moves the mark. Once at the end of every step, and from
     /// `Ctx.maybeYield` so a long step pays per batch, not when it
@@ -647,18 +656,19 @@ pub const Worker = struct {
             // (`ticksTo` is 0 on this thread; `Sim.run` never seeds its
             // factor.)
             const cost = sim.stepCost();
-            self.charged_ticks += cost;
+            self.ticks.charged += cost;
             f.ctx.tenant.charge(
                 .cpu,
                 f.ctx.class,
                 @intCast(cost),
                 _coarse.ms(),
             );
-            return self.charged_ticks;
+            return self.ticks.charged;
         }
+
         const now = readTicks();
-        const ticks = now -| self.charged_ticks;
-        self.charged_ticks = now;
+        const ticks = now -| self.ticks.charged;
+        self.ticks.charged = now;
         if (ticks > 0) f.ctx.tenant.charge(
             .cpu,
             f.ctx.class,
@@ -666,6 +676,24 @@ pub const Worker = struct {
             _coarse.ms(),
         );
         return now;
+    }
+
+    /// Whether the running step should give way at this yield point:
+    /// it has run for `Runtime.slice_us`, and the worker has work only
+    /// its loop can move. That is a ready fiber, a completion to reap,
+    /// a request a parked fiber queued that has not gone to the kernel,
+    /// or a pump overdue (timers fire there). A step with none of them
+    /// keeps running: yielding would hand the worker back to itself.
+    /// Never due under a simulation, where a step has no real length.
+    pub fn sliceDue(self: *Worker) bool {
+        const now = readTicks();
+        const ran_ns = ticksTo(now -| self.ticks.step_start, .ns);
+        if (!runtime().pastSlice(ran_ns)) return false;
+
+        if (completionsReady(&self.loop) > 0) return true;
+        if (pendingSubmissions(&self.loop) > 0) return true;
+        for (&self.ready) |*q| if (q.len() > 0) return true;
+        return ticksTo(now -| self.ticks.last_pump, .ms) >= 1;
     }
 
     pub fn runMain(self: *Worker) void {
@@ -712,8 +740,8 @@ pub const Worker = struct {
         // and the next clock tick each land ~1 ms in (we just updated the
         // clock above, so don't re-tick on the very first iteration).
         const seed_ticks = readTicks();
-        self.last_pump_ticks = seed_ticks;
-        self.last_coarse_clock_ticks = seed_ticks;
+        self.ticks.last_pump = seed_ticks;
+        self.ticks.last_coarse_clock = seed_ticks;
         // Steal-victim PRNG: TSC entropy, id-mixed so workers starting the
         // same cycle still diverge; `| 1` keeps the xorshift state nonzero.
         self.rng_state = (seed_ticks ^ (@as(u64, self.id) << 32)) | 1;
@@ -728,8 +756,9 @@ pub const Worker = struct {
             //    the only work-*finding* step, taken only when we run dry.
 
             const enter = readTicks();
-            self.charged_ticks = enter;
-            const since_clock = enter -% self.last_coarse_clock_ticks;
+            self.ticks.charged = enter;
+            self.ticks.step_start = enter;
+            const since_clock = enter -% self.ticks.last_coarse_clock;
             if (ticksTo(since_clock, .ns) >= std.time.ns_per_ms) {
                 // Advance the coarse clock at most once per ms (TSC-gated, no
                 // syscall on the fast path). `enter` is reused for CPU
@@ -737,7 +766,7 @@ pub const Worker = struct {
                 // compare; the write-guard in `update` keeps it to ~1 store/ms
                 // across all workers.
                 _coarse.update();
-                self.last_coarse_clock_ticks = enter;
+                self.ticks.last_coarse_clock = enter;
             }
 
             if (self.nextFiber()) |f| {
@@ -745,9 +774,31 @@ pub const Worker = struct {
                 // out hands the hunt to a parked peer (wake chain).
                 if (self.is_thief) _ = self.exitThiefAndNotify(rt, true);
 
+                // A fiber that gave way is about to hold the worker for
+                // another slice. Without this each I/O step of a
+                // connection beside it waited three slices, not one: the
+                // SQE that step queued was not sent until the slice
+                // ended, and the fiber its completion woke was behind
+                // this one, which requeued before the pump after its
+                // step. So pump first, and run after whatever is ready.
+                if (f.gave_way) {
+                    f.gave_way = false;
+                    if (pendingSubmissions(&self.loop) > 0 or
+                        completionsReady(&self.loop) > 0)
+                    {
+                        self.loop.run(.no_wait) catch {};
+                        self.ticks.last_pump = enter;
+                    }
+                    if (self.hasReady()) {
+                        self.scheduleLocal(f);
+                        continue;
+                    }
+                }
+
                 const finished = self.runFiber(f);
                 const exit = self.chargeCpu(f);
-                self.last_work_ticks = exit;
+                self.ticks.last_step_end = exit;
+
                 // Skip the reading if the counter went backwards (thread
                 // migrated mid-step to a CPU with a slightly behind TSC).
                 const cycNs = ticksTo(exit -| enter, .ns);
@@ -776,17 +827,24 @@ pub const Worker = struct {
                 //     not up to ~1 ms later.
                 //   - pendingSubmissions: SQEs queued by running fibers → flush
                 //     a batch so the reads actually dispatch.
+                //     A step that ran past the slice flushes any at all: it
+                //     kept the worker from its loop that long already, and
+                //     the fiber waiting on a lone SQE is who it gave way to.
                 // `run(.no_wait)` submits + reaps in one syscall and returns
                 // immediately. The ~1 ms timer is the backstop (keeps timers /
                 // async wakes live when I/O is sparse) and is LAST in the `or`
                 // so its division is only computed when neither peek fired.
+                // It is timed from the step's end: timed from its start, a
+                // long step would put the pump off to the step after it.
 
+                const pending = pendingSubmissions(&self.loop);
                 if (completionsReady(&self.loop) > 0 or
-                    pendingSubmissions(&self.loop) >= io_submit_batch or
-                    ticksTo(enter -% self.last_pump_ticks, .ms) >= 1)
+                    pending >= io_submit_batch or
+                    (pending > 0 and rt.pastSlice(cycNs)) or
+                    ticksTo(exit -| self.ticks.last_pump, .ms) >= 1)
                 {
                     self.loop.run(.no_wait) catch {};
-                    self.last_pump_ticks = enter;
+                    self.ticks.last_pump = exit;
                 }
                 continue;
             }
@@ -837,7 +895,7 @@ pub const Worker = struct {
             //    wake (and a C-state exit on a pinned core) costs more than
             //    that. Poll the completion ring for a short while first.
             const since_work =
-                ticksTo(readTicks() -% self.last_work_ticks, .ns);
+                ticksTo(readTicks() -% self.ticks.last_step_end, .ns);
             if (rt.prepark_poll_us.load(.monotonic) > 0 and
                 since_work < std.time.ns_per_ms and
                 self.pollBeforePark(rt))
@@ -898,6 +956,8 @@ pub const WakeStats = struct {
     parks: u64 = 0,
     /// Pre-park polls that found work, sparing a park + kernel wake.
     poll_hits: u64 = 0,
+    /// Steps that gave way at a yield point (`yieldIfSliceDue`).
+    sliced: u64 = 0,
 };
 
 pub const Stats = struct {
@@ -941,10 +1001,6 @@ pub const InitOptions = struct {
     /// worker i takes the i-th CPU of the process's allowed set; with
     /// more workers than CPUs nobody is pinned. See `Worker.pinToCpu`.
     pin_workers: bool = true,
-
-    /// See `Runtime.steal_lone` / `Runtime.prepark_poll_us`.
-    steal_lone: bool = false,
-    prepark_poll_us: u64 = 20,
 
     /// Deterministic simulation (sim.zig): one worker, a seeded pick over
     /// both rings, a virtual clock that jumps to the next deadline when
@@ -1024,10 +1080,14 @@ pub const Runtime = struct {
     /// of 2+, see `trySteal`). `prepark_poll_us`: how long, in
     /// microseconds, a worker that ran a fiber within the last
     /// millisecond polls its completion ring before blocking; 0 = block
-    /// at once (see `Worker.pollBeforePark`). Atomics: `apply` stores
+    /// at once (see `Worker.pollBeforePark`). `slice_us`: how long, in
+    /// microseconds, a step may run before it gives way at a yield
+    /// point to other work on its worker; 0 = it runs until it parks
+    /// (see `Worker.sliceDue`). Atomics: `apply` stores
     /// them from the governor's fiber while every worker reads.
-    steal_lone: std.atomic.Value(bool) = .init(false),
-    prepark_poll_us: std.atomic.Value(u64) = .init(20),
+    steal_lone: std.atomic.Value(bool),
+    prepark_poll_us: std.atomic.Value(u64),
+    slice_us: std.atomic.Value(u64),
 
     /// The simulation driving worker 0 (`InitOptions.sim`), else null.
     sim: ?_sim.Sim = null,
@@ -1053,6 +1113,7 @@ pub const Runtime = struct {
     pub const Cfg = struct {
         steal_lone: bool = false,
         poll_us: u64 = 20,
+        slice_us: u64 = 50,
         cpu_milli: i64 = 0,
 
         pub const docs = .{
@@ -1068,6 +1129,11 @@ pub const Runtime = struct {
                 " last ms polls its completion ring before blocking. 0 =" ++
                 " block at once; above ~100 the spinning starts to cost" ++
                 " writes.",
+            .slice_us = "Microseconds a statement may run before it gives" ++
+                " way, at its next yield point, to other work on its" ++
+                " worker: a ready fiber, or I/O the worker has to send" ++
+                " or collect. 0 = it runs until it parks, and a" ++
+                " connection sharing its worker waits a whole statement.",
             .cpu_milli = "Millicores the statements of every database" ++
                 " may consume between them, 1000 per core, paid in ticks" ++
                 " at their yields; the worker threads stay one per core." ++
@@ -1075,10 +1141,18 @@ pub const Runtime = struct {
         };
     };
 
+    /// Whether a step that has run `ran_ns` has had its time slice.
+    /// Never with the slice off.
+    pub fn pastSlice(self: *const Runtime, ran_ns: u64) bool {
+        const slice_us = self.slice_us.load(.monotonic);
+        return slice_us > 0 and ran_ns >= slice_us * std.time.ns_per_us;
+    }
+
     /// Sets the tunables and the meter's cpu capacity from `cfg`.
     pub fn apply(self: *Runtime, cfg: Cfg) void {
         self.steal_lone.store(cfg.steal_lone, .monotonic);
         self.prepark_poll_us.store(cfg.poll_us, .monotonic);
+        self.slice_us.store(cfg.slice_us, .monotonic);
         const workers: i64 = @intCast(self.laneWorkers(.default));
         const milli = if (cfg.cpu_milli > 0) cfg.cpu_milli else workers * 1000;
         if (milli != _meter.capacity.cpu_milli) {
@@ -1121,8 +1195,11 @@ pub const Runtime = struct {
         self.pin_workers = opts.pin_workers and !sim_mode;
         self.sim = null;
         self.spawn_seq = .init(0);
-        self.steal_lone = .init(opts.steal_lone);
-        self.prepark_poll_us = .init(opts.prepark_poll_us);
+        // The `--runtime` values as shipped, until a host's `apply`.
+        const cfg: Cfg = .{};
+        self.steal_lone = .init(cfg.steal_lone);
+        self.prepark_poll_us = .init(cfg.poll_us);
+        self.slice_us = .init(cfg.slice_us);
         self.idle = .{ .{}, .{} };
         self.num_thieves = @splat(.{});
 
@@ -1556,6 +1633,19 @@ pub fn yield() void {
     f.coro.yield();
 }
 
+/// The time slice, for `Ctx.maybeYield`: yields if the running step is
+/// due to give way (`Worker.sliceDue`). The fiber goes to the back of
+/// its ring and is marked `gave_way`, so what waited runs first and
+/// so does what the worker's next pump wakes. It may resume on another
+/// worker. A no-op off any fiber.
+pub fn yieldIfSliceDue() void {
+    const w = currentWorkerOrNull() orelse return;
+    if (w.current_fiber == null or !w.sliceDue()) return;
+    w.wake_stats.sliced += 1;
+    w.current_fiber.?.gave_way = true;
+    yield();
+}
+
 /// Park the current fiber. If a `wake` already fired (awaken bit
 /// set) the token is consumed and `park` returns without yielding.
 /// Otherwise the fiber transitions to `.waiting`, records park
@@ -1754,7 +1844,7 @@ pub fn dumpWorkerCpu(writer: *std.Io.Writer) !void {
     try writer.print("  ring capacity (never shrinks → ≈ peak): hi_max={d} nm_max={d} (init {d})\n", .{
         cap_hi, cap_nm, _queue.local_queue_capacity,
     });
-    // The idle-peer wake path, per worker (see WakeStats). Five numbers
+    // The idle-peer wake path, per worker (see WakeStats). Six numbers
     // per worker, each named for what happened; the legend is printed
     // with the table because the dump is read cold, from an admin
     // command or a test run, not next to this code.
@@ -1764,25 +1854,28 @@ pub fn dumpWorkerCpu(writer: *std.Io.Writer) !void {
             "  skipped  pile-ups that woke nobody: a thief was already hunting, or nobody was parked\n" ++
             "  stole    fibers this worker took from busier peers\n" ++
             "  parked   times it blocked with nothing to do\n" ++
-            "  polled   times the pre-park poll found work, so it did not block\n",
+            "  polled   times the pre-park poll found work, so it did not block\n" ++
+            "  sliced   long steps that gave way to other work there\n",
     );
     const col = "{s:>8}";
-    try writer.print("        " ++ col ++ col ++ col ++ col ++ col ++ "\n", .{
-        "woke", "skipped", "stole", "parked", "polled",
+    try writer.print("        " ++ col ** 6 ++ "\n", .{
+        "woke", "skipped", "stole", "parked", "polled", "sliced",
     });
-    var total: [5]u64 = .{ 0, 0, 0, 0, 0 };
+    var total: [6]u64 = @splat(0);
     for (workers) |*w| {
         const s = w.wake_stats;
-        const row: [5]u64 = .{
-            s.notify_sent, s.gated_thief + s.gated_noidle, s.stolen, s.parks, s.poll_hits,
+        const row: [6]u64 = .{
+            s.notify_sent, s.gated_thief + s.gated_noidle,
+            s.stolen,      s.parks,
+            s.poll_hits,   s.sliced,
         };
-        try writer.print("  W{d:0>2}   {d:>8}{d:>8}{d:>8}{d:>8}{d:>8}\n", .{
-            w.id, row[0], row[1], row[2], row[3], row[4],
+        try writer.print("  W{d:0>2}   " ++ "{d:>8}" ** 6 ++ "\n", .{
+            w.id, row[0], row[1], row[2], row[3], row[4], row[5],
         });
         for (&total, row) |*t, v| t.* += v;
     }
-    try writer.print("  total {d:>8}{d:>8}{d:>8}{d:>8}{d:>8}\n", .{
-        total[0], total[1], total[2], total[3], total[4],
+    try writer.print("  total " ++ "{d:>8}" ** 6 ++ "\n", .{
+        total[0], total[1], total[2], total[3], total[4], total[5],
     });
 }
 

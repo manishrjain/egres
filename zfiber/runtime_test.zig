@@ -362,3 +362,52 @@ test "Runtime: dumpFibers reflects a parked fiber and prints its trace" {
     try std.testing.expect(has_symbols);
     try std.testing.expect(has_summary);
 }
+
+/// A fiber that runs through yield points with another fiber ready
+/// behind it. The other is high priority, so pinned to this worker:
+/// it runs before the spin ends only if the spinner gives way.
+const Spinner = struct {
+    ran: std.atomic.Value(bool) = .init(false),
+
+    fn mark(self: *Spinner) void {
+        self.ran.store(true, .release);
+    }
+
+    /// Up to `points` yield points; returns whether the other fiber
+    /// had run by the time the spin ended.
+    fn spin(self: *Spinner, points: usize) !bool {
+        var g: fiber.Group(void) = .init(std.testing.allocator);
+        defer g.deinit();
+        const worker_id = fiber.currentWorker().laneOffset();
+        try g.spawn(
+            .{ .priority = .high, .worker_id = worker_id },
+            mark,
+            .{self},
+        );
+        var done: usize = 0;
+        while (done < points and !self.ran.load(.acquire)) : (done += 1) {
+            try fiber.ctx().maybeYield();
+        }
+        const ran = self.ran.load(.acquire);
+        g.wait();
+        return ran;
+    }
+};
+
+test "Runtime: a long step gives way at a yield point to a ready fiber" {
+    // No tick counter here (a simulation): a step has no length.
+    if (fiber.ticksTo(@as(u64, 1 << 40), .ns) == 0) return error.SkipZigTest;
+    var s: Spinner = .{};
+    // The bound only stops a broken build from spinning forever: the
+    // slice is due after a few thousand yield points.
+    try std.testing.expect(try s.spin(100_000_000));
+}
+
+test "Runtime: with no time slice a step holds its worker until it parks" {
+    const slice_us = &fiber.runtime().slice_us;
+    const was = slice_us.swap(0, .monotonic);
+    defer slice_us.store(was, .monotonic);
+    var s: Spinner = .{};
+    // Far longer than the slice it would have had.
+    try std.testing.expect(!try s.spin(500_000));
+}

@@ -32,11 +32,11 @@
 //!
 //! A context is also where a statement is interruptible: its loops call
 //! `maybeYield` once per batch, and every policy that stops or paces a
-//! statement (the shutdown's stop stage, the tenant's cpu share and
-//! the statement's memory cap today; cancel later) delivers through
-//! that one call, so the loops never learn about any of them. The
-//! statement's memory is what its arenas hold from `allocator`,
-//! counted here and on the tenant.
+//! statement (the shutdown's stop stage, the tenant's cpu share, the
+//! statement's memory cap and the worker's time slice today; cancel
+//! later) delivers through that one call, so the loops never learn
+//! about any of them. The statement's memory is what its arenas hold
+//! from `allocator`, counted here and on the tenant.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -239,7 +239,11 @@ pub const Ctx = struct {
     /// with the pool full, than its tenant's share, then
     /// charges the cpu since the last settle to the tenant and pays
     /// its debt: a bucket below zero parks the fiber until the rate
-    /// has covered it. Cancel will come through here too. The drain
+    /// has covered it. Last, a step that has run its time slice gives
+    /// way to other work on its worker (`Worker.sliceDue`): a tenant
+    /// inside its share is never parked, and without the slice it
+    /// would hold the worker for the whole statement.
+    /// Cancel will come through here too. The drain
     /// stage before the stop is not an interrupt: a
     /// running statement gets the grace period to finish on its own,
     /// only `start` refuses new ones. Callers must treat this as a
@@ -257,6 +261,8 @@ pub const Ctx = struct {
             if (w.current_fiber) |f| _ = w.chargeCpu(f);
         }
         self.tenant.pay(.cpu, self.class);
+        // After the pay: a statement it parked resumes on a new step.
+        _rt.yieldIfSliceDue();
     }
 };
 
