@@ -21,6 +21,7 @@ const _config = @import("config.zig");
 
 const Tree = _tree.Tree;
 const Item = _table.table.Item;
+const ItemRef = _table.table.ItemRef;
 const Version = @import("kv.zig").Version;
 const Builder = _table.builder.Builder;
 
@@ -37,12 +38,13 @@ const log = std.log.scoped(.zdb_tree);
 ///    tombstone is itself unreachable and is discarded.
 ///
 /// 2. Roaring rollup (`track`): when the item's newest version is a
-///    roaring delta, the chain down to its terminal (`Item.chain`) is
-///    folded by `rollupRoaring` into a synthetic state (config triggers
-///    permitting) or emitted verbatim. Only that head chain is ever
-///    folded: everything below its terminal is shadowed history, and
-///    re-rolling it would regenerate a synthetic state under the live
-///    terminal on every compaction until GC collapses the chain.
+///    roaring delta, the chain down to its terminal (`Item.visibleAt`,
+///    `.fold`) is folded by `rollupRoaring` into a synthetic state
+///    (config triggers permitting) or emitted verbatim. Only that head
+///    chain is ever folded: everything below its terminal is shadowed
+///    history, and re-rolling it would regenerate a synthetic state
+///    under the live terminal on every compaction until GC collapses
+///    the chain.
 ///
 /// `track` consumes and decides; the Emitter (passed per call) only
 /// knows how to emit, and runs `retain` over what it is handed.
@@ -123,8 +125,8 @@ pub const VersionTracker = struct {
     /// valid for the whole call: the merge holds their storage until
     /// its own `next`, which is what lets the rollup's peek below yield
     /// for I/O with the chain still borrowed.
-    fn track(t: *VersionTracker, e: *Tree.Emitter, item: Item) !void {
-        if (foldable(e, item)) |chain| return t.rollupRoaring(e, item, chain);
+    fn track(t: *VersionTracker, e: *Tree.Emitter, item: ItemRef) !void {
+        if (foldable(e, item)) |chain| return t.rollupRoaring(e, item, &chain);
         try e.emitOne(item);
     }
 
@@ -137,7 +139,7 @@ pub const VersionTracker = struct {
     /// Null otherwise: the item is emitted verbatim. A lone state is
     /// already rolled, raw rows are not ours, and everything below the
     /// terminal is shadowed history that is never folded.
-    fn foldable(e: *const Tree.Emitter, item: Item) ?Item {
+    fn foldable(e: *const Tree.Emitter, item: ItemRef) ?Item {
         if (!e.opts.rollup_enabled) return null;
         // An L0 to L0 merge folds nothing: a state it wrote would be
         // rewritten by the next push, and L0 would hold whole postings.
@@ -146,7 +148,9 @@ pub const VersionTracker = struct {
         const newest = item.newest();
         if (!(newest.meta.isRoaring() and newest.meta.isDelta())) return null;
 
-        const chain = item.chain();
+        // A rollup folds what is stored, under no snapshot: every
+        // version is visible, so there is always a chain.
+        const chain = item.visibleAt(std.math.maxInt(u64), .fold).?;
         for (chain.versions.slice()) |ver| {
             if (ver.meta.isRoaring() and ver.meta.isDelta()) continue;
             if (ver.meta.isDeleted()) continue;
@@ -158,7 +162,7 @@ pub const VersionTracker = struct {
 
     /// Whether `chain` ends in a terminal (a state or a tombstone), as
     /// against running out of versions on a delta.
-    fn hasTerminal(chain: Item) bool {
+    fn hasTerminal(chain: ItemRef) bool {
         const vers = chain.versions.slice();
         return !vers[vers.len - 1].meta.isDelta();
     }
@@ -175,8 +179,8 @@ pub const VersionTracker = struct {
     fn rollupRoaring(
         t: *VersionTracker,
         e: *Tree.Emitter,
-        item: Item,
-        chain: Item,
+        item: ItemRef,
+        chain: ItemRef,
     ) !void {
         const opts = &e.opts;
         const alloc = e.allocator;
@@ -258,7 +262,7 @@ pub const VersionTracker = struct {
         utils.clearRetainCap(&t.rolled);
         try t.rolled.append(t.allocator, synthetic);
         try t.rolled.appendSlice(t.allocator, item.versions.slice()[1..]);
-        try e.emitOne(.{
+        try e.emitOne(&.{
             .key = item.key,
             .versions = .{ .many = t.rolled.items },
         });
@@ -280,7 +284,7 @@ pub const VersionTracker = struct {
     /// (validateDelta).
     pub fn foldChain(
         alloc: std.mem.Allocator,
-        chain: Item,
+        chain: ItemRef,
         external: ?*const zroar.Bitmap,
     ) !zroar.Bitmap {
         const vers = chain.versions.slice();
@@ -427,7 +431,7 @@ pub const Emitter = struct {
     /// Feed one item — one primary with its versions — in merge
     /// (consumption) order. Nothing is held across calls: the merge
     /// keeps the item's storage pinned until its own `next`.
-    pub fn push(e: *Emitter, item: Item) !void {
+    pub fn push(e: *Emitter, item: ItemRef) !void {
         e.stats.keys_in += item.versions.len();
         for (item.versions.slice()) |ver| {
             e.stats.bytes_in += item.key.primary.len + ver.value.len;
@@ -437,7 +441,7 @@ pub const Emitter = struct {
 
     /// Write the versions of `item` that retention keeps as one entry
     /// of the output.
-    fn emitOne(e: *Emitter, item: Item) !void {
+    fn emitOne(e: *Emitter, item: ItemRef) !void {
         const t = &e.tracker;
         t.startItem();
         utils.clearRetainCap(&t.kept);

@@ -23,6 +23,7 @@ const String = @import("value.zig").String;
 const log = std.log.scoped(.sql);
 const Forest = zdb.forest.Forest;
 const Item = zdb.kv.Item;
+const ItemRef = zdb.kv.ItemRef;
 const Key = zdb.kv.Key;
 const Value = @import("value.zig").Value;
 const KeyRange = zdb.kv.KeyRange;
@@ -55,7 +56,7 @@ pub const ExecCtx = struct {
     }
 
     /// `item` as the row a predicate or target evaluates against.
-    pub fn row(self: *ExecCtx, item: Item) _expr.Row {
+    pub fn row(self: *ExecCtx, item: ItemRef) _expr.Row {
         return .{
             .scratch = self.scratch.allocator(),
             .tbl = self.tbl,
@@ -156,7 +157,7 @@ pub const Batch = struct {
     /// FROM rec` over 15 MiB rows is one row per fill, sent and
     /// unpinned before the next is pinned, and nothing slices into
     /// `bytes` then, so growing it for a copy is safe.
-    pub fn append(self: *Batch, item: Item, mode: ValueMode) !bool {
+    pub fn append(self: *Batch, item: ItemRef, mode: ValueMode) !bool {
         if (self.full()) return false;
 
         const src = item.newest();
@@ -222,9 +223,9 @@ pub const Batch = struct {
         batch: *const Batch,
         it: Selection.Iterator(.{}),
 
-        pub fn next(self: *Selected) ?Item {
+        pub fn next(self: *Selected) ?ItemRef {
             const i = self.it.next() orelse return null;
-            return self.batch.rows.items[i];
+            return &self.batch.rows.items[i];
         }
     };
 
@@ -438,7 +439,7 @@ pub const BitmapNode = union(enum) {
         while (try cursor.next()) |entry| : (seen += 1) {
             // One yield point per hundred keys: a key is one fold.
             if (seen % 100 == 0) try fiber.ctx().maybeYield();
-            var part = try cursor.bitmap(alloc, &entry);
+            var part = try cursor.bitmap(alloc, entry);
             defer part.deinit();
             try acc.orInPlace(&part);
         }
@@ -567,7 +568,7 @@ pub const SeqScan = struct {
             return b.counted > 0;
         }
         const mode: Batch.ValueMode = if (self.keep_value) .borrow else .none;
-        if (self.stash) |item| {
+        if (self.stash) |*item| {
             // An empty batch admits any single row.
             const ok = try b.append(item, mode);
             std.debug.assert(ok);
@@ -583,7 +584,7 @@ pub const SeqScan = struct {
             }
 
             if (!try b.append(item, mode)) {
-                self.stash = item;
+                self.stash = item.*;
                 break;
             }
         }
@@ -731,7 +732,7 @@ pub const IndexWalk = struct {
         if (self.egids) |*bm| bm.deinit();
         self.egids = null;
         self.it = null;
-        self.egids = try cursor.bitmap(ctx.tx.allocator, &entry);
+        self.egids = try cursor.bitmap(ctx.tx.allocator, entry);
         self.it = self.egids.?.iterator();
         return true;
     }
@@ -800,14 +801,14 @@ pub const Fetch = struct {
                 continue;
             };
             if (self.pred) |p| {
-                if (!try p.matches(ctx.row(item))) {
+                if (!try p.matches(ctx.row(&item))) {
                     self.chunk_pos += 1;
                     continue;
                 }
             }
             // A row that does not fit ends the fill and is offered
             // again by the next one (an empty batch admits any row).
-            if (!try batch.append(item, self.valueMode())) break;
+            if (!try batch.append(&item, self.valueMode())) break;
             self.chunk_pos += 1;
         }
         return batch.numRows() > 0;
@@ -870,7 +871,7 @@ pub const Filter = struct {
             // copied the word it is handing bits out of.
             var it = batch.sel.iterator(.{});
             while (it.next()) |i| {
-                const item = batch.rows.items[i];
+                const item = &batch.rows.items[i];
                 if (!try self.pred.matches(ctx.row(item))) {
                     batch.sel.unset(i);
                 }
@@ -996,7 +997,7 @@ pub const Sort = struct {
         errdefer arena.deinit();
 
         for (keyed.items) |*k|
-            k.* = try self.keyedIn(ctx, arena.allocator(), k.item);
+            k.* = try self.keyedIn(ctx, arena.allocator(), &k.item);
         self.row_arena.?.deinit();
         self.row_arena = arena;
     }
@@ -1007,17 +1008,17 @@ pub const Sort = struct {
         self: *Sort,
         ctx: *ExecCtx,
         arloc: std.mem.Allocator,
-        row: Item,
+        row: ItemRef,
     ) !Keyed {
         const item = try row.dupe(arloc);
-        return .{ .item = item, .cells = try self.cellsOf(ctx, arloc, item) };
+        return .{ .item = item, .cells = try self.cellsOf(ctx, arloc, &item) };
     }
 
     fn cellsOf(
         self: *Sort,
         ctx: *ExecCtx,
         arloc: std.mem.Allocator,
-        item: Item,
+        item: ItemRef,
     ) ![]const Value {
         const cells = try arloc.alloc(Value, self.keys.len);
         const row: _expr.Row = .{

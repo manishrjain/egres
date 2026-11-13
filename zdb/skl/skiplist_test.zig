@@ -347,7 +347,7 @@ test "skiplist: meta survives put and get" {
     defer sl.release();
 
     const meta: Meta = .{ .kind = .deleted, .encoding = .roaring };
-    try sl.putItem(.{
+    try sl.putItem(&.{
         .key = .{ .primary = "key1" },
         .versions = .{ .one = .{ .ts = 1, .meta = meta, .value = "val1" } },
     });
@@ -370,7 +370,7 @@ test "skiplist: overwrite in place updates meta, not just value" {
 
     // Same key AND same timestamp takes the overwrite-in-place branch, where
     // it'd be easy to swap the value and forget meta.
-    try sl.putItem(.{
+    try sl.putItem(&.{
         .key = .{ .primary = "key1" },
         .versions = .{ .one = .{
             .ts = 5,
@@ -378,7 +378,7 @@ test "skiplist: overwrite in place updates meta, not just value" {
             .value = "first",
         } },
     });
-    try sl.putItem(.{
+    try sl.putItem(&.{
         .key = .{ .primary = "key1" },
         .versions = .{ .one = .{
             .ts = 5,
@@ -397,7 +397,7 @@ test "skiplist: meta reaches the iterator" {
     var sl = try skiplist.SkipList.init(testing.allocator);
     defer sl.release();
 
-    try sl.putItem(.{
+    try sl.putItem(&.{
         .key = .{ .primary = "a" },
         .versions = .{ .one = .{
             .ts = 1,
@@ -405,7 +405,7 @@ test "skiplist: meta reaches the iterator" {
             .value = "va",
         } },
     });
-    try sl.putItem(.{
+    try sl.putItem(&.{
         .key = .{ .primary = "b" },
         .versions = .{ .one = .{
             .ts = 1,
@@ -460,7 +460,7 @@ test "skiplist: iterator limit copies only what a reader can use" {
         .{ .ts = 30, .kind = .state }, .{ .ts = 40, .kind = .delta },
         .{ .ts = 50, .kind = .delta },
     };
-    for (puts) |p| try sl.putItem(.{
+    for (puts) |p| try sl.putItem(&.{
         .key = .{ .primary = "k" },
         .versions = .{ .one = .{
             .ts = p.ts,

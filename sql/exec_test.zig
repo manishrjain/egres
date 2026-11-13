@@ -331,10 +331,10 @@ test "sql.exec: Batch row cap, byte cap, growth only when empty" {
     var keys: [exec.row_cap][8]u8 = undefined;
     for (&keys, 1..) |*k, egid| k.* = sql.key.encodeEgid(egid);
     for (&keys) |*k| {
-        try testing.expect(try b.append(tinyItem(k, "v"), .copy));
+        try testing.expect(try b.append(&tinyItem(k, "v"), .copy));
     }
     try testing.expect(b.full());
-    try testing.expect(!try b.append(tinyItem(&keys[0], "v"), .copy));
+    try testing.expect(!try b.append(&tinyItem(&keys[0], "v"), .copy));
     try testing.expectEqual(@as(usize, exec.row_cap), b.sel.count());
     try testing.expectEqual(cap0, b.bytes.capacity);
     var n: usize = 0;
@@ -352,7 +352,7 @@ test "sql.exec: Batch row cap, byte cap, growth only when empty" {
     const big = [_]u8{0xAB} ** 1024;
     n = 0;
     try testing.expect(!b.full());
-    while (try b.append(tinyItem(&keys[n], &big), .copy)) n += 1;
+    while (try b.append(&tinyItem(&keys[n], &big), .copy)) n += 1;
     try testing.expectEqual(exec.byte_cap / (8 + big.len), n);
     try testing.expectEqual(n, b.numRows());
     try testing.expectEqual(cap0, b.bytes.capacity);
@@ -360,17 +360,17 @@ test "sql.exec: Batch row cap, byte cap, growth only when empty" {
     // even though the row limit is far away, and a tiny row that would
     // fit is refused too. reset() reopens.
     try testing.expect(b.full());
-    try testing.expect(!try b.append(tinyItem(&keys[0], "v"), .copy));
+    try testing.expect(!try b.append(&tinyItem(&keys[0], "v"), .copy));
     b.reset();
     try testing.expect(!b.full());
 
     // .none copies the key only; .borrow copies the key only too and
     // keeps the value slice as given — the caller's storage, pinned.
-    try testing.expect(try b.append(tinyItem(&keys[0], &big), .none));
+    try testing.expect(try b.append(&tinyItem(&keys[0], &big), .none));
     try testing.expectEqual(@as(usize, 8), b.bytes.items.len);
     try testing.expectEqualStrings("", b.rows.items[0].newest().value);
     b.reset();
-    try testing.expect(try b.append(tinyItem(&keys[0], &big), .borrow));
+    try testing.expect(try b.append(&tinyItem(&keys[0], &big), .borrow));
     try testing.expectEqual(@as(usize, 8), b.bytes.items.len);
     const kept = b.rows.items[0].newest().value;
     try testing.expectEqual(@as([*]const u8, &big), kept.ptr);
@@ -380,7 +380,7 @@ test "sql.exec: Batch row cap, byte cap, growth only when empty" {
     // same number of 1 KiB rows fit, with only their keys in `bytes`.
     b.reset();
     n = 0;
-    while (try b.append(tinyItem(&keys[n], &big), .borrow)) n += 1;
+    while (try b.append(&tinyItem(&keys[n], &big), .borrow)) n += 1;
     try testing.expectEqual(exec.byte_cap / (8 + big.len), n);
     try testing.expectEqual(n * 8, b.bytes.items.len);
     try testing.expectEqual(n * big.len, b.borrowed);
@@ -391,16 +391,16 @@ test "sql.exec: Batch row cap, byte cap, growth only when empty" {
     const huge = try testing.allocator.alloc(u8, exec.byte_cap + 1);
     defer testing.allocator.free(huge);
     @memset(huge, 1);
-    try testing.expect(try b.append(tinyItem(&keys[0], huge), .copy));
+    try testing.expect(try b.append(&tinyItem(&keys[0], huge), .copy));
     try testing.expectEqual(@as(usize, 1), b.numRows());
     try testing.expect(b.bytes.capacity > cap0);
     try testing.expectEqualSlices(u8, huge, b.rows.items[0].newest().value);
 
     // Borrowed, it is admitted alone too, and the next row is refused.
     b.reset();
-    try testing.expect(try b.append(tinyItem(&keys[0], huge), .borrow));
+    try testing.expect(try b.append(&tinyItem(&keys[0], huge), .borrow));
     try testing.expectEqual(@as(usize, 1), b.numRows());
-    try testing.expect(!try b.append(tinyItem(&keys[1], "v"), .borrow));
+    try testing.expect(!try b.append(&tinyItem(&keys[1], "v"), .borrow));
     try testing.expect(b.full());
 }
 
@@ -806,7 +806,7 @@ test "sql.exec: materialize: ascending arena copies, locks held, streams back" {
     try testing.expectEqual(@as(usize, 1250), rows.len);
     try testing.expectEqual(@as(usize, 1250), tx.held_rows.items.len);
     var last: u64 = 0;
-    for (rows) |r| {
+    for (rows) |*r| {
         const egid = sql.key.decodeEgid(r.key.primary).?;
         try testing.expect(egid > last);
         last = egid;
@@ -815,7 +815,7 @@ test "sql.exec: materialize: ascending arena copies, locks held, streams back" {
     }
     // The copies outlive the batch: refill it and the rows still read.
     b.reset();
-    const first = fx.tbl.parseCol(rows[0], fx.col("a"));
+    const first = fx.tbl.parseCol(&rows[0], fx.col("a"));
     try testing.expectEqual(Value{ .int4 = 2 }, first);
 
     // Second call is idempotent; next() streams the capture in batches

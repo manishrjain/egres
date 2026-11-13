@@ -496,7 +496,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
     // locked.
     const changes = try arloc.alloc(Change, rows.len);
     var row: _value.Row = .{};
-    for (rows, changes, 0..) |item, *change, ri| {
+    for (rows, changes, 0..) |*item, *change, ri| {
         if (ri % _exec.row_cap == 0) try fiber.ctx().maybeYield();
 
         const post = (try evalSets(
@@ -508,7 +508,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
             sets,
             &row,
         )) orelse return;
-        change.* = .{ .pre = item, .post = post };
+        change.* = .{ .pre = item.*, .post = post };
     }
     const n = (try write(
         self,
@@ -601,7 +601,7 @@ fn write(
             // it yet, and its build merges in every row written
             // meanwhile (index_ddl.zig).
             if (idx.isBuilding()) continue;
-            const old: []const String = if (change.pre) |item|
+            const old: []const String = if (change.pre) |*item|
                 try idx.keys(
                     arloc,
                     tbl.parseCol(item, idx.column),
@@ -777,12 +777,12 @@ fn resolveConflicts(
     // (id) a key has one stored row and one proposer (collisionPred),
     // so a DO UPDATE change gets one pre; under a bare ON CONFLICT a
     // change may collide on several indexes, and DO NOTHING drops it.
-    for (hits) |item| for (uniques) |unique| {
+    for (hits) |*item| for (uniques) |unique| {
         const cell = tbl.parseCol(item, unique.idx.column);
         const egid = _key.decodeEgid(item.key.primary).?;
         for (try unique.idx.keys(arloc, cell, egid)) |key| {
             const ci = unique.change_by_key.get(key) orelse continue;
-            changes[ci].pre = item;
+            changes[ci].pre = item.*;
         }
     };
 
@@ -797,7 +797,7 @@ fn resolveConflicts(
         const keep = switch (oc.action) {
             .nothing => false,
             .update => if (where) |cond|
-                cond.matches(ctx.row(item)) catch |err| {
+                cond.matches(ctx.row(&item)) catch |err| {
                     if (err == error.OutOfMemory) return err;
                     try replyExprErr(state, err);
                     return false;
@@ -823,7 +823,7 @@ fn resolveConflicts(
             arloc,
             tbl,
             table_name,
-            item,
+            &item,
             sets,
             &row,
         )) orelse return false;
@@ -963,7 +963,7 @@ fn evalSets(
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
     table_name: String,
-    item: zdb.kv.Item,
+    item: zdb.kv.ItemRef,
     sets: []const Set,
     row: *_value.Row,
 ) !?[]const _value.Value {
@@ -1289,7 +1289,7 @@ fn sendReturning(
     for (changes) |change| {
         const item = change.returned orelse continue;
         if (emitter.full()) return true;
-        emitter.emit(item) catch |err| {
+        emitter.emit(&item) catch |err| {
             try replyEmitErr(state, err);
             return null;
         };
@@ -1341,7 +1341,7 @@ pub const RowEmitter = struct {
     /// (O(1), Table.read, no full-row decode) and printed with its
     /// column's padding; any other target is computed into `scratch`.
     /// Each cell goes out in its field's format, text or binary.
-    pub fn emit(self: *RowEmitter, item: zdb.kv.Item) !void {
+    pub fn emit(self: *RowEmitter, item: zdb.kv.ItemRef) !void {
         _ = self.scratch.reset(.retain_capacity);
         const row: _expr.Row = .{
             .scratch = self.scratch.allocator(),

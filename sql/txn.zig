@@ -337,7 +337,7 @@ pub const Txn = struct {
         const list = try zdb.skl.SkipList.initCapacity(allocator, 0);
         errdefer list.release();
 
-        for (writes.items) |item| try list.putItem(item);
+        for (writes.items) |*item| try list.putItem(item);
         return list;
     }
 
@@ -516,7 +516,7 @@ pub const Txn = struct {
         meta: Meta,
     ) !void {
         const w = try self.pendingWrites();
-        try w.putItem(.{
+        try w.putItem(&.{
             .key = .{
                 .namespace = self.ns,
                 .table_id = table_id,
@@ -645,7 +645,7 @@ pub const Txn = struct {
             try encodeDelta(self.allocator, posting, &buf);
 
             const w = try self.pendingWrites();
-            try w.putItem(.{
+            try w.putItem(&.{
                 .key = Key.init(e.key_ptr.*),
                 .versions = .{ .one = .{
                     .ts = zdb.kv.pending_ts,

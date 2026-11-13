@@ -2021,7 +2021,7 @@ const ScanCollector = struct {
     alloc: std.mem.Allocator,
     got: std.ArrayList(zdb.kv.Item) = .empty,
 
-    fn emit(self: *ScanCollector, item: zdb.kv.Item) anyerror!bool {
+    fn emit(self: *ScanCollector, item: zdb.kv.ItemRef) anyerror!bool {
         try self.got.append(self.alloc, try item.dupe(self.alloc));
         return true;
     }
@@ -2927,9 +2927,10 @@ test "cursor: a split applied by another fiber mid-walk loses and repeats nothin
     defer got.deinit();
     var cur = try f.openCursor(alloc, ns42_table0, .all, .{});
     defer cur.deinit();
-    for (0..3) |_| _ = try got.emit(
-        (try cur.next()) orelse return error.TestExpectedItem,
-    );
+    for (0..3) |_| {
+        const item = (try cur.next()) orelse return error.TestExpectedItem;
+        _ = try got.emit(item);
+    }
 
     // The split runs on another fiber, as raft apply would: fresh objects
     // for both halves swapped in, the old one retired.

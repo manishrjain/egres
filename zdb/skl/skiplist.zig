@@ -8,6 +8,7 @@ const utils = @import("utils");
 const String = utils.String;
 const Key = @import("../kv.zig").Key;
 const Item = @import("../kv.zig").Item;
+const ItemRef = @import("../kv.zig").ItemRef;
 const Version = @import("../kv.zig").Version;
 const Direction = @import("../kv.zig").Direction;
 const KeyRange = @import("../kv.zig").KeyRange;
@@ -233,7 +234,7 @@ pub const SkipList = struct {
     /// Convenience for callers with nothing to say about the row: raw
     /// encoding, no flags. The write path uses putItem.
     pub fn put(self: *Self, key: Key, ts: u64, value: String) Error!void {
-        return self.putItem(.{
+        return self.putItem(&.{
             .key = key,
             .versions = .{ .one = .{ .ts = ts, .meta = .{}, .value = value } },
         });
@@ -242,7 +243,7 @@ pub const SkipList = struct {
     /// Write every version of `item`. A version at a timestamp the key
     /// already holds replaces that one; any other goes into the chain at
     /// its timestamp, whatever order versions arrive in.
-    pub fn putItem(self: *Self, item: Item) Error!void {
+    pub fn putItem(self: *Self, item: ItemRef) Error!void {
         var lefties = [_]?*Node{null} ** max_height;
         const found = self.findNode(item.key, &lefties);
         var vers = item.versions.slice();
@@ -400,6 +401,9 @@ pub const Iterator = struct {
     skiplist: *SkipList,
     node: ?*SkipList.Node,
     vers: std.ArrayList(Version) = .empty,
+    /// The current node as an item, its key over `vers`: kept current
+    /// by `fill`, and what `itemRef` points at.
+    item: Item = undefined,
     dir: Direction,
     /// Kept from `seekRange`: the walk ends at the bound ahead of it.
     range: KeyRange = .all,
@@ -474,12 +478,10 @@ pub const Iterator = struct {
         try self.fill();
     }
 
-    pub fn itemRef(self: *const Iterator) ?Item {
-        const node = self.node orelse return null;
-        return .{
-            .key = Key.init(node.key),
-            .versions = .{ .many = self.vers.items },
-        };
+    /// The current item, read in place: valid until the iterator
+    /// moves.
+    pub fn itemRef(self: *const Iterator) ?ItemRef {
+        return if (self.node == null) null else &self.item;
     }
 
     pub fn next(self: *Iterator) !void {
@@ -504,7 +506,13 @@ pub const Iterator = struct {
     /// can fail: the seek landed inside the one behind.
     fn checkBound(self: *Iterator) void {
         const node = self.node orelse return;
-        if (!self.range.contains(Key.init(node.key))) self.node = null;
+        const key = Key.init(node.key);
+        const bound = self.range;
+        const past = switch (self.dir) {
+            .forward => !bound.right.isInf() and key.ge(bound.right),
+            .reverse => !bound.left.isInf() and key.lt(bound.left),
+        };
+        if (past) self.node = null;
     }
 
     /// Copy the current node's chain into `vers`. A writer may publish
@@ -513,6 +521,9 @@ pub const Iterator = struct {
     fn fill(self: *Iterator) !void {
         utils.clearRetainCap(&self.vers);
         const node = self.node orelse return;
+        // No item if the chain could not be copied.
+        errdefer self.node = null;
+
         const lim = self.limit;
         var cur = node.vhead.load(.acquire);
         while (cur) |vnode| : (cur = vnode.next.load(.acquire)) {
@@ -521,5 +532,9 @@ pub const Iterator = struct {
             try self.vers.append(self.allocator, ver);
             if (self.vers.items.len >= lim.want and !ver.meta.isDelta()) break;
         }
+        self.item = .{
+            .key = Key.init(node.key),
+            .versions = .{ .many = self.vers.items },
+        };
     }
 };

@@ -112,7 +112,11 @@ pub const Iterator = union(enum) {
         }
     }
 
-    pub fn itemRef(self: *const Iterator) ?_table.Item {
+    /// The source's own item, read in place: valid until the source
+    /// moves. A pointer and not a copy because a scan looks at every
+    /// item and keeps few, and a copy taken right after the item was
+    /// written waits for those writes to land.
+    pub fn itemRef(self: *const Iterator) ?_table.ItemRef {
         return switch (self.*) {
             inline else => |*it| it.itemRef(),
         };
@@ -134,21 +138,25 @@ pub const Iterator = union(enum) {
 /// One item per key, drawn from every source that holds it.
 ///
 /// `live` is the sources that still hold an item, sorted by that item's
-/// key in the walk's direction (ties by the source's position among
-/// the inputs, so a txn's pending writes, source 0, come first). The
-/// sources holding the next key are therefore the first `n_cur`
+/// key in the walk's direction; sources on one key are in no order.
+/// The sources holding the next key are therefore the first `n_cur`
 /// entries, and the item is built from them: one source's versions as
 /// they are, or several sources' versions sorted by timestamp
-/// descending with a repeated timestamp dropped (a version a flushed
-/// memtable and its L0 table both hold, or a txn's pending write over
-/// the committed version it read; the lower source wins). Source order
-/// is not timestamp order — L0 tables arrive oldest first, and a txn's
-/// pending version can be older than committed memtable versions —
-/// which is why the versions are sorted. `next` takes those sources
-/// out, advances them, and puts each back at its place with a scan
-/// from the front: a source in the middle of a run of keys costs one
-/// compare, one that jumped past the others costs as many as it
-/// passed.
+/// descending. Source order is not timestamp order (L0 tables arrive
+/// oldest first), which is why the versions are sorted.
+///
+/// A timestamp names one version of a key, but two sources can hold
+/// that version at once: a reader that took the memtables before a
+/// flush and the tree after it holds a memtable and its L0 table.
+/// The copies are the same, so such a version is taken once, from
+/// whichever source comes up first. A txn's pending writes never tie
+/// with a committed version: they sit at kv.pending_ts, above all of
+/// them.
+///
+/// `next` takes the current sources out, advances them, and puts each
+/// back at its place with a scan from the front: a source in the
+/// middle of a run of keys costs one compare, one that jumped past the
+/// others costs as many as it passed.
 ///
 /// Nothing is held: the item's key and values point into the sources,
 /// which keep their blocks and arenas pinned until they are advanced,
@@ -172,22 +180,25 @@ pub const MergeIterator = struct {
             return v;
         }
 
-        /// Drop the head for as long as it is at `ts`.
-        fn skip(self: *Run, ts: u64) void {
+        /// Drop the head for as long as it is `kept` again, this
+        /// source's copy of it.
+        fn skip(self: *Run, kept: Version) void {
             while (self.top()) |v| {
-                if (v.ts != ts) break;
+                if (v.ts != kept.ts) break;
+                // One timestamp, one version: a copy that differs would
+                // make the item depend on which source came up first.
+                std.debug.assert(v.meta.toByte() == kept.meta.toByte());
+                std.debug.assert(std.mem.eql(u8, v.value, kept.value));
                 self.versions = self.versions[1..];
             }
         }
     };
 
-    /// One input: its iterator, its current item (refreshed on every
-    /// advance, null once exhausted), and its position among the inputs
-    /// as given to `init`, the tie-break between equal keys.
+    /// One input: its iterator and its current item (the iterator's
+    /// own, taken again on every advance, null once exhausted).
     const Source = struct {
         it: Iterator,
-        item: ?_table.Item = null,
-        prio: usize,
+        item: ?_table.ItemRef = null,
     };
 
     allocator: std.mem.Allocator,
@@ -195,13 +206,14 @@ pub const MergeIterator = struct {
     /// Every input, for the merge's lifetime: a source that ran out
     /// leaves `live` but comes back on the next `seekRange`.
     srcs: []*Source,
-    /// The sources holding an item, sorted by (key, prio).
+    /// The sources holding an item, sorted by key.
     live: std.ArrayList(*Source) = .empty,
-    /// How many sources at the front of `live` hold the current key.
+    /// How many sources at the front of `live` hold the current key;
+    /// 0 when there is no item. With one, the item is that source's
+    /// own, read in place; with more it is `merged`.
     n_cur: usize = 0,
-    /// The current item: the first source's own item, or its key over
-    /// `vers` when the key is shared.
-    cur: ?_table.Item = null,
+    /// The shared key over `vers`.
+    merged: _table.Item = undefined,
     vers: std.ArrayList(Version) = .empty,
     /// Scratch for `build`: what is left of each current source's run.
     runs: std.ArrayList(Run) = .empty,
@@ -220,10 +232,10 @@ pub const MergeIterator = struct {
         errdefer allocator.free(srcs);
         var made: usize = 0;
         errdefer for (srcs[0..made]) |src| allocator.destroy(src);
-        for (srcs, iters, 0..) |*slot, it, prio| {
+        for (srcs, iters) |*slot, it| {
             const src = try allocator.create(Source);
             std.debug.assert(it.direction() == dir);
-            src.* = .{ .it = it, .prio = prio };
+            src.* = .{ .it = it };
             slot.* = src;
             made += 1;
         }
@@ -251,16 +263,16 @@ pub const MergeIterator = struct {
         self.pins.deinit(self.allocator);
     }
 
-    /// The order of `live`: by key in the walk's direction (the full
-    /// key, since a MultiGet seek over the memtables has no end bound
-    /// and its sources can settle on keys of different tables or
-    /// namespaces), then by prio. The direction is the context
-    /// std.sort passes.
-    fn earlier(dir: Direction, a: *Source, b: *Source) bool {
+    /// The order of `live`: `a`'s key comes strictly before `b`'s in
+    /// the walk's direction, so the two do not share it. The full key
+    /// is compared, since a MultiGet seek over the memtables has no end
+    /// bound and its sources can settle on keys of different tables or
+    /// namespaces. The direction is the context std.sort passes.
+    fn ahead(dir: Direction, a: *Source, b: *Source) bool {
         return switch (a.item.?.key.order(b.item.?.key)) {
             .lt => dir == .forward,
             .gt => dir == .reverse,
-            .eq => a.prio < b.prio,
+            .eq => false,
         };
     }
 
@@ -271,7 +283,7 @@ pub const MergeIterator = struct {
             src.item = src.it.itemRef();
             if (src.item != null) self.live.appendAssumeCapacity(src);
         }
-        std.mem.sortUnstable(*Source, self.live.items, self.dir, earlier);
+        std.mem.sortUnstable(*Source, self.live.items, self.dir, ahead);
         try self.build();
     }
 
@@ -291,8 +303,12 @@ pub const MergeIterator = struct {
         return self.pins.items;
     }
 
-    pub fn itemRef(self: *const MergeIterator) ?_table.Item {
-        return self.cur;
+    pub fn itemRef(self: *const MergeIterator) ?_table.ItemRef {
+        return switch (self.n_cur) {
+            0 => null,
+            1 => self.live.items[0].item.?,
+            else => &self.merged,
+        };
     }
 
     /// Step to the next key: advance the sources the item was built
@@ -302,7 +318,8 @@ pub const MergeIterator = struct {
     /// the advanced one lands behind them, and the next pass finds the
     /// next of them at the front.
     pub fn next(self: *MergeIterator) Error!void {
-        if (self.cur == null) return;
+        if (self.n_cur == 0) return;
+        const alone = self.n_cur == 1;
         for (0..self.n_cur) |_| {
             const src = self.live.items[0];
             try src.it.next();
@@ -311,12 +328,19 @@ pub const MergeIterator = struct {
                 _ = self.live.orderedRemove(0);
                 continue;
             }
-            // Its place among the rest: past every source that sorts
-            // before it. One compare and no move when it still holds
-            // the smallest key.
+            // A run of keys from one source, most of any scan: its
+            // next key is still ahead of every other source's, so it
+            // is the item as it stands, at one compare.
+            if (alone) {
+                const items = self.live.items;
+                if (items.len == 1 or ahead(self.dir, src, items[1])) return;
+            }
+            // Its place among the rest: past every source whose key
+            // comes before its own. One compare and no move when it
+            // still holds the smallest key.
             var pos: usize = 0;
             for (self.live.items[1..]) |other| {
-                if (!earlier(self.dir, other, src)) break;
+                if (!ahead(self.dir, other, src)) break;
                 pos += 1;
             }
             const items = self.live.items;
@@ -330,8 +354,9 @@ pub const MergeIterator = struct {
     /// holding the next key in the walk's direction.
     fn build(self: *MergeIterator) Error!void {
         self.n_cur = 0;
-        self.cur = null;
         if (self.live.items.len == 0) return;
+        // No item if the versions cannot be gathered.
+        errdefer self.n_cur = 0;
 
         const first = self.live.items[0].item.?;
         self.n_cur = 1;
@@ -339,10 +364,7 @@ pub const MergeIterator = struct {
             const item = self.live.items[self.n_cur].item.?;
             if (!item.key.eq(first.key)) break;
         }
-        if (self.n_cur == 1) {
-            self.cur = first;
-            return;
-        }
+        if (self.n_cur == 1) return;
 
         // Each source's run is already newest first, so the runs are
         // merged, linear in the versions: a hot key can hold hundreds
@@ -352,36 +374,44 @@ pub const MergeIterator = struct {
         // head among the others. The lead's versions newer than that
         // come in a row, without another scan: one source usually holds
         // a key's whole recent history. A head shared with another run
-        // is a repeated version (a flushed memtable and its L0 table, a
-        // txn's pending write over the committed version it read): the
-        // lead is the first run found holding it, the lower source, so
-        // its copy is taken and the others' dropped.
+        // is one version held twice (a flushed memtable and its L0
+        // table): the lead's copy is taken and the others' dropped.
         utils.clearRetainCap(&self.vers);
         try self.runs.resize(self.allocator, self.n_cur);
         for (self.live.items[0..self.n_cur], self.runs.items) |src, *run|
             run.* = .{ .versions = src.item.?.versions.slice() };
 
         while (true) {
+            // One pass over the heads: `lead` is the run whose head is
+            // the newest, `next_ts` the newest head among the rest.
             var lead: ?usize = null;
             var lead_ts: u64 = 0;
             var next_ts: ?u64 = null;
             for (self.runs.items, 0..) |run, i| {
+                // A run with nothing left takes no part.
                 const ts = (run.top() orelse continue).ts;
                 if (lead == null or ts > lead_ts) {
+                    // A newer head: this run leads, and the one it
+                    // displaced is the newest of the rest so far.
                     if (lead != null) next_ts = lead_ts;
                     lead = i;
                     lead_ts = ts;
                 } else if (next_ts == null or ts > next_ts.?) {
+                    // Not newer than the lead, so it competes for
+                    // second. A head equal to the lead's lands here
+                    // too, which is how a duplicate shows up below.
                     next_ts = ts;
                 }
             }
+            // No run has a version left: the item is complete.
             const run = &self.runs.items[lead orelse break];
 
             if (next_ts != null and lead_ts == next_ts.?) {
                 // We found a duplicate version. Pick the lead. Advance all
                 // the rest. And re-calculate lead and next.
-                try self.vers.append(self.allocator, run.next());
-                for (self.runs.items) |*r| r.skip(lead_ts);
+                const kept = run.next();
+                try self.vers.append(self.allocator, kept);
+                for (self.runs.items) |*r| r.skip(kept);
                 continue;
             }
 
@@ -390,7 +420,7 @@ pub const MergeIterator = struct {
                 try self.vers.append(self.allocator, run.next());
             }
         }
-        self.cur = .{
+        self.merged = .{
             .key = first.key,
             .versions = .{ .many = self.vers.items },
         };
@@ -468,7 +498,7 @@ pub const ConcatIterator = struct {
         try self.iters[cur].seekRange(start, end);
     }
 
-    pub fn itemRef(self: *const ConcatIterator) ?_table.Item {
+    pub fn itemRef(self: *const ConcatIterator) ?_table.ItemRef {
         const cur = self.current orelse return null;
         return self.iters[cur].itemRef();
     }

@@ -78,47 +78,62 @@ test "Item: visibleAt cuts at the newest version not above ts" {
     };
 
     // At a version's own ts: that version is visible.
-    try expectEqual(@as(usize, 3), item.visibleAt(30).?.versions.len());
-    try expectEqual(@as(u64, 30), item.visibleAt(30).?.newest().ts);
-    try expectEqual(@as(u64, 10), item.visibleAt(10).?.newest().ts);
-    try expectEqual(@as(usize, 1), item.visibleAt(10).?.versions.len());
+    try expectEqual(3, item.visibleAt(30, .all).?.versions.len());
+    try expectEqual(30, item.visibleAt(30, .all).?.newest().ts);
+    try expectEqual(10, item.visibleAt(10, .all).?.newest().ts);
+    try expectEqual(1, item.visibleAt(10, .all).?.versions.len());
 
     // Between two versions: the older one wins.
-    try expectEqual(@as(u64, 20), item.visibleAt(25).?.newest().ts);
-    try expectEqual(@as(usize, 2), item.visibleAt(25).?.versions.len());
+    try expectEqual(20, item.visibleAt(25, .all).?.newest().ts);
+    try expectEqual(2, item.visibleAt(25, .all).?.versions.len());
 
     // Above every version: the whole item.
-    try expectEqual(@as(usize, 3), item.visibleAt(99).?.versions.len());
+    try expectEqual(3, item.visibleAt(99, .all).?.versions.len());
 
-    // Below every version: nothing is visible yet.
-    try expectEqual(@as(?Item, null), item.visibleAt(9));
+    // Below every version: nothing is visible yet, at either depth.
+    try expectEqual(null, item.visibleAt(9, .all));
+    try expectEqual(null, item.visibleAt(9, .fold));
 
     // The key travels with the window.
-    try std.testing.expectEqualStrings("k", item.visibleAt(25).?.key.primary);
+    const at_25 = item.visibleAt(25, .all).?;
+    try std.testing.expectEqualStrings("k", at_25.key.primary);
 }
 
-test "Item: chain stops at a state, a tombstone, or the end" {
+test "Item: visibleAt .fold stops at a state, a tombstone, or the end" {
+    const latest = std.math.maxInt(u64);
     const at_state = Item{
         .key = .{ .primary = "k" },
         .versions = .{ .many = &three },
     };
     // Two deltas plus the state they fold onto.
-    const state_chain = at_state.chain();
-    try expectEqual(@as(usize, 3), state_chain.versions.len());
-    try expectEqual(@as(u64, 10), state_chain.versions.slice()[2].ts);
+    const state_chain = at_state.visibleAt(latest, .fold).?;
+    try expectEqual(3, state_chain.versions.len());
+    try expectEqual(10, state_chain.versions.slice()[2].ts);
 
-    const with_tomb = [_]Version{
+    const history = [_]Version{
+        .{ .ts = 40, .meta = .{ .kind = .delta }, .value = "d" },
         .{ .ts = 30, .meta = .{ .kind = .delta }, .value = "c" },
         .{ .ts = 20, .meta = .{ .kind = .deleted }, .value = "" },
         .{ .ts = 10, .meta = .{ .kind = .state }, .value = "a" },
     };
-    const at_tomb = Item{
+    const with_tomb = Item{
         .key = .{ .primary = "k" },
-        .versions = .{ .many = &with_tomb },
+        .versions = .{ .many = &history },
     };
-    const tomb_chain = at_tomb.chain();
-    try expectEqual(@as(usize, 2), tomb_chain.versions.len());
-    try expectEqual(@as(u64, 20), tomb_chain.versions.slice()[1].ts);
+    // The tombstone ends the chain, and the state under it is left out.
+    const tomb_chain = with_tomb.visibleAt(latest, .fold).?;
+    try expectEqual(3, tomb_chain.versions.len());
+    try expectEqual(20, tomb_chain.versions.slice()[2].ts);
+
+    // A read below the newest delta folds from the one it sees.
+    const older = with_tomb.visibleAt(35, .fold).?;
+    try expectEqual(2, older.versions.len());
+    try expectEqual(30, older.newest().ts);
+    try expectEqual(20, older.versions.slice()[1].ts);
+
+    // A read at the tombstone gets it alone; one below it, the state.
+    try expectEqual(1, with_tomb.visibleAt(20, .fold).?.versions.len());
+    try expectEqual(10, with_tomb.visibleAt(15, .fold).?.newest().ts);
 
     // All deltas: the chain is every version, and stays open.
     const deltas = [_]Version{
@@ -129,14 +144,31 @@ test "Item: chain stops at a state, a tombstone, or the end" {
         .key = .{ .primary = "k" },
         .versions = .{ .many = &deltas },
     };
-    try expectEqual(@as(usize, 2), open.chain().versions.len());
+    try expectEqual(2, open.visibleAt(latest, .fold).?.versions.len());
 
     // A state at the head is its own chain.
     const solo = Item{
         .key = .{ .primary = "k" },
         .versions = .{ .one = .{ .ts = 30, .meta = .{}, .value = "c" } },
     };
-    try expectEqual(@as(usize, 1), solo.chain().versions.len());
+    try expectEqual(1, solo.visibleAt(latest, .fold).?.versions.len());
+    try expectEqual(null, solo.visibleAt(29, .fold));
+}
+
+test "visibleVersions: a slice of the versions given, empty for none" {
+    const visible = zdb.kv.visibleVersions;
+
+    // The rest from the first visible version, or down to the state.
+    try expectEqual(three[1..].ptr, visible(&three, 25, .all).ptr);
+    try expectEqual(2, visible(&three, 25, .all).len);
+    try expectEqual(3, visible(&three, 99, .fold).len);
+    try expectEqual(1, visible(&three, 10, .fold).len);
+
+    // Nothing visible, and nothing to look at: an iterator under a
+    // limit can hand over an item with no versions.
+    try expectEqual(0, visible(&three, 9, .all).len);
+    try expectEqual(0, visible(&.{}, 99, .all).len);
+    try expectEqual(0, visible(&.{}, 99, .fold).len);
 }
 
 test "Item: dupe copies every version, free releases them" {
@@ -214,6 +246,25 @@ test "Key: after sorts past its primary and before every longer one" {
     // Never crosses a table or namespace boundary.
     const other: Key = .{ .table_id = 8, .primary = "a" };
     try std.testing.expectEqual(std.math.Order.lt, k_end.order(other));
+}
+
+test "orderBytes: agrees with std.mem.order at any length and prefix" {
+    // Pairs that share a prefix of any length up to four words and
+    // then differ, end, or carry on: the word loop, the byte tail and
+    // the length each decide some of them.
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const rand = prng.random();
+    var a_buf: [32]u8 = undefined;
+    var b_buf: [32]u8 = undefined;
+    for (0..20_000) |_| {
+        rand.bytes(&a_buf);
+        rand.bytes(&b_buf);
+        const shared = rand.uintAtMost(usize, a_buf.len);
+        @memcpy(b_buf[0..shared], a_buf[0..shared]);
+        const a = a_buf[0..rand.uintAtMost(usize, a_buf.len)];
+        const b = b_buf[0..rand.uintAtMost(usize, b_buf.len)];
+        try expectEqual(std.mem.order(u8, a, b), zdb.kv.orderBytes(a, b));
+    }
 }
 
 test "Key: table edges sort outside every key of their table" {

@@ -11,6 +11,7 @@ const pred = sql.pred;
 const Pred = pred.Pred;
 const Value = sql.value.Value;
 const Item = zdb.kv.Item;
+const ItemRef = zdb.kv.ItemRef;
 
 /// (a int4, b text) assembled by hand — no catalog, no forest. Everything
 /// lives in one arena, dropped by the test.
@@ -38,7 +39,7 @@ const Fixture = struct {
 
     /// `item` as the row a predicate evaluates against, computing
     /// into the fixture's allocator.
-    fn row(self: *const Fixture, stored: Item) sql.expr.Row {
+    fn row(self: *const Fixture, stored: ItemRef) sql.expr.Row {
         return .{ .scratch = self.a, .tbl = &self.tbl, .item = stored };
     }
 
@@ -143,51 +144,51 @@ test "sql.pred: eval follows SQL three-valued logic" {
     const U: ?bool = null;
 
     // A leaf: true, unknown (NULL cell), false.
-    try testing.expectEqual(T, try a_eq_1.eval(fx.row(r1)));
-    try testing.expectEqual(U, try a_eq_1.eval(fx.row(r2)));
-    try testing.expectEqual(F, try a_eq_1.eval(fx.row(r3)));
+    try testing.expectEqual(T, try a_eq_1.eval(fx.row(&r1)));
+    try testing.expectEqual(U, try a_eq_1.eval(fx.row(&r2)));
+    try testing.expectEqual(F, try a_eq_1.eval(fx.row(&r3)));
     // `= NULL` is unknown for every row, NULL cell or not.
-    try testing.expectEqual(U, try a_eq_null.eval(fx.row(r1)));
-    try testing.expectEqual(U, try a_eq_null.eval(fx.row(r2)));
+    try testing.expectEqual(U, try a_eq_null.eval(fx.row(&r1)));
+    try testing.expectEqual(U, try a_eq_null.eval(fx.row(&r2)));
     // IS [NOT] NULL is exact, never unknown.
-    try testing.expectEqual(F, try b_is_null.eval(fx.row(r1)));
-    try testing.expectEqual(T, try b_is_null.eval(fx.row(r3)));
-    try testing.expectEqual(T, try b_not_null.eval(fx.row(r1)));
-    try testing.expectEqual(F, try b_not_null.eval(fx.row(r3)));
+    try testing.expectEqual(F, try b_is_null.eval(fx.row(&r1)));
+    try testing.expectEqual(T, try b_is_null.eval(fx.row(&r3)));
+    try testing.expectEqual(T, try b_not_null.eval(fx.row(&r1)));
+    try testing.expectEqual(F, try b_not_null.eval(fx.row(&r3)));
     // The egid pseudo-column reads from the key.
-    try testing.expectEqual(F, try egid_3.eval(fx.row(r1)));
-    try testing.expectEqual(T, try egid_3.eval(fx.row(r3)));
+    try testing.expectEqual(F, try egid_3.eval(fx.row(&r1)));
+    try testing.expectEqual(T, try egid_3.eval(fx.row(&r3)));
 
     // NOT keeps unknown unknown.
     const not_a1 = Pred{ .not = &a_eq_1 };
-    try testing.expectEqual(F, try not_a1.eval(fx.row(r1)));
-    try testing.expectEqual(U, try not_a1.eval(fx.row(r2)));
-    try testing.expectEqual(T, try not_a1.eval(fx.row(r3)));
+    try testing.expectEqual(F, try not_a1.eval(fx.row(&r1)));
+    try testing.expectEqual(U, try not_a1.eval(fx.row(&r2)));
+    try testing.expectEqual(T, try not_a1.eval(fx.row(&r3)));
     const not_a_null = Pred{ .not = &a_eq_null };
-    try testing.expectEqual(U, try not_a_null.eval(fx.row(r1)));
+    try testing.expectEqual(U, try not_a_null.eval(fx.row(&r1)));
 
     // AND: false dominates unknown; unknown dominates true.
     const and_kids = [_]Pred{ a_eq_1, b_eq_x };
     const and_ = Pred{ .and_ = &and_kids };
-    try testing.expectEqual(T, try and_.eval(fx.row(r1)));
-    try testing.expectEqual(U, try and_.eval(fx.row(r2))); // unknown AND true
-    try testing.expectEqual(F, try and_.eval(fx.row(r3))); // false AND unknown
+    try testing.expectEqual(T, try and_.eval(fx.row(&r1)));
+    try testing.expectEqual(U, try and_.eval(fx.row(&r2))); // unknown AND true
+    try testing.expectEqual(F, try and_.eval(fx.row(&r3))); // false AND unknown
     // OR: true dominates unknown; unknown dominates false.
     const or_kids = [_]Pred{ a_eq_1, b_eq_x };
     const or_ = Pred{ .or_ = &or_kids };
-    try testing.expectEqual(T, try or_.eval(fx.row(r1)));
-    try testing.expectEqual(T, try or_.eval(fx.row(r2))); // unknown OR true
-    try testing.expectEqual(U, try or_.eval(fx.row(r3))); // false OR unknown
+    try testing.expectEqual(T, try or_.eval(fx.row(&r1)));
+    try testing.expectEqual(T, try or_.eval(fx.row(&r2))); // unknown OR true
+    try testing.expectEqual(U, try or_.eval(fx.row(&r3))); // false OR unknown
     const or_2_kids = [_]Pred{ a_eq_2, egid_3 };
     const or_2 = Pred{ .or_ = &or_2_kids };
-    try testing.expectEqual(T, try or_2.eval(fx.row(r3)));
-    try testing.expectEqual(F, try or_2.eval(fx.row(r1)));
+    try testing.expectEqual(T, try or_2.eval(fx.row(&r3)));
+    try testing.expectEqual(F, try or_2.eval(fx.row(&r1)));
 
     // matches: only TRUE passes — `= NULL` selects nothing.
-    try testing.expect(try a_eq_1.matches(fx.row(r1)));
-    try testing.expect(!try a_eq_1.matches(fx.row(r2)));
-    try testing.expect(!try a_eq_null.matches(fx.row(r2)));
-    try testing.expect(!try or_.matches(fx.row(r3)));
+    try testing.expect(try a_eq_1.matches(fx.row(&r1)));
+    try testing.expect(!try a_eq_1.matches(fx.row(&r2)));
+    try testing.expect(!try a_eq_null.matches(fx.row(&r2)));
+    try testing.expect(!try or_.matches(fx.row(&r3)));
 }
 
 test "sql.pred: IS DISTINCT FROM and IS TRUE are never unknown" {
@@ -207,14 +208,14 @@ test "sql.pred: IS DISTINCT FROM and IS TRUE are never unknown" {
     const dist_null = try pred.colCmp(a, fx.col("a"), .differs, .null_value);
     const same_1 = try pred.colCmp(a, fx.col("a"), .same, .{ .int4 = 1 });
     const same_null = try pred.colCmp(a, fx.col("a"), .same, .null_value);
-    try testing.expectEqual(F, try dist_1.eval(fx.row(r1)));
-    try testing.expectEqual(T, try dist_1.eval(fx.row(r2)));
-    try testing.expectEqual(T, try dist_null.eval(fx.row(r1)));
-    try testing.expectEqual(F, try dist_null.eval(fx.row(r2)));
-    try testing.expectEqual(T, try same_1.eval(fx.row(r1)));
-    try testing.expectEqual(F, try same_1.eval(fx.row(r2)));
-    try testing.expectEqual(F, try same_null.eval(fx.row(r1)));
-    try testing.expectEqual(T, try same_null.eval(fx.row(r2)));
+    try testing.expectEqual(F, try dist_1.eval(fx.row(&r1)));
+    try testing.expectEqual(T, try dist_1.eval(fx.row(&r2)));
+    try testing.expectEqual(T, try dist_null.eval(fx.row(&r1)));
+    try testing.expectEqual(F, try dist_null.eval(fx.row(&r2)));
+    try testing.expectEqual(T, try same_1.eval(fx.row(&r1)));
+    try testing.expectEqual(F, try same_1.eval(fx.row(&r2)));
+    try testing.expectEqual(F, try same_null.eval(fx.row(&r1)));
+    try testing.expectEqual(T, try same_null.eval(fx.row(&r2)));
 
     // IS [NOT] TRUE | FALSE | UNKNOWN over true, false and NULL.
     const cells = [_]Value{ .{ .bool_ = true }, .{ .bool_ = false }, .null_value };
@@ -229,8 +230,8 @@ test "sql.pred: IS DISTINCT FROM and IS TRUE are never unknown" {
         for (truth) |t| {
             const yes = Pred{ .bool_test = .{ .node = leaf, .is = t.is, .negate = false } };
             const no = Pred{ .bool_test = .{ .node = leaf, .is = t.is, .negate = true } };
-            try testing.expectEqual(@as(?bool, t.want[i]), try yes.eval(fx.row(r1)));
-            try testing.expectEqual(@as(?bool, !t.want[i]), try no.eval(fx.row(r1)));
+            try testing.expectEqual(@as(?bool, t.want[i]), try yes.eval(fx.row(&r1)));
+            try testing.expectEqual(@as(?bool, !t.want[i]), try no.eval(fx.row(&r1)));
         }
     }
 
@@ -281,7 +282,7 @@ test "sql.pred: a literal longer than its char(n) column binds to never" {
         .key = .{ .namespace = 1, .table_id = 16, .primary = try a.dupe(u8, &sql.key.encodeEgid(1)) },
         .versions = .{ .one = .{ .ts = 1, .meta = .{}, .value = bytes } },
     };
-    const on: sql.expr.Row = .{ .scratch = a, .tbl = &tbl, .item = row };
+    const on: sql.expr.Row = .{ .scratch = a, .tbl = &tbl, .item = &row };
     try testing.expectEqual(@as(?bool, false), try p_over.or_[0].eval(on));
     try testing.expectEqual(@as(?bool, true), try p_over.or_[1].eval(on));
     try testing.expect(try p_over.matches(on));
@@ -314,22 +315,22 @@ test "sql.pred: ordered comparisons follow the column's order, NULL unknown" {
     };
     for (cases) |case| {
         const p = try pred.colCmp(a, fx.col("a"), case.op, .{ .int4 = 2 });
-        try testing.expectEqual(case.r1, try p.eval(fx.row(r1)));
-        try testing.expectEqual(U, try p.eval(fx.row(r2)));
-        try testing.expectEqual(case.r3, try p.eval(fx.row(r3)));
+        try testing.expectEqual(case.r1, try p.eval(fx.row(&r1)));
+        try testing.expectEqual(U, try p.eval(fx.row(&r2)));
+        try testing.expectEqual(case.r3, try p.eval(fx.row(&r3)));
     }
     // Text orders bytewise; a NULL cell is unknown whatever the operator.
     const b_lt = try pred.colCmp(a, fx.col("b"), .lt, .{ .text = "b" });
-    try testing.expectEqual(T, try b_lt.eval(fx.row(r1)));
-    try testing.expectEqual(F, try b_lt.eval(fx.row(r2)));
-    try testing.expectEqual(U, try b_lt.eval(fx.row(r3)));
+    try testing.expectEqual(T, try b_lt.eval(fx.row(&r1)));
+    try testing.expectEqual(F, try b_lt.eval(fx.row(&r2)));
+    try testing.expectEqual(U, try b_lt.eval(fx.row(&r3)));
     // A comparison against NULL is unknown for every row.
     const a_gt_null = try pred.colCmp(a, fx.col("a"), .gt, .null_value);
-    try testing.expectEqual(U, try a_gt_null.eval(fx.row(r1)));
+    try testing.expectEqual(U, try a_gt_null.eval(fx.row(&r1)));
     // The egid pseudo-column orders by key.
     const egid_ge_2 = try pred.colCmp(a, fx.col("egid"), .ge, .{ .uint8 = 2 });
-    try testing.expectEqual(F, try egid_ge_2.eval(fx.row(r1)));
-    try testing.expectEqual(T, try egid_ge_2.eval(fx.row(r3)));
+    try testing.expectEqual(F, try egid_ge_2.eval(fx.row(&r1)));
+    try testing.expectEqual(T, try egid_ge_2.eval(fx.row(&r3)));
 }
 
 test "sql.pred: expressions on either side compute per row" {
@@ -361,8 +362,8 @@ test "sql.pred: expressions on either side compute per row" {
         const text = try std.fmt.allocPrint(a, "SELECT * FROM t WHERE {s};", .{case.where});
         const stmt = try sql.parse.statement(a, text);
         const p = try pred.bind(a, tbl, stmt.select.where.?, .{});
-        try testing.expectEqual(case.r1, try p.eval(fx.row(r1)));
-        try testing.expectEqual(case.r2, try p.eval(fx.row(r2)));
+        try testing.expectEqual(case.r1, try p.eval(fx.row(&r1)));
+        try testing.expectEqual(case.r2, try p.eval(fx.row(&r2)));
     }
 
     // The bare column goes left whichever side it was written on, so
@@ -376,7 +377,7 @@ test "sql.pred: expressions on either side compute per row" {
     // An expression that fails to compute fails the row's evaluation.
     const bad = try sql.parse.statement(a, "SELECT * FROM t WHERE a / 0 = 1;");
     const pb = try pred.bind(a, tbl, bad.select.where.?, .{});
-    try testing.expectError(error.DivisionByZero, pb.eval(fx.row(r1)));
+    try testing.expectError(error.DivisionByZero, pb.eval(fx.row(&r1)));
 }
 
 test "sql.pred: NaN is equal to itself and above every number" {
@@ -405,10 +406,10 @@ test "sql.pred: NaN is equal to itself and above every number" {
 
     const T: ?bool = true;
     const F: ?bool = false;
-    try testing.expectEqual(T, try eq_self.eval(fx.row(r)));
-    try testing.expectEqual(F, try ne_self.eval(fx.row(r)));
-    try testing.expectEqual(T, try same_self.eval(fx.row(r)));
-    try testing.expectEqual(T, try gt_inf.eval(fx.row(r)));
-    try testing.expectEqual(F, try lt_inf.eval(fx.row(r)));
-    try testing.expectEqual(T, try differs_one.eval(fx.row(r)));
+    try testing.expectEqual(T, try eq_self.eval(fx.row(&r)));
+    try testing.expectEqual(F, try ne_self.eval(fx.row(&r)));
+    try testing.expectEqual(T, try same_self.eval(fx.row(&r)));
+    try testing.expectEqual(T, try gt_inf.eval(fx.row(&r)));
+    try testing.expectEqual(F, try lt_inf.eval(fx.row(&r)));
+    try testing.expectEqual(T, try differs_one.eval(fx.row(&r)));
 }

@@ -10,6 +10,7 @@ const KeyRange = @import("../kv.zig").KeyRange;
 const TableKey = @import("../kv.zig").TableKey;
 const Meta = @import("../kv.zig").Meta;
 pub const Item = @import("../kv.zig").Item;
+pub const ItemRef = @import("../kv.zig").ItemRef;
 const Version = @import("../kv.zig").Version;
 const _idx = @import("index.zig");
 const _buffers = @import("../buffers.gen.zig");
@@ -608,8 +609,14 @@ pub const BlockIterator = struct {
     alloc: std.mem.Allocator,
     /// The current entry's stored key: the primary.
     key_buf: std.ArrayList(u8),
-    /// Stamped onto every emitted key: the tree this block is read for.
-    table_key: TableKey,
+    /// The current entry's overlap with `base_key`: that many leading
+    /// bytes of `key_buf` are the base key's already when the next
+    /// entry's key is built over it.
+    key_overlap: usize = 0,
+    /// The current entry, kept current by `setIdx` and what `itemRef`
+    /// points at: `key_buf` under the ids of the tree this block is
+    /// read for, over `vers`.
+    item: Item,
     /// The payload's entries, located once (a `buffers.BlockPayload`).
     entries: zbuf.ArrayVar(_buffers.BlockEntryReader),
     base_key: String,
@@ -646,7 +653,13 @@ pub const BlockIterator = struct {
         return .{
             .alloc = alloc,
             .key_buf = .empty,
-            .table_key = table_key,
+            .item = .{
+                .key = .{
+                    .namespace = table_key.namespace,
+                    .table_id = table_key.table_id,
+                },
+                .versions = .{ .many = &.{} },
+            },
             .entries = payload.entries(),
             .base_key = base_key,
             .entry_idx = 0,
@@ -689,9 +702,11 @@ pub const BlockIterator = struct {
         }
     };
 
-    /// Read entry i's key without copying it.
-    fn storedKeyAt(self: *BlockIterator, i: usize) Error!StoredKey {
-        const entry = try self.entries.at(@intCast(i));
+    /// `entry`'s key, checked and read without copying it.
+    fn storedKey(
+        self: *const BlockIterator,
+        entry: _buffers.BlockEntryReader,
+    ) Error!StoredKey {
         const overlap: usize = entry.keyOverlap();
         const diff = entry.keyDiff();
         if (overlap > self.base_key.len) return error.CorruptTable;
@@ -715,7 +730,7 @@ pub const BlockIterator = struct {
         target_key: String,
         shared_w_base: usize,
     ) Error!std.math.Order {
-        const sk = try self.storedKeyAt(i);
+        const sk = try self.storedKey(try self.entries.at(@intCast(i)));
         const slen = sk.len();
         const tlen = target_key.len;
 
@@ -805,20 +820,10 @@ pub const BlockIterator = struct {
         try self.setIdx(self.entry_idx - 1);
     }
 
-    pub fn itemRef(self: *const BlockIterator) ?Item {
-        if (!self.is_valid) return null;
-        // Built per call rather than cached in setIdx: a few loads off a
-        // hot key_buf, where caching costs a 40-byte store plus a reload,
-        // and every caller reads it about once per position. Measured:
-        // caching made a key walk ~20% SLOWER.
-        return .{
-            .key = .{
-                .namespace = self.table_key.namespace,
-                .table_id = self.table_key.table_id,
-                .primary = self.key_buf.items,
-            },
-            .versions = .{ .many = self.vers.items },
-        };
+    /// The current entry, read in place: valid until the iterator
+    /// moves.
+    pub fn itemRef(self: *const BlockIterator) ?ItemRef {
+        return if (self.is_valid) &self.item else null;
     }
 
     fn setIdx(self: *BlockIterator, i: usize) Error!void {
@@ -828,17 +833,26 @@ pub const BlockIterator = struct {
         }
 
         const entry = try self.entries.at(@intCast(i));
-        const key_overlap: usize = entry.keyOverlap();
-        const diff = entry.keyDiff();
-        if (key_overlap > self.base_key.len) return error.CorruptTable;
-        if (key_overlap + diff.len < min_key_len) return error.CorruptTable;
+        const stored = try self.storedKey(entry);
 
-        // Reconstruct full key into reusable buffer: base[0..overlap] ++ diff.
-        utils.clearRetainCap(&self.key_buf);
-        try self.key_buf.appendSlice(self.alloc, self.base_key[0..key_overlap]);
-        try self.key_buf.appendSlice(self.alloc, diff);
+        // The stored key pasted together, over the last entry's: of
+        // the base key only what this overlap adds is copied. Entries
+        // of a block overlap it alike, so that is usually nothing.
+        try self.key_buf.ensureTotalCapacity(self.alloc, stored.len());
+        self.key_buf.items.len = stored.len();
+
+        const key = self.key_buf.items;
+        const overlap = stored.base.len;
+        if (self.key_overlap < overlap) @memcpy(
+            key[self.key_overlap..overlap],
+            stored.base[self.key_overlap..],
+        );
+        self.key_overlap = overlap;
+        @memcpy(key[overlap..], stored.diff);
 
         try self.unpackVersions(entry);
+        self.item.key.primary = key;
+        self.item.versions = .{ .many = self.vers.items };
         self.entry_idx = i;
         self.is_valid = true;
     }
@@ -1147,7 +1161,7 @@ pub const TableIterator = struct {
         if (!self.range.contains(item.key)) self.valid = false;
     }
 
-    pub fn itemRef(self: *const TableIterator) ?Item {
+    pub fn itemRef(self: *const TableIterator) ?ItemRef {
         if (!self.valid) return null;
         return self.bi.?.itemRef();
     }

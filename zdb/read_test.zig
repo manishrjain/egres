@@ -203,7 +203,7 @@ test "multiget: rows resolve across pending writes, memtables, L0 and L1" {
     const read_ts: u64 = 100;
     const pending = try zdb.skl.SkipList.initCapacity(alloc, 0);
     defer pending.release();
-    try pending.putItem(.{
+    try pending.putItem(&.{
         .key = Fixture.key("k07"),
         .versions = .{ .one = .{
             .ts = zdb.kv.pending_ts,
@@ -211,7 +211,7 @@ test "multiget: rows resolve across pending writes, memtables, L0 and L1" {
             .value = "pend",
         } },
     });
-    try pending.putItem(.{
+    try pending.putItem(&.{
         .key = Fixture.key("k08"),
         .versions = .{ .one = .{
             .ts = zdb.kv.pending_ts,
@@ -296,7 +296,7 @@ test "multiget: other tables in the memtables and pending writes are skipped" {
     // seek window must not let the merge land on them.
     const pending = try zdb.skl.SkipList.initCapacity(alloc, 0);
     defer pending.release();
-    try pending.putItem(.{
+    try pending.putItem(&.{
         .key = otherKey("b"),
         .versions = .{ .one = .{
             .ts = 100,
@@ -692,7 +692,7 @@ test "cursor: a posting folds from its newest state, not under it" {
     defer cur.deinit();
     const item = (try cur.next()) orelse return error.TestExpectedItem;
     try std.testing.expectEqual(3, item.versions.len());
-    var bm = try cur.bitmap(alloc, &item);
+    var bm = try cur.bitmap(alloc, item);
     defer bm.deinit();
     try std.testing.expectEqual(3, bm.getCardinality());
     for ([_]u64{ 2, 3, 4 }) |v| try std.testing.expect(bm.contains(v));
@@ -751,7 +751,7 @@ test "cursor: reverse walks pending, memtables, L0 and L1 descending" {
 
     const pending = try zdb.skl.SkipList.initCapacity(alloc, 0);
     defer pending.release();
-    try pending.putItem(.{
+    try pending.putItem(&.{
         .key = Fixture.key("k07"),
         .versions = .{ .one = .{
             .ts = zdb.kv.pending_ts,
@@ -759,7 +759,7 @@ test "cursor: reverse walks pending, memtables, L0 and L1 descending" {
             .value = "pend",
         } },
     });
-    try pending.putItem(.{
+    try pending.putItem(&.{
         .key = Fixture.key("k08"),
         .versions = .{ .one = .{
             .ts = zdb.kv.pending_ts,
@@ -802,7 +802,7 @@ test "multiget: allocation failure releases pending writes" {
     }
     const keys = [_]String{ "a", "b", "c", "d" };
     for (keys) |key| {
-        try pending.putItem(.{
+        try pending.putItem(&.{
             .key = Fixture.key(key),
             .versions = .{ .one = .{
                 .ts = 10,
@@ -842,7 +842,7 @@ test "cursor: allocation failure releases a pending value pin" {
         while (pending.ref_count.load(.acquire) > 1) pending.release();
         pending.release();
     }
-    try pending.putItem(.{
+    try pending.putItem(&.{
         .key = Fixture.key("a"),
         .versions = .{ .one = .{
             .ts = 10,
@@ -883,7 +883,7 @@ test "cursor: allocation failure releases sources during merge handoff" {
         }
         pending.release();
     }
-    try pending.putItem(.{
+    try pending.putItem(&.{
         .key = Fixture.key("a"),
         .versions = .{ .one = .{
             .ts = 10,

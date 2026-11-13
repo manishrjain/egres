@@ -1103,7 +1103,7 @@ pub const AdminServer = struct {
             mode: proto.ScanCmd.Mode,
             ns: u32,
 
-            fn emit(c: *@This(), item: zdb.kv.Item) anyerror!bool {
+            fn emit(c: *@This(), item: zdb.kv.ItemRef) anyerror!bool {
                 // Memtables are forest-wide; an item with a different
                 // namespace means we've walked off the end of ours.
                 if (item.key.namespace != c.ns) return false;

@@ -108,6 +108,12 @@ pub const Version = struct {
     // to .raw would drop a row's metadata, so let the compiler catch a new one.
     meta: Meta,
     value: String,
+
+    /// Whether a read at `ts` sees this version: committed at or
+    /// below it, or the reader's own pending write.
+    pub fn isVisible(self: Version, ts: u64) bool {
+        return self.ts <= ts or self.ts == pending_ts;
+    }
 };
 
 /// A row's versions, newest first. One version sits inline, so a
@@ -135,6 +141,29 @@ pub const Versions = union(enum) {
     }
 };
 
+/// The versions of `vers`, newest first, that a read at `ts` sees:
+/// those at or below `ts`, a pending one (`pending_ts`) always among
+/// them, as far down as `depth` says. Empty when none is visible. A
+/// walk from the newest, not a binary search: reads are almost always
+/// at or near the newest version, so the first compare usually
+/// decides. Inline because a scan calls it for every row, and a caller
+/// that names its depth pays for no branch on it.
+pub inline fn visibleVersions(
+    vers: []const Version,
+    ts: u64,
+    depth: Item.Depth,
+) []const Version {
+    var from: usize = 0;
+    while (from < vers.len and !vers[from].isVisible(ts)) from += 1;
+    const vis = vers[from..];
+    if (depth == .all) return vis;
+
+    for (vis, 1..) |ver, n| {
+        if (!ver.meta.isDelta()) return vis[0..n];
+    }
+    return vis;
+}
+
 /// One primary and its versions, newest first. `key` says where the
 /// row lives (namespace, table_id, primary); `versions` is never
 /// empty. A version's stamp is `versions[i].ts`.
@@ -146,62 +175,39 @@ pub const Item = struct {
     key: Key,
     versions: Versions,
 
-    pub fn newest(self: Item) Version {
+    pub fn newest(self: *const Item) Version {
         return switch (self.versions) {
             .one => |ver| ver,
             .many => |vers| vers[0],
         };
     }
 
-    /// The versions at or below `ts`: the suffix from the first version
-    /// with `ts <=` it. Null when every version is newer. A walk from
-    /// the newest, not a binary search: reads are almost always at or
-    /// near the newest version, so the first compare usually decides.
-    /// The versions at or below `ts`, newest first — a pending one
-    /// (`pending_ts`) always among them — or null when there is none.
-    pub fn visibleAt(self: Item, ts: u64) ?Item {
-        switch (self.versions) {
-            .one => |ver| return if (visible(ver, ts)) self else null,
-            .many => |vers| {
-                for (vers, 0..) |ver, i| {
-                    if (visible(ver, ts)) {
-                        return .{
-                            .key = self.key,
-                            .versions = .{ .many = vers[i..] },
-                        };
-                    }
-                }
-                return null;
-            },
-        }
-    }
+    /// How far down the visible versions go from the newest of them.
+    pub const Depth = enum {
+        /// To the oldest.
+        all,
+        /// To the first that is not a delta (a state or a tombstone),
+        /// which is included: the chain a fold reads. Every version
+        /// when all are deltas.
+        fold,
+    };
 
-    fn visible(ver: Version, ts: u64) bool {
-        return ver.ts <= ts or ver.ts == pending_ts;
-    }
-
-    /// The chain a read folds: the versions down to and including the
-    /// first that is not a delta (a state or a tombstone), or every
-    /// version when none is.
-    pub fn chain(self: Item) Item {
-        const vers = switch (self.versions) {
-            .one => return self,
+    /// The item a read at `ts` sees: its `visibleVersions`, or null
+    /// when it has none.
+    pub fn visibleAt(self: *const Item, ts: u64, depth: Depth) ?Item {
+        const all = switch (self.versions) {
+            // One version is the whole item at either depth, or nothing.
+            .one => |ver| return if (ver.isVisible(ts)) self.* else null,
             .many => |vers| vers,
         };
-        for (vers, 0..) |ver, i| {
-            if (!ver.meta.isDelta()) {
-                return .{
-                    .key = self.key,
-                    .versions = .{ .many = vers[0 .. i + 1] },
-                };
-            }
-        }
-        return self;
+        const vis = visibleVersions(all, ts, depth);
+        if (vis.len == 0) return null;
+        return .{ .key = self.key, .versions = .{ .many = vis } };
     }
 
     /// A copy owned by `allocator`: the primary, every value, and the
     /// versions slice when there are several. Release with `free`.
-    pub fn dupe(self: Item, allocator: std.mem.Allocator) !Item {
+    pub fn dupe(self: *const Item, allocator: std.mem.Allocator) !Item {
         const primary = try allocator.dupe(u8, self.key.primary);
         errdefer allocator.free(primary);
         const key: Key = .{
@@ -239,7 +245,7 @@ pub const Item = struct {
         }
     }
 
-    pub fn free(self: Item, allocator: std.mem.Allocator) void {
+    pub fn free(self: *const Item, allocator: std.mem.Allocator) void {
         allocator.free(self.key.primary);
         switch (self.versions) {
             .one => |ver| allocator.free(ver.value),
@@ -250,6 +256,11 @@ pub const Item = struct {
         }
     }
 };
+
+/// An item read in place, the form every borrower takes: valid until
+/// its source moves, and never written through. What is kept past
+/// that is an `Item` of its own (`dupe`).
+pub const ItemRef = *const Item;
 
 /// Global identity of an LSM tree: a namespace (u64, global) plus a
 /// namespace-local tree_id. The tree_id packs `(table_id << 32) | split_id`
@@ -520,7 +531,7 @@ pub const Key = struct {
         // primaries, `after` sorts past `exact`.
         const edge_ord = std.math.order(self.edgeRank(), other.edgeRank());
         if (edge_ord != .eq) return edge_ord;
-        const p_ord = std.mem.order(u8, self.primary, other.primary);
+        const p_ord = orderBytes(self.primary, other.primary);
         if (p_ord != .eq) return p_ord;
         return std.math.order(
             @intFromBool(self.bound == .after),
@@ -570,6 +581,23 @@ pub const Key = struct {
         return 12 + self.primary.len;
     }
 };
+
+/// `std.mem.order` for bytes, eight at a time: a word read big-endian
+/// orders as its bytes do. Keys of one table share a long prefix, and
+/// every merge step and seek probe compares two of them.
+pub fn orderBytes(a: String, b: String) std.math.Order {
+    const shorter = @min(a.len, b.len);
+    var at: usize = 0;
+    while (at + 8 <= shorter) : (at += 8) {
+        const x = std.mem.readInt(u64, a[at..][0..8], .big);
+        const y = std.mem.readInt(u64, b[at..][0..8], .big);
+        if (x != y) return std.math.order(x, y);
+    }
+    while (at < shorter) : (at += 1) {
+        if (a[at] != b[at]) return std.math.order(a[at], b[at]);
+    }
+    return std.math.order(a.len, b.len);
+}
 
 /// Which way an iterator walks a range `[left, right)`: `forward`
 /// positions at the first key at or past `left` and steps up;

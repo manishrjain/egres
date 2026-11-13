@@ -610,7 +610,7 @@ const IndexBuild = struct {
     fn rowKeys(
         self: *IndexBuild,
         at: anytype,
-        item: zdb.kv.Item,
+        item: zdb.kv.ItemRef,
         egid: u64,
     ) ![]const String {
         const cell = at.tbl.parseCol(item, at.idx.column);

@@ -342,7 +342,7 @@ pub const Level = struct {
         const found = it.itemRef() orelse return null;
         if (!found.key.eq(lookup.key)) return null;
 
-        const vis = found.visibleAt(lookup.read_ts) orelse return null;
+        const vis = found.visibleAt(lookup.read_ts, .all) orelse return null;
         return try vis.dupe(allocator);
     }
 

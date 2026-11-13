@@ -26,6 +26,7 @@ const Key = zdb.kv.Key;
 const TableKey = zdb.kv.TableKey;
 const KeyRange = zdb.kv.KeyRange;
 const Item = zdb.kv.Item;
+const ItemRef = zdb.kv.ItemRef;
 
 pub const Error = error{UndefinedTable};
 
@@ -240,7 +241,11 @@ pub const Table = struct {
     /// One column's value out of a stored row: the egid from the key,
     /// any other cell by a null-bit test plus one O(1) read
     /// (row.parseCol) — no full-row decode.
-    pub fn parseCol(self: *const Table, item: Item, col: *const Column) _value.Value {
+    pub fn parseCol(
+        self: *const Table,
+        item: ItemRef,
+        col: *const Column,
+    ) _value.Value {
         if (col.isEgid()) return .{ .uint8 = _key.decodeEgid(item.key.primary).? };
         const value = item.newest().value;
         return _row.parseCol(&self.ps, value, self.ps.columns[col.pos]);

@@ -33,6 +33,7 @@ const Tree = _tree.Tree;
 const TableCache = _tree.TableCache;
 const Table = _table.Table;
 const Item = _table.table.Item;
+const ItemRef = _table.table.ItemRef;
 const SkipList = _skl.SkipList;
 const Emitter = _tree.Tree.Emitter;
 const _mitr = _table.merge_iterator;
@@ -263,7 +264,7 @@ pub const Memtables = struct {
         self.mu.deinit();
     }
 
-    pub fn putItem(self: *Memtables, item: Item) !void {
+    pub fn putItem(self: *Memtables, item: ItemRef) !void {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         try self.current.putItem(item);
@@ -294,10 +295,10 @@ pub const Memtables = struct {
         try iter.seekRange(range.left, range.right);
         var copied: usize = 0;
         while (iter.itemRef()) |item| : (try iter.next()) {
-            var copy = item.visibleAt(ts) orelse continue;
+            var copy = item.visibleAt(ts, .all) orelse continue;
             copy.key.namespace = to.namespace;
             if (to.table_id) |tid| copy.key.table_id = tid;
-            try self.putItem(copy);
+            try self.putItem(&copy);
             copied += 1;
         }
         // The copies may come from any memtable the walk read, so the
@@ -722,7 +723,7 @@ pub const Forest = struct {
     /// Callers can use shouldFreeze() afterward to decide whether to propose
     /// a memtable freeze through Raft.
     pub fn put(self: *Forest, items: []const Item) !void {
-        for (items) |item| {
+        for (items) |*item| {
             try self.memtables.putItem(item);
         }
     }
@@ -932,7 +933,7 @@ pub const Forest = struct {
         var em = try Emitter.init(tree, bottom, self.snapshotTs());
         defer em.deinit();
 
-        for (items) |item| try em.push(item);
+        for (items) |*item| try em.push(item);
 
         var r = try em.finish();
         defer r.changes.deinit(self.allocator);

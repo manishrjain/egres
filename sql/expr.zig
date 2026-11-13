@@ -49,7 +49,7 @@ const Func = _funcs.Func;
 pub const Row = struct {
     scratch: std.mem.Allocator,
     tbl: ?*const Table,
-    item: ?zdb.kv.Item,
+    item: ?zdb.kv.ItemRef,
 };
 
 pub const Node = union(enum) {

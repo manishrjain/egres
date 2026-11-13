@@ -25,6 +25,7 @@ const TableKey = kv.TableKey;
 const KeyRange = kv.KeyRange;
 const Level = _level.Level;
 const Item = _table.table.Item;
+const ItemRef = _table.table.ItemRef;
 const Table = _table.Table;
 const TableIterator = _table.TableIterator;
 const Tree = _tree.Tree;
@@ -559,9 +560,9 @@ pub const MultiGet = struct {
         try it.seekRange(start, start.after());
         while (it.itemRef()) |found| {
             if (!found.key.eq(start)) return;
-            if (found.visibleAt(node.maxTs(read_ts))) |vis| {
+            if (found.visibleAt(node.maxTs(read_ts), .fold)) |chain| {
                 var buf: [1]Pin = undefined;
-                try self.take(node, vis.chain(), it.currentPins(&buf));
+                try self.take(node, &chain, it.currentPins(&buf));
                 if (node.done()) return;
             }
             try it.next();
@@ -572,7 +573,7 @@ pub const MultiGet = struct {
     fn take(
         self: *MultiGet,
         node: *Node,
-        wanted: Item,
+        wanted: ItemRef,
         pins: []const Pin,
     ) !void {
         const arloc = self.arena.allocator();
@@ -744,7 +745,7 @@ pub fn scan(
     range: KeyRange,
     opts: ScanOptions,
     ctx: anytype,
-    comptime cb: fn (@TypeOf(ctx), Item) anyerror!bool,
+    comptime cb: fn (@TypeOf(ctx), ItemRef) anyerror!bool,
 ) !u64 {
     var cur = try self.openCursor(allocator, table_key, range, opts);
     defer cur.deinit();
@@ -835,6 +836,9 @@ pub const Cursor = struct {
     /// block or memtable arena, since consecutive items share one —
     /// so those borrows stay valid past the following `next`.
     pins: std.ArrayList(Pin) = .empty,
+    /// The item handed out when the options admit only some of a
+    /// key's versions: its key over those.
+    part: Item = undefined,
     /// No tree left to visit.
     done: bool = false,
     /// Items handed out so far — what `scan` returns. Bounded by
@@ -855,13 +859,14 @@ pub const Cursor = struct {
     /// (`max_rows` reached, or the range walked to its end). Null is
     /// sticky.
     ///
-    /// The returned Item is a BORROW valid until the following `next`
-    /// or `deinit`: its key and versions point into the merge's
-    /// buffers, its values into blocks or arenas the merge holds refs
-    /// on, and the advance overwrites the ones and may release the
-    /// others. Copy what must outlive the call — except the values
-    /// under `opts.pin_values`, which stay valid until `releasePins`.
-    pub fn next(self: *Cursor) !?Item {
+    /// The returned item is a BORROW valid until the following `next`
+    /// or `deinit`, read in place: it is the merge's own or the
+    /// cursor's, its key and versions point into the merge's buffers,
+    /// its values into blocks or arenas the merge holds refs on, and
+    /// the advance overwrites the ones and may release the others.
+    /// Copy what must outlive the call — except the values under
+    /// `opts.pin_values`, which stay valid until `releasePins`.
+    pub fn next(self: *Cursor) !?ItemRef {
         while (self.emitted < self.opts.max_rows) {
             if (self.merge == null) {
                 if (self.done) return null;
@@ -948,7 +953,7 @@ pub const Cursor = struct {
     pub fn bitmap(
         self: *const Cursor,
         alloc: std.mem.Allocator,
-        item: *const Item,
+        item: ItemRef,
     ) !zroar.Bitmap {
         std.debug.assert(self.want_versions == std.math.maxInt(u32));
         return foldBitmap(alloc, item.versions.slice());
@@ -992,8 +997,9 @@ pub const Cursor = struct {
             // Memtable iters come from the cursor arena so they live
             // exactly as long as the merge. (Memtables.getIterators
             // returns a fresh slice; freeing it through the arena at
-            // deinit is fine.) The txn's pending skiplist rides in as
-            // src 0 — the merge's equal-key tie-break.
+            // deinit is fine.) The txn's pending skiplist is the first
+            // source; its versions sit at kv.pending_ts, so they lead
+            // their keys by timestamp, not by position.
             const srcs = try self.forest.memtables.getIterators(
                 a,
                 .{ .pending = self.opts.pending },
@@ -1024,7 +1030,10 @@ pub const Cursor = struct {
     /// Walk the open merge to the next item the options admit and
     /// return the part of it they admit, leaving the merge positioned
     /// ON it. Null when this tree is drained.
-    fn nextVisible(self: *Cursor, merge: *merge_iterator.MergeIterator) !?Item {
+    fn nextVisible(
+        self: *Cursor,
+        merge: *merge_iterator.MergeIterator,
+    ) !?ItemRef {
         while (merge.itemRef()) |item| {
             if (self.window(item)) |vis| {
                 self.emitted += 1;
@@ -1036,30 +1045,22 @@ pub const Cursor = struct {
     }
 
     /// The versions of `item` this scan hands out, newest first, or
-    /// null when none is.
-    fn window(self: *const Cursor, item: Item) ?Item {
+    /// null when none is: `item` itself when that is all of them, the
+    /// usual case, and `part` otherwise.
+    fn window(self: *Cursor, item: ItemRef) ?ItemRef {
+        const opts = &self.opts;
         // Not written yet, as far as this scan is concerned: versions
         // above read_ts go first, before the tombstone rule (a delete
         // above read_ts must not hide a key still live at read_ts) and
         // before the version cap (invisible versions must not consume
-        // it).
-        const vis = item.visibleAt(self.opts.read_ts) orelse return null;
-        // Unchanged since min_ts, as far as this scan is concerned: a
-        // key whose newest visible version is at or below it is not
-        // emitted at all, and one that changed emits only what changed.
-        if (vis.newest().ts <= self.opts.min_ts) return null;
+        // it). Then unchanged since min_ts: a key whose newest visible
+        // version is at or below it is not emitted at all, and one
+        // that changed emits only what changed.
+        const all = item.versions.slice();
+        const vers = kv.visibleVersions(all, opts.read_ts, .all);
+        if (vers.len == 0) return null;
+        if (vers[0].ts <= opts.min_ts) return null;
 
-        const vers = switch (vis.versions) {
-            // One version, and it passed the checks above; a tombstone
-            // is hidden unless asked for.
-            .one => |ver| {
-                if (ver.meta.isDeleted() and !self.opts.include_deleted) {
-                    return null;
-                }
-                return vis;
-            },
-            .many => |vers| vers,
-        };
         var n: usize = 0;
         while (n < vers.len and n < self.want_versions) : (n += 1) {
             const ver = vers[n];
@@ -1069,7 +1070,9 @@ pub const Cursor = struct {
             if (ver.meta.isDeleted() and !self.opts.include_deleted) break;
         }
         if (n == 0) return null;
-        return .{ .key = vis.key, .versions = .{ .many = vers[0..n] } };
+        if (n == all.len) return item;
+        self.part = .{ .key = item.key, .versions = .{ .many = vers[0..n] } };
+        return &self.part;
     }
 };
 

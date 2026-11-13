@@ -375,6 +375,47 @@ test "seekGe: prefix-length and version ordering" {
     try std.testing.expect(it.itemRef() == null);
 }
 
+test "block iterator: a key is rebuilt right over any other entry's" {
+    const alloc = std.testing.allocator;
+
+    // One block whose entries overlap its base key, the first, by 8,
+    // 7, 4, 2, 0 and 0 bytes: a step between any two has to put back
+    // base bytes the buffer lost, or write over ones it holds.
+    const keys = [_]String{
+        "abcdefgh", "abcdefgz", "abcdzz", "abz", "b", "bcdefgh1",
+    };
+    var b = Builder.init(alloc, .{ .block_bytes = 4 * 1024 });
+    defer b.deinit();
+    for (keys) |k| try b.add(.{ .primary = k }, 1, k);
+    var tb = try b.finish();
+    defer tb.deinit();
+    const t = try openBuffer(alloc, &tb);
+    defer destroyTable(t);
+    try std.testing.expectEqual(@as(usize, 1), t.blockCount());
+
+    var it = TableIterator.init(alloc, t, zero_table_key, .forward);
+    defer it.deinit();
+    for (keys) |from| {
+        for (keys) |to| {
+            try it.seekRange(.{ .primary = from }, Key.inf);
+            try it.seekRange(.{ .primary = to }, Key.inf);
+            const item = it.itemRef().?;
+            try std.testing.expectEqualStrings(to, item.key.primary);
+            try std.testing.expectEqualStrings(to, item.newest().value);
+        }
+    }
+
+    var rev = TableIterator.init(alloc, t, zero_table_key, .reverse);
+    defer rev.deinit();
+    try rev.seekRange(Key.inf, Key.inf);
+    var at: usize = keys.len;
+    while (rev.itemRef()) |item| : (try rev.next()) {
+        at -= 1;
+        try std.testing.expectEqualStrings(keys[at], item.key.primary);
+    }
+    try std.testing.expectEqual(@as(usize, 0), at);
+}
+
 test "iterator window reads blocks in spans and yields the same items" {
     const alloc = std.testing.allocator;
     var tb = try buildRangeTable(alloc, "w", 0, 2000, 4 * 1024);
@@ -830,7 +871,7 @@ test "merge iterator gathers one primary from every source" {
     defer b2.deinit();
     try b2.addItem(.{ .key = .{ .primary = "k" }, .versions = .{ .many = &.{
         .{ .ts = 20, .meta = .{}, .value = "k20" },
-        .{ .ts = 10, .meta = .{}, .value = "k10-dup" },
+        .{ .ts = 10, .meta = .{}, .value = "k10" },
     } } });
     var t2 = try b2.finish();
     defer t2.deinit();
@@ -868,7 +909,7 @@ test "merge iterator gathers one primary from every source" {
     try std.testing.expectEqual(@as(usize, 1), m.currentPins().len);
 
     // k: every version of it, timestamp descending, drawn from all
-    // three sources; the duplicate at 10 comes from the lower source.
+    // three sources; the version at 10, which two hold, comes once.
     try m.next();
     const k = m.itemRef().?;
     try std.testing.expectEqualStrings("k", k.key.primary);
