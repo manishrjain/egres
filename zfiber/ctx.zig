@@ -31,12 +31,13 @@
 //! statement, and evicting a trace frees it whole.
 //!
 //! A context is also where a statement is interruptible: its loops call
-//! `maybeYield` once per batch, and every policy that stops or paces a
-//! statement (the shutdown's stop stage, the tenant's cpu share, the
-//! statement's memory cap and the worker's time slice today; cancel
-//! later) delivers through that one call, so the loops never learn
-//! about any of them. The statement's memory is what its arenas hold
-//! from `allocator`, counted here and on the tenant.
+//! `maybeYield` once per batch or `meter` once per row, and every policy
+//! that stops or paces a statement (the shutdown's stop stage, the
+//! tenant's cpu share, the statement's memory cap and the worker's time
+//! slice today; cancel later) delivers through that one yield point, so
+//! the loops never learn about any of them. The statement's memory is
+//! what its arenas hold from `allocator`, counted here and on the
+//! tenant.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -95,6 +96,8 @@ pub const Ctx = struct {
     /// same instance and one started before `install` is never
     /// counted out.
     counted: bool = false,
+    /// Units of work the statement has put through `meter`.
+    metered: u32 = 0,
     /// What every read and write on the fiber runs as; vfs and the
     /// caches look them up with `current()`, nothing passes them. A
     /// fiber sets its own; a spawn copies the spawner's.
@@ -230,6 +233,23 @@ pub const Ctx = struct {
     /// over its share. `MemLimit`: the statement is past the cap. Both
     /// are the statement's, answered as out of memory.
     pub const YieldError = error{ Shutdown, MemShare, MemLimit };
+
+    /// Units between the yield points `meter` makes. A count's row is
+    /// about 30 ns, so its yield points are 8 µs apart; at 64 units
+    /// the yield points took 3% off a count.
+    pub const meter_units = 256;
+
+    /// One unit of a loop's work, a row or an index key: the first of
+    /// a statement and every `meter_units`th after it is a yield point
+    /// (`maybeYield`), whichever loops they fall in. Cheap enough to
+    /// call per row, which `maybeYield` is not, so a loop keeps no
+    /// stride of its own. On a fiber's own context only: `bg` is
+    /// never written.
+    pub inline fn meter(self: *Ctx) YieldError!void {
+        std.debug.assert(self != &bg);
+        self.metered +%= 1;
+        if (self.metered % meter_units == 1) try self.maybeYield();
+    }
 
     /// The statement's yield point: a loop calls this once per batch or
     /// block of work, and the runtime may pause the statement here or

@@ -104,9 +104,8 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
     // Every VALUES row coerced into the cells of one Change, before
     // any lock or write: a Restart re-runs the whole statement.
     const changes = try arloc.alloc(Change, ins.rows.len);
-    for (ins.rows, changes, 0..) |row_lits, *change, ri| {
-        // A yield point per batch of rows, the executor's stride.
-        if (ri % _exec.row_cap == 0) try fiber.ctx().maybeYield();
+    for (ins.rows, changes) |row_lits, *change| {
+        try fiber.ctx().meter();
 
         if (row_lits.len != target_cols.len)
             return replyErrorCode(state, pgwire.sqlstate.syntax_error, "INSERT has the wrong number of values");
@@ -496,8 +495,8 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
     // locked.
     const changes = try arloc.alloc(Change, rows.len);
     var row: _value.Row = .{};
-    for (rows, changes, 0..) |*item, *change, ri| {
-        if (ri % _exec.row_cap == 0) try fiber.ctx().maybeYield();
+    for (rows, changes) |*item, *change| {
+        try fiber.ctx().meter();
 
         const post = (try evalSets(
             state,
@@ -583,7 +582,7 @@ fn write(
 
     var keys: std.ArrayList(IndexKey) = .empty;
     for (changes, 0..) |*change, ri| {
-        if (ri % _exec.row_cap == 0) try fiber.ctx().maybeYield();
+        try fiber.ctx().meter();
 
         if (change.pre) |item| {
             change.egid = _key.decodeEgid(item.key.primary).?;

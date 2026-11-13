@@ -20,7 +20,6 @@ const _key = @import("key.zig");
 const _table = @import("table.zig");
 const _txn = @import("txn.zig");
 const _database = @import("database.zig");
-const _exec = @import("exec.zig");
 const _value = @import("value.zig");
 const _server = @import("server.zig");
 
@@ -633,11 +632,9 @@ const IndexBuild = struct {
             .{ .read_ts = self.read_ts },
         );
         defer cur.deinit();
-        var seen: usize = 0;
-        while (try cur.next()) |item| : (seen += 1) {
-            // The backfill is the longest statement there is: a yield
-            // point every batch of rows, as a DML scan has.
-            if (seen % _exec.row_cap == 0) try fiber.ctx().maybeYield();
+        while (try cur.next()) |item| {
+            // The backfill is the longest statement there is.
+            try fiber.ctx().meter();
             const egid = _key.decodeEgid(item.key.primary) orelse
                 continue; // not row-shaped: nothing to index
             try rows.setV1(egid, try self.rowKeys(at, item, egid));
@@ -670,9 +667,8 @@ const IndexBuild = struct {
         });
         defer cur.deinit();
         var changed: usize = 0;
-        var seen: usize = 0;
-        while (try cur.next()) |item| : (seen += 1) {
-            if (seen % _exec.row_cap == 0) try fiber.ctx().maybeYield();
+        while (try cur.next()) |item| {
+            try fiber.ctx().meter();
             const egid = _key.decodeEgid(item.key.primary) orelse continue;
             changed += 1;
             const keys: []const String = if (item.newest().meta.isDeleted())

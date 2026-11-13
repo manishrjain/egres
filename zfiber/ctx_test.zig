@@ -171,3 +171,28 @@ test "ctx: a statement's arenas count on it and its tenant, to the cap" {
     try std.testing.expectEqual(0, qctx.mem_held.load(.monotonic));
     try std.testing.expectEqual(0, t.mem_held.load(.monotonic));
 }
+
+test "ctx: meter yields on a statement's first unit and every stride after" {
+    const meter = fiber.meter;
+    const stride = fiber.Ctx.meter_units;
+    const qctx = fiber.ctx();
+    try qctx.start("select 1", false);
+    defer qctx.finish();
+    var arena = qctx.newArena();
+    defer arena.deinit();
+    _ = try arena.allocator().alloc(u8, 100_000);
+
+    // Over the cap every yield point refuses the statement, so the
+    // refusals tell which units were one.
+    meter.query_mem_bytes.store(50_000, .monotonic);
+    defer meter.query_mem_bytes.store(0, .monotonic);
+    var refused: usize = 0;
+    for (0..3 * stride) |unit| {
+        qctx.meter() catch |err| {
+            try std.testing.expectEqual(error.MemLimit, err);
+            try std.testing.expectEqual(0, unit % stride);
+            refused += 1;
+        };
+    }
+    try std.testing.expectEqual(3, refused);
+}

@@ -435,10 +435,9 @@ pub const BitmapNode = union(enum) {
             },
         );
         defer cursor.deinit();
-        var seen: usize = 0;
-        while (try cursor.next()) |entry| : (seen += 1) {
-            // One yield point per hundred keys: a key is one fold.
-            if (seen % 100 == 0) try fiber.ctx().maybeYield();
+        while (try cursor.next()) |entry| {
+            // A unit per key: a key is one fold.
+            try fiber.ctx().meter();
             var part = try cursor.bitmap(alloc, entry);
             defer part.deinit();
             try acc.orInPlace(&part);
@@ -549,13 +548,13 @@ pub const SeqScan = struct {
         if (self.count_only) {
             // Nothing is handed over: the whole range is counted in one
             // call, and the batch carries only the count.
-            var seen: usize = 0;
-            while (try cursor.next()) |item| : (seen += 1) {
-                // One yield point per batch's worth of rows. No batch
-                // boundary gives one here, and a count with none is a
-                // single step as long as the table: nothing can pause
-                // or stop it, and its worker serves nobody else.
-                if (seen % row_cap == 0) try fiber.ctx().maybeYield();
+            const fctx = fiber.ctx();
+            while (try cursor.next()) |item| {
+                // No batch boundary gives a yield point here, and a
+                // count with none is a single step as long as the
+                // table: nothing can pause or stop it, and its worker
+                // serves nobody else.
+                try fctx.meter();
                 if (self.pred) |pred| {
                     // The whole range in one fill: no batch bounds the
                     // scratch, so each row starts it empty.
@@ -689,7 +688,6 @@ pub const IndexWalk = struct {
     /// points at `egids`: not movable once open.
     egids: ?zroar.Bitmap = null,
     it: ?zroar.Iterator = null,
-    keys_seen: usize = 0,
 
     fn open(self: *IndexWalk, ctx: *ExecCtx) !void {
         const r = self.range;
@@ -725,9 +723,8 @@ pub const IndexWalk = struct {
     fn nextKey(self: *IndexWalk, ctx: *ExecCtx) !bool {
         const cursor = &self.cursor.?;
         const entry = (try cursor.next()) orelse return false;
-        // One yield point per hundred keys: a key is one fold.
-        self.keys_seen += 1;
-        if (self.keys_seen % 100 == 0) try fiber.ctx().maybeYield();
+        // A unit per key: a key is one fold.
+        try fiber.ctx().meter();
 
         if (self.egids) |*bm| bm.deinit();
         self.egids = null;
