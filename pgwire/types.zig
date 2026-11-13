@@ -114,6 +114,8 @@ pub const sqlstate = struct {
     pub const invalid_savepoint_specification: [5]u8 = .{ '3', 'B', '0', '0', '1' };
     pub const admin_shutdown: [5]u8 = .{ '5', '7', 'P', '0', '1' };
     pub const out_of_memory: [5]u8 = .{ '5', '3', '2', '0', '0' };
+    pub const io_error: [5]u8 = .{ '5', '8', '0', '3', '0' };
+    pub const data_corrupted: [5]u8 = .{ 'X', 'X', '0', '0', '1' };
     pub const program_limit_exceeded: [5]u8 = .{ '5', '4', '0', '0', '0' };
 };
 

@@ -1357,6 +1357,28 @@ pub fn replyErrorCode(state: *pgwire.ConnState, code: [5]u8, msg: String) !void 
     try state.sendError(.{ .code = code, .message = msg });
 }
 
+/// Answer a read of storage that failed, with the code Postgres has
+/// for it. Bytes that were read and are wrong are data_corrupted.
+/// Any other error is the store not giving the bytes, io_error: the
+/// set is open, and a real disk's errors come under names no list
+/// here would hold.
+pub fn replyStorageErr(
+    state: *pgwire.ConnState,
+    err: anyerror,
+    msg: String,
+) !void {
+    const code = switch (err) {
+        error.CorruptTable,
+        error.ChecksumMismatch,
+        error.CorruptPosting,
+        error.CorruptIndexEntry,
+        => pgwire.sqlstate.data_corrupted,
+        error.OutOfMemory => pgwire.sqlstate.out_of_memory,
+        else => pgwire.sqlstate.io_error,
+    };
+    return replyErrorCode(state, code, msg);
+}
+
 /// The tenant waited its bound for memory and is still past its soft limit
 /// (`Tenant.payForMem`): the statement did not start.
 fn replyMemShare(state: *pgwire.ConnState) !void {

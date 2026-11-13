@@ -1836,3 +1836,30 @@ test "merge iterator reverse merges sorted streams, chains newest first" {
     try m.next();
     try std.testing.expect(m.itemRef() == null);
 }
+
+test "table: a failed read keeps its error, not CorruptTable" {
+    // Only the simulated disk fails on purpose.
+    const disk = fiber.simDisk() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    defer disk.setFaults(tmp.path, .{}) catch {};
+
+    var store = try vfs.Store.initFile(alloc, tmp.path, vfs.g());
+    defer store.deinit();
+    var tb = try buildRangeTable(alloc, "k", 0, 100, 4096);
+    defer tb.deinit();
+    const name = try zdb.sstName(alloc, 1);
+    defer alloc.free(name);
+    try store.put(name, tb.bytes);
+
+    const tbl = try Table.open(alloc, &store, 1, tb.extent());
+    defer destroyTable(tbl);
+
+    try disk.setFaults(tmp.path, .{ .read = 1000 });
+    try std.testing.expectError(error.InputOutput, tbl.readBlock(0));
+
+    try disk.setFaults(tmp.path, .{});
+    const val = try tbl.readBlock(0);
+    val.decrRef();
+}

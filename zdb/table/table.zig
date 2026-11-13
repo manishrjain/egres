@@ -70,12 +70,10 @@ pub fn sstName(allocator: std.mem.Allocator, file_id: u64) ![]u8 {
     return std.fmt.allocPrint(allocator, "{x:0>16}.sst", .{file_id});
 }
 
-pub const Error = _idx.Error || _buffers.Error || compress.Error ||
-    std.mem.Allocator.Error || error{
-    ChecksumMismatch,
-    CorruptTable,
-    UnsupportedTableFormat,
-};
+/// Open: a read that fails keeps the error its store gave, so a
+/// caller can tell it from bytes that were read and are wrong. Those
+/// are `CorruptTable` and `ChecksumMismatch`.
+pub const Error = anyerror;
 
 const log = std.log.scoped(.table);
 
@@ -506,11 +504,11 @@ pub const Table = struct {
         if (bi.len < 4) return error.CorruptTable;
 
         // Read raw bytes (temporary)
-        const result = self.obj.readAligned(
+        const result = try self.obj.readAligned(
             self.allocator,
             @intCast(bi.offset),
             bi.len,
-        ) catch return error.CorruptTable;
+        );
         defer result.free();
 
         const val = try self.decodeBlock(result.data);
@@ -578,8 +576,7 @@ pub const Table = struct {
         }
         if (reqs.items.len == 0) return 0;
 
-        self.obj.batchRead(&arena, reqs.items) catch
-            return error.CorruptTable;
+        try self.obj.batchRead(&arena, reqs.items);
 
         for (reqs.items, wanted.items) |req, idx| {
             const val = try self.decodeBlock(req.data);
@@ -1213,11 +1210,11 @@ pub const TableIterator = struct {
                 if (len + cur.len > self.window_bytes) break;
                 len += cur.len;
             }
-            self.window = self.table.obj.readAligned(
+            self.window = try self.table.obj.readAligned(
                 self.allocator,
                 block.offset,
                 len,
-            ) catch return error.CorruptTable;
+            );
         }
         const at: usize = @intCast(block.offset - self.window.?.offset);
         return self.table.decodeBlock(self.window.?.data[at..][0..block.len]);

@@ -41,6 +41,7 @@ const litToValue = _parse.litToValue;
 const log = std.log.scoped(.sql);
 const replyError = _server.replyError;
 const replyErrorCode = _server.replyErrorCode;
+const replyStorageErr = _server.replyStorageErr;
 const replyLockErr = _server.replyLockErr;
 
 pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !void {
@@ -591,7 +592,7 @@ fn write(
                 log.err("write '{s}': alloc egid: {s}", .{
                     table_name, @errorName(err),
                 });
-                try replyError(state, "row id allocation failed");
+                try replyStorageErr(state, err, "row id allocation failed");
                 return null;
             };
         }
@@ -1806,7 +1807,7 @@ fn probeUnique(
                 index_table_id,
                 @errorName(err),
             });
-            try replyError(state, "unique index probe failed");
+            try replyStorageErr(state, err, "unique index probe failed");
             return false;
         };
         defer res.deinit();
@@ -1868,7 +1869,7 @@ fn logDeleteErr(table_name: String, what: String, err: anyerror) void {
 /// Map an executor failure (root.next / gatherAndLockRows) onto the wire:
 /// row-lock errors (a locking plan locks the matches) ride
 /// replyLockErr — Restart propagates to the statement driver — and
-/// anything else is an internal read failure.
+/// anything else is a read of storage that failed (`replyStorageErr`).
 fn replyRunErr(
     state: *pgwire.ConnState,
     comptime verb: String,
@@ -1901,7 +1902,7 @@ fn replyRunErr(
                 verb ++ " '{s}': scan: {s}",
                 .{ table_name, @errorName(err) },
             );
-            return replyError(state, "scan failed");
+            return replyStorageErr(state, err, "scan failed");
         },
     };
 }
