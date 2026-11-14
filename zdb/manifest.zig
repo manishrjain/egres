@@ -936,8 +936,8 @@ pub const Manifest = struct {
         errdefer self.freeTree(&tree);
         {
             const s = self.trees.getPtr(sk).?;
-            tree.left = try s.left.dupe(self.allocator);
-            tree.right = try s.right.dupe(self.allocator);
+            tree.left = try boundIn(s.left, dk).dupe(self.allocator);
+            tree.right = try boundIn(s.right, dk).dupe(self.allocator);
             tree.kind = s.kind;
             for (s.levels.items) |lm| {
                 var copy = LevelState{
@@ -954,6 +954,17 @@ pub const Manifest = struct {
             var tit = lm.tables.keyIterator();
             while (tit.next()) |id| self.ssts.getPtr(id.*).?.refs += 1;
         }
+    }
+
+    /// `bound` as a bound of tree `tk`: a key of its namespace and
+    /// table, which is what a key is routed by. An unbounded side has
+    /// neither.
+    fn boundIn(bound: Key, tk: TreeKey) Key {
+        if (bound.isInf()) return bound;
+        var out = bound;
+        out.namespace = tk.namespace;
+        out.table_id = treeTableId(tk.tree_id);
+        return out;
     }
 
     /// Count total table entries across all trees and levels.

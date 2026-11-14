@@ -1009,6 +1009,110 @@ fn expectTableRow(
     }
 }
 
+// Ten one-key tables, k01 to k10, at the bottom level of `tree_id`,
+// which then splits at k06 as in "forest: split tree".
+const split_keys = [_]String{
+    "k01", "k02", "k03", "k04", "k05",
+    "k06", "k07", "k08", "k09", "k10",
+};
+
+fn fillAndSplit(
+    f: *Forest,
+    alloc: std.mem.Allocator,
+    store: *vfs.Store,
+    ns: u64,
+    tree_id: u64,
+) !void {
+    var changes: [split_keys.len]_manifest.SSTableChange = undefined;
+    for (split_keys, &changes, 1..) |key, *c, file_id| {
+        const ext = try buildAndWriteTable(alloc, store, file_id, key);
+        c.* = _manifest.createSSTableChange(file_id, ns, tree_id, 3, ext);
+    }
+    {
+        const tree = f.getTree(ns, tree_id).?;
+        defer tree.release();
+        try tree.applyCompaction(2, &changes);
+    }
+    try f.splitTreeForTests(ns, tree_id);
+}
+
+test "forest: branch_ns of a split table has the rows of both halves" {
+    const alloc = std.testing.allocator;
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+
+    const f_live = try flags.Live(Config).create(alloc, .{});
+    defer f_live.destroy();
+    var store = try vfs.Store.initFile(alloc, tmp.path, vfs.g());
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
+    defer f.close();
+
+    const src: u64 = 7;
+    const nc = try f.buildNsCreate(alloc, .{ .given = src }, "seven");
+    defer alloc.free(nc.change.tree_changes);
+    try f.applyTrees(1, nc.change);
+    try fillAndSplit(f, alloc, &store, src, 0);
+    for (split_keys) |key| try expectRow(f, alloc, src, key, "v");
+
+    const br = try f.buildNsBranch(alloc, src, "eight");
+    defer alloc.free(br.change.tree_changes);
+    try f.applyNsBranch(3, 30, br.change);
+    const dst = br.namespace;
+
+    // Two trees again, and a key of the branch is routed between them
+    // as its source's is.
+    const halves = f.tables.get(.{ .namespace = dst, .table_id = 0 }).?;
+    try std.testing.expectEqual(@as(usize, 2), halves.entries.items.len);
+    for (split_keys) |key| try expectRow(f, alloc, dst, key, "v");
+}
+
+test "forest: branch_table of a split table has the rows of both halves" {
+    const alloc = std.testing.allocator;
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+
+    const f_live = try flags.Live(Config).create(alloc, .{});
+    defer f_live.destroy();
+    var store = try vfs.Store.initFile(alloc, tmp.path, vfs.g());
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
+    defer f.close();
+
+    const ns: u64 = 7;
+    const nc = try f.buildNsCreate(alloc, .{ .given = ns }, "seven");
+    defer alloc.free(nc.change.tree_changes);
+    try f.applyTrees(1, nc.change);
+    var ct_tc = [_]_manifest.TreeChange{
+        _manifest.newTableChange("users", .posting_index),
+    };
+    const ct = try f.buildTables(alloc, ns, &ct_tc, .create_tree);
+    defer alloc.free(ct.table_ids);
+    try f.applyTrees(2, ct.change);
+    const src: zdb.kv.TableKey = .{
+        .namespace = ns,
+        .table_id = ct.table_ids[0],
+    };
+    try fillAndSplit(f, alloc, &store, ns, zdb.kv.makeTreeId(src.table_id, 0));
+    for (split_keys) |key| try expectTableRow(f, alloc, src, key, "v");
+
+    var br_tc = [_]_manifest.TreeChange{
+        _manifest.newTableChange("users2", .none),
+    };
+    br_tc[0].from_table_id = src.table_id;
+    const br = try f.buildTables(alloc, ns, &br_tc, .branch_table);
+    defer alloc.free(br.table_ids);
+    try f.applyTableBranch(3, 30, br.change);
+    const dst: zdb.kv.TableKey = .{
+        .namespace = ns,
+        .table_id = br.table_ids[0],
+    };
+
+    const halves = f.tables.get(dst).?;
+    try std.testing.expectEqual(@as(usize, 2), halves.entries.items.len);
+    for (split_keys) |key| try expectTableRow(f, alloc, dst, key, "v");
+}
+
 test "forest: branch_table shares files and forks memtables as of its ts" {
     const alloc = std.testing.allocator;
     var tmp = try vfs.TmpDir.init(alloc);
