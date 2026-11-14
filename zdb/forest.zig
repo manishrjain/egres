@@ -993,9 +993,23 @@ pub const Forest = struct {
     pub fn applyFlush(
         self: *Forest,
         index: u64,
-        changes: []const _manifest.SSTableChange,
+        flushed: []const _manifest.SSTableChange,
         memtable_id: u64,
     ) !void {
+        // A table dropped after the flush was built takes none of it:
+        // the entry is committed behind the drop, and replay meets it
+        // there again. Its files are left to the orphan scan.
+        var live: std.ArrayList(_manifest.SSTableChange) = .empty;
+        defer live.deinit(self.allocator);
+        for (flushed) |c| {
+            if (!self.hasTable(.{
+                .namespace = c.namespace_id,
+                .table_id = treeTableId(c.tree_id),
+            })) continue;
+            try live.append(self.allocator, c);
+        }
+        const changes = live.items;
+
         // Load all new L0 tables concurrently via the cache. The announce
         // prefetch may have pre-opened these (follower path) → cache hit.
         // On the leader they will typically be misses. This is the step

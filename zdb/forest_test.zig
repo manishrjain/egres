@@ -573,6 +573,51 @@ test "forest: drop_ns removes every table and forgets the id counter" {
     );
 }
 
+test "forest: a flush applied after a drop takes nothing for what is gone" {
+    const alloc = std.testing.allocator;
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+
+    const f_live = try flags.Live(Config).create(alloc, .{});
+    defer f_live.destroy();
+    var store = try vfs.Store.initFile(alloc, tmp.path, vfs.g());
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
+    defer f.close();
+
+    // Two namespaces, a row of each in the memtable the flush is of.
+    const gone: u64 = 7;
+    const kept: u64 = 8;
+    const nc7 = try f.buildNsCreate(alloc, .{ .given = gone }, "seven");
+    defer alloc.free(nc7.change.tree_changes);
+    try f.applyTrees(1, nc7.change);
+    const nc8 = try f.buildNsCreate(alloc, .{ .given = kept }, "eight");
+    defer alloc.free(nc8.change.tree_changes);
+    try f.applyTrees(2, nc8.change);
+
+    try f.newMemtable(3);
+    try f.put(&.{
+        rowItem(gone, "a", 10, "a10"),
+        rowItem(kept, "b", 10, "b10"),
+    });
+    try f.newMemtable(4);
+    var flush = (try f.buildFlush()) orelse return error.TestExpectedFlush;
+    defer flush.changes.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), flush.changes.items.len);
+
+    // The drop is committed after the flush was built and before its
+    // entry: the entry names trees that are gone when it applies.
+    const dc = try f.buildNsDrop(alloc, gone);
+    defer alloc.free(dc.tree_changes);
+    try f.applyTrees(5, dc);
+    try f.applyFlush(6, flush.changes.items, flush.newest_memtable_id);
+
+    // The other namespace has its table, and the memtable is flushed.
+    try expectRow(f, alloc, kept, "b", "b10");
+    try std.testing.expect(!f.hasNamespace(gone));
+    try std.testing.expect((try f.buildFlush()) == null);
+}
+
 test "forest: drop_tree keeps an SST shared with another tree" {
     const alloc = std.testing.allocator;
     var tmp = try vfs.TmpDir.init(alloc);
