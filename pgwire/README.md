@@ -56,7 +56,7 @@ memory). `close` does a final flush for a trailing fatal error.
 
 | Event | Front-end action |
 |-------|------------------|
-| `startup_complete` | State machine has queued AuthOk + ParameterStatus + BackendKeyData + RFQ. |
+| `startup_complete` | State machine has queued AuthOk. Handler ends the startup: `acceptStartup` (ParameterStatus + BackendKeyData + RFQ) or `refuseStartup` (FATAL, closed). |
 | `query` | `h.onQuery(state, sql)`, then `state.endCommand()` (queues RFQ). |
 | `execute` | `h.onExecute(state, ExecuteCtx)`. RFQ is **not** emitted here — it arrives on the next `Sync`. An error sets `state.ext_failed`. |
 | `describe` | `h.onDescribe(state, DescribeCtx)`. ParameterDescription already emitted for `stmt` kind. |

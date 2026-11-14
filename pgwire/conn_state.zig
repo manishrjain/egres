@@ -123,9 +123,10 @@ pub const DescribeCtx = struct {
 };
 
 pub const Event = union(enum) {
-    /// Completed startup parameter parse. Slices borrow from
-    /// `frame`; copy them out before `releaseBuffers` or the next
-    /// `nextEvent` call.
+    /// The startup's params, with AuthenticationOk queued. The handler
+    /// ends the startup: `acceptStartup` or `refuseStartup`. Slices
+    /// borrow from `frame`; copy them out before `releaseBuffers` or
+    /// the next `nextEvent` call.
     startup_complete: _proto.StartupParams,
     /// A simple Query message arrived. `sql` borrows from `frame`
     /// until `releaseBuffers` or the next `nextEvent` call.
@@ -469,43 +470,67 @@ pub const ConnState = struct {
             const params = _proto.parseStartupParams(self.frame) catch
                 return error.BadProtocol;
 
-            // AuthenticationOk + a small bundle of ParameterStatus +
-            // BackendKeyData + ReadyForQuery. Everything goes into
-            // `out` in one batch so the driver can flush once.
+            // Postgres looks the database up after authentication, so
+            // the handler ends the startup once it has: `acceptStartup`
+            // or `refuseStartup`, queued behind this in one batch.
             try _proto.encodeAuthenticationOk(self.out);
-            // The set of ParameterStatus messages a real Postgres
-            // backend sends after AuthOk. Some clients refuse to
-            // proceed without specific entries — pgx's simple-query
-            // mode, for example, hard-requires
-            // `standard_conforming_strings=on`.
-            const announce = [_]struct { k: String, v: String }{
-                .{ .k = "server_version", .v = self.cfg.server_version },
-                .{ .k = "egres_version", .v = self.cfg.egres_version },
-                .{ .k = "server_encoding", .v = self.cfg.server_encoding },
-                .{ .k = "client_encoding", .v = self.cfg.client_encoding },
-                .{ .k = "DateStyle", .v = self.cfg.date_style },
-                .{ .k = "TimeZone", .v = self.cfg.timezone },
-                .{ .k = "IntervalStyle", .v = self.cfg.interval_style },
-                .{ .k = "integer_datetimes", .v = "on" },
-                .{ .k = "standard_conforming_strings", .v = "on" },
-                .{ .k = "is_superuser", .v = "off" },
-                .{ .k = "session_authorization", .v = self.cfg.session_authorization },
-                .{ .k = "application_name", .v = "" },
-            };
-            for (announce) |p| {
-                try _proto.encodeParameterStatus(&self.scratch_out, p.k, p.v);
-                try _proto.writeFrame(self.out, .parameter_status, self.scratch_out.writer.buffered());
-            }
-            try _proto.encodeBackendKeyData(
-                self.out,
-                self.cfg.backend_pid,
-                self.cfg.backend_secret,
-            );
-            try _proto.encodeReadyForQuery(self.out, self.tx_status);
-
-            self.phase = .ready;
             return .{ .startup_complete = params };
         }
+    }
+
+    /// Ends a startup the handler takes: ParameterStatus,
+    /// BackendKeyData and ReadyForQuery.
+    pub fn acceptStartup(self: *ConnState) StateError!void {
+        std.debug.assert(self.phase == .awaiting_startup);
+        // The set of ParameterStatus messages a real Postgres
+        // backend sends after AuthOk. Some clients refuse to
+        // proceed without specific entries — pgx's simple-query
+        // mode, for example, hard-requires
+        // `standard_conforming_strings=on`.
+        const announce = [_]struct { k: String, v: String }{
+            .{ .k = "server_version", .v = self.cfg.server_version },
+            .{ .k = "egres_version", .v = self.cfg.egres_version },
+            .{ .k = "server_encoding", .v = self.cfg.server_encoding },
+            .{ .k = "client_encoding", .v = self.cfg.client_encoding },
+            .{ .k = "DateStyle", .v = self.cfg.date_style },
+            .{ .k = "TimeZone", .v = self.cfg.timezone },
+            .{ .k = "IntervalStyle", .v = self.cfg.interval_style },
+            .{ .k = "integer_datetimes", .v = "on" },
+            .{ .k = "standard_conforming_strings", .v = "on" },
+            .{ .k = "is_superuser", .v = "off" },
+            .{
+                .k = "session_authorization",
+                .v = self.cfg.session_authorization,
+            },
+            .{ .k = "application_name", .v = "" },
+        };
+        for (announce) |p| {
+            try _proto.encodeParameterStatus(&self.scratch_out, p.k, p.v);
+            try _proto.writeFrame(
+                self.out,
+                .parameter_status,
+                self.scratch_out.writer.buffered(),
+            );
+        }
+        try _proto.encodeBackendKeyData(
+            self.out,
+            self.cfg.backend_pid,
+            self.cfg.backend_secret,
+        );
+        try _proto.encodeReadyForQuery(self.out, self.tx_status);
+        self.phase = .ready;
+    }
+
+    /// Ends a startup the handler refuses: a FATAL where ReadyForQuery
+    /// would have gone, and the session is over.
+    pub fn refuseStartup(
+        self: *ConnState,
+        code: [5]u8,
+        msg: String,
+    ) StateError!void {
+        std.debug.assert(self.phase == .awaiting_startup);
+        try self.emitFatal(msg, code);
+        self.phase = .closed;
     }
 
     fn consumeReady(self: *ConnState) StateError!Event {

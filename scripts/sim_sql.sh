@@ -7,14 +7,16 @@
 # kept under the directory named at the end.
 #
 # Usage: scripts/sim_sql.sh [first_seed] [count] [sched] [filter]
-#   filter      a test name filter; one that starts with "BIG:" runs
-#               the slow tests, such as the one with disk errors
+#   filter      a test name filter that matches one of the tests: two
+#               in one process would share the simulated network. One
+#               that starts with "BIG:" runs a slow test, such as the
+#               one with disk errors
 set -uo pipefail
 cd "$(dirname "$0")/.."
 first=${1:-1}
 count=${2:-20}
 sched=${3:-random}
-filter=${4:-sim: sql}
+filter=${4:-sim: sql keeps}
 logs=$(mktemp -d "${TMPDIR:-/tmp}/sim-sql.XXXXXX")
 # Unquoted where it is used: empty, or the one flag.
 big=

@@ -61,8 +61,8 @@ const StubHandler = struct {
         state: *pgwire.ConnState,
         params: pgwire.proto.StartupParams,
     ) !void {
-        _ = state;
         if (params.database) |d| try self.database.appendSlice(self.alloc, d);
+        try state.acceptStartup();
     }
 
     pub fn onQuery(

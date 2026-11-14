@@ -40,8 +40,8 @@ const String = _value.String;
 
 /// The default database, present from a node's very first boot — created
 /// by the WAL's genesis entry (see `engine.Engine.open`), never at runtime.
-/// Sessions that name no database land here (psql defaults dbname to the
-/// user name; that also misses and falls back per onStartup).
+/// Sessions that name no database land here. psql names one always,
+/// the user's name unless told another.
 pub const default_database = "egres";
 
 pub const Database = _database.Database;
@@ -419,11 +419,11 @@ pub const Handler = struct {
     /// so both count against the tenant's pool.
     alloc: std.mem.Allocator,
     /// The session's namespace, resolved once from the startup packet's
-    /// database (Postgres resolves at connect too). 0 = the name didn't
-    /// exist at connect; every query then fails with 3D000. Re-validated
-    /// per DDL — the database can be dropped mid-session, and a dead id
-    /// must not reach the manifest (nextTableId's getOrPut would resurrect
-    /// its counter entry).
+    /// database (Postgres resolves at connect too); a name that is no
+    /// database is refused there. Re-validated per statement: the
+    /// database can be dropped mid-session, every query then fails
+    /// with 3D000, and a dead id must not reach the manifest
+    /// (nextTableId's getOrPut would resurrect its counter entry).
     namespace: u64 = 0,
     /// The session's Database, resolved once: Server.database never
     /// frees one, so the pointer is good for the session and every
@@ -617,20 +617,36 @@ pub const Handler = struct {
         return true;
     }
 
-    pub fn onStartup(self: *Handler, state: *pgwire.ConnState, params: pgwire.proto.StartupParams) !void {
+    /// Resolves the session's database and ends the startup. A name
+    /// that is no database is refused as Postgres refuses it: FATAL
+    /// 3D000 after AuthenticationOk, and the connection closes.
+    pub fn onStartup(
+        self: *Handler,
+        state: *pgwire.ConnState,
+        params: pgwire.proto.StartupParams,
+    ) !void {
         const requested = params.database orelse "";
-        self.namespace = self.srv.engine.forest.manifest.lookupNamespace(
-            if (requested.len > 0) requested else default_database,
-        ) orelse 0;
-        // The database is the tenant: every statement on this fiber is
-        // charged to it from here. A name that resolved to nothing
-        // stays on the system's, and is refused per statement anyway.
-        if (self.namespace != 0) {
-            fiber.ctx().tenant = try fiber.meter.tenants.get(
-                self.namespace,
-                utils.coarseMs(),
+        const name = if (requested.len > 0) requested else default_database;
+        const manifest = &self.srv.engine.forest.manifest;
+        self.namespace = manifest.lookupNamespace(name) orelse {
+            const msg = try std.fmt.allocPrint(
+                self.alloc,
+                "database \"{s}\" does not exist",
+                .{name},
             );
-        }
+            defer self.alloc.free(msg);
+            return state.refuseStartup(
+                pgwire.sqlstate.invalid_catalog_name,
+                msg,
+            );
+        };
+        // The database is the tenant: every statement on this fiber is
+        // charged to it from here.
+        fiber.ctx().tenant = try fiber.meter.tenants.get(
+            self.namespace,
+            utils.coarseMs(),
+        );
+        try state.acceptStartup();
         // What the connection reads and keeps from here, frames,
         // prepared statements and their parsed forms, is the
         // tenant's memory.

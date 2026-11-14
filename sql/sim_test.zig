@@ -37,8 +37,9 @@
 //! is read back: all of it applied or none. The log must not give up,
 //! and once every resource works again no statement may fail.
 //!
-//! One sim seed is one workload and one schedule:
-//! `zig build test -- --sim-seed N --filter "sim: sql"`.
+//! One sim seed is one workload and one schedule. A process runs one
+//! of these tests: two would share the simulated network's one host.
+//! `zig build test -- --sim-seed N --filter "sim: sql keeps"`.
 
 const std = @import("std");
 const testing = std.testing;

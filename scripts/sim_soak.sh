@@ -10,7 +10,9 @@
 #            [limit_s]
 #   dir         where the binary, the results and the logs go
 #   filter      a test name filter; "" runs the whole suite per seed,
-#               and one that starts with "BIG:" runs the slow tests
+#               and one that starts with "BIG:" runs the slow tests.
+#               Of the tests of sql/sim_test.zig it may match one:
+#               two in one process would share the simulated network
 #   limit_s     real seconds one seed may take before it is ended and
 #               counted as failed; without it, by the filter
 #
@@ -29,7 +31,7 @@ dir=$(cd "$dir" && pwd)
 cd "$(dirname "$0")/.."
 hours=${2:-8}
 jobs=${3:-8}
-filter=${4-sim: sql}
+filter=${4-sim: sql keeps}
 first=${5:-1}
 max_fail=25
 scheds=(random priority_random priority_fifo)

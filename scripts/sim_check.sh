@@ -20,7 +20,7 @@ seed=${1:-42}
 if [ $# -ge 2 ]; then
     filters=("$2")
 else
-    filters=("Channel:" "diskwal" "driver:" "sim: sql")
+    filters=("Channel:" "diskwal" "driver:" "sim: sql keeps")
 fi
 
 trace() {

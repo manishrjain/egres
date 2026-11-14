@@ -346,6 +346,7 @@ test "ConnState: startup → AuthOk + ParamStatus + ReadyForQuery" {
 
     const ev = try s.nextEvent();
     try testing.expect(ev == .startup_complete);
+    try s.acceptStartup();
     try testing.expectEqual(conn_state.Phase.ready, s.phase);
 
     // Drain the prepared response stream and assert the tag sequence:
@@ -366,6 +367,32 @@ test "ConnState: startup → AuthOk + ParamStatus + ReadyForQuery" {
     try testing.expectEqual(@as(u8, 'Z'), tags.items[tags.items.len - 1]);
 }
 
+test "ConnState: a refused startup is AuthOk, a FATAL, and closed" {
+    const a = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+
+    const startup = hexToBytes(startup_golden_hex);
+    var rdr = std.Io.Reader.fixed(&startup);
+    var s = conn_state.ConnState.init(a, &rdr, &aw.writer, .{});
+    defer s.deinit();
+
+    try testing.expect(try s.nextEvent() == .startup_complete);
+    try s.refuseStartup("3D000".*, "database \"nope\" does not exist");
+    try testing.expectEqual(conn_state.Phase.closed, s.phase);
+    try testing.expect(try s.nextEvent() == .terminate);
+
+    const out = aw.writer.buffered();
+    const auth = try proto.decodeMessage(out);
+    try testing.expectEqual(@as(u8, 'R'), auth.msg.tag);
+    const fatal = try proto.decodeMessage(out[auth.consumed..]);
+    try testing.expectEqual(@as(u8, 'E'), fatal.msg.tag);
+    try testing.expectEqual(out.len, auth.consumed + fatal.consumed);
+    const body = fatal.msg.body;
+    try testing.expect(std.mem.indexOf(u8, body, "SFATAL\x00") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "C3D000\x00") != null);
+}
+
 test "ConnState: Query event surfaces SQL text" {
     const a = std.testing.allocator;
     var aw: std.Io.Writer.Allocating = .init(a);
@@ -384,6 +411,7 @@ test "ConnState: Query event surfaces SQL text" {
     defer s.deinit();
 
     _ = try s.nextEvent(); // drive past startup
+    try s.acceptStartup();
     resetOut(&aw);
 
     const ev = try s.nextEvent();
@@ -415,6 +443,7 @@ test "ConnState: a frame holds its own body only" {
     defer s.deinit();
 
     _ = try s.nextEvent(); // drive past startup
+    try s.acceptStartup();
     const big = try s.nextEvent();
     try testing.expectEqual(big_len, big.query.len);
     // Sized to the body, not a step past it, and gone once the
@@ -444,6 +473,7 @@ test "ConnState: Terminate transitions to closed" {
     defer s.deinit();
 
     _ = try s.nextEvent(); // drive past startup
+    try s.acceptStartup();
     resetOut(&aw);
 
     const ev = try s.nextEvent();
@@ -664,6 +694,7 @@ fn primedConnState(
     var s = conn_state.ConnState.init(a, rdr, &aw.writer, .{});
     errdefer s.deinit();
     _ = try s.nextEvent(); // drive past startup
+    try s.acceptStartup();
     resetOut(aw);
     return s;
 }

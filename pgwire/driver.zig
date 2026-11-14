@@ -33,9 +33,10 @@
 //!
 //! What each event owes (see `conn_state.Event`):
 //!
-//!  - `startup_complete`: the state machine already queued AuthOk +
-//!    ParameterStatus + ReadyForQuery. The params borrow the read
-//!    buffer — dupe anything kept.
+//!  - `startup_complete`: the state machine already queued AuthOk.
+//!    The handler ends the startup with `state.acceptStartup` or,
+//!    for a database it does not have, `state.refuseStartup`. The
+//!    params borrow the read buffer — dupe anything kept.
 //!  - `query`: the handler emits RowDescription (0..1) → DataRow
 //!    (0..N) → CommandComplete (or sendError), and the front-end
 //!    then calls `endCommand` for the trailing ReadyForQuery.

@@ -76,8 +76,8 @@ expect "re-CREATE after drop" "CREATE TABLE" psql "$E" -X -c "CREATE TABLE t (id
 # First 't' consumed 16 (table) + 17 (its _pkey index); re-CREATE gets 18.
 grep -q "created table 't' -> ns=16 table_id=18" "$LOG" && ok "dropped ids not reused (got 18)" || bad "table_id reuse"
 
-# --- unknown database fails per query ---------------------------------------
-expect "unknown dbname errors" "database does not exist" \
+# --- unknown database is refused at connect ----------------------------------
+expect "unknown dbname is refused" 'FATAL:  database "nope" does not exist' \
     psql "host=127.0.0.1 port=3210 dbname=nope sslmode=disable" -X -c "CREATE TABLE x (a int);"
 
 # --- restart: names + id counter survive WAL replay -------------------------
@@ -194,7 +194,8 @@ psql "$E" -X -qc "DROP TABLE snap_t;" >/dev/null
 expect "CREATE DATABASE app" "CREATE DATABASE" psql "$E" -X -c "CREATE DATABASE app;"
 expect "same table name in app" "CREATE TABLE" psql "$A" -X -c "CREATE TABLE t (x uint8);"
 expect "DROP DATABASE with tables" "DROP DATABASE" psql "$E" -X -c "DROP DATABASE app;"
-expect "dropped-db session fails" "database does not exist" psql "$A" -X -c "CREATE TABLE y (a int);"
+expect "dropped db refuses a session" 'database "app" does not exist' \
+    psql "$A" -X -c "CREATE TABLE y (a int);"
 
 # --- CREATE DATABASE ... TEMPLATE: a branch of the template ----------------
 # The branch holds every row of the source as of the statement, rows
