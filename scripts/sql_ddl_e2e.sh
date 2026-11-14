@@ -468,6 +468,78 @@ expect "char(1,2) is a syntax error" "syntax error" psql "$E" -X -c "CREATE TABL
 expect "length on text rejected" "not allowed for type" psql "$E" -X -c "CREATE TABLE cn3 (a text(4));"
 expect "DROP char(n) table" "DROP TABLE" psql "$E" -X -c "DROP TABLE cn;"
 
+# --- column rename updates only the selected catalog row -------------------
+psql "$E" -X -v ON_ERROR_STOP=1 -q <<'SQL'
+CREATE DATABASE app;
+CREATE TABLE rename_target (
+    account_no int,
+    code text,
+    display_name text
+);
+INSERT INTO rename_target VALUES (83, 'z09', 'Other database');
+SQL
+psql "$A" -X -v ON_ERROR_STOP=1 -q <<'SQL'
+CREATE TABLE rename_target (
+    account_no int PRIMARY KEY,
+    code varchar(3) NOT NULL UNIQUE,
+    display_name text
+);
+INSERT INTO rename_target VALUES (17, 'a01', 'Alice');
+CREATE TABLE rename_empty ();
+SQL
+
+expect "RENAME COLUMN missing table errors" "42P01" \
+    psql "$A" -X -v VERBOSITY=verbose -c \
+    "ALTER TABLE rename_missing RENAME COLUMN code TO label;"
+expect "RENAME COLUMN IF EXISTS skips missing table" "^ALTER TABLE$" \
+    psql "$A" -X -c \
+    "ALTER TABLE IF EXISTS rename_missing RENAME COLUMN code TO label;"
+expect "RENAME COLUMN on an index is rejected" "42809" \
+    psql "$A" -X -v VERBOSITY=verbose -c \
+    "ALTER TABLE rename_target_code_key RENAME COLUMN code TO label;"
+expect "IF EXISTS does not hide a missing column" "42703" \
+    psql "$A" -X -v VERBOSITY=verbose -c \
+    "ALTER TABLE IF EXISTS rename_target
+        RENAME COLUMN no_such_column TO label;"
+expect "RENAME COLUMN on a zero-column table errors" "42703" \
+    psql "$A" -X -v VERBOSITY=verbose -c \
+    "ALTER TABLE rename_empty RENAME COLUMN code TO label;"
+expect "RENAME COLUMN to its own name errors" "42701" \
+    psql "$A" -X -v VERBOSITY=verbose -c \
+    "ALTER TABLE rename_target RENAME COLUMN code TO code;"
+expect "RENAME COLUMN to another column's name errors" "42701" \
+    psql "$A" -X -v VERBOSITY=verbose -c \
+    "ALTER TABLE rename_target RENAME COLUMN code TO account_no;"
+expect "RENAME COLUMN to quoted EGID is reserved" \
+    '42701: column name "egid" is reserved' \
+    psql "$A" -X -v VERBOSITY=verbose -c \
+    'ALTER TABLE rename_target RENAME COLUMN code TO "EGID";'
+
+expect "RENAME COLUMN completes" "^ALTER TABLE$" \
+    psql "$A" -X -c \
+    "ALTER TABLE rename_target RENAME COLUMN code TO label;"
+expect "rename preserves existing values and other columns" \
+    "^17|a01|Alice$" \
+    psql "$A" -X -At -F '|' -c \
+    "SELECT account_no, label, display_name FROM rename_target;"
+expect "old column name no longer resolves" "42703" \
+    psql "$A" -X -v VERBOSITY=verbose -c \
+    "SELECT code FROM rename_target;"
+expect "renamed column retains its unique index" "23505" \
+    psql "$A" -X -v VERBOSITY=verbose -c \
+    "INSERT INTO rename_target VALUES (29, 'a01', 'Bob');"
+expect "renamed column retains its type modifier" "22001" \
+    psql "$A" -X -v VERBOSITY=verbose -c \
+    "INSERT INTO rename_target VALUES (29, 'b002', 'Bob');"
+expect "rename leaves the other database unchanged" \
+    "^83|z09|Other database$" \
+    psql "$E" -X -At -F '|' -c \
+    "SELECT account_no, code, display_name FROM rename_target;"
+expect "original index name remains usable" "^DROP INDEX$" \
+    psql "$A" -X -c "DROP INDEX rename_target_code_key;"
+psql "$E" -X -v ON_ERROR_STOP=1 -qc "DROP TABLE rename_target;"
+psql "$E" -X -v ON_ERROR_STOP=1 -qc "DROP DATABASE app;"
+
 # --- no unexpected server-side errors ---------------------------------------
 if grep -qE '^[^ ]+ ERROR ' "$LOG"; then bad "server log has errors"; else ok "server log clean"; fi
 

@@ -53,6 +53,13 @@ pub const DropTable = struct {
     missing_ok: bool = false, // IF EXISTS
 };
 
+pub const RenameColumn = struct {
+    table: String, // borrowed
+    old_name: String, // borrowed
+    new_name: String, // borrowed
+    missing_ok: bool = false,
+};
+
 /// CREATE TABLE `name` AS TABLE `source` [WITH [NO] DATA], or AS
 /// SELECT * FROM `source`: the new table is a branch of the source,
 /// every row and index as of the statement
@@ -398,6 +405,7 @@ pub const Stmt = union(enum) {
     create_table: CreateTable,
     create_table_as: CreateTableAs,
     drop_table: DropTable,
+    rename_column: RenameColumn,
     create_index: CreateIndex,
     drop_index: DropIndex,
     insert: Insert,
@@ -482,6 +490,8 @@ pub fn statement(alloc: std.mem.Allocator, sql: String) parser.ParseError!Stmt {
     if (parser.cast(c.DeallocateStmt, node)) |s| return .{
         .deallocate = if (s.isall) null else try dup(alloc, s.name),
     };
+    if (parser.cast(c.RenameStmt, node)) |s|
+        return parseRenameColumn(alloc, s);
     return .unsupported;
 }
 
@@ -509,6 +519,21 @@ fn parseCreateDatabase(
         cd.source = try dup(alloc, arg.sval);
     }
     return .{ .create_database = cd };
+}
+
+fn parseRenameColumn(
+    alloc: std.mem.Allocator,
+    s: *const c.RenameStmt,
+) parser.ParseError!Stmt {
+    if (s.renameType != c.OBJECT_COLUMN or
+        s.relationType != c.OBJECT_TABLE)
+        return .unsupported;
+    return .{ .rename_column = .{
+        .table = try relname(alloc, s.relation),
+        .old_name = try dup(alloc, s.subname),
+        .new_name = try dup(alloc, s.newname),
+        .missing_ok = s.missing_ok,
+    } };
 }
 
 fn dup(alloc: std.mem.Allocator, s: [*c]const u8) parser.ParseError!String {

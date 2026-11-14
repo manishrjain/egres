@@ -449,6 +449,107 @@ pub fn writeCatalogRows(
     try eng.proposeWrites(table_key.namespace, kvs, .apply);
 }
 
+pub fn renameColumn(
+    self: *Handler,
+    state: *pgwire.ConnState,
+    rc: _parse.RenameColumn,
+) !void {
+    const eng = self.srv.engine;
+    self.srv.ddl_mu.lock(@src());
+    defer self.srv.ddl_mu.unlock();
+    if (!try self.ddlReady(state)) return;
+
+    const ns = try self.sessionNamespace(state) orelse return;
+    const table_id = eng.forest.manifest.lookupTable(ns, rc.table) orelse {
+        if (rc.missing_ok) return state.sendCommandComplete("ALTER TABLE");
+        return replyErrorCode(
+            state,
+            pgwire.sqlstate.undefined_table,
+            "table does not exist",
+        );
+    };
+
+    var arena = std.heap.ArenaAllocator.init(eng.allocator);
+    defer arena.deinit();
+    const scan = _table.scanIndexKeys(arena.allocator(), eng.forest, .{
+        .namespace = ns,
+        .table_id = table_id,
+    }) catch |err| {
+        log.err("rename column on '{s}': index scan: {s}", .{
+            rc.table, @errorName(err),
+        });
+        return replyError(state, "rename column failed");
+    };
+    if (scan.is_index)
+        return replyErrorCode(
+            state,
+            pgwire.sqlstate.wrong_object_type,
+            "cannot rename a column of an index",
+        );
+
+    const db = self.srv.database(ns) catch
+        return replyError(state, "internal error: database state");
+    const table_lock = db.tableLock(table_id) catch
+        return replyError(state, "internal error: lock state");
+    table_lock.lock(@src());
+    defer table_lock.unlock();
+
+    const columns = _table.loadColumnRows(
+        arena.allocator(),
+        eng.forest,
+        &self.srv.catalog_ps,
+        .{ .namespace = ns, .table_id = table_id },
+    ) catch |err| switch (err) {
+        // A table declared with no columns has no column-catalog rows.
+        error.UndefinedTable => &.{},
+        else => {
+            log.err("rename column on '{s}': catalog rows: {s}", .{
+                rc.table, @errorName(err),
+            });
+            return replyError(state, "failed to load table schema");
+        },
+    };
+    const version = _catalog.deriveCurrentVersion(columns);
+    for (columns) |col| {
+        if (!col.liveAt(version)) continue;
+        if (!std.mem.eql(u8, col.name, rc.old_name)) continue;
+        if (std.ascii.eqlIgnoreCase(rc.new_name, "egid"))
+            return replyErrorCode(
+                state,
+                pgwire.sqlstate.duplicate_column,
+                "column name \"egid\" is reserved",
+            );
+        for (columns) |existing| {
+            if (!existing.liveAt(version)) continue;
+            if (std.mem.eql(u8, existing.name, rc.new_name))
+                return replyErrorCode(
+                    state,
+                    pgwire.sqlstate.duplicate_column,
+                    "column already exists",
+                );
+        }
+        var renamed = col;
+        renamed.name = rc.new_name;
+        writeCatalogRows(self, arena.allocator(), .{
+            .namespace = ns,
+            .table_id = table_id,
+        }, &.{renamed}, &.{}) catch |err| {
+            log.err("rename column on '{s}': catalog write: {s}", .{
+                rc.table, @errorName(err),
+            });
+            return replyError(state, "failed to rename column");
+        };
+
+        db.forgetTable(table_id);
+        return state.sendCommandComplete("ALTER TABLE");
+    }
+    return replyErrorCode(
+        state,
+        pgwire.sqlstate.undefined_column,
+        "column does not exist",
+    );
+}
+
 pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: _parse.DropTable) !void {
     const eng = self.srv.engine;
     self.srv.ddl_mu.lock(@src());

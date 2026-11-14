@@ -67,6 +67,52 @@ test "sql.parse: CREATE TABLE AS TABLE / SELECT * FROM parse to a branch" {
     try testing.expect(named == .invalid);
 }
 
+test "sql.parse: ALTER TABLE RENAME COLUMN is recognized" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const stmt = try parse.statement(
+        alloc,
+        "ALTER TABLE accounts RENAME COLUMN email TO contact_email;",
+    );
+    try testing.expect(stmt == .rename_column);
+
+    const rename = stmt.rename_column;
+    try testing.expectEqualStrings("accounts", rename.table);
+    try testing.expectEqualStrings("email", rename.old_name);
+    try testing.expectEqualStrings("contact_email", rename.new_name);
+    try testing.expect(!rename.missing_ok);
+
+    const optional = try parse.statement(alloc,
+        \\ALTER TABLE IF EXISTS "Accounts" RENAME "Email" TO "Contact_Email";
+    );
+    try testing.expect(optional == .rename_column);
+    try testing.expect(optional.rename_column.missing_ok);
+    try testing.expectEqualStrings("Accounts", optional.rename_column.table);
+    try testing.expectEqualStrings("Email", optional.rename_column.old_name);
+    try testing.expectEqualStrings(
+        "Contact_Email",
+        optional.rename_column.new_name,
+    );
+}
+
+test "sql.parse: other rename kinds stay unsupported" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const statements = [_]String{
+        "ALTER TABLE accounts RENAME TO customers;",
+        "ALTER VIEW account_view RENAME COLUMN email TO contact_email;",
+    };
+    for (statements) |statement| {
+        const stmt = try parse.statement(alloc, statement);
+        try testing.expect(stmt == .unsupported);
+    }
+}
+
 test "sql.parse: everything else is unsupported; bad SQL is a syntax error" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);

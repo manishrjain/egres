@@ -213,6 +213,58 @@ if { q "SELECT name FROM t;" 2>&1 || true; } | grep -q "does not exist"; then
     ok "table is gone after the queued drop"
 else bad "table still queryable after drop"; fi
 
+# --- column rename waits for an open reader transaction --------------------
+q "CREATE TABLE rename_lock_t (email text);" >/dev/null
+q "INSERT INTO rename_lock_t VALUES ('holder@x');" >/dev/null
+rename_txn_out=$(psql "$E" -X -v VERBOSITY=verbose 2>&1 <<'SQL'
+BEGIN;
+ALTER TABLE rename_lock_t RENAME COLUMN email TO contact_email;
+ROLLBACK;
+SQL
+)
+if grep -q "25001" <<<"$rename_txn_out"; then
+    ok "RENAME COLUMN in txn block rejected with 25001"
+else
+    bad "RENAME COLUMN in txn block was not rejected"
+fi
+
+send 1 "BEGIN;"
+send 1 "SELECT email FROM rename_lock_t;"
+sync_session 1
+if ! grep -qx "holder@x" "$D/out1"; then
+    bad "rename lock holder did not read its table"
+    exit 1
+fi
+sync_session 2
+send 2 "ALTER TABLE rename_lock_t RENAME COLUMN email TO contact_email;"
+send 2 "\\echo RENAME_DONE"
+# The completion marker follows the query even when it returns an error.
+# Observe a bounded response window after the reader holds the table.
+for _ in $(seq 1 10); do
+    if grep -qx "RENAME_DONE" "$D/out2"; then break; fi
+    sleep 0.1
+done
+rename_waited=1
+if grep -qx "RENAME_DONE" "$D/out2"; then
+    rename_waited=0
+fi
+send 1 "COMMIT;"
+sync_session 1
+sync_session 2
+if [ "$rename_waited" -eq 1 ] && grep -qx "ALTER TABLE" "$D/out2"; then
+    ok "RENAME COLUMN waits for the reader txn, then succeeds after commit"
+else
+    bad "RENAME COLUMN did not wait and succeed after commit"
+fi
+send 1 "SELECT contact_email FROM rename_lock_t;"
+sync_session 1
+if [ "$(grep -cx 'holder@x' "$D/out1")" -eq 2 ]; then
+    ok "existing reader session sees renamed column after commit"
+else
+    bad "existing reader session did not see renamed column"
+fi
+q "DROP TABLE rename_lock_t;" >/dev/null
+
 q "CREATE TABLE t2 (id int4, name text);" >/dev/null
 q "INSERT INTO t2 VALUES (1, 'base');" >/dev/null # egid 1
 
