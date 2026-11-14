@@ -718,6 +718,20 @@ expect "a column without FROM is undefined" "column does not exist" q \
     "SELECT a;"
 expect "an unknown function without FROM" "now() is not supported" q \
     "SELECT now();"
+# What SQLAlchemy runs first on connect: it reads the release from
+# version() and needs the schema.
+expect "version() as a driver reads it" "PostgreSQL 16.0 (Egres" v \
+    "SELECT pg_catalog.version();"
+expect "current_schema()" "public" v "SELECT current_schema();"
+expect "md5" "900150983cd24fb0d6963f7d28e17f72" v "SELECT md5('abc');"
+expect "split_part and lpad" "00b" v \
+    "SELECT lpad(split_part('a,b,c', ',', 2), 3, '0');"
+expect "strpos, reverse and repeat" "3|cbacba" v \
+    "SELECT strpos(reverse('cba'), 'c'), repeat(reverse('abc'), 2);"
+expect "split_part at 0 refused" "field position must not be zero" q \
+    "SELECT split_part('a', ',', 0);"
+expect "repeat past the limit refused" "requested length too large" q \
+    "SELECT repeat('x', 2000000000);"
 expect "SELECT * without FROM" "no tables specified" q "SELECT *;"
 # Number input and float output as Postgres's (#29, #30).
 expect "floats print as Postgres prints them" \

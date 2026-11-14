@@ -1308,6 +1308,8 @@ fn replyEmitErr(state: *pgwire.ConnState, err: anyerror) !void {
         error.DivisionByZero,
         error.SubstringLength,
         error.PowerArgument,
+        error.FieldPosition,
+        error.LengthTooLarge,
         error.InvalidUtf8,
         error.InvalidValue,
         => replyExprErr(state, @errorCast(err)),
@@ -1600,6 +1602,16 @@ fn replyExprErr(state: *pgwire.ConnState, err: _expr.EvalError) !void {
             state,
             pgwire.sqlstate.invalid_argument_for_power_function,
             "invalid argument for power function",
+        ),
+        error.FieldPosition => replyErrorCode(
+            state,
+            pgwire.sqlstate.invalid_parameter_value,
+            "field position must not be zero",
+        ),
+        error.LengthTooLarge => replyErrorCode(
+            state,
+            pgwire.sqlstate.program_limit_exceeded,
+            "requested length too large",
         ),
     };
 }
@@ -1894,6 +1906,8 @@ fn replyRunErr(
         error.DivisionByZero,
         error.SubstringLength,
         error.PowerArgument,
+        error.FieldPosition,
+        error.LengthTooLarge,
         error.InvalidUtf8,
         error.InvalidValue,
         => replyExprErr(state, @errorCast(err)),

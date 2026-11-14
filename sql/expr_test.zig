@@ -622,6 +622,101 @@ test "sql.expr: the function table's string, number and NULL forms" {
     try testing.expectError(error.TypeMismatch, fx.bind("a = lower(b)"));
 }
 
+test "sql.expr: md5, strpos, reverse, repeat, pads and split_part" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const arloc = arena.allocator();
+    var fx = try Fixture.init(arloc);
+    defer fx.tbl.deinit();
+    // a = 5, b = "ab", c = 2.5. Every expected value is Postgres 18's.
+    const row = try sampleRow(&fx);
+    const text = struct {
+        fn of(f: *const Fixture, r: Item, want: String, set: String) !void {
+            try testing.expectEqualStrings(want, (try f.eval(set, r)).text);
+        }
+    }.of;
+
+    try text(&fx, row, "d41d8cd98f00b204e9800998ecf8427e", "b = md5('')");
+    try text(&fx, row, "187ef4436122d1cc2f40dc2b92f0eba0", "b = md5(b)");
+    try expectEval(&fx, row, .{ .int4 = 3 }, "a = strpos('héllo', 'l')");
+    try expectEval(&fx, row, .{ .int4 = 1 }, "a = strpos('abc', '')");
+    try expectEval(&fx, row, .{ .int4 = 0 }, "a = strpos('abc', 'z')");
+    try expectEval(&fx, row, .{ .int4 = 3 }, "a = position('c' in 'abc')");
+    try text(&fx, row, "olléh", "b = reverse('héllo')");
+    try text(&fx, row, "ababab", "b = repeat(b, 3)");
+    try text(&fx, row, "", "b = repeat('x', -1)");
+    try text(&fx, row, "   hi", "b = lpad('hi', 5)");
+    try text(&fx, row, "xyxhi", "b = lpad('hi', 5, 'xy')");
+    try text(&fx, row, "hixyx", "b = rpad('hi', 5, 'xy')");
+    try text(&fx, row, "he", "b = lpad('hello', 2)");
+    try text(&fx, row, "he", "b = rpad('hello', 2)");
+    try text(&fx, row, "hi", "b = lpad('hi', 5, '')");
+    try text(&fx, row, "", "b = rpad('hi', -1)");
+    try text(&fx, row, "üüé", "b = lpad('é', 3, 'ü')");
+    try text(&fx, row, "b", "b = split_part('a,b,c', ',', 2)");
+    try text(&fx, row, "c", "b = split_part('a,b,c', ',', -1)");
+    try text(&fx, row, "", "b = split_part('a,b,c', ',', 4)");
+    try text(&fx, row, "", "b = split_part('a,b,c', ',', -4)");
+    try text(&fx, row, "", "b = split_part('a,,b', ',', 2)");
+    try text(&fx, row, "c", "b = split_part('a--b--c', '--', 3)");
+    try text(&fx, row, "a,b", "b = split_part('a,b', '', -1)");
+    try text(&fx, row, "", "b = split_part('a,b', '', 2)");
+    // A self-overlapping delim splits as it does scanning forward.
+    try text(&fx, row, "a", "b = split_part('aaa', 'aa', -1)");
+    try text(&fx, row, "", "b = split_part('aaa', 'aa', -2)");
+    try text(&fx, row, "a", "b = split_part('aaa', 'aa', 2)");
+    try text(&fx, row, "", "b = split_part('aaaa', 'aa', -1)");
+    try text(&fx, row, "a", "b = split_part('a,b,c', ',', -3)");
+    // An empty fill pads nothing, at any length.
+    try text(&fx, row, "hi", "b = lpad('hi', 2000000000, '')");
+    try text(&fx, row, "hi", "b = rpad('hi', 2000000000, '')");
+    // The fill repeats, cut at a character.
+    try text(&fx, row, "abcabcabcx", "b = lpad('x', 10, 'abc')");
+    try text(&fx, row, "xabcabcabc", "b = rpad('x', 10, 'abc')");
+    try text(&fx, row, "éüéx", "b = lpad('x', 4, 'éü')");
+    try text(&fx, row, "ééé", "b = repeat('é', 3)");
+    try text(&fx, row, "abcabcabcabc", "b = repeat('abc', 4)");
+    try text(&fx, row, "public", "b = current_schema()");
+    const ver = (try fx.eval("b = version()", row)).text;
+    try testing.expect(std.mem.startsWith(u8, ver, "PostgreSQL 16.0 (Egres "));
+
+    try expectEvalErr(
+        &fx,
+        row,
+        error.FieldPosition,
+        "b = split_part(b, ',', 0)",
+    );
+    try expectEvalErr(
+        &fx,
+        row,
+        error.LengthTooLarge,
+        "b = repeat('x', 2000000000)",
+    );
+    try expectEvalErr(
+        &fx,
+        row,
+        error.LengthTooLarge,
+        "b = lpad('x', 2000000000)",
+    );
+    // Postgres's edges: 4 bytes a character for LPAD and RPAD, the
+    // bytes themselves for REPEAT.
+    try expectEvalErr(
+        &fx,
+        row,
+        error.LengthTooLarge,
+        "b = rpad('x', 268435455, 'y')",
+    );
+    try expectEvalErr(
+        &fx,
+        row,
+        error.LengthTooLarge,
+        "b = repeat('ab', 536870910)",
+    );
+    try testing.expectError(error.NoSuchOperator, fx.bind("b = md5(a)"));
+    try testing.expectError(error.NoSuchOperator, fx.bind("b = repeat(b, b)"));
+}
+
 test "sql.expr: NaN equals itself and orders above every number" {
     const nan = Value{ .float8 = std.math.nan(f64) };
     const nan4 = Value{ .float4 = std.math.nan(f32) };

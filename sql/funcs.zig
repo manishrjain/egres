@@ -8,6 +8,8 @@
 
 const std = @import("std");
 
+const pgwire = @import("pgwire");
+
 const _expr = @import("expr.zig");
 const _value = @import("value.zig");
 const String = _value.String;
@@ -533,6 +535,228 @@ fn charOffset(text: String, n: usize) EvalError!usize {
     return @min(off, text.len);
 }
 
+/// MD5(s): the digest of the string's bytes, as 32 lowercase hex
+/// digits.
+pub const md5: Func = .{
+    .name = "md5",
+    .min_args = 1,
+    .max_args = 1,
+    .args = .{ .each = text_arg },
+    .result = .{ .fixed = .text },
+    .eval = .{ .strict = evalMd5 },
+};
+
+fn evalMd5(arloc: std.mem.Allocator, args: []const Scalar) EvalError!?Scalar {
+    const Md5 = std.crypto.hash.Md5;
+    var digest: [Md5.digest_length]u8 = undefined;
+    Md5.hash(args[0].text, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return .{ .text = try arloc.dupe(u8, &hex) };
+}
+
+/// STRPOS(s, sub): the character `sub` first starts at, from 1; 0 when
+/// it does not occur, 1 for an empty `sub`. The grammar turns
+/// `POSITION(sub IN s)` into position(s, sub), the same order.
+pub const strpos: Func = .{
+    .name = "strpos",
+    .min_args = 2,
+    .max_args = 2,
+    .args = .{ .each = text_arg },
+    .result = .{ .fixed = .int4 },
+    .eval = .{ .strict = evalStrpos },
+};
+pub const position = alias("position", strpos);
+
+fn evalStrpos(_: std.mem.Allocator, args: []const Scalar) EvalError!?Scalar {
+    const text = args[0].text;
+    const at = std.mem.indexOf(u8, text, args[1].text) orelse
+        return .{ .int = 0 };
+    return .{ .int = @intCast(try charCount(text[0..at]) + 1) };
+}
+
+/// REVERSE(s), character by character, so a multibyte one stays whole.
+pub const reverse: Func = .{
+    .name = "reverse",
+    .min_args = 1,
+    .max_args = 1,
+    .args = .{ .each = text_arg },
+    .result = .{ .fixed = .text },
+    .eval = .{ .strict = evalReverse },
+};
+
+fn evalReverse(
+    arloc: std.mem.Allocator,
+    args: []const Scalar,
+) EvalError!?Scalar {
+    const text = args[0].text;
+    const out = try arloc.alloc(u8, text.len);
+    var off: usize = 0;
+    while (off < text.len) {
+        const n = std.unicode.utf8ByteSequenceLength(text[off]) catch
+            return error.InvalidUtf8;
+        if (off + n > text.len) return error.InvalidUtf8;
+        const end = text.len - off;
+        @memcpy(out[end - n .. end], text[off .. off + n]);
+        off += n;
+    }
+    return .{ .text = out };
+}
+
+/// The largest value Postgres builds: MaxAllocSize less the 4-byte
+/// varlena header. REPEAT refuses a longer result, and LPAD and RPAD
+/// one whose 4-byte-per-character worst case is longer, before
+/// allocating anything.
+const max_value_bytes: usize = (1 << 30) - 1 - 4;
+
+/// `dst` filled with `pattern` again and again, cut where `dst` ends:
+/// a memset for one byte, else one copy and then each pass copies
+/// everything written so far, so n copies take log n memcpys.
+fn fillRepeating(dst: []u8, pattern: String) void {
+    std.debug.assert(pattern.len > 0);
+    if (pattern.len == 1) return @memset(dst, pattern[0]);
+    var done = @min(pattern.len, dst.len);
+    @memcpy(dst[0..done], pattern[0..done]);
+    while (done < dst.len) {
+        const n = @min(done, dst.len - done);
+        @memcpy(dst[done..][0..n], dst[0..n]);
+        done += n;
+    }
+}
+
+/// REPEAT(s, n): s n times; empty for n below 1.
+pub const repeat: Func = .{
+    .name = "repeat",
+    .min_args = 2,
+    .max_args = 2,
+    .args = .{ .each = text_count },
+    .result = .{ .fixed = .text },
+    .eval = .{ .strict = evalRepeat },
+};
+
+fn evalRepeat(
+    arloc: std.mem.Allocator,
+    args: []const Scalar,
+) EvalError!?Scalar {
+    const text = args[0].text;
+    const n = try intArg(args[1]);
+    // An empty s is empty at any n, which also keeps a huge n from
+    // looping.
+    if (n <= 0 or text.len == 0) return .{ .text = "" };
+    if (n > max_value_bytes) return error.LengthTooLarge;
+    const total = std.math.mul(usize, text.len, @intCast(n)) catch
+        return error.LengthTooLarge;
+    if (total > max_value_bytes) return error.LengthTooLarge;
+    const out = try arloc.alloc(u8, total);
+    fillRepeating(out, text);
+    return .{ .text = out };
+}
+
+/// LPAD and RPAD(s, n [, fill]): s padded to n characters with `fill`
+/// (a space without it), repeated and cut to fit, on that side. An s
+/// already n long or longer is cut to its first n characters; an empty
+/// `fill` leaves a shorter s as it is; n below 1 is empty.
+pub const lpad: Func = .{
+    .name = "lpad",
+    .min_args = 2,
+    .max_args = 3,
+    .args = .{ .each = &[_]Func.Kind{ .string, .number, .string } },
+    .result = .{ .fixed = .text },
+    .eval = .{ .strict = padder(.left) },
+};
+pub const rpad: Func = .{
+    .name = "rpad",
+    .min_args = 2,
+    .max_args = 3,
+    .args = .{ .each = &[_]Func.Kind{ .string, .number, .string } },
+    .result = .{ .fixed = .text },
+    .eval = .{ .strict = padder(.right) },
+};
+
+/// The strict eval for LPAD or RPAD: the padding goes on that side.
+fn padder(comptime side: Side) StrictEval {
+    return struct {
+        fn eval(
+            arloc: std.mem.Allocator,
+            args: []const Scalar,
+        ) EvalError!?Scalar {
+            return try pad(arloc, args, side);
+        }
+    }.eval;
+}
+
+fn pad(
+    arloc: std.mem.Allocator,
+    args: []const Scalar,
+    side: Side,
+) EvalError!Scalar {
+    const text = args[0].text;
+    const n = try intArg(args[1]);
+    if (n <= 0) return .{ .text = "" };
+    const fill = if (args.len > 2) args[2].text else " ";
+    const len = try charCount(text);
+    // An empty fill pads nothing, so the result is at most s; Postgres
+    // decides that before it checks the size, so a huge n is fine.
+    if (fill.len == 0) {
+        if (n >= len) return .{ .text = text };
+        return .{ .text = try charSlice(text, 0, @intCast(n)) };
+    }
+    if (n > max_value_bytes / 4) return error.LengthTooLarge;
+    const want: usize = @intCast(n);
+    if (len >= want) return .{ .text = try charSlice(text, 0, want) };
+    // The padding is the fill repeated and cut at a character
+    // boundary: whole copies and then its first `missing % fill_chars`
+    // characters.
+    const missing = want - len;
+    const fill_chars = try charCount(fill);
+    const rest = try charSlice(fill, 0, missing % fill_chars);
+    const pad_bytes = missing / fill_chars * fill.len + rest.len;
+    const out = try arloc.alloc(u8, text.len + pad_bytes);
+    const padding = if (side == .left)
+        out[0..pad_bytes]
+    else
+        out[text.len..];
+    fillRepeating(padding, fill);
+    @memcpy(if (side == .left) out[pad_bytes..] else out[0..text.len], text);
+    return .{ .text = out };
+}
+
+/// SPLIT_PART(s, delim, n): the n-th field of s split on `delim`, from
+/// 1; a negative n counts from the end of the same fields; past the
+/// last field is empty.
+/// An empty `delim` makes s one field. n of 0 is an error, as in
+/// Postgres 14 and on.
+pub const split_part: Func = .{
+    .name = "split_part",
+    .min_args = 3,
+    .max_args = 3,
+    .args = .{ .each = &[_]Func.Kind{ .string, .string, .number } },
+    .result = .{ .fixed = .text },
+    .eval = .{ .strict = evalSplitPart },
+};
+
+fn evalSplitPart(
+    _: std.mem.Allocator,
+    args: []const Scalar,
+) EvalError!?Scalar {
+    const text = args[0].text;
+    const delim = args[1].text;
+    const n = try intArg(args[2]);
+    if (n == 0) return error.FieldPosition;
+    if (text.len == 0) return .{ .text = "" };
+    if (delim.len == 0) {
+        return .{ .text = if (n == 1 or n == -1) text else "" };
+    }
+    // Fields are found scanning forward, as Postgres does, so a
+    // self-overlapping delim ('aa' in 'aaa') splits the same way for a
+    // negative n: count the fields, then take that one from the front.
+    const count: i128 = @intCast(std.mem.count(u8, text, delim) + 1);
+    const nth = if (n > 0) n else count + n + 1;
+    if (nth < 1 or nth > count) return .{ .text = "" };
+    var fields = std.mem.splitSequence(u8, text, delim);
+    for (1..@intCast(nth)) |_| _ = fields.next();
+    return .{ .text = fields.next().? };
+}
+
 // ---- numbers --------------------------------------------------------
 
 /// ABS and SIGN keep their argument's kind: an integer stays an
@@ -772,6 +996,44 @@ fn negated(n: i128, neg: bool) EvalError!i128 {
     return -n;
 }
 
+// ---- session information --------------------------------------------
+
+/// VERSION(): "PostgreSQL" and the release psql shows. Drivers read the
+/// version from it the way SQLAlchemy does, matching `PostgreSQL
+/// (\d+)\.(\d+)`, so it leads with that and keeps Egres's tag after.
+pub const version: Func = .{
+    .name = "version",
+    .min_args = 0,
+    .max_args = 0,
+    .args = .scalar,
+    .result = .{ .fixed = .text },
+    .eval = .{ .strict = evalVersion },
+};
+
+const version_text = "PostgreSQL " ++ (pgwire.Config{}).server_version;
+
+fn evalVersion(_: std.mem.Allocator, _: []const Scalar) EvalError!?Scalar {
+    return .{ .text = version_text };
+}
+
+/// CURRENT_SCHEMA(): every table is in `public`, the schema
+/// search_path resolves to.
+pub const current_schema: Func = .{
+    .name = "current_schema",
+    .min_args = 0,
+    .max_args = 0,
+    .args = .scalar,
+    .result = .{ .fixed = .text },
+    .eval = .{ .strict = evalCurrentSchema },
+};
+
+fn evalCurrentSchema(
+    _: std.mem.Allocator,
+    _: []const Scalar,
+) EvalError!?Scalar {
+    return .{ .text = "public" };
+}
+
 // ---- lookup ---------------------------------------------------------
 
 const table = [_]*const Func{
@@ -782,7 +1044,9 @@ const table = [_]*const Func{
     &rtrim,    &left,        &right,            &abs,
     &floor,    &ceil,        &ceiling,          &sign,
     &round,    &trunc,       &mod,              &power,
-    &pow,      &sqrt,
+    &pow,      &sqrt,        &md5,              &strpos,
+    &position, &reverse,     &repeat,           &lpad,
+    &rpad,     &split_part,  &version,          &current_schema,
 };
 
 const by_name = std.StaticStringMap(*const Func).initComptime(blk: {
