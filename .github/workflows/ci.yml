@@ -51,9 +51,10 @@ jobs:
         run: ./scripts/prepush.sh
 
   # The SQL harness under the simulation (scripts/sim_sql.sh): a whole
-  # node on a simulated disk and network, pgwire clients, power cuts
-  # and, in the second step, disk errors. Its tests skip without a
-  # seed, so the test job above does not run them. The seeds are
+  # node on a simulated disk and network, pgwire clients and power
+  # cuts. The second step adds disk errors; the third branches a
+  # database under load and drops the one it came from. Its tests skip
+  # without a seed, so the test job above does not run them. The seeds are
   # fixed: a failure is a regression, and it replays on any machine
   # with the command the script prints. Linux only: the simulation
   # stands in for the disk, the network and the clock. Fresh seeds
@@ -81,7 +82,7 @@ jobs:
           TMPDIR: ${{ runner.temp }}/sim-logs
         run: |
           mkdir -p "$TMPDIR"
-          scripts/sim_sql.sh 1 10
+          scripts/sim_sql.sh 1 10 random "sim: sql keeps"
 
       - name: Crashes and disk errors, seeds 1 to 10
         env:
@@ -89,6 +90,13 @@ jobs:
         run: |
           mkdir -p "$TMPDIR"
           scripts/sim_sql.sh 1 10 random "BIG: sim: sql rides"
+
+      - name: Branches, seeds 1 to 10
+        env:
+          TMPDIR: ${{ runner.temp }}/sim-logs
+        run: |
+          mkdir -p "$TMPDIR"
+          scripts/sim_sql.sh 1 10 random "sim: sql branches"
 
       - uses: actions/upload-artifact@v4
         if: failure()

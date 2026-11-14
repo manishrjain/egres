@@ -83,9 +83,22 @@ const Shape = struct {
     stretch_more_ms: u64 = 2500,
     /// The most bytes a row's body is the hex of.
     body_max: usize = 450,
+    /// The same for an account's memo.
+    memo_max: usize = 200,
     /// The resources have faults while the writers run, drawn from
     /// the seed (`Resources.drawDirs`).
     faults: bool = false,
+    /// The database the clients work in.
+    db: String = sql.default_database,
+    /// After each of these crash counts a branch is made of the newest
+    /// database while its clients run. It has clients of its own from
+    /// then on.
+    branch_after: []const u32 = &.{},
+    /// After this many crashes the first database is dropped while
+    /// its clients run. They end there.
+    drop_first_after: ?u32 = null,
+    /// Every database left at the end must have compacted.
+    compacts: bool = false,
 };
 
 /// Every kind of error, each off one time in two: a seed runs some of
@@ -104,10 +117,30 @@ fn drawRate() u16 {
     return rates[fiber.random().uintLessThan(usize, rates.len)];
 }
 
-/// `Shape.body_max` of the run, for `bodyOf`.
+/// `Shape.body_max` and `Shape.memo_max` of the run, for `bodyOf`
+/// and `memoOf`.
 var body_max: usize = 450;
+var memo_max: usize = 200;
 /// Writer `w` has the ids and the seqs in [w * span, (w + 1) * span).
 const span = 1_000_000;
+/// A site's writers take their seqs from its own slice of that range,
+/// so a version written in one database never reads as another's.
+const seqs_per_site = span / 8;
+/// The databases a run branches, in the order it makes them.
+const branch_names = [_]String{ "b1", "b2", "b3" };
+/// What the server answers for a database that is not there.
+const gone_code = "3D000";
+/// The database whose DROP was sent. From then on its clients may be
+/// told it is gone.
+var dropping: ?String = null;
+
+/// Whether `err` is what a client of `db` gets for its database being
+/// dropped, which it may only once the DROP was sent.
+fn left(db: String, err: anyerror) bool {
+    const gone = dropping orelse return false;
+    if (!std.mem.eql(u8, gone, db)) return false;
+    return err == error.DatabaseGone or err == error.StartupRefused;
+}
 
 /// Ports on the simulated network, which has one host.
 const sql_addr = "127.0.0.1:5432";
@@ -484,7 +517,7 @@ const Instance = struct {
             if (waited_ms > 30_000) return error.NoLeader;
             fiber.sleepMs(10);
         }
-        var first = try connect(alloc);
+        var first = try connect(alloc, sql.default_database);
         first.close();
         return self;
     }
@@ -518,15 +551,11 @@ const Instance = struct {
 /// applied what its WAL held at boot, and refuses until then, so the
 /// first connection of a boot is retried, within a bound: a boot that
 /// never gets there is a failed run, not a hang.
-fn connect(alloc: std.mem.Allocator) !pgwire.Client {
+fn connect(alloc: std.mem.Allocator, db: String) !pgwire.Client {
     const addr = try fiber.net.IpAddress.parseIpAndPort(sql_addr);
     var waited_ms: u32 = 0;
     while (waited_ms <= 60_000) : (waited_ms += 10) {
-        return pgwire.Client.connect(
-            alloc,
-            addr,
-            sql.default_database,
-        ) catch |err| {
+        return pgwire.Client.connect(alloc, addr, db) catch |err| {
             if (err != error.ConnectionRefused) return err;
             fiber.sleepMs(10);
             continue;
@@ -543,7 +572,9 @@ fn ask(
     text: String,
 ) !pgwire.client.Reply {
     const reply = try client.query(arloc, text);
-    return refusal(reply.err orelse return reply, text);
+    const refused = reply.err orelse return reply;
+    if (std.mem.eql(u8, &refused.code, gone_code)) return error.DatabaseGone;
+    return refusal(refused, text);
 }
 
 fn refusal(
@@ -581,10 +612,22 @@ fn expectTag(reply: pgwire.client.Reply, tag: String, text: String) !void {
 
 /// The table every writer has its rows in, and an index that moves
 /// with every write of one.
-fn createTable(alloc: std.mem.Allocator) !void {
+fn createDatabase(alloc: std.mem.Allocator, db: String) !void {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    var client = try connect(alloc);
+    var client = try connect(alloc, sql.default_database);
+    defer client.close();
+    try exec(&client, arena.allocator(), try std.fmt.allocPrint(
+        arena.allocator(),
+        "CREATE DATABASE {s}",
+        .{db},
+    ), "CREATE DATABASE");
+}
+
+fn createTable(alloc: std.mem.Allocator, db: String) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var client = try connect(alloc, db);
     defer client.close();
     try exec(
         &client,
@@ -602,12 +645,14 @@ fn createTable(alloc: std.mem.Allocator) !void {
 }
 
 /// The tellers' tables, each with an index that moves with every
-/// transfer, and all the money in account 0.
+/// transfer, and all the money in account 0. The memo gives a row
+/// bytes, so these tables flush and compact as the writers' does.
 fn createBank(client: *pgwire.Client, arloc: std.mem.Allocator) !void {
     for (0..bank_tables) |tbl| {
         try exec(client, arloc, try std.fmt.allocPrint(
             arloc,
-            "CREATE TABLE bank{d} (id int8 PRIMARY KEY, balance int8)",
+            "CREATE TABLE bank{d}" ++
+                " (id int8 PRIMARY KEY, balance int8, memo text)",
             .{tbl},
         ), "CREATE TABLE");
         try exec(client, arloc, try std.fmt.allocPrint(
@@ -618,8 +663,8 @@ fn createBank(client: *pgwire.Client, arloc: std.mem.Allocator) !void {
     }
     try exec(client, arloc, try std.fmt.allocPrint(
         arloc,
-        "INSERT INTO bank0 (id, balance) VALUES (0, {d})",
-        .{bank_total},
+        "INSERT INTO bank0 (id, balance, memo) VALUES (0, {d}, '{s}')",
+        .{ bank_total, try memoOf(arloc, 0, bank_total) },
     ), "INSERT 0 1");
 }
 
@@ -633,6 +678,8 @@ const Statement = struct { text: String, tag: String };
 
 const Writer = struct {
     id: u32,
+    /// The database its rows are in.
+    db: String,
     alloc: std.mem.Allocator,
     prng: std.Random.DefaultPrng,
     /// Open during a session and a check, not between them.
@@ -651,9 +698,102 @@ const Writer = struct {
     /// Steps the server answered with an error under disk errors.
     refused: u64 = 0,
     failed: ?anyerror = null,
+    /// The rows it started from, and every acknowledged write since
+    /// with the number of the step that made it: the rows at any
+    /// moment, for a branch of its database.
+    base: Rows = @splat(null),
+    journal: std.ArrayList(Entry) = .empty,
+    steps: u32 = 0,
+    /// A branch's writer before its first read. Null once it has
+    /// taken the rows it found as its start.
+    origin: ?Origin = null,
+
+    const Entry = struct { write: Write, step: u32 };
+
+    /// The moments of the source's writer a branch may be: after
+    /// `lo` to `hi` of its steps, the counts when the branch was sent
+    /// and answered, or after `hi` and what it had in flight then.
+    const Origin = struct {
+        source: *const Writer,
+        lo: u32,
+        hi: u32,
+        in_flight: []Write,
+
+        fn holds(self: Origin, rows: Rows) bool {
+            var steps = self.lo;
+            while (steps <= self.hi) : (steps += 1) {
+                if (std.meta.eql(rows, self.source.rowsAfter(steps)))
+                    return true;
+            }
+            var last = self.source.rowsAfter(self.hi);
+            apply(&last, self.in_flight);
+            return std.meta.eql(rows, last);
+        }
+    };
 
     fn deinit(self: *Writer) void {
         self.pending.deinit(self.alloc);
+        self.journal.deinit(self.alloc);
+        if (self.origin) |origin| self.alloc.free(origin.in_flight);
+    }
+
+    /// One more step: `writes`, acknowledged together.
+    fn record(self: *Writer, writes: []const Write) !void {
+        for (writes) |write| try self.journal.append(
+            self.alloc,
+            .{ .write = write, .step = self.steps },
+        );
+        self.steps += 1;
+    }
+
+    /// The rows after the first `steps` steps.
+    fn rowsAfter(self: *const Writer, steps: u32) Rows {
+        var rows = self.base;
+        for (self.journal.items) |entry| {
+            if (entry.step >= steps) break;
+            apply(&rows, &.{entry.write});
+        }
+        return rows;
+    }
+
+    /// A branch's writer takes `found` as its start. They must be the
+    /// source's rows at one moment, or the branch is not a snapshot.
+    fn adopt(self: *Writer, found: Rows) !void {
+        const origin = self.origin.?;
+        if (!origin.holds(found)) {
+            const sent = origin.source.rowsAfter(origin.lo);
+            const answered = origin.source.rowsAfter(origin.hi);
+            for (found, sent, answered, 0..) |got, a, b, row| {
+                if (std.meta.eql(got, a) and std.meta.eql(got, b)) continue;
+                log.err("writer {d} of {s} row {d}: found {?d}, the" ++
+                    " source had {?d} when the branch was sent and" ++
+                    " {?d} when it was answered", .{
+                    self.id, self.db, row, got, a, b,
+                });
+            }
+            return error.BranchNotOneMoment;
+        }
+        self.alloc.free(origin.in_flight);
+        self.origin = null;
+        self.base = found;
+        self.acked = found;
+    }
+
+    /// A branch's writer reads its rows before anything else.
+    fn enter(self: *Writer, stop: *const bool) !void {
+        if (self.origin == null) return;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        while (true) {
+            const found = self.readAll(arena.allocator()) catch |err| {
+                if (err != error.StatementRefused) return err;
+                if (stop.* or resources.down()) return err;
+                if (!resources.mayRefuse()) return err;
+                fiber.sleepMs(5);
+                continue;
+            };
+            return self.adopt(found);
+        }
     }
 
     /// The writer's fiber: sessions of statements until `stop`.
@@ -662,6 +802,7 @@ const Writer = struct {
             // The crash or the shut filesystem took the step in
             // flight: an error, or the connection gone. `recover`
             // decides what became of it.
+            if (left(self.db, err)) return;
             if (!resources.down()) self.failed = err;
         };
     }
@@ -670,7 +811,7 @@ const Writer = struct {
     /// the next: closing the first ends the block it may have had open.
     fn sessions(self: *Writer, stop: *const bool) !void {
         while (!stop.*) {
-            self.client = try connect(self.alloc);
+            self.client = try connect(self.alloc, self.db);
             defer self.client.close();
             self.session(stop) catch |err| {
                 if (err != error.StatementRefused) return err;
@@ -684,6 +825,7 @@ const Writer = struct {
     }
 
     fn session(self: *Writer, stop: *const bool) !void {
+        try self.enter(stop);
         try self.settle(stop);
         while (!stop.*) {
             try self.step();
@@ -815,7 +957,7 @@ const Writer = struct {
         const st = try self.statement(arloc, write);
         try self.pending.append(self.alloc, write);
         try exec(&self.client, arloc, st.text, st.tag);
-        self.acknowledged();
+        try self.acknowledged();
     }
 
     /// BEGIN, one to four writes of distinct rows, a read of one of
@@ -847,14 +989,15 @@ const Writer = struct {
         if (!commit)
             return exec(&self.client, arloc, "ROLLBACK", "ROLLBACK");
         try exec(&self.client, arloc, "COMMIT", "COMMIT");
-        self.acknowledged();
+        try self.acknowledged();
     }
 
     /// The server answered what was in flight.
-    fn acknowledged(self: *Writer) void {
+    fn acknowledged(self: *Writer) !void {
         log.debug("writer {d}: acknowledged {any}", .{
             self.id, self.pending.items,
         });
+        try self.record(self.pending.items);
         apply(&self.acked, self.pending.items);
         self.pending.clearRetainingCapacity();
     }
@@ -941,10 +1084,12 @@ const Writer = struct {
     fn recover(self: *Writer) !void {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        self.client = try connect(self.alloc);
+        self.client = try connect(self.alloc, self.db);
         defer self.client.close();
 
         const found = try self.readAll(arena.allocator());
+        // The crash came before its first read.
+        if (self.origin != null) return self.adopt(found);
         var with_pending = self.acked;
         apply(&with_pending, self.pending.items);
 
@@ -960,7 +1105,10 @@ const Writer = struct {
             }
             return error.CrashLostOrTornWrites;
         }
-        if (moved) self.kept_in_flight += 1;
+        if (moved) {
+            self.kept_in_flight += 1;
+            try self.record(self.pending.items);
+        }
         log.debug("writer {d}: after the crash, in flight {any} kept: {}", .{
             self.id, self.pending.items, moved,
         });
@@ -975,7 +1123,7 @@ const Writer = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const arloc = arena.allocator();
-        self.client = try connect(self.alloc);
+        self.client = try connect(self.alloc, self.db);
         defer self.client.close();
 
         const st = try self.statement(arloc, self.draw(0));
@@ -987,7 +1135,7 @@ const Writer = struct {
     fn expectAcked(self: *Writer) !void {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        self.client = try connect(self.alloc);
+        self.client = try connect(self.alloc, self.db);
         defer self.client.close();
         const found = try self.readAll(arena.allocator());
         try expectRows(self.id, "restart", self.acked, found);
@@ -1016,6 +1164,8 @@ fn conflictOf(code: [5]u8) ?usize {
 /// settling: the accounts add up with the transfer or without it.
 const Teller = struct {
     id: u32,
+    /// The database its accounts are in.
+    db: String,
     alloc: std.mem.Allocator,
     prng: std.Random.DefaultPrng,
     /// Open during a session and an audit, not between them.
@@ -1037,6 +1187,7 @@ const Teller = struct {
         self.sessions(stop) catch |err| {
             // A statement the crash or a shut filesystem failed is not
             // a failed run. Accounts read wrong are, whenever read.
+            if (!self.wrong and left(self.db, err)) return;
             if (self.wrong or !resources.down()) self.failed = err;
         };
     }
@@ -1045,7 +1196,7 @@ const Teller = struct {
     /// next: closing the first ends the block it had open.
     fn sessions(self: *Teller, stop: *const bool) !void {
         while (!stop.*) {
-            self.client = try connect(self.alloc);
+            self.client = try connect(self.alloc, self.db);
             defer self.client.close();
             self.session(stop) catch |err| {
                 if (err != error.StatementRefused) return err;
@@ -1074,7 +1225,7 @@ const Teller = struct {
     fn audit(self: *Teller) !void {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        self.client = try connect(self.alloc);
+        self.client = try connect(self.alloc, self.db);
         defer self.client.close();
         try self.readAll(arena.allocator());
     }
@@ -1088,6 +1239,8 @@ const Teller = struct {
     ) !pgwire.client.Reply {
         const reply = try self.client.query(arloc, text);
         const refused = reply.err orelse return reply;
+        if (std.mem.eql(u8, &refused.code, gone_code))
+            return error.DatabaseGone;
         const conflict = conflictOf(refused.code) orelse
             return refusal(refused, text);
         self.conflicts[conflict] += 1;
@@ -1173,9 +1326,9 @@ const Teller = struct {
         return balanceOf(cols[0]);
     }
 
-    /// Takes account `id` from `has` to `now`. A balance of zero is no
-    /// row, so this inserts or deletes at that end. An UPDATE has the
-    /// server do the sum one time in two.
+    /// Takes account `id` from `has` to `now`, with the memo of `now`.
+    /// A balance of zero is no row, so this inserts or deletes at that
+    /// end. An UPDATE has the server do the sum one time in two.
     fn set(
         self: *Teller,
         arloc: std.mem.Allocator,
@@ -1189,30 +1342,38 @@ const Teller = struct {
             "DELETE FROM bank{d} WHERE id = {d}",
             .{ tbl, id },
         ), "DELETE 1");
+        const memo = try memoOf(arloc, id, now);
         if (has == 0) return self.execute(arloc, try std.fmt.allocPrint(
             arloc,
-            "INSERT INTO bank{d} (id, balance) VALUES ({d}, {d})",
-            .{ tbl, id, now },
+            "INSERT INTO bank{d} (id, balance, memo)" ++
+                " VALUES ({d}, {d}, '{s}')",
+            .{ tbl, id, now, memo },
         ), "INSERT 0 1");
 
         const text = if (self.prng.random().boolean())
             try std.fmt.allocPrint(
                 arloc,
-                "UPDATE bank{d} SET balance = {d} WHERE id = {d}",
-                .{ tbl, now, id },
+                "UPDATE bank{d} SET balance = {d}, memo = '{s}'" ++
+                    " WHERE id = {d}",
+                .{ tbl, now, memo, id },
             )
         else
             try std.fmt.allocPrint(
                 arloc,
-                "UPDATE bank{d} SET balance = balance {s} {d} WHERE id = {d}",
-                .{ tbl, if (now < has) "-" else "+", @abs(now - has), id },
+                "UPDATE bank{d} SET balance = balance {s} {d}," ++
+                    " memo = '{s}' WHERE id = {d}",
+                .{
+                    tbl,  if (now < has) "-" else "+", @abs(now - has),
+                    memo, id,
+                },
             );
         try self.execute(arloc, text, "UPDATE 1");
     }
 
     /// Every account in one transaction, each table by its primary
     /// key and by its index on the balance. The two must show the same
-    /// rows, each with a balance over zero, and `bank_total` in all.
+    /// rows, each with a balance over zero and the memo of that
+    /// balance, and `bank_total` in all.
     fn readAll(self: *Teller, arloc: std.mem.Allocator) !void {
         var by_key: Balances = @splat(null);
         var by_index: Balances = @splat(null);
@@ -1220,7 +1381,7 @@ const Teller = struct {
         for (0..bank_tables) |tbl| {
             try self.readTable(arloc, &by_key, try std.fmt.allocPrint(
                 arloc,
-                "SELECT id, balance FROM bank{d}",
+                "SELECT id, balance, memo FROM bank{d}",
                 .{tbl},
             ));
             // Wide enough for a balance `backOut` wrote, if one leaks.
@@ -1251,11 +1412,20 @@ const Teller = struct {
     ) !void {
         const reply = try self.query(arloc, text);
         for (reply.rows) |cols| {
-            if (cols.len != 2) return error.WrongColumnCount;
+            if (cols.len != 2 and cols.len != 3)
+                return error.WrongColumnCount;
             const id = try intOf(cols[0]);
             if (id >= num_accounts) return error.UnknownAccount;
             if (found[id] != null) return error.RowReadTwice;
-            found[id] = try balanceOf(cols[1]);
+            const has = try balanceOf(cols[1]);
+            found[id] = has;
+            if (cols.len == 2) continue;
+            const memo = try memoOf(arloc, @intCast(id), has);
+            if (std.mem.eql(u8, cols[2] orelse "", memo)) continue;
+            self.wrong = true;
+            log.err("teller {d}: account {d} holds {d} with the memo" ++
+                " of another balance", .{ self.id, id, has });
+            return error.MemoOfAnotherBalance;
         }
     }
 };
@@ -1307,9 +1477,26 @@ fn idOf(writer: u32, row: u32) u64 {
 /// length and content come from the two, so a body from another write
 /// or a damaged one does not pass for it.
 fn bodyOf(arloc: std.mem.Allocator, id: u64, seq: u64) !String {
+    return hexOf(arloc, id, seq, body_max);
+}
+
+/// What account `id` carries beside `balance`: bytes that come from
+/// the two, so a row put together from two versions does not read as
+/// one of them.
+fn memoOf(arloc: std.mem.Allocator, id: u32, balance: i64) !String {
+    return hexOf(arloc, id, @bitCast(balance), memo_max);
+}
+
+/// The hex of 1 to `max` bytes drawn from `id` and `seq`.
+fn hexOf(
+    arloc: std.mem.Allocator,
+    id: u64,
+    seq: u64,
+    max: usize,
+) !String {
     var prng = std.Random.DefaultPrng.init(seq *% 0x9e3779b97f4a7c15 +% id);
     const rand = prng.random();
-    const raw = try arloc.alloc(u8, 1 + rand.uintLessThan(usize, body_max));
+    const raw = try arloc.alloc(u8, 1 + rand.uintLessThan(usize, max));
     rand.bytes(raw);
     return std.fmt.allocPrint(arloc, "{x}", .{raw});
 }
@@ -1335,23 +1522,257 @@ fn seqOf(
 /// Run every writer and teller for `ms` virtual milliseconds, then
 /// tell them to stop and call `at_end`. Returns once each has had the
 /// statement it was in answered.
+/// One database and the clients that work in it.
+const Site = struct {
+    db: String,
+    state: enum { live, dropped } = .live,
+    /// Compactions that wrote a table here, over every boot.
+    compactions: u64 = 0,
+    writers: [num_writers]Writer,
+    tellers: [num_tellers]Teller,
+
+    const clients = num_writers + num_tellers;
+
+    /// Site `nth` of the run. The clients draw their seeds here, the
+    /// writers first.
+    fn init(alloc: std.mem.Allocator, db: String, nth: usize) Site {
+        var site: Site = .{
+            .db = db,
+            .writers = undefined,
+            .tellers = undefined,
+        };
+        for (&site.writers, 0..) |*w, id| w.* = .{
+            .id = @intCast(id),
+            .db = db,
+            .alloc = alloc,
+            .prng = std.Random.DefaultPrng.init(fiber.random().int(u64)),
+            .next_seq = nth * seqs_per_site + 1,
+        };
+        for (&site.tellers, 0..) |*t, id| t.* = .{
+            .id = @intCast(id),
+            .db = db,
+            .alloc = alloc,
+            .prng = std.Random.DefaultPrng.init(fiber.random().int(u64)),
+        };
+        return site;
+    }
+
+    fn deinit(self: *Site) void {
+        for (&self.writers) |*w| w.deinit();
+    }
+
+    /// Before `inst` goes: what it compacted here.
+    fn countCompactions(self: *Site, inst: *Instance) void {
+        const forest = inst.eng.forest;
+        const ns = forest.manifest.lookupNamespace(self.db) orelse return;
+        self.compactions += forest.compactionsIn(ns);
+    }
+
+    /// After a crash and a restart: each writer's rows with or
+    /// without what it had in flight, and accounts that add up.
+    fn recover(self: *Site) !void {
+        if (self.state == .dropped) return;
+        for (&self.writers) |*w| try w.recover();
+        try self.tellers[0].audit();
+    }
+
+    /// After a clean stop and a restart: every acknowledged write.
+    fn expectAcked(self: *Site) !void {
+        if (self.state == .dropped) return;
+        for (&self.writers) |*w| try w.expectAcked();
+        try self.tellers[0].audit();
+    }
+
+    fn firstFailure(self: *const Site) !void {
+        for (self.writers) |w| if (w.failed) |err| return err;
+        for (self.tellers) |t| if (t.failed) |err| return err;
+    }
+};
+
+/// Makes the run's branches and drops its first database, each with
+/// one statement sent while the clients of every site run.
+const Brancher = struct {
+    alloc: std.mem.Allocator,
+    /// Never grows past its capacity: the clients hold pointers into it.
+    sites: *std.ArrayList(Site),
+    /// Branches asked for so far, and whether the drop was.
+    branches: usize = 0,
+    drop: bool = false,
+    /// How far into the stretch the statement is sent.
+    wait_ms: u64 = 0,
+    /// Sent and not acknowledged: an error or a crash answered it.
+    /// It applied whole or not at all, which `recover` finds out.
+    sent: bool = false,
+    /// The steps of each writer of the source when a branch was sent.
+    lo: [num_writers]u32 = @splat(0),
+    failed: ?anyerror = null,
+
+    const Due = enum { branch, drop };
+
+    /// What this stretch has to send. A branch before the drop, so a
+    /// branch always has a source.
+    fn due(self: *const Brancher) ?Due {
+        const sites = self.sites.items;
+        if (sites.len - 1 < self.branches) return .branch;
+        if (self.drop and sites[0].state == .live) return .drop;
+        return null;
+    }
+
+    /// Before the stretch that follows `crashes` crashes and runs for
+    /// `ms`.
+    fn plan(self: *Brancher, shape: Shape, crashes: u32, ms: u64) void {
+        for (shape.branch_after) |after| {
+            if (after == crashes) self.branches += 1;
+        }
+        if (shape.drop_first_after == crashes) self.drop = true;
+        if (self.due() == null) return;
+        self.wait_ms = fiber.random().uintLessThan(u64, ms);
+    }
+
+    fn run(
+        self: *Brancher,
+        group: *fiber.Group(void),
+        stop: *const bool,
+    ) void {
+        self.send(group, stop) catch |err| {
+            // The crash took the statement in flight.
+            if (!resources.down()) self.failed = err;
+        };
+    }
+
+    fn send(
+        self: *Brancher,
+        group: *fiber.Group(void),
+        stop: *const bool,
+    ) !void {
+        fiber.sleepMs(self.wait_ms);
+        const what = self.due() orelse return;
+        if (stop.*) return;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const arloc = arena.allocator();
+        var client = try connect(self.alloc, sql.default_database);
+        defer client.close();
+
+        const sites = self.sites.items;
+        const source = &sites[sites.len - 1];
+        const text = switch (what) {
+            .branch => try std.fmt.allocPrint(
+                arloc,
+                "CREATE DATABASE {s} TEMPLATE {s}",
+                .{ branch_names[sites.len - 1], source.db },
+            ),
+            .drop => try std.fmt.allocPrint(
+                arloc,
+                "DROP DATABASE {s}",
+                .{sites[0].db},
+            ),
+        };
+        for (&self.lo, &source.writers) |*lo, *w| lo.* = w.steps;
+        if (what == .drop) dropping = sites[0].db;
+        self.sent = true;
+        const reply = try client.query(arloc, text);
+        if (reply.err) |refused| {
+            // Under disk errors it applied or not, as after a crash.
+            if (resources.down() or resources.mayRefuse()) return;
+            return refusal(refused, text);
+        }
+        self.sent = false;
+        log.info("{s}", .{text});
+        if (what == .drop) {
+            sites[0].state = .dropped;
+            return;
+        }
+        const site = try self.open(source);
+        // After `stop` the group is being waited for: the new site's
+        // clients start with the next stretch.
+        if (stop.*) return;
+        for (&site.writers) |*w|
+            try group.spawn(.{}, Writer.run, .{ w, stop });
+        for (&site.tellers) |*t|
+            try group.spawn(.{}, Teller.run, .{ t, stop });
+    }
+
+    /// The site of the branch just made of `source`. Each of its
+    /// writers may start from any moment of the source's writer since
+    /// the statement was sent.
+    fn open(self: *Brancher, source: *const Site) !*Site {
+        const nth = self.sites.items.len;
+        self.sites.appendAssumeCapacity(
+            Site.init(self.alloc, branch_names[nth - 1], nth),
+        );
+        const site = &self.sites.items[nth];
+        for (&site.writers, &source.writers, self.lo) |*w, *from, lo| {
+            w.origin = .{
+                .source = from,
+                .lo = lo,
+                .hi = from.steps,
+                .in_flight = try self.alloc.dupe(Write, from.pending.items),
+            };
+        }
+        return site;
+    }
+
+    /// After a restart, before the sites recover: a DROP not
+    /// acknowledged took the whole database or left all of it.
+    fn recoverDrop(self: *Brancher) !void {
+        if (!self.sent or self.due() != .drop) return;
+        self.sent = false;
+        const first = &self.sites.items[0];
+        if (try exists(self.alloc, first.db)) return;
+        first.state = .dropped;
+    }
+
+    /// After the sites recovered: a branch not acknowledged is there
+    /// whole, one moment of its source, or not at all. Then it is
+    /// sent again in the next stretch.
+    fn recoverBranch(self: *Brancher) !void {
+        if (!self.sent) return;
+        self.sent = false;
+        const sites = self.sites.items;
+        if (!try exists(self.alloc, branch_names[sites.len - 1])) return;
+        const site = try self.open(&sites[sites.len - 1]);
+        try site.recover();
+    }
+};
+
+/// Whether a session can be opened in `db`.
+fn exists(alloc: std.mem.Allocator, db: String) !bool {
+    var client = connect(alloc, db) catch |err| {
+        if (err == error.StartupRefused) return false;
+        return err;
+    };
+    client.close();
+    return true;
+}
+
 fn runClients(
     alloc: std.mem.Allocator,
-    writers: []Writer,
-    tellers: []Teller,
+    sites: []Site,
+    brancher: *Brancher,
     ms: u64,
     ctx: anytype,
     comptime at_end: fn (@TypeOf(ctx)) anyerror!void,
 ) !void {
     var stop = false;
-    const clients = writers.len + tellers.len;
-    var group = try fiber.Group(void).initCapacity(alloc, clients);
+    // Room for the brancher and for a site it makes in this stretch.
+    var group = try fiber.Group(void).initCapacity(
+        alloc,
+        (sites.len + 1) * Site.clients + 1,
+    );
     defer group.deinit();
     defer group.wait();
     defer stop = true;
 
-    for (writers) |*w| try group.spawn(.{}, Writer.run, .{ w, &stop });
-    for (tellers) |*t| try group.spawn(.{}, Teller.run, .{ t, &stop });
+    for (sites) |*site| {
+        if (site.state == .dropped) continue;
+        for (&site.writers) |*w|
+            try group.spawn(.{}, Writer.run, .{ w, &stop });
+        for (&site.tellers) |*t|
+            try group.spawn(.{}, Teller.run, .{ t, &stop });
+    }
+    if (brancher.due() != null)
+        try group.spawn(.{}, Brancher.run, .{ brancher, &group, &stop });
     try resources.injectFaults(ms);
     // Before `at_end`, which may park: no writer starts a statement
     // after the first thing it does.
@@ -1396,9 +1817,14 @@ fn endWithoutCrash(inst: *Instance) anyerror!void {
     try resources.endOutages();
 }
 
-fn firstFailure(writers: []const Writer, tellers: []const Teller) !void {
-    for (writers) |w| if (w.failed) |err| return err;
-    for (tellers) |t| if (t.failed) |err| return err;
+/// Closes the server, each site's compactions counted first.
+fn close(sites: []Site, inst: *Instance) void {
+    for (sites) |*site| site.countCompactions(inst);
+    inst.close();
+}
+
+fn firstFailure(sites: []const Site) !void {
+    for (sites) |*site| try site.firstFailure();
 }
 
 test "sim: sql keeps acknowledged statements across crashes" {
@@ -1423,10 +1849,38 @@ test "BIG: sim: sql rides through disk errors" {
     try run(.{ .faults = true });
 }
 
+// A branch is made under load, takes the same load itself, and the
+// database it came from is dropped under it.
+test "sim: sql branches a database under load" {
+    try run(.{
+        .db = "src",
+        .crashes = 5,
+        .branch_after = &.{1},
+        .drop_first_after = 3,
+    });
+}
+
+// Opt-in: a branch and a branch of it, larger bodies so every site
+// compacts, and disk errors.
+test "BIG: sim: sql branches a database under disk errors" {
+    try run(.{
+        .db = "src",
+        .crashes = 10,
+        .stretch_ms = 500,
+        .stretch_more_ms = 4000,
+        .body_max = 6000,
+        .faults = true,
+        .branch_after = &.{ 1, 4 },
+        .drop_first_after = 7,
+        .compacts = true,
+    });
+}
+
 fn run(shape: Shape) !void {
     const sim = fiber.simDisk() orelse return error.SkipZigTest;
     const alloc = testing.allocator;
     body_max = shape.body_max;
+    memo_max = shape.memo_max;
 
     // Four times what the waits of this shape add up to at their
     // longest. A run past it is stuck and ends with its fibers
@@ -1443,19 +1897,14 @@ fn run(shape: Shape) !void {
     var tmp = try vfs.TmpDir.init(alloc);
     defer tmp.deinit();
 
-    var writers: [num_writers]Writer = undefined;
-    for (&writers, 0..) |*w, id| w.* = .{
-        .id = @intCast(id),
-        .alloc = alloc,
-        .prng = std.Random.DefaultPrng.init(fiber.random().int(u64)),
-    };
-    defer for (&writers) |*w| w.deinit();
-    var tellers: [num_tellers]Teller = undefined;
-    for (&tellers, 0..) |*t, id| t.* = .{
-        .id = @intCast(id),
-        .alloc = alloc,
-        .prng = std.Random.DefaultPrng.init(fiber.random().int(u64)),
-    };
+    // All the room the run needs, taken once: a site never moves.
+    var sites: std.ArrayList(Site) = .empty;
+    defer sites.deinit(alloc);
+    defer for (sites.items) |*site| site.deinit();
+    try sites.ensureTotalCapacity(alloc, 1 + shape.branch_after.len);
+    sites.appendAssumeCapacity(Site.init(alloc, shape.db, 0));
+    var brancher: Brancher = .{ .alloc = alloc, .sites = &sites };
+    dropping = null;
 
     const dir = try std.fmt.allocPrint(alloc, "{s}/data", .{tmp.path});
     defer alloc.free(dir);
@@ -1472,78 +1921,107 @@ fn run(shape: Shape) !void {
     var booted: ?*Instance = try Instance.open(alloc, dir);
     defer if (booted) |inst| inst.close();
 
-    try createTable(alloc);
+    if (!std.mem.eql(u8, shape.db, sql.default_database))
+        try createDatabase(alloc, shape.db);
+    try createTable(alloc, shape.db);
 
-    for (0..shape.crashes) |_| {
+    for (0..shape.crashes) |crashes| {
         const crash: CrashAt = .{
             .inst = booted.?,
             .mode = if (fiber.random().boolean()) .lose_all else .lose_some,
         };
         const ms = shape.stretch_ms +
             fiber.random().uintLessThan(u64, shape.stretch_more_ms);
+        brancher.plan(shape, @intCast(crashes), ms);
         try resources.start();
-        try runClients(alloc, &writers, &tellers, ms, &crash, CrashAt.take);
-        try firstFailure(&writers, &tellers);
+        try runClients(
+            alloc,
+            sites.items,
+            &brancher,
+            ms,
+            &crash,
+            CrashAt.take,
+        );
+        try firstFailure(sites.items);
+        if (brancher.failed) |err| return err;
 
         // The next boot is on a disk that works again.
-        booted.?.close();
+        close(sites.items, booted.?);
         booted = null;
         try resources.clear();
         booted = try Instance.open(alloc, dir);
-        for (&writers) |*w| try w.recover();
-        try tellers[0].audit();
+        try brancher.recoverDrop();
+        for (sites.items) |*site| try site.recover();
+        try brancher.recoverBranch();
     }
+    // Every branch and the drop of this shape happened.
+    try testing.expect(brancher.due() == null);
 
     // A last stretch, a clean stop, and a restart that must lose nothing.
     resources.endShutdowns();
     try resources.start();
     try runClients(
         alloc,
-        &writers,
-        &tellers,
+        sites.items,
+        &brancher,
         1000,
         booted.?,
         endWithoutCrash,
     );
-    try firstFailure(&writers, &tellers);
+    try firstFailure(sites.items);
     try stillUp(booted.?);
     try resources.clear();
     if (shape.faults) {
         // The faults are over: every statement is answered again, the
         // first of each writer the read of what it had in flight.
-        try runClients(alloc, &writers, &tellers, 500, booted.?, stillUp);
-        try firstFailure(&writers, &tellers);
+        try runClients(
+            alloc,
+            sites.items,
+            &brancher,
+            500,
+            booted.?,
+            stillUp,
+        );
+        try firstFailure(sites.items);
     }
-    booted.?.close();
+    close(sites.items, booted.?);
     booted = null;
     booted = try Instance.open(alloc, dir);
-    for (&writers) |*w| try w.expectAcked();
-    try tellers[0].audit();
+    for (sites.items) |*site| try site.expectAcked();
 
     // The WAL's disk stops taking writes. The statement in flight
     // fails once the log gives up, the node stops by itself, and a
     // restart on a disk that works has every acknowledged row.
     try sim.setFaults(wal_dir, .{ .write = 1000 });
     const started = utils.coarseMs();
-    try writers[0].refusedWrite();
+    const last = &sites.items[sites.items.len - 1];
+    try last.writers[0].refusedWrite();
     const waited = utils.coarseMs() - started;
     try testing.expect(waited < 2 * retry_ms);
     try testing.expect(booted.?.eng.node.shutdown.hasFailed());
-    booted.?.close();
+    close(sites.items, booted.?);
     booted = null;
     try sim.setFaults(wal_dir, .{});
     booted = try Instance.open(alloc, dir);
-    for (&writers) |*w| try w.expectAcked();
-    try tellers[0].audit();
+    for (sites.items) |*site| try site.expectAcked();
+
+    for (sites.items) |*site| {
+        site.countCompactions(booted.?);
+        log.info("{s}: {t}, {d} compactions", .{
+            site.db, site.state, site.compactions,
+        });
+        if (shape.compacts and site.state == .live)
+            try testing.expect(site.compactions > 0);
+    }
 
     var ops: u64 = 0;
     var kept: u32 = 0;
     var refused: u64 = 0;
-    for (writers) |w| {
+    for (sites.items) |site| for (site.writers) |w| {
         ops += w.ops;
         kept += w.kept_in_flight;
         refused += w.refused;
-    }
+    };
     log.info(
         "{d} statements and blocks across {d} crashes," ++
             " {d} of them in flight at a crash and kept," ++
@@ -1555,12 +2033,12 @@ fn run(shape: Shape) !void {
     var short: u64 = 0;
     var reads: u64 = 0;
     var conflicts: [conflict_codes.len]u64 = @splat(0);
-    for (tellers) |t| {
+    for (sites.items) |site| for (site.tellers) |t| {
         transfers += t.transfers;
         short += t.short;
         reads += t.reads;
         for (&conflicts, t.conflicts) |*sum, count| sum.* += count;
-    }
+    };
     log.info(
         "bank: {d} transfers, {d} more from an empty account, {d} reads" ++
             " of all accounts, ended by another transaction: {d} with 40001," ++

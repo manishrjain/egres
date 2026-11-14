@@ -910,7 +910,10 @@ pub const Tree = struct {
 
     /// Whether `changes` unlists `id` somewhere: a create of the same id
     /// in that entry is a trivial move, not a new file.
-    fn deletedIn(changes: []const _manifest.SSTableChange, id: u64) bool {
+    pub fn deletedIn(
+        changes: []const _manifest.SSTableChange,
+        id: u64,
+    ) bool {
         for (changes) |c| {
             if (c.op == .delete and c.sst_id == id) return true;
         }

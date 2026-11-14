@@ -279,6 +279,7 @@ pub const StorageImpl = struct {
                     if (self.forest.getTree(sc.namespace_id, sc.tree_id)) |tree| {
                         defer tree.release();
                         try tree.applyCompaction(index, mcs.sstable_changes);
+                        try self.forest.noteCompaction(mcs.sstable_changes);
                     }
                 }
             },

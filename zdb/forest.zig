@@ -598,6 +598,9 @@ pub const Forest = struct {
     /// The reads open on this node, by the minute they read at. A
     /// reader calls `begin` and `end` on it directly.
     read_marks: ReadMarks,
+    /// Compactions applied in each namespace that wrote a table, since
+    /// this forest opened: how a test sees that a database compacted.
+    compactions: fiber.SafeHashMap(u64, u64),
 
     // Read paths, from read.zig.
     pub const get = _read.get;
@@ -665,6 +668,7 @@ pub const Forest = struct {
             .store = store,
             .manifest = manifest,
             .tables = fiber.SafeHashMap(TableKey, *TableTrees).init(allocator),
+            .compactions = fiber.SafeHashMap(u64, u64).init(allocator),
             .table_cache = TableCache.init(allocator, store),
             .memtables = Memtables.init(allocator, mt),
             .snapshot_ts = std.atomic.Value(u64).init(0),
@@ -713,6 +717,7 @@ pub const Forest = struct {
             self.allocator.destroy(trees.*);
         }
         self.tables.deinit();
+        self.compactions.deinit();
 
         self.manifest.deinit();
         self.table_cache.deinit();
@@ -985,6 +990,25 @@ pub const Forest = struct {
         const listed = trees.list(held);
         std.debug.assert(listed.len == 1);
         return TableTrees.retain(listed[0]).?;
+    }
+
+    /// A compaction entry was applied. Counted for its namespace when
+    /// it wrote a table: a move lists a file it also unlists.
+    pub fn noteCompaction(
+        self: *Forest,
+        changes: []const _manifest.SSTableChange,
+    ) !void {
+        for (changes) |c| {
+            if (c.op != .create) continue;
+            if (Tree.deletedIn(changes, c.sst_id)) continue;
+            const so_far = self.compactions.get(c.namespace_id) orelse 0;
+            return self.compactions.put(c.namespace_id, so_far + 1);
+        }
+    }
+
+    /// Compactions of `namespace` that wrote a table since the open.
+    pub fn compactionsIn(self: *Forest, namespace: u64) u64 {
+        return self.compactions.get(namespace) orelse 0;
     }
 
     /// applyFlush is Phase B: commits the manifest changes from a memtable

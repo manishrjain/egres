@@ -618,6 +618,34 @@ test "forest: a flush applied after a drop takes nothing for what is gone" {
     try std.testing.expect((try f.buildFlush()) == null);
 }
 
+test "forest: a compaction is counted for its namespace when it wrote" {
+    const alloc = std.testing.allocator;
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+
+    const f_live = try flags.Live(Config).create(alloc, .{});
+    defer f_live.destroy();
+    var store = try vfs.Store.initFile(alloc, tmp.path, vfs.g());
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
+    defer f.close();
+
+    const ext: _manifest.Extent = .{ .size = 4096, .index_offset = 0 };
+    // Tables 1 and 2 merged into 3: a table was written.
+    try f.noteCompaction(&.{
+        _manifest.createSSTableChange(3, 7, 0, 1, ext),
+        _manifest.deleteSSTableChange(1, 7, 0, 0),
+        _manifest.deleteSSTableChange(2, 7, 0, 0),
+    });
+    // Table 4 moved down a level: none was.
+    try f.noteCompaction(&.{
+        _manifest.createSSTableChange(4, 7, 0, 2, ext),
+        _manifest.deleteSSTableChange(4, 7, 0, 1),
+    });
+    try std.testing.expectEqual(@as(u64, 1), f.compactionsIn(7));
+    try std.testing.expectEqual(@as(u64, 0), f.compactionsIn(8));
+}
+
 test "forest: drop_tree keeps an SST shared with another tree" {
     const alloc = std.testing.allocator;
     var tmp = try vfs.TmpDir.init(alloc);

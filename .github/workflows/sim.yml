@@ -35,7 +35,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [errors, many-crashes]
+        variant: [errors, many-crashes, branches]
         shard: [0, 1]
         include:
           # Four crashes, with disk errors while the writers run.
@@ -50,10 +50,18 @@ jobs:
             filter: 'BIG: sim: sql keeps'
             hours: 3
             limit_s: 7200
+          # Ten crashes and larger rows, with disk errors: a database
+          # is branched, the branch is branched, and the first one is
+          # dropped, each under the same load. A seed takes up to as
+          # long as one of many-crashes, so the same hours and limit.
+          - variant: branches
+            filter: 'BIG: sim: sql branches'
+            hours: 3
+            limit_s: 7200
     runs-on: ubuntu-latest
     # The build, the hours, and the last seeds in flight, each up to
-    # its limit: five hours of seeds either way. Under the runner's 6
-    # hours.
+    # its limit: five hours of seeds for every variant. Under the
+    # runner's 6 hours.
     timeout-minutes: 345
     steps:
       - uses: actions/checkout@v7
