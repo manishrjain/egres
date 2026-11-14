@@ -567,3 +567,73 @@ test "skiplist: a reverse reader steps onto a key inserted below it" {
     try it.next();
     try testing.expect(it.itemRef() == null);
 }
+
+test "skiplist: a seek never lands below its key while a writer inserts there" {
+    var sl = try skiplist.SkipList.init(testing.allocator);
+    defer sl.release();
+    // A table of one key, sought from a key before it that the list
+    // does not hold, and a writer filling the table below: each new
+    // key goes in between the seek's last step and where it lands.
+    const sought: Key = .{ .namespace = 2, .table_id = 1, .primary = "w" };
+    try sl.put(.{
+        .namespace = 2,
+        .table_id = 1,
+        .primary = "want",
+    }, 1, "v");
+
+    const Writer = struct {
+        fn run(list: *skiplist.SkipList, done: *std.atomic.Value(bool)) void {
+            defer done.store(true, .release);
+            for (0..50_000) |i| {
+                var primary: [8]u8 = undefined;
+                std.mem.writeInt(u64, &primary, i, .big);
+                list.put(.{
+                    .namespace = 1,
+                    .table_id = 16,
+                    .primary = &primary,
+                }, 1, "row") catch return;
+            }
+        }
+    };
+    const Reader = struct {
+        fn run(
+            list: *skiplist.SkipList,
+            key: Key,
+            done: *std.atomic.Value(bool),
+            below: *std.atomic.Value(u64),
+        ) void {
+            var it = skiplist.Iterator.init(
+                testing.allocator,
+                list,
+                .{},
+                .forward,
+            ) catch return;
+            defer it.deinit();
+            // Bounded, so a run on one worker ends: the writer is
+            // behind this fiber there.
+            for (0..20_000_000) |_| {
+                if (done.load(.acquire)) return;
+                it.seekRange(key, Key.inf) catch return;
+                const item = it.itemRef() orelse continue;
+                if (item.key.order(key) == .lt)
+                    _ = below.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+
+    var done: std.atomic.Value(bool) = .init(false);
+    var below: std.atomic.Value(u64) = .init(0);
+    var g: fiber.Group(void) = .init(testing.allocator);
+    defer g.deinit();
+    try g.ensureTotalCapacity(3);
+    // Each on a worker of its own: the readers never yield.
+    try g.spawn(.{ .worker_id = 0 }, Writer.run, .{ sl, &done });
+    for (1..3) |id| try g.spawn(
+        .{ .worker_id = @intCast(id) },
+        Reader.run,
+        .{ sl, sought, &done, &below },
+    );
+    g.wait();
+
+    try testing.expectEqual(@as(u64, 0), below.load(.monotonic));
+}

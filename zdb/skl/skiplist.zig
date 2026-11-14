@@ -174,6 +174,9 @@ pub const SkipList = struct {
     ) FindResult {
         var current = self.head;
         var level: i32 = @intCast(self.max_height_seen.load(.acquire) - 1);
+        // The node the walk of the last level stopped before: the
+        // first past the key, null at the end of the list.
+        var past: ?*Node = null;
 
         while (level >= 0) {
             const level_idx: usize = @intCast(level);
@@ -185,21 +188,21 @@ pub const SkipList = struct {
             // list. But if we find an exact match, we don't care that
             // lefties isn't being fully filled because we're returning
             // earlier (cmp == .eq).
-            while (current.next[level_idx].load(.acquire)) |next| {
+            past = while (current.next[level_idx].load(.acquire)) |next| {
                 const cmp = Key.init(next.key).order(search_key);
-                if (cmp == .gt) break;
+                if (cmp == .gt) break next;
                 if (cmp == .eq) return .{ .node = next, .exact = true };
                 current = next;
-            }
+            } else null;
 
             if (lefties) |u| u[level_idx] = current;
             level -= 1;
         }
 
-        return .{
-            .node = current.next[0].load(.acquire),
-            .exact = false,
-        };
+        // The node that was compared, not `current.next[0]` read again:
+        // a writer may have linked a key below the one sought behind
+        // `current` since, and a seek would land on it.
+        return .{ .node = past, .exact = false };
     }
 
     /// The node holding the largest key, or null for an empty list:
