@@ -31,6 +31,8 @@ const xev = @import("xev");
 const _fb = @import("fiber.zig");
 const _rt = @import("runtime.zig");
 const _fsops = @import("fsops.zig");
+const _dl = @import("deadlines.zig");
+const logEvery = @import("utils").logEvery;
 const _context = @import("utils").context;
 const String = @import("utils").String;
 
@@ -357,6 +359,35 @@ pub const Server = struct {
         _ = options;
         return submit(.accept, self);
     }
+
+    /// `accept` until it hands out a stream, or null when it failed
+    /// and `stopped(ctx)`. A failed accept ends no listener: out of
+    /// descriptors, short of memory or a connection lost before it was
+    /// taken all pass, and libxev names them all `Unexpected`. A stop
+    /// can fail it the same way, when the self-connect that wakes it
+    /// leaves no descriptor for the end accepted, so the stop is asked
+    /// after each failure.
+    pub fn acceptUntil(
+        self: Server,
+        ctx: anytype,
+        comptime stopped: fn (@TypeOf(ctx)) bool,
+    ) ?Stream {
+        while (true) {
+            const stream = self.accept(.{}) catch |err| {
+                if (stopped(ctx)) return null;
+                logEvery(.err, 30, "accept on port {d} failed: {s}", .{
+                    self.port(), @errorName(err),
+                });
+                // Add a wait to avoid looping and pegging the CPU if we're out
+                // of file descriptors for example.
+                _dl.sleepMs(accept_retry_ms);
+                continue;
+            };
+            return stream;
+        }
+    }
+
+    const accept_retry_ms: u64 = 2;
 
     pub fn close(self: Server) void {
         submit(.close_server, self);

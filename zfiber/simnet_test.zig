@@ -195,6 +195,32 @@ fn acceptAborted(srv: net.Server) anyerror!void {
     try testing.expectError(error.ConnectionAborted, srv.accept(.{}));
 }
 
+const Flag = std.atomic.Value(bool);
+
+fn isSet(flag: *Flag) bool {
+    return flag.load(.acquire);
+}
+
+fn setAfter(flag: *Flag, ms: u64) anyerror!void {
+    fiber.sleepMs(ms);
+    flag.store(true, .release);
+}
+
+test "simnet: acceptUntil asks again after a failure, until it is stopped" {
+    // A listener that is gone fails every accept at once.
+    const srv = try listenAny();
+    srv.close();
+    var stop: Flag = .init(false);
+    var group = Group.init(testing.allocator);
+    defer group.deinit();
+    try group.spawn(.{}, setAfter, .{ &stop, 50 });
+
+    try testing.expect(srv.acceptUntil(&stop, isSet) == null);
+    // Asked again until the flag was set, not given up on the first.
+    try testing.expect(stop.load(.acquire));
+    for (group.wait()) |r| try r;
+}
+
 test "simnet: closing a listener ends its parked accept" {
     const srv = try listenAny();
     var group = Group.init(testing.allocator);

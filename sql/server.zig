@@ -302,13 +302,14 @@ pub const Server = struct {
         ) catch {};
 
         log.info("sql listener started on port {d} (pgwire)", .{listener.port()});
-        while (!self.engine.node.shutdown.isDraining()) {
-            const stream = listener.accept(.{}) catch |err| {
-                log.err("accept failed: {s}", .{@errorName(err)});
-                return;
-            };
+        const shutdown: *const fiber.Shutdown = &self.engine.node.shutdown;
+        while (!shutdown.isDraining()) {
+            const stream = listener.acceptUntil(
+                shutdown,
+                fiber.Shutdown.isDraining,
+            ) orelse return;
             // Shutdown watcher's self-connection: drop it and exit.
-            if (self.engine.node.shutdown.isDraining()) {
+            if (shutdown.isDraining()) {
                 stream.close();
                 return;
             }

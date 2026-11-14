@@ -207,6 +207,7 @@ pub fn main(init: std.process.Init) !void {
     try galloc.verifyInUse(allocator);
     log.info("{s} in use: OK", .{galloc.kind});
     const argv = try utils.context.g().argv();
+    raiseOpenFiles();
 
     // The in-tree fiber runtime. One worker per core; worker id 0 is the
     // dedicated `.raft` lane so raft loops get priority isolation, the rest
@@ -234,6 +235,32 @@ pub fn main(init: std.process.Init) !void {
     try fiber.spawnDetached(.{}, bootstrapAndStop, .{ allocator, argv });
     fiber_rt.run();
     if (failed.load(.acquire)) return error.Failed;
+}
+
+/// Raises the open-file limit to the hard one. A shell hands out a
+/// soft limit of 1,024 or so, and every tree keeps its table files
+/// open, so a few hundred databases use that up.
+fn raiseOpenFiles() void {
+    var limit = std.posix.getrlimit(.NOFILE) catch |err| {
+        log.warn("open-file limit: not read: {s}", .{@errorName(err)});
+        return;
+    };
+    const was = limit.cur;
+    // macOS refuses a soft limit above OPEN_MAX, whatever the hard one.
+    const most = if (comptime builtin.os.tag.isDarwin())
+        @min(limit.max, std.c.OPEN_MAX)
+    else
+        limit.max;
+    if (most > was) {
+        limit.cur = most;
+        std.posix.setrlimit(.NOFILE, limit) catch |err| {
+            log.warn("open-file limit: left at {d}: {s}", .{
+                was, @errorName(err),
+            });
+            return;
+        };
+    }
+    log.info("open-file limit: {d}, was {d}", .{ limit.cur, was });
 }
 
 /// Detached and never joined: parked in sleepMs at shutdown, freed by

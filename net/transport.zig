@@ -264,11 +264,19 @@ pub const Transport = struct {
         s.queueMsg(message_type, value);
     }
 
+    /// Set by `deinit`: the loops leave at their next look.
+    fn isShuttingDown(self: *Transport) bool {
+        return self.shutting_down.load(.acquire);
+    }
+
     fn acceptLoop(self: *Transport) void {
         log.debug("acceptLoop started", .{});
         defer log.debug("node {d}: accept loop exiting", .{self.cfg.self_id});
         while (true) {
-            const conn = self.listener.?.accept(.{}) catch return;
+            const conn = self.listener.?.acceptUntil(
+                self,
+                isShuttingDown,
+            ) orelse return;
             // deinit's self-connect (see there): not a peer.
             if (self.shutting_down.load(.acquire)) {
                 conn.close();

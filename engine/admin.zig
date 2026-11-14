@@ -784,15 +784,16 @@ pub const AdminServer = struct {
         // accumulating handles would pin one ~1 MiB-stack fiber per connection
         // in the registry for the whole server lifetime. Handlers self-exit on
         // `isShuttingDown()`, so no collective join is needed at shutdown.
+        const shutdown: *const fiber.Shutdown = &self.engine.node.shutdown;
         var conn_id: u64 = 0;
-        while (!self.engine.node.isShuttingDown()) {
-            const stream = listener.accept(.{}) catch |err| {
-                log.err("runListener: accept failed: {}", .{err});
-                return;
-            };
+        while (!shutdown.isStopping()) {
+            const stream = listener.acceptUntil(
+                shutdown,
+                fiber.Shutdown.isStopping,
+            ) orelse return;
             // The shutdown watcher wakes this accept by self-connecting; once
             // shutting down, drop that throwaway connection and exit.
-            if (self.engine.node.isShuttingDown()) {
+            if (shutdown.isStopping()) {
                 stream.close();
                 return;
             }
