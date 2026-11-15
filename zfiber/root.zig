@@ -121,6 +121,7 @@ pub const CloseMode = _channel.CloseMode;
 
 const _group = @import("group.zig");
 pub const Group = _group.Group;
+pub const forEachIndex = _group.forEachIndex;
 
 const _watermark = @import("watermark.zig");
 pub const Watermark = _watermark.Watermark;

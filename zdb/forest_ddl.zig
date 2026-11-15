@@ -13,11 +13,13 @@
 
 const std = @import("std");
 const log = std.log.scoped(.forest);
+const fiber = @import("zfiber");
 const utils = @import("utils");
 const String = utils.String;
 const _manifest = @import("manifest.zig");
 const KeyRange = @import("kv.zig").KeyRange;
 const TableKey = @import("kv.zig").TableKey;
+const TreeKey = @import("kv.zig").TreeKey;
 const Key = @import("kv.zig").Key;
 const makeTreeId = @import("kv.zig").makeTreeId;
 const treeTableId = @import("kv.zig").treeTableId;
@@ -65,8 +67,31 @@ pub fn openTablesFromManifest(self: *Forest) !void {
     // manifest), so we only need the keys here.
     const keys = try self.manifest.treeKeys(self.allocator, null);
     defer self.allocator.free(keys);
-    for (keys) |tk| try self.installTree(tk.namespace, tk.tree_id);
+
+    const install: Install = .{ .forest = self, .keys = keys };
+    try fiber.forEachIndex(
+        self.allocator,
+        keys.len,
+        install_lanes,
+        &install,
+        Install.at,
+    );
 }
+
+/// Trees `openTablesFromManifest` installs at once. A tenant's tree is
+/// a few small files, each one read of the drive, so one at a time
+/// leaves the drive idle between reads: 26,000 tenants took 15 s.
+const install_lanes = 32;
+
+const Install = struct {
+    forest: *Forest,
+    keys: []const TreeKey,
+
+    fn at(self: *const Install, key_idx: usize) anyerror!void {
+        const tk = self.keys[key_idx];
+        try self.forest.installTree(tk.namespace, tk.tree_id);
+    }
+};
 
 /// Which namespace id a create takes.
 pub const NsId = union(enum) {

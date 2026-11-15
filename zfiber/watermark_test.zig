@@ -346,3 +346,33 @@ test "Watermark: reset lowers the value; waitForOrReset reports it, waitForUntim
     g.wait();
     try std.testing.expect(plain_done.load(.acquire));
 }
+
+test "Watermark: add counts across fibers and wakes the waiter at its target" {
+    var wm = fiber.Watermark.init(std.testing.allocator);
+    defer wm.deinit();
+
+    const Waiter = struct {
+        fn run(w: *fiber.Watermark, reached: *bool) void {
+            w.waitForUntimed(64) catch return;
+            reached.* = true;
+        }
+    };
+    const Adder = struct {
+        fn run(w: *fiber.Watermark) void {
+            for (0..8) |_| {
+                w.add(1);
+                fiber.yield();
+            }
+        }
+    };
+
+    var reached = false;
+    var g: fiber.Group(void) = .init(std.testing.allocator);
+    defer g.deinit();
+    try g.spawn(.{}, Waiter.run, .{ &wm, &reached });
+    for (0..8) |_| try g.spawn(.{}, Adder.run, .{&wm});
+    g.wait();
+
+    try std.testing.expect(reached);
+    try std.testing.expectEqual(64, wm.load());
+}

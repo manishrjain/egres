@@ -171,30 +171,59 @@ pub const TableCache = struct {
             }
         }
         if (misses.items.len == 0) return;
+        // One miss, the usual case for a tenant's tree, needs no
+        // watchdog: a start opening 100,000 files spawned one each.
+        if (misses.items.len == 1) return self.openOne(misses.items[0]);
 
-        // Phase 2: open misses concurrently. Each fiber writes to need.table
-        // and bumps `completed` on return; the watchdog uses that to log
-        // periodic progress if the group hangs.
-        var tse: utils.SafeError = .{};
-        var completed = std.atomic.Value(usize).init(0);
-
-        // The watchdog waits on this, so it exits the moment the last
-        // open lands rather than at its next 500 ms poll: the group's
-        // wait() below holds the apply fiber, and a flush or compaction
-        // apply used to cost a full 500 ms because of it.
-        var done = fiber.Watermark.init(self.allocator);
-        defer done.deinit();
-
+        // Phase 2: open the misses, `open_lanes` at a time. `opened`
+        // counts them: the watchdog logs progress from it if the opens
+        // hang, and exits the moment the last one lands rather than at
+        // its next 500 ms poll. `loadTables` holds the apply fiber
+        // until it has, and a flush or compaction apply used to cost a
+        // full 500 ms because of it.
         const total = misses.items.len;
-        var g = try fiber.Group(void).initCapacity(self.allocator, 1 + total);
+        var opens: Opens = .{
+            .cache = self,
+            .misses = misses.items,
+            .opened = fiber.Watermark.init(self.allocator),
+        };
+        defer opens.opened.deinit();
+
+        var g = try fiber.Group(void).initCapacity(self.allocator, 1);
         defer g.deinit();
-        g.spawn(.{}, loadTablesWatchdog, .{ total, &completed, &done }) catch {};
-        for (misses.items) |n| {
-            try g.spawn(.{}, openFiber, .{ self, n, &tse, &completed, &done });
+        g.spawn(.{}, loadTablesWatchdog, .{ total, &opens.opened }) catch {};
+        // An error leaves some opens never started, so the count the
+        // watchdog waits for may not come: closing releases it. It is
+        // joined before `opens` leaves the stack.
+        defer {
+            opens.opened.close();
+            g.wait();
         }
-        g.wait();
-        if (tse.get()) |err| return err;
+        try fiber.forEachIndex(
+            self.allocator,
+            total,
+            open_lanes,
+            &opens,
+            Opens.at,
+        );
     }
+
+    /// Tables one `loadTables` opens at once. A fiber per table mapped
+    /// a stack per table: a tree with thousands of them spawned
+    /// thousands of fibers.
+    const open_lanes = 32;
+
+    const Opens = struct {
+        cache: *TableCache,
+        misses: []const *TableNeed,
+        /// How many opens have returned, failed ones included.
+        opened: fiber.Watermark,
+
+        fn at(self: *Opens, miss_idx: usize) anyerror!void {
+            defer self.opened.add(1);
+            try self.cache.openOne(self.misses[miss_idx]);
+        }
+    };
 
     /// Release the refs `loadTables` handed out, and forget the pointers.
     pub fn decrRefs(needed: []TableNeed) void {
@@ -204,18 +233,14 @@ pub const TableCache = struct {
         }
     }
 
-    /// Sibling of the `openFiber` spawns: log every 15 s while opens
+    /// Runs beside the opens: log every 15 s while they
     /// are still short. Woken by `done` as each open lands, so it exits
     /// with the last one and never holds the group's `wait()` open.
-    fn loadTablesWatchdog(
-        total: usize,
-        completed: *std.atomic.Value(usize),
-        done: *fiber.Watermark,
-    ) void {
+    fn loadTablesWatchdog(total: usize, opened: *fiber.Watermark) void {
         const start = utils.coarseMs();
         var last_warn = start;
-        while (completed.load(.acquire) < total) {
-            done.waitFor(total, 500) catch |err| switch (err) {
+        while (opened.load() < total) {
+            opened.waitFor(total, 500) catch |err| switch (err) {
                 error.Timeout => {},
                 else => return,
             };
@@ -223,21 +248,14 @@ pub const TableCache = struct {
             if (now - last_warn >= 15_000) {
                 log.warn(
                     "loadTables watchdog: {d}/{d} opens completed after {d}ms",
-                    .{ completed.load(.acquire), total, now - start },
+                    .{ opened.load(), total, now - start },
                 );
                 last_warn = now;
             }
         }
     }
 
-    fn openFiber(
-        self: *TableCache,
-        need: *TableNeed,
-        tse: *utils.SafeError,
-        completed: *std.atomic.Value(usize),
-        done: *fiber.Watermark,
-    ) void {
-        defer done.advance(completed.fetchAdd(1, .release) + 1);
+    fn openOne(self: *TableCache, need: *TableNeed) !void {
         // Phase A: check under write lock (brief — no I/O).
         self.mu.lock(@src());
         if (self.tables.get(need.id)) |t| {
@@ -251,15 +269,12 @@ pub const TableCache = struct {
         // Phase B: open the SST WITHOUT holding the lock. Table.open
         // yields the fiber (I/O); holding the lock here would deadlock
         // cooperative fibers on the same OS thread (EDEADLK).
-        const t = Table.open(
+        const t = try Table.open(
             self.allocator,
             self.store,
             need.id,
             need.extent,
-        ) catch |err| {
-            tse.set(err);
-            return;
-        };
+        );
 
         // Phase C: re-acquire write lock to insert; handle race with another
         // fiber. The open-time ref becomes the cache's on success; on the
@@ -275,9 +290,8 @@ pub const TableCache = struct {
         }
         self.tables.put(need.id, t) catch |err| {
             self.mu.unlock();
-            tse.set(err);
             dropUnowned(t);
-            return;
+            return err;
         };
         t.incrRef(); // the caller's, under the lock
         self.mu.unlock();

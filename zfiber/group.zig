@@ -24,6 +24,7 @@
 const std = @import("std");
 const _fb = @import("fiber.zig");
 const _runtime = @import("runtime.zig");
+const SafeError = @import("utils").SafeError;
 
 pub fn Group(comptime T: type) type {
     return struct {
@@ -113,4 +114,61 @@ pub fn Group(comptime T: type) type {
             if (comptime T != void) return self.results.items;
         }
     };
+}
+
+/// Call `func(ctx, idx)` for every `idx` below `count`, on at most
+/// `lanes` fibers at once: the caller and up to `lanes - 1` spawned.
+/// A fiber per item maps a stack per item, and a large fan-out queues
+/// on the kernel's mm lock; lanes keep the fibers fixed while the
+/// items grow. Each lane owns every `lanes`th index, so they share no
+/// cursor. The first error stops the lanes at their next item and is
+/// returned once every lane has; the indexes left are never called.
+pub fn forEachIndex(
+    alloc: std.mem.Allocator,
+    count: usize,
+    lanes: usize,
+    ctx: anytype,
+    comptime func: fn (@TypeOf(ctx), usize) anyerror!void,
+) !void {
+    std.debug.assert(lanes > 0);
+    const Ctx = @TypeOf(ctx);
+    const Lane = struct {
+        fn run(
+            lane_ctx: Ctx,
+            first: usize,
+            stride: usize,
+            end: usize,
+            tse: *SafeError,
+        ) void {
+            var idx = first;
+            while (idx < end) : (idx += stride) {
+                if (tse.get() != null) return;
+                func(lane_ctx, idx) catch |err| {
+                    tse.set(err);
+                    return;
+                };
+            }
+        }
+    };
+
+    const stride = @min(count, lanes);
+    if (stride == 0) return;
+    var tse: SafeError = .{};
+    var g = try Group(void).initCapacity(alloc, stride - 1);
+    defer g.deinit();
+    // A lane that failed to spawn fails the call, after the lanes
+    // already running have stopped: they hold `tse` and `ctx`.
+    for (1..stride) |first| {
+        g.spawn(
+            .{},
+            Lane.run,
+            .{ ctx, first, stride, count, &tse },
+        ) catch |err| {
+            tse.set(err);
+            break;
+        };
+    }
+    Lane.run(ctx, 0, stride, count, &tse);
+    g.wait();
+    if (tse.get()) |err| return err;
 }

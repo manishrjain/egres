@@ -83,3 +83,54 @@ test "Group: ensureTotalCapacity pre-sizes without spawning" {
     try std.testing.expectEqual(@as(u32, 1), results[0]);
     try std.testing.expectEqual(@as(u32, 4), results[3]);
 }
+
+const Visits = struct {
+    seen: []std.atomic.Value(u32),
+    running: std.atomic.Value(u32) = .init(0),
+    most_running: std.atomic.Value(u32) = .init(0),
+    fail_at: ?usize = null,
+
+    fn visit(self: *Visits, idx: usize) anyerror!void {
+        const now = self.running.fetchAdd(1, .acq_rel) + 1;
+        _ = self.most_running.fetchMax(now, .acq_rel);
+        defer _ = self.running.fetchSub(1, .acq_rel);
+        // Give the other lanes the worker, so they overlap.
+        fiber.yield();
+        if (self.fail_at) |at| if (idx == at) return error.Stop;
+        _ = self.seen[idx].fetchAdd(1, .acq_rel);
+    }
+};
+
+test "forEachIndex: every index once, never more than the lanes" {
+    var seen = [_]std.atomic.Value(u32){.init(0)} ** 100;
+    var visits: Visits = .{ .seen = &seen };
+    const gpa = std.testing.allocator;
+    try fiber.forEachIndex(gpa, 100, 8, &visits, Visits.visit);
+    for (&seen) |*s| try std.testing.expectEqual(1, s.load(.acquire));
+    try std.testing.expect(visits.most_running.load(.acquire) <= 8);
+}
+
+test "forEachIndex: fewer items than lanes, and none" {
+    var seen = [_]std.atomic.Value(u32){.init(0)} ** 3;
+    var visits: Visits = .{ .seen = &seen };
+    const gpa = std.testing.allocator;
+    try fiber.forEachIndex(gpa, 3, 8, &visits, Visits.visit);
+    for (&seen) |*s| try std.testing.expectEqual(1, s.load(.acquire));
+    try std.testing.expect(visits.most_running.load(.acquire) <= 3);
+    try fiber.forEachIndex(gpa, 0, 8, &visits, Visits.visit);
+}
+
+test "forEachIndex: the first error stops the lanes and is returned" {
+    var seen = [_]std.atomic.Value(u32){.init(0)} ** 1000;
+    var visits: Visits = .{ .seen = &seen, .fail_at = 5 };
+    try std.testing.expectError(error.Stop, fiber.forEachIndex(
+        std.testing.allocator,
+        1000,
+        4,
+        &visits,
+        Visits.visit,
+    ));
+    var called: u32 = 0;
+    for (&seen) |*s| called += s.load(.acquire);
+    try std.testing.expect(called < 1000);
+}

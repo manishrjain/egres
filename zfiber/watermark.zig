@@ -77,6 +77,14 @@ pub const Watermark = struct {
         }
     }
 
+    /// Raise the value by `count` and wake the waiters it reaches:
+    /// for a watermark that counts things done, by fibers that each
+    /// know only that theirs is.
+    pub fn add(self: *Watermark, count: u64) void {
+        const now = self.value.fetchAdd(count, .release) + count;
+        self.wakeReached(now);
+    }
+
     /// Mark the watermark closed and wake every waiter with
     /// `error.Closed`. Idempotent. `advance` still works after
     /// close — `closed` only affects the wait paths.
