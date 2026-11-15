@@ -173,7 +173,7 @@ pub fn createIndex(
             return replyError(state, "create index failed");
         },
     };
-    eng.proposeMC(created.change, .apply) catch |err| {
+    eng.proposeMC(created.change) catch |err| {
         logCreateIndexErr(name, "propose tree", err);
         return replyError(state, "create index failed");
     };
@@ -726,7 +726,7 @@ const IndexBuild = struct {
             .sstable_changes = changes.items,
             .tree_changes = &.{},
             .memtable_id = 0,
-        }, .apply);
+        });
         // applyBackfill skips (deterministically, on every node) when
         // the bottom level was not empty; surface that as a failure
         // instead of marking valid an index that lacks its scanned
@@ -877,8 +877,7 @@ fn removeIndex(
     }};
     try eng.proposeWrites(ns, &kvs, .apply);
 
-    const mc = try eng.forest.buildTableDrop(a, ns, &.{index_tid});
-    try eng.proposeMC(mc, .apply);
+    try eng.dropTables(ns, &.{index_tid});
     try self.srv.forgetTable(.{ .namespace = ns, .table_id = base_tid });
 }
 

@@ -77,7 +77,7 @@ pub fn createDatabase(
             return replyError(state, "create database failed");
         },
     };
-    eng.proposeMC(created.change, .apply) catch |err| {
+    eng.proposeMC(created.change) catch |err| {
         log.err("create database '{s}': propose: {s}", .{ name, @errorName(err) });
         return replyError(state, "create database proposal failed");
     };
@@ -124,15 +124,10 @@ pub fn dropDatabase(self: *Handler, state: *pgwire.ConnState, name: String) !voi
         m.unlock();
     }
 
-    const mc = eng.forest.buildNsDrop(arena.allocator(), ns) catch |err| {
+    eng.dropNamespace(ns) catch |err| {
         log.err("drop database '{s}': {s}", .{ name, @errorName(err) });
         db.dropped.store(false, .release);
         return replyError(state, "drop database failed");
-    };
-    eng.proposeMC(mc, .apply) catch |err| {
-        log.err("drop database '{s}': propose: {s}", .{ name, @errorName(err) });
-        db.dropped.store(false, .release);
-        return replyError(state, "drop database proposal failed");
     };
     log.info("dropped database '{s}' (ns={d})", .{ name, ns });
     try state.sendCommandComplete("DROP DATABASE");
@@ -224,7 +219,7 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
     table_lock.lock(@src());
     defer table_lock.unlock();
 
-    eng.proposeMC(created.change, .apply) catch |err| {
+    eng.proposeMC(created.change) catch |err| {
         log.err("create table '{s}': propose: {s}", .{ ct.name, @errorName(err) });
         return replyError(state, "create table proposal failed");
     };
@@ -374,7 +369,7 @@ pub fn createTableAs(
     table_lock.lock(@src());
     defer table_lock.unlock();
 
-    eng.proposeMC(created.change, .apply) catch |err| {
+    eng.proposeMC(created.change) catch |err| {
         log.err("create table as '{s}': propose: {s}", .{
             cta.name, @errorName(err),
         });
@@ -515,14 +510,9 @@ pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: _parse.DropTable)
     // as unreachable garbage (ids are never reused). TODO: issue
     // tombstones for them.
     try scan.table_ids.append(a, table_id);
-    const ids = scan.table_ids.items;
-    const mc = eng.forest.buildTableDrop(a, ns, ids) catch |err| {
+    eng.dropTables(ns, scan.table_ids.items) catch |err| {
         log.err("drop table '{s}': {s}", .{ dt.name, @errorName(err) });
         return replyError(state, "drop table failed");
-    };
-    eng.proposeMC(mc, .apply) catch |err| {
-        log.err("drop table '{s}': propose: {s}", .{ dt.name, @errorName(err) });
-        return replyError(state, "drop table proposal failed");
     };
     // Evict the cached Table (safe: we hold the exclusive table
     // table lock, and DML holds its Table only under the shared one).

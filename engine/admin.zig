@@ -1724,7 +1724,7 @@ pub const AdminServer = struct {
             try proto.writeErr(stream, @errorName(err));
             return;
         };
-        self.engine.proposeMC(nr.change, .apply) catch |err| {
+        self.engine.proposeMC(nr.change) catch |err| {
             log.err("ns create failed: {s}", .{@errorName(err)});
             try proto.writeErr(stream, @errorName(err));
             return;

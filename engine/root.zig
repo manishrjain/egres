@@ -18,7 +18,9 @@
 //!     — no raft round-trip.
 //!   * LSM housekeeping is replicated too: the flush/compaction/snapshot/split
 //!     loops propose manifest changes so every node installs the same SSTs, and
-//!     snapshots prune the raft WAL.
+//!     snapshots prune the raft WAL. Manifest changes, DDL's among them, go
+//!     one at a time: each is applied before the next is checked against the
+//!     trees (`Engine.change_mu`), so none is applied to a tree that is gone.
 //!
 //! `Engine.open` opens one node's parts (raft WAL, raft node, forest) and
 //! wires them (state machine ↔ node, file-id allocator ↔ node+WAL, raft

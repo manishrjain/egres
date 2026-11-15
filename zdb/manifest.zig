@@ -769,6 +769,47 @@ pub const Manifest = struct {
         }
     }
 
+    /// Whether `mc` changes a tree that is gone: one its SSTs are for,
+    /// unless `mc` creates that tree itself (a split's new half), or
+    /// the tree a split narrows. A change is built from the trees of
+    /// one moment and applied at a later one. Its proposer asks this
+    /// under the engine's change lock and holds the lock until the
+    /// apply (`Engine.proposeHeld`), so no drop comes in between. The
+    /// apply asks again and skips a stale change whole: `apply` here
+    /// for a snapshot draft, the engine on the live path.
+    pub fn isStale(self: *Manifest, mc: ManifestChange) bool {
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
+
+        for (mc.tree_changes) |tc| {
+            if (tc.op != .update) continue;
+            const narrowed: TreeKey = .{
+                .namespace = tc.namespace_id,
+                .tree_id = tc.tree_id,
+            };
+            if (!self.trees.contains(narrowed)) return true;
+        }
+        for (mc.sstable_changes) |sc| {
+            const key: TreeKey = .{
+                .namespace = sc.namespace_id,
+                .tree_id = sc.tree_id,
+            };
+            if (self.trees.contains(key)) continue;
+            if (!creates(mc, key)) return true;
+        }
+        return false;
+    }
+
+    /// Whether `mc` creates the tree `key`.
+    fn creates(mc: ManifestChange, key: TreeKey) bool {
+        for (mc.tree_changes) |tc| {
+            if (tc.op != .create) continue;
+            if (tc.namespace_id != key.namespace) continue;
+            if (tc.tree_id == key.tree_id) return true;
+        }
+        return false;
+    }
+
     /// Apply one whole ManifestChange: its structural changes (trees, then
     /// SSTs — trees first, because an SST can only attach to a tree that
     /// exists) plus the name-registry and id-counter effects its `cmd`
@@ -776,7 +817,9 @@ pub const Manifest = struct {
     /// entry does to manifest state: the live apply path
     /// (Forest.applyTrees) and the snapshot draft replay both go through
     /// it, so a name or counter can never be recorded on one path and
-    /// missed on the other. `index` is the log index of the applying
+    /// missed on the other. A change for a tree that is gone is skipped
+    /// whole (`isStale`), as the live path skips it, so a draft ends with
+    /// the trees the node has. `index` is the log index of the applying
     /// entry, used as a new SST's `raft_index` exactly as in `commit`.
     ///
     /// Two phases, like `restoreFrom`: the structural changes under one
@@ -787,6 +830,7 @@ pub const Manifest = struct {
     /// TODO: We probably should move table names over to the table schema,
     /// and avoid storing them in the MANIFEST.
     pub fn apply(self: *Manifest, index: u64, mc: ManifestChange) !void {
+        if (self.isStale(mc)) return;
         if (mc.cmd == .branch_ns) return self.applyNsBranch(mc);
         if (mc.cmd == .branch_table) return self.applyTableBranch(mc);
         {

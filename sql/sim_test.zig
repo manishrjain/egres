@@ -134,6 +134,9 @@ const gone_code = "3D000";
 /// The database whose DROP was sent. From then on its clients may be
 /// told it is gone.
 var dropping: ?String = null;
+/// Manifest changes the boots so far skipped at apply for a tree that
+/// was gone: each got into the log around the engine's change lock.
+var stale_changes: u64 = 0;
 
 /// Whether `err` is what a client of `db` gets for its database being
 /// dropped, which it may only once the DROP was sent.
@@ -1818,9 +1821,10 @@ fn endWithoutCrash(inst: *Instance) anyerror!void {
     try resources.endOutages();
 }
 
-/// Closes the server, each site's compactions counted first.
+/// Closes the server, what it compacted and skipped counted first.
 fn close(sites: []Site, inst: *Instance) void {
     for (sites) |*site| site.countCompactions(inst);
+    stale_changes += inst.eng.staleChanges();
     inst.close();
 }
 
@@ -1906,6 +1910,7 @@ fn run(shape: Shape) !void {
     sites.appendAssumeCapacity(Site.init(alloc, shape.db, 0));
     var brancher: Brancher = .{ .alloc = alloc, .sites = &sites };
     dropping = null;
+    stale_changes = 0;
 
     const dir = try std.fmt.allocPrint(alloc, "{s}/data", .{tmp.path});
     defer alloc.free(dir);
@@ -2014,6 +2019,8 @@ fn run(shape: Shape) !void {
         if (shape.compacts and site.state == .live)
             try testing.expect(site.compactions > 0);
     }
+    stale_changes += booted.?.eng.staleChanges();
+    try testing.expectEqual(@as(u64, 0), stale_changes);
 
     var ops: u64 = 0;
     var kept: u32 = 0;

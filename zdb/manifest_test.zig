@@ -173,6 +173,70 @@ test "manifest applySSTableChange on missing tree errors" {
     );
 }
 
+// A change is built from the trees of one moment and applied at a later
+// one. Its proposer asks `isStale` before proposing and its apply asks
+// again; `apply`, which a snapshot draft replays the log through, skips
+// a stale change whole.
+test "manifest: a change for a dropped tree is stale" {
+    const alloc = std.testing.allocator;
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
+
+    try manifest.commit(1, &.{}, &.{
+        createTreeChange(1, 0, "", "", .posting_index),
+    });
+    try manifest.commit(2, &.{
+        createSSTableChange(10, 0, 1, 0, no_extent),
+    }, &.{});
+
+    // A flush's or a compaction's tables.
+    var written = [_]_manifest.SSTableChange{
+        createSSTableChange(11, 0, 1, 0, no_extent),
+        deleteSSTableChange(10, 0, 1, 0),
+    };
+    const flush: _manifest.ManifestChange = .{
+        .cmd = .flush,
+        .sstable_changes = &written,
+        .tree_changes = &.{},
+        .memtable_id = 0,
+    };
+    // A split: tree 1 narrowed, tree 2 its new half with table 10.
+    var moved = [_]_manifest.SSTableChange{
+        createSSTableChange(10, 0, 2, 0, no_extent),
+    };
+    var halves = [_]_manifest.TreeChange{
+        updateTreeChange(1, 0, "", ""),
+        createTreeChange(2, 0, "", "", .posting_index),
+    };
+    const split: _manifest.ManifestChange = .{
+        .cmd = .tree_split,
+        .sstable_changes = &moved,
+        .tree_changes = &halves,
+        .memtable_id = 0,
+    };
+    try std.testing.expect(!manifest.isStale(flush));
+    try std.testing.expect(!manifest.isStale(split));
+
+    var gone = [_]_manifest.TreeChange{deleteTreeChange(1, 0)};
+    const drop: _manifest.ManifestChange = .{
+        .cmd = .drop_tree,
+        .sstable_changes = &.{},
+        .tree_changes = &gone,
+        .memtable_id = 0,
+    };
+    try manifest.apply(3, drop);
+    try std.testing.expect(manifest.isStale(flush));
+    try std.testing.expect(manifest.isStale(split));
+    // A drop needs no tree to be there: its replay finds them gone.
+    try std.testing.expect(!manifest.isStale(drop));
+
+    // Skipped whole: the split's new half is not created either.
+    try manifest.apply(4, flush);
+    try manifest.apply(5, split);
+    try std.testing.expectEqual(@as(u32, 0), manifest.trees.count());
+    try std.testing.expectEqual(@as(u32, 0), manifest.ssts.count());
+}
+
 // -------------------------------------------------------------------------
 // serialize → restoreFrom round-trip
 // -------------------------------------------------------------------------

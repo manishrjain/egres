@@ -100,6 +100,9 @@ pub const StorageImpl = struct {
     /// `oldest_memtable_index` field (0 if no snapshot, equivalent to "no
     /// skipping"). Read-only after `recovery_done` flips, so no atomic.
     oldest_memtable_index: u64 = 0,
+    /// Manifest changes skipped at apply for a tree that was gone.
+    /// Each is one that reached the log outside `Engine.change_mu`.
+    stale_changes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn asStateMachine(self: *StorageImpl) raft.Node.StateMachine {
         return .{
@@ -270,6 +273,20 @@ pub const StorageImpl = struct {
             }
         }
 
+        // Its proposer checked this under the change lock and held it
+        // until here (`Engine.proposeHeld`), so a stale change is one
+        // that went around the lock. Skipped whole, as a snapshot draft
+        // skips it (`Manifest.apply`): the trees stay the same on both.
+        if (self.forest.manifest.isStale(mcs.*)) {
+            _ = self.stale_changes.fetchAdd(1, .monotonic);
+            log.err(
+                "manifest change idx={d} cmd={t} is for a tree that is " ++
+                    "gone: skipped",
+                .{ index, mcs.cmd },
+            );
+            return;
+        }
+
         switch (mcs.cmd) {
             .new_memtable => try self.forest.newMemtable(index),
             .flush => try self.forest.applyFlush(index, mcs.sstable_changes, mcs.memtable_id),
@@ -386,6 +403,10 @@ pub const InFlight = struct {
 /// ordered); `apply` = also applied to this node's state (locally readable).
 pub const Wait = enum { commit, apply };
 
+/// `Engine.change_mu`. An RWMutex for its hold token; nothing takes it
+/// shared.
+const ChangeLock = fiber.RWMutex(.tracked);
+
 /// The glue binding `zdb` (the forest) and `raft` (the node) into one
 /// replicated storage unit: writes flow through raft and apply into the forest,
 /// reads come from the forest, and the background loops keep the LSM healthy via
@@ -431,6 +452,20 @@ pub const Engine = struct {
     /// they don't touch routes, and a split runs only when no job of its
     /// tree does (`Tree.reserveJob`).
     flush_split_mu: fiber.Mutex(.tracked) = .{},
+
+    /// One manifest change at a time, from the check of what it was
+    /// built on to its apply. A change is built from the trees of one
+    /// moment and applied at a later one: a flush, a compaction or a
+    /// split whose tree a drop removed in between is for nothing, and
+    /// a drop that a split got in front of misses a tree. The holder
+    /// (`holdChanges`) has applied every entry before its own, builds
+    /// or checks its change, proposes it and waits for the apply
+    /// (`proposeHeld`). So the trees it saw are the trees the apply
+    /// finds, on this run and on every replay of the log. A build that
+    /// takes long, a flush's or a compaction's tables, runs before the
+    /// hold and is checked under it. Taken after `flush_split_mu`,
+    /// never before it.
+    change_mu: ChangeLock = .{},
 
     /// Background fibers: the raft runtime + compaction + snapshot loops, plus
     /// any front-end listeners the binary registers via `spawnListener`.
@@ -510,6 +545,7 @@ pub const Engine = struct {
         self.in_flight_mu.unlock();
         self.in_flight_mu.deinit();
         self.flush_split_mu.deinit();
+        self.change_mu.deinit();
         self.bg.deinit();
         self.raft_rt.deinit();
 
@@ -1261,11 +1297,11 @@ pub const Engine = struct {
             .started_at_ms = utils.coarseMs(),
         });
         defer self.removeInFlight(.new_memtable, InFlight.no_tree, 0);
+        const held = try self.holdChanges(@src());
+        defer held.release();
         // memtable_id stays 0 in the proposal: the id is assigned at apply
         // as the entry's own log index, identically on every node.
-        const payload = try zdb_bufs.marshalRoot(self.allocator, _manifest.ManifestChange{ .cmd = .new_memtable, .memtable_id = 0 });
-        defer self.allocator.free(payload);
-        try self.node.proposeAndWaitForApply(payload, .manifest);
+        try self.proposeHeld(held, .{ .cmd = .new_memtable, .memtable_id = 0 });
     }
 
     fn proposeFlush(self: *Engine) !void {
@@ -1287,19 +1323,23 @@ pub const Engine = struct {
 
         var changes = result.changes;
         defer changes.deinit(self.allocator);
-        if (changes.items.len == 0) return;
 
         try self.announceNewFiles(changes.items);
 
-        const payload = try encodeManifestChange(
-            self.allocator,
-            .flush,
-            changes.items,
-            &.{},
-            result.newest_memtable_id,
-        );
-        defer self.allocator.free(payload);
-        try self.node.proposeAndWaitForApply(payload, .manifest);
+        // A table dropped during the build takes none of the flush.
+        // The entry goes out with what is left, even with no table:
+        // its apply is what releases the memtables.
+        const held = try self.holdChanges(@src());
+        const kept = self.forest.keepListed(changes.items);
+        const proposed = self.proposeHeld(held, .{
+            .cmd = .flush,
+            .sstable_changes = changes.items[0..kept],
+            .memtable_id = result.newest_memtable_id,
+        });
+        held.release();
+        // Whatever became of the proposal, no entry names these.
+        try self.forest.removeUnlisted(changes.items[kept..]);
+        return proposed;
     }
 
     fn proposeCompaction(self: *Engine, job: TakenJob) !void {
@@ -1365,10 +1405,26 @@ pub const Engine = struct {
             cid, t2 - t1,
         });
 
-        const payload = try encodeManifestChange(self.allocator, .compaction, changes.items, &.{}, 0);
-        defer self.allocator.free(payload);
-
-        try self.node.proposeAndWaitForApply(payload, .manifest);
+        const held = try self.holdChanges(@src());
+        const proposed = self.proposeHeld(held, .{
+            .cmd = .compaction,
+            .sstable_changes = changes.items,
+        });
+        held.release();
+        proposed catch |err| switch (err) {
+            // The tree was dropped during the build, and no entry names
+            // the tables written for it. Any other failure may have left
+            // the entry in the log: its tables wait for the orphan scan.
+            error.StaleChange => {
+                try self.forest.removeUnlisted(changes.items);
+                log.info("compact cid={d} tree={d} L{d}: tree dropped " ++
+                    "during the build, nothing proposed", .{
+                    cid, job.key.tree_id, src,
+                });
+                return;
+            },
+            else => return err,
+        };
         const t3 = utils.coarseMs();
         // The one line per compaction a release log keeps: every phase's
         // time is in it.
@@ -1393,12 +1449,15 @@ pub const Engine = struct {
             .started_at_ms = utils.coarseMs(),
         });
         defer self.removeInFlight(.split, key, 0);
-        // buildSplit allocates sstable_changes / tree_changes on the arena;
-        // encodeManifestChange copies the bytes into a self-owned payload,
-        // so the arena can be torn down right after encode. No new SST
-        // files are produced (split just remaps existing tables between
-        // trees), so announceNewFiles is unnecessary here. tree_split routes
-        // through applyManifestChange to applySplit on every node.
+        // Built under the hold: a split writes no table, so the build
+        // is short, and no drop of the tree can come before its apply.
+        const held = try self.holdChanges(@src());
+        defer held.release();
+        // buildSplit allocates sstable_changes / tree_changes on the arena.
+        // No new SST files are produced (split just remaps existing tables
+        // between trees), so announceNewFiles is unnecessary here.
+        // tree_split routes through applyManifestChange to applySplit on
+        // every node.
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const mc = try self.forest.buildSplit(
@@ -1428,15 +1487,7 @@ pub const Engine = struct {
             key.tree_id, mc.sstable_changes.len, n_create, n_delete, mc.tree_changes.len,
         });
 
-        const payload = try encodeManifestChange(
-            self.allocator,
-            mc.cmd,
-            mc.sstable_changes,
-            mc.tree_changes,
-            0,
-        );
-        defer self.allocator.free(payload);
-        try self.node.proposeAndWaitForApply(payload, .manifest);
+        try self.proposeHeld(held, mc);
     }
 
     /// Announce new SST files, BEFORE their manifest change is proposed:
@@ -1616,9 +1667,15 @@ pub const Engine = struct {
         self.storage_impl.apply_observer = obs;
     }
 
+    /// Manifest changes this node skipped at apply for a tree that was
+    /// gone. Zero unless one reached the log outside `change_mu`.
+    pub fn staleChanges(self: *const Engine) u64 {
+        return self.storage_impl.stale_changes.load(.monotonic);
+    }
+
     /// Propose an already-encoded payload through Raft and block for `wait`
-    /// (commit = quorum; apply = also applied here). The one propose+wait path
-    /// the encode helpers below funnel through.
+    /// (commit = quorum; apply = also applied here). Not for a manifest
+    /// change, which enters the log through `proposeHeld` only.
     pub fn proposeAndWait(self: *Engine, payload: String, proposal_type: raft.Node.ProposalType, wait_for: Wait) !void {
         switch (wait_for) {
             .apply => try self.node.proposeAndWaitForApply(payload, proposal_type),
@@ -1634,15 +1691,77 @@ pub const Engine = struct {
         }
     }
 
-    /// Encode a forest manifest change (ns/tree create or drop, …) and propose
-    /// it. Pairs with the forest `build*` constructors: the caller builds the
-    /// change (leader side), this makes it real everywhere. Control plane uses
-    /// `.apply` — the change must be locally visible when the caller returns.
-    pub fn proposeMC(self: *Engine, mc: _manifest.ManifestChange, wait_for: Wait) !void {
+    /// Takes the change lock, on a leader that has applied every entry
+    /// before now (`catchUp`): what the holder then reads of the trees
+    /// is what its change is applied to. See `change_mu`.
+    fn holdChanges(
+        self: *Engine,
+        comptime src: std.builtin.SourceLocation,
+    ) !ChangeLock.Exclusive {
+        const held = self.change_mu.hold(.exclusive, src);
+        errdefer held.release();
+        try self.catchUp();
+        return held;
+    }
+
+    /// The one way a manifest change enters the log: checked against
+    /// the trees (`Manifest.isStale`), proposed, and applied here before
+    /// the holder lets go. `error.StaleChange`, with nothing proposed,
+    /// for a change whose tree was dropped since it was built. A
+    /// proposal that fails otherwise is not in the log, or the node is
+    /// stopping or has stepped down: it proposes nothing more until a
+    /// new term, whose first hold applies what the log kept.
+    fn proposeHeld(
+        self: *Engine,
+        held: ChangeLock.Exclusive,
+        mc: _manifest.ManifestChange,
+    ) !void {
+        self.change_mu.assertHeld(held);
+        if (self.forest.manifest.isStale(mc)) return error.StaleChange;
         // The whole change: a branch names its source in `branch_from`.
         const payload = try zdb_bufs.marshalRoot(self.allocator, mc);
         defer self.allocator.free(payload);
-        try self.proposeAndWait(payload, .manifest, wait_for);
+        try self.node.proposeAndWaitForApply(payload, .manifest);
+    }
+
+    /// Propose a change from a forest `build*` constructor and return
+    /// once it is applied here. For a change built on no list of
+    /// trees: a create or a branch, and an index backfill, whose one
+    /// tree the caller's DDL lock keeps. A drop lists trees, so it is
+    /// built under the hold: `dropTables`, `dropNamespace`.
+    pub fn proposeMC(self: *Engine, mc: _manifest.ManifestChange) !void {
+        const held = try self.holdChanges(@src());
+        defer held.release();
+        try self.proposeHeld(held, mc);
+    }
+
+    /// DROP TABLE and DROP INDEX: one change for every tree of
+    /// `table_ids`, listed and proposed under one hold, so no split
+    /// gives a table a tree the change does not name.
+    pub fn dropTables(
+        self: *Engine,
+        namespace: u64,
+        table_ids: []const u32,
+    ) !void {
+        const held = try self.holdChanges(@src());
+        defer held.release();
+
+        const mc = try self.forest.buildTableDrop(
+            self.allocator,
+            namespace,
+            table_ids,
+        );
+        defer self.allocator.free(mc.tree_changes);
+        try self.proposeHeld(held, mc);
+    }
+
+    /// DROP DATABASE: as `dropTables`, for every tree of `namespace`.
+    pub fn dropNamespace(self: *Engine, namespace: u64) !void {
+        const held = try self.holdChanges(@src());
+        defer held.release();
+        const mc = try self.forest.buildNsDrop(self.allocator, namespace);
+        defer self.allocator.free(mc.tree_changes);
+        try self.proposeHeld(held, mc);
     }
 
     /// Encode key-value writes and propose them as one .data entry — one
@@ -1736,25 +1855,6 @@ fn seedGenesis(
     try wal.setHardState(.{ .commit_index = 1 });
     log.info("seeded genesis: database '{s}' -> ns={d}", .{
         name, zdb.manifest.first_namespace,
-    });
-}
-
-/// Encode a ManifestChange into a zbuf-serialized payload to propose.
-fn encodeManifestChange(
-    allocator: std.mem.Allocator,
-    cmd: _manifest.Command,
-    sstable_changes: []_manifest.SSTableChange,
-    tree_changes: []_manifest.TreeChange,
-    memtable_id: u64,
-) ![]u8 {
-    // marshalRoot serializes every field of the nested SSTableChange /
-    // TreeChange (namespace_id, checksum, size, …); a hand-written writer
-    // that copies only a subset would silently drop the new id-model fields.
-    return zdb_bufs.marshalRoot(allocator, _manifest.ManifestChange{
-        .cmd = cmd,
-        .sstable_changes = sstable_changes,
-        .tree_changes = tree_changes,
-        .memtable_id = memtable_id,
     });
 }
 

@@ -361,6 +361,67 @@ test "branch: a restart keeps the rows a namespace branch copied" {
     );
 }
 
+// The change lock keeps such an entry out of the log
+// (`Engine.proposeHeld`). One that got there all the same wedged the
+// apply loop or the snapshot, each failing on a tree that was gone.
+test "apply: a flush behind a drop is skipped whole, in the draft too" {
+    var fx: ApplyFixture = undefined;
+    try fx.setup(0);
+    defer fx.teardown();
+
+    // 3: a second namespace. 4, 5: a row of each in memtable 1, which
+    // 6 freezes.
+    const other: u64 = 8;
+    const created = try fx.forest.buildNsCreate(
+        fx.arena.allocator(),
+        .{ .given = other },
+        "",
+    );
+    try fx.apply(3, 30, created.change);
+    var gone_row = [_]zen.KeyValueStruct{
+        .{ .key = try fx.key(ns, "a"), .value = "1" },
+    };
+    try fx.applyData(4, 40, ns, &gone_row);
+    var kept_row = [_]zen.KeyValueStruct{
+        .{ .key = try fx.key(other, "b"), .value = "2" },
+    };
+    try fx.applyData(5, 50, other, &kept_row);
+    try fx.apply(6, 60, newMemtable());
+
+    // The flush is built with a table for each namespace, and `ns` is
+    // dropped in front of its entry.
+    var flush = (try fx.forest.buildFlush()) orelse
+        return error.TestExpectedFlush;
+    defer flush.changes.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), flush.changes.items.len);
+    const drop = try fx.forest.buildNsDrop(fx.arena.allocator(), ns);
+    try fx.apply(7, 70, drop);
+    try fx.apply(8, 80, .{
+        .tree_changes = &.{},
+        .sstable_changes = flush.changes.items,
+        .cmd = .flush,
+        .memtable_id = flush.newest_memtable_id,
+    });
+
+    // Skipped and counted. The memtable is still to be flushed, and
+    // the other namespace's row is read from it.
+    try testing.expectEqual(
+        @as(u64, 1),
+        fx.impl.stale_changes.load(.monotonic),
+    );
+    try testing.expect(fx.forest.memtables.immutableCount() == 1);
+    const catalog: zdb.kv.TableKey = .{ .namespace = other, .table_id = 1 };
+    try testing.expectEqualStrings("2", (try fx.readIn(catalog, "b", 80)).?);
+
+    // The draft replays the same entries and lists no table either.
+    const snap_bytes = try fx.snapshotAt(8);
+    defer testing.allocator.free(snap_bytes);
+    var draft = zdb.manifest.Manifest.init(testing.allocator);
+    defer draft.deinit();
+    try draft.restoreFrom(snap_bytes);
+    try testing.expectEqual(@as(u32, 0), draft.ssts.count());
+}
+
 fn newMemtable() zdb.manifest.ManifestChange {
     return .{
         .tree_changes = &.{},

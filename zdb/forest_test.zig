@@ -573,7 +573,7 @@ test "forest: drop_ns removes every table and forgets the id counter" {
     );
 }
 
-test "forest: a flush applied after a drop takes nothing for what is gone" {
+test "forest: a flush built before a drop keeps the tables of what is left" {
     const alloc = std.testing.allocator;
     var tmp = try vfs.TmpDir.init(alloc);
     defer tmp.deinit();
@@ -605,17 +605,76 @@ test "forest: a flush applied after a drop takes nothing for what is gone" {
     defer flush.changes.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), flush.changes.items.len);
 
-    // The drop is committed after the flush was built and before its
-    // entry: the entry names trees that are gone when it applies.
+    // The drop is applied after the flush was built. The proposer
+    // takes the dropped trees' tables out before the flush is proposed.
     const dc = try f.buildNsDrop(alloc, gone);
     defer alloc.free(dc.tree_changes);
     try f.applyTrees(5, dc);
-    try f.applyFlush(6, flush.changes.items, flush.newest_memtable_id);
+    const listed_len = f.keepListed(flush.changes.items);
+    try std.testing.expectEqual(@as(usize, 1), listed_len);
+    const listed = flush.changes.items[0..listed_len];
+    try std.testing.expectEqual(kept, listed[0].namespace_id);
+    try f.applyFlush(6, listed, flush.newest_memtable_id);
 
     // The other namespace has its table, and the memtable is flushed.
     try expectRow(f, alloc, kept, "b", "b10");
     try std.testing.expect(!f.hasNamespace(gone));
     try std.testing.expect((try f.buildFlush()) == null);
+
+    // No entry names the dropped tree's table, so its file goes.
+    const unlisted = flush.changes.items[listed_len..];
+    try std.testing.expect(try sstExists(alloc, &store, unlisted[0].sst_id));
+    try f.removeUnlisted(unlisted);
+    try std.testing.expect(!try sstExists(alloc, &store, unlisted[0].sst_id));
+    try std.testing.expect(try sstExists(alloc, &store, listed[0].sst_id));
+}
+
+test "forest: a change refused at propose keeps a moved file, not a new one" {
+    const alloc = std.testing.allocator;
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+
+    const f_live = try flags.Live(Config).create(alloc, .{});
+    defer f_live.destroy();
+    var store = try vfs.Store.initFile(alloc, tmp.path, vfs.g());
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
+    defer f.close();
+
+    const gone: u64 = 7;
+    const nc = try f.buildNsCreate(alloc, .{ .given = gone }, "seven");
+    defer alloc.free(nc.change.tree_changes);
+    try f.applyTrees(1, nc.change);
+
+    // One table listed, and one written by a build never proposed.
+    try f.newMemtable(2);
+    try f.put(&.{rowItem(gone, "a", 10, "a10")});
+    try f.newMemtable(3);
+    var first = (try f.buildFlush()) orelse return error.TestExpectedFlush;
+    defer first.changes.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), first.changes.items.len);
+    try f.applyFlush(4, first.changes.items, first.newest_memtable_id);
+    try f.put(&.{rowItem(gone, "b", 10, "b10")});
+    try f.newMemtable(5);
+    var second = (try f.buildFlush()) orelse return error.TestExpectedFlush;
+    defer second.changes.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), second.changes.items.len);
+
+    const dc = try f.buildNsDrop(alloc, gone);
+    defer alloc.free(dc.tree_changes);
+    try f.applyTrees(6, dc);
+
+    // A compaction built before the drop: the listed table moved one
+    // level down under its own id, and the new one merged.
+    var moved = first.changes.items[0];
+    moved.level = 1;
+    const merged = second.changes.items[0];
+    try f.removeUnlisted(&[_]_manifest.SSTableChange{ moved, merged });
+
+    // The drop retired the moved file, and a restart from before the
+    // drop's snapshot opens it again.
+    try std.testing.expect(try sstExists(alloc, &store, moved.sst_id));
+    try std.testing.expect(!try sstExists(alloc, &store, merged.sst_id));
 }
 
 test "forest: a compaction is counted for its namespace when it wrote" {

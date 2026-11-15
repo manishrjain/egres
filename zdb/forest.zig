@@ -1011,29 +1011,69 @@ pub const Forest = struct {
         return self.compactions.get(namespace) orelse 0;
     }
 
+    /// Puts first in a built flush the tables of trees that are still
+    /// there, in their order, and returns how many: the rest are of
+    /// trees dropped while it was built. The proposer calls this under
+    /// the engine's change lock and proposes only the first ones, so
+    /// each tree is there at the apply. No entry names the rest.
+    pub fn keepListed(
+        self: *Forest,
+        changes: []_manifest.SSTableChange,
+    ) usize {
+        var kept: usize = 0;
+        for (changes, 0..) |c, idx| {
+            if (!self.hasTree(c.namespace_id, c.tree_id)) continue;
+            std.mem.swap(
+                _manifest.SSTableChange,
+                &changes[kept],
+                &changes[idx],
+            );
+            kept += 1;
+        }
+        return kept;
+    }
+
+    /// Deletes the files `changes` creates that the manifest does not
+    /// know. For a change no log entry names: refused at propose, or
+    /// taken out of one. A file the manifest lists or has retired
+    /// stays: a move creates its table's own file one level down, and
+    /// a restart from before the drop's snapshot opens it again. A
+    /// file that does not delete is left to the orphan scan.
+    pub fn removeUnlisted(
+        self: *Forest,
+        changes: []const _manifest.SSTableChange,
+    ) !void {
+        var removed: usize = 0;
+        for (changes) |c| {
+            if (c.op != .create) continue;
+            if (self.manifest.knowsFile(c.sst_id)) continue;
+
+            const name = try sstName(self.allocator, c.sst_id);
+            defer self.allocator.free(name);
+            const deleted = self.removeFile(name, c.sst_id) catch |err| {
+                log.warn(
+                    "removeUnlisted: delete {s}: {s}",
+                    .{ name, @errorName(err) },
+                );
+                continue;
+            };
+            if (deleted) removed += 1;
+        }
+        if (removed > 0) log.info(
+            "removeUnlisted: deleted {d} SST(s) no entry names",
+            .{removed},
+        );
+    }
+
     /// applyFlush is Phase B: commits the manifest changes from a memtable
     /// flush and updates in-memory levels. Called on all nodes after Raft
     /// commit. Also removes the flushed memtable from the immutable list.
     pub fn applyFlush(
         self: *Forest,
         index: u64,
-        flushed: []const _manifest.SSTableChange,
+        changes: []const _manifest.SSTableChange,
         memtable_id: u64,
     ) !void {
-        // A table dropped after the flush was built takes none of it:
-        // the entry is committed behind the drop, and replay meets it
-        // there again. Its files are left to the orphan scan.
-        var live: std.ArrayList(_manifest.SSTableChange) = .empty;
-        defer live.deinit(self.allocator);
-        for (flushed) |c| {
-            if (!self.hasTable(.{
-                .namespace = c.namespace_id,
-                .table_id = treeTableId(c.tree_id),
-            })) continue;
-            try live.append(self.allocator, c);
-        }
-        const changes = live.items;
-
         // Load all new L0 tables concurrently via the cache. The announce
         // prefetch may have pre-opened these (follower path) → cache hit.
         // On the leader they will typically be misses. This is the step
@@ -1328,27 +1368,33 @@ pub const Forest = struct {
             const st = self.store.stat(name) catch continue;
             if (st.mtime_s > cutoff_s) continue;
 
-            // A pre-opened table for a create that never applied sits in
-            // the cache with an open handle; without this, it would keep
-            // its blocks until the process exits.
-            self.table_cache.evict(id);
-            self.store.delete(name) catch |err| switch (err) {
-                error.FileNotFound => continue,
-                else => {
-                    log.warn(
-                        "removeOrphans: delete {s}: {s}",
-                        .{ name, @errorName(err) },
-                    );
-                    continue;
-                },
+            const deleted = self.removeFile(name, id) catch |err| {
+                log.warn(
+                    "removeOrphans: delete {s}: {s}",
+                    .{ name, @errorName(err) },
+                );
+                continue;
             };
-            removed += 1;
+            if (deleted) removed += 1;
         }
         if (removed > 0) log.info(
             "removeOrphans: deleted {d} of {d} unknown SST(s) last " ++
                 "written at or before the cutoff",
             .{ removed, unknowns.len },
         );
+    }
+
+    /// Deletes `id`'s file, `name`, which the manifest does not know.
+    /// Its table cache entry goes first: a table pre-opened for a create
+    /// that never applied would keep its blocks until the process exits.
+    /// False when the file was gone already.
+    fn removeFile(self: *Forest, name: String, id: u64) !bool {
+        self.table_cache.evict(id);
+        self.store.delete(name) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        return true;
     }
 
     // -----------------------------------------
