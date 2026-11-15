@@ -39,6 +39,21 @@ test "Mutex(.tracked): a released lock derives held==0 and is skipped" {
     try std.testing.expect(std.mem.indexOf(u8, aw.writer.buffered(), "LOCKS:") != null);
 }
 
+test "Mutex(.tracked): a lock unlinks from anywhere in the registry" {
+    var locks: [3]fiber.Mutex(.tracked) = .{ .{}, .{}, .{} };
+    for (&locks) |*mu| {
+        mu.lock(@src());
+        mu.unlock();
+    }
+    // The list runs newest first, so this unlinks the middle lock, then
+    // the head (unless a test alongside registered after us), then the
+    // oldest. The check panics on a lock left linked after its deinit.
+    for ([_]usize{ 1, 2, 0 }) |lock_idx| {
+        locks[lock_idx].deinit();
+        fiber.checkLockRegistryForTests();
+    }
+}
+
 test "RWMutex(.tracked): only the first reader of a shared session records" {
     var rw: fiber.RWMutex(.tracked) = .{};
     defer rw.deinit();

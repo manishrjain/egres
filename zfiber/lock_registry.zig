@@ -46,6 +46,7 @@ pub const Tracking = struct {
     holder_src: ?*const SourceLocation = null,
     held_since_ms: i64 = 0,
     next: ?*Tracking = null,
+    prev: ?*Tracking = null,
     owner: *anyopaque = undefined,
     snapshot: *const fn (*anyopaque) Snap = undefined,
     /// 0 = unregistered, 2 = linked. Lets the common case skip `reg_mu`.
@@ -56,7 +57,9 @@ pub const Tracking = struct {
 // std.Io.Mutex. MUST stay a thread mutex (not a fiber lock): guarding fiber-lock
 // tracking with a fiber lock would recurse, and the dump/unregister paths run
 // from the main thread during shutdown after the runtime is torn down. Critical
-// sections are pure CPU (link/unlink/walk) — no yields inside.
+// sections are pure CPU (link/unlink/walk) — no yields inside. Doubly
+// linked so an unlink takes no walk: shutdown unlinks every lock, and
+// 26,000 tenants hold about 230,000 of them.
 var reg_mu: std.Io.Mutex = .init;
 var live_head: ?*Tracking = null;
 /// Count of currently-registered tracked locks (registers − unregisters).
@@ -113,7 +116,9 @@ fn ensureRegistered(self: *Tracking, owner: *anyopaque, snapshot: *const fn (*an
     if (self.registered.load(.acquire) == 2) return; // double-checked under lock
     self.owner = owner;
     self.snapshot = snapshot;
+    self.prev = null;
     self.next = live_head;
+    if (live_head) |head| head.prev = self;
     live_head = self;
     self.registered.store(2, .release);
     _ = registered_count.fetchAdd(1, .monotonic);
@@ -126,18 +131,10 @@ pub fn unregister(self: *Tracking) void {
     if (self.registered.load(.acquire) != 2) return;
     regLock();
     defer regUnlock();
-    if (live_head == self) {
-        live_head = self.next;
-    } else {
-        var prev = live_head;
-        while (prev) |p| : (prev = p.next) {
-            if (p.next == self) {
-                p.next = self.next;
-                break;
-            }
-        }
-    }
+    if (self.prev) |prev| prev.next = self.next else live_head = self.next;
+    if (self.next) |next| next.prev = self.prev;
     self.next = null;
+    self.prev = null;
     self.registered.store(0, .release);
     _ = registered_count.fetchSub(1, .monotonic);
 }
