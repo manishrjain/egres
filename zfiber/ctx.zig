@@ -239,14 +239,15 @@ pub const Ctx = struct {
     /// the yield points took 3% off a count.
     pub const meter_units = 256;
 
-    /// One unit of a loop's work, a row or an index key: the first of
-    /// a statement and every `meter_units`th after it is a yield point
-    /// (`maybeYield`), whichever loops they fall in. Cheap enough to
+    /// One unit of a loop's work, a row, an index key, a merged item,
+    /// a manifest record: the first and every `meter_units`th after it
+    /// is a yield point (`maybeYield`), whichever loops they fall in.
+    /// Every long loop's, on a statement or off one. Cheap enough to
     /// call per row, which `maybeYield` is not, so a loop keeps no
-    /// stride of its own. On a fiber's own context only: `bg` is
-    /// never written.
+    /// stride of its own. Off any fiber it is nothing: `bg` is shared
+    /// and never written.
     pub inline fn meter(self: *Ctx) YieldError!void {
-        std.debug.assert(self != &bg);
+        if (self == &bg) return;
         self.metered +%= 1;
         if (self.metered % meter_units == 1) try self.maybeYield();
     }

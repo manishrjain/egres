@@ -1161,9 +1161,13 @@ fn runPartition_(
     // --- merge loop ---
     var emitter = try Emitter.init(self, dest, snapshot_ts);
     defer emitter.deinit();
+    // Between its reads a partition merges for tens of ms, on a worker
+    // sessions are dealt to, as the job's tenant: its cpu is charged
+    // and paid per batch, not when the partition parks.
     while (merge.itemRef()) |item| {
         try emitter.push(item);
         try merge.next();
+        try fiber.ctx().meter();
     }
     return emitter.finish();
 }

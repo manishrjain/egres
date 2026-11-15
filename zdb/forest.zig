@@ -829,6 +829,9 @@ pub const Forest = struct {
             // No tree for the key (its namespace is gone): dropped.
             if (cur) |em| try em.push(item);
             try iter.next();
+            // The walk is every frozen memtable, 200 ms and more under
+            // four writers, on a worker sessions are dealt to.
+            try fiber.ctx().meter();
         }
         if (cur) |em| try flushes.spawn(.{}, flushTable, .{ em, &flush_err });
 

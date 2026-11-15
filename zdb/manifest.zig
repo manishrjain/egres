@@ -561,6 +561,13 @@ pub const Manifest = struct {
         self.mu.deinit();
     }
 
+    /// For a manifest on an arena its owner frees whole, the snapshot
+    /// build's draft: only the lock leaves. Freeing 26,000 tenants'
+    /// trees one by one took 24 ms, on a worker sessions share.
+    pub fn deinitOnArena(self: *Manifest) void {
+        self.mu.deinit();
+    }
+
     /// Applies a single table CREATE or DELETE to the tree's levels, and
     /// maintains the file's `SstInfo`. `index` is the log index of the
     /// entry being applied; a CREATE that does not carry its own
@@ -1049,9 +1056,12 @@ pub const Manifest = struct {
         // Reverse map (ns, table_id) → table name, so a tree's CREATE change
         // below can carry its table's name — the same vehicle the live
         // create_tree apply uses (TreeChange.name).
+        // A snapshot build serializes every tree, on a worker sessions
+        // share: with 26,000 tenants this and the replay were 93 ms.
         var tnames = std.AutoHashMap(TableKey, String).init(a);
         var nit = self.namespaces.iterator();
         while (nit.next()) |kv| {
+            try fiber.ctx().meter();
             var tit = kv.value_ptr.tables.iterator();
             while (tit.next()) |t| {
                 // t.key = table name. t.value = uint32 table id.
@@ -1064,6 +1074,7 @@ pub const Manifest = struct {
 
         var it = self.trees.iterator();
         while (it.next()) |kv| {
+            try fiber.ctx().meter();
             const tk = kv.key_ptr.*;
             const tree = kv.value_ptr.*;
             const left_raw = try tree.left.marshal(a);
@@ -1107,6 +1118,7 @@ pub const Manifest = struct {
         var namespaces: std.ArrayList(_zen.NamespaceStruct) = .empty;
         var cit = self.namespaces.iterator();
         while (cit.next()) |kv| {
+            try fiber.ctx().meter();
             try namespaces.append(a, .{
                 .id = kv.key_ptr.*,
                 .next_table_id = kv.value_ptr.next_table_id,
@@ -1151,10 +1163,14 @@ pub const Manifest = struct {
             while (nit.next()) |n| n.deinit(self.allocator);
             self.namespaces.clearRetainingCapacity();
 
+            // A snapshot of 26,000 tenants took 90 ms to restore, on a
+            // worker sessions share: each loop here gives way.
+
             // Order matters: trees must exist before tables can attach to them.
             const tc_len = reader.treeChangesLen();
             var i: u32 = 0;
             while (i < tc_len) : (i += 1) {
+                try fiber.ctx().meter();
                 const tc = try reader.treeChangesAt(i);
                 // index 0: a serialized manifest carries only
                 // creates, so nothing here reaches `decrSST`.
@@ -1173,6 +1189,7 @@ pub const Manifest = struct {
             const tbl_len = reader.sstableChangesLen();
             i = 0;
             while (i < tbl_len) : (i += 1) {
+                try fiber.ctx().meter();
                 const tc = try reader.sstableChangesAt(i);
                 // Every serialized create carries its own raft_index, so
                 // the applying-entry index is irrelevant here.
@@ -1192,6 +1209,7 @@ pub const Manifest = struct {
             const ns_len = reader.namespacesLen();
             i = 0;
             while (i < ns_len) : (i += 1) {
+                try fiber.ctx().meter();
                 const c = try reader.namespacesAt(i);
                 const slot = try self.namespaces.getOrPut(c.id());
                 if (!slot.found_existing) slot.value_ptr.* = .{};
@@ -1207,6 +1225,7 @@ pub const Manifest = struct {
         const tc_len = reader.treeChangesLen();
         var i: u32 = 0;
         while (i < tc_len) : (i += 1) {
+            try fiber.ctx().meter();
             const tc = try reader.treeChangesAt(i);
             if (tc.op() == .create)
                 try self.registerTableName(.{
@@ -1217,6 +1236,7 @@ pub const Manifest = struct {
         const ns_len = reader.namespacesLen();
         i = 0;
         while (i < ns_len) : (i += 1) {
+            try fiber.ctx().meter();
             const c = try reader.namespacesAt(i);
             try self.registerNamespaceName(c.id(), c.name());
         }

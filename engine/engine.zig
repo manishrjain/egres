@@ -1007,9 +1007,15 @@ pub const Engine = struct {
         );
 
         // Seed draft from previous snapshot's manifest, then replay every
-        // manifest-bearing log entry in (prev_snap.index, target].
-        var draft = _manifest.Manifest.init(self.allocator);
-        defer draft.deinit();
+        // manifest-bearing log entry in (prev_snap.index, target]. The
+        // draft is on an arena, freed whole: what the replay's drops and
+        // deletes let go of stays until then, one snapshot interval of
+        // it at most.
+        var arloc = std.heap.ArenaAllocator.init(self.allocator);
+        defer arloc.deinit();
+        var draft = _manifest.Manifest.init(arloc.allocator());
+        defer draft.deinitOnArena();
+
         if (prev_snap.data.len > 0) {
             try draft.restoreFrom(prev_snap.data);
         }
@@ -1032,6 +1038,9 @@ pub const Engine = struct {
         var scratch: std.ArrayList(u8) = .empty;
         defer scratch.deinit(self.allocator);
         for (result.entries) |stored| {
+            // The scan is every entry since the snapshot, on a worker
+            // sessions share.
+            try fiber.ctx().meter();
             const reader = raft.buffers.LogEntryReader.parseRoot(stored.bytes) catch |err| {
                 log.err("maybeProposeSnapshot: parseRoot at index={d}: {s}", .{
                     stored.index, @errorName(err),
@@ -1154,6 +1163,12 @@ pub const Engine = struct {
             if (self.proposeFlush()) |_| {
                 retry_ms = 0;
             } else |err| {
+                // A flush the stop interrupted is redone from the log
+                // after the restart; only a live node has failed.
+                if (self.node.isShuttingDown()) {
+                    log.info("flush dropped at shutdown", .{});
+                    return;
+                }
                 retry_ms = nextRetryMs(retry_ms);
                 utils.logEvery(.err, 30, "proposeFlush failed: {s}; " ++
                     "retrying in {d} ms", .{ @errorName(err), retry_ms });
