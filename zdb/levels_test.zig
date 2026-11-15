@@ -547,6 +547,7 @@ test "levels: open" {
         test_tree_id,
         &manifest,
         &cache,
+        null,
     );
     defer tree.release();
 
@@ -594,6 +595,7 @@ test "levels: pick compact level" {
         test_tree_id,
         &manifest,
         &cache,
+        null,
     );
     defer tree.release();
 
@@ -615,6 +617,72 @@ test "levels: pick compact level" {
     try tree.updateCompactCandidate();
     try std.testing.expect(tree.compact_candidate != null);
     try std.testing.expectEqual(@as(u8, 1), tree.compact_candidate.?.level);
+}
+
+test "levels: a retired tree never retakes a split's left half's key" {
+    const alloc = std.testing.allocator;
+
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    var store = try vfs.Store.initFile(alloc, tmp.path, vfs.g());
+    defer store.deinit();
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
+    var cache = TableCache.init(alloc, &store);
+    defer cache.deinit();
+    // As in the test above: one table in L1 is over its target.
+    var live = flags.Live(config.Config).initFrom(alloc, .{
+        .lmax_target_bytes = 1,
+    });
+    defer live.deinit();
+    var queue = zdb.compaction.CompactQueue.init(alloc);
+    defer queue.deinit();
+
+    // Two trees under one key, as a split's left tree takes the id of
+    // the tree it replaces while that one is still open.
+    const old = try Tree.open(alloc, &live, 0, 1, &manifest, &cache, &queue);
+    var old_open = true;
+    defer if (old_open) old.release();
+    const left = try Tree.open(alloc, &live, 0, 1, &manifest, &cache, &queue);
+    defer left.release();
+    try std.testing.expect(queue.best() == null);
+
+    var tb = try buildTable(alloc, &.{
+        .{ .key = "a", .ts = 1, .val = "va" },
+        .{ .key = "b", .ts = 1, .val = "vb" },
+    });
+    defer tb.deinit();
+    const t = try openTableOwned(alloc, &tb);
+    _ = try cache.own(999, t);
+    for ([_]*Tree{ old, left }) |tree| {
+        const h = tree.mu.hold(.exclusive, @src());
+        defer h.release();
+        try tree.levels[1].addEntry(h, 999, 999, t);
+    }
+    t.decrRef();
+
+    try old.updateCompactCandidate();
+    try std.testing.expectEqual(@as(u64, 1), queue.best().?.tree_id);
+    try left.updateCompactCandidate();
+
+    // Retired, the old tree takes the shared entry out with it and
+    // posts no more, even when it finishes a job; the left tree posts
+    // again, as applySplit does, and that entry stands.
+    old.leaveQueue();
+    try std.testing.expect(queue.best() == null);
+    try left.updateCompactCandidate();
+    try old.updateCompactCandidate();
+    old.release();
+    old_open = false;
+    try std.testing.expectEqual(@as(u64, 1), queue.best().?.tree_id);
+
+    // The entry was the left tree's: its withdrawal empties the queue.
+    {
+        const h = left.mu.hold(.exclusive, @src());
+        defer h.release();
+        left.clearCandidate();
+    }
+    try std.testing.expect(queue.best() == null);
 }
 
 // ---------------------------------------------------------------------------
@@ -675,6 +743,7 @@ test "levels: compact L0 L1" {
         test_tree_id,
         &manifest,
         &cache,
+        null,
     );
     defer tree.release();
 
@@ -770,6 +839,7 @@ test "levels: compact L0 L1 with dest overlap" {
         test_tree_id,
         &manifest,
         &cache,
+        null,
     );
     defer tree.release();
 
@@ -858,7 +928,15 @@ test "levels: an L0 push splits into a fiber per L1 range" {
     defer cache.deinit();
     var live = flags.Live(config.Config).initFrom(alloc, opts);
     defer live.deinit();
-    const tree = try Tree.open(alloc, &live, 0, test_tree_id, &manifest, &cache);
+    const tree = try Tree.open(
+        alloc,
+        &live,
+        0,
+        test_tree_id,
+        &manifest,
+        &cache,
+        null,
+    );
     defer tree.release();
 
     try std.testing.expectEqual(@as(usize, 2), tree.numTablesAt(0));
@@ -957,6 +1035,7 @@ test "levels: an L1 merge splits into a fiber per L2 range" {
         test_tree_id,
         &manifest,
         &cache,
+        null,
     );
     defer tree.release();
 
@@ -1045,6 +1124,7 @@ test "levels: compact L1 L2" {
         test_tree_id,
         &manifest,
         &cache,
+        null,
     );
     defer tree.release();
 
@@ -1101,6 +1181,7 @@ test "levels: get L0 shadows L1" {
         test_tree_id,
         &manifest,
         &cache,
+        null,
     );
     defer tree.release();
 
@@ -1261,6 +1342,7 @@ fn setupTombstoneTree(
         tree_id,
         &fx.manifest,
         &fx.cache,
+        null,
     );
 }
 
@@ -1341,6 +1423,7 @@ fn setupPlacedTreeCfg(
         tree_id,
         &fx.manifest,
         &fx.cache,
+        null,
     );
 }
 
@@ -2306,6 +2389,7 @@ fn setupTreeWithTables(
         tree_id,
         &fx.manifest,
         &fx.cache,
+        null,
     );
 }
 
@@ -2731,6 +2815,7 @@ fn setupTreeMulti(
         tree_id,
         &fx.manifest,
         &fx.cache,
+        null,
     );
 }
 

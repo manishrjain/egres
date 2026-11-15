@@ -324,6 +324,9 @@ pub const Tree = struct {
     cache: *TableCache,
     levels: []Level,
     compact_candidate: ?CompactCandidate = null,
+    /// Where `compact_candidate` is posted for the forest's pick; null
+    /// for a tree opened outside a forest.
+    compact_queue: ?*_compaction.CompactQueue,
     /// Levels with a job running on them (`reserveJob`): the candidate
     /// never names one, so two jobs of this tree run at once only on
     /// disjoint levels.
@@ -365,6 +368,7 @@ pub const Tree = struct {
 
     // Compaction, from compaction.zig.
     pub const updateCompactCandidate = _compaction.updateCompactCandidate;
+    pub const leaveQueue = _compaction.leaveQueue;
     pub const updateCompactCandidate_ = _compaction.updateCompactCandidate_;
     pub const clearCandidate = _compaction.clearCandidate;
     pub const reserveJob = _compaction.reserveJob;
@@ -431,6 +435,7 @@ pub const Tree = struct {
         tree_id: u64,
         manifest: *_manifest.Manifest,
         cache: *TableCache,
+        compact_queue: ?*_compaction.CompactQueue,
     ) !*Tree {
         const opts = live.cur();
         const self = try allocator.create(Tree);
@@ -488,6 +493,7 @@ pub const Tree = struct {
             .tree_id = tree_id,
             .manifest = manifest,
             .cache = cache,
+            .compact_queue = compact_queue,
             .levels = levels,
             .key_range = kr,
             .kind = kind,

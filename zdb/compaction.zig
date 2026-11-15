@@ -29,6 +29,7 @@ const Lock = _level_handler.Lock;
 pub const TableEntry = _level_handler.TableEntry;
 const Key = @import("kv.zig").Key;
 const TableKey = @import("kv.zig").TableKey;
+const TreeKey = @import("kv.zig").TreeKey;
 const KeyRange = @import("kv.zig").KeyRange;
 const MergeIterator = _table.merge_iterator.MergeIterator;
 const ConcatIterator = _table.merge_iterator.ConcatIterator;
@@ -286,6 +287,57 @@ pub fn levelTarget(opts: _config.Config, level: usize) i64 {
 // Compaction selection
 // -----------------------------------------------------------------------
 
+/// The trees with a job to offer and their scores, which
+/// `Forest.bestTreeToCompact` picks from. A tree posts its verdict here
+/// whenever it changes, under its own lock. Walking every tree for the
+/// pick took about 25 ms with 26,000 tenants, on a worker it held,
+/// and each compaction loop walked twice a second even with no work.
+pub const CompactQueue = struct {
+    mu: fiber.Mutex(.untracked) = .{},
+    /// Each tree's score.
+    entries: std.AutoHashMapUnmanaged(TreeKey, f64) = .empty,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) CompactQueue {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *CompactQueue) void {
+        self.entries.deinit(self.allocator);
+    }
+
+    fn post(self: *CompactQueue, tree: *const Tree, score: f64) !void {
+        self.mu.lock(@src());
+        defer self.mu.unlock();
+        try self.entries.put(self.allocator, keyOf(tree), score);
+    }
+
+    fn withdraw(self: *CompactQueue, tree: *const Tree) void {
+        self.mu.lock(@src());
+        defer self.mu.unlock();
+        _ = self.entries.remove(keyOf(tree));
+    }
+
+    pub fn best(self: *CompactQueue) ?TreeKey {
+        self.mu.lock(@src());
+        defer self.mu.unlock();
+        var best_key: ?TreeKey = null;
+        var best_score: f64 = 0;
+        var it = self.entries.iterator();
+        while (it.next()) |kv| {
+            if (best_key == null or kv.value_ptr.* > best_score) {
+                best_key = kv.key_ptr.*;
+                best_score = kv.value_ptr.*;
+            }
+        }
+        return best_key;
+    }
+
+    fn keyOf(tree: *const Tree) TreeKey {
+        return .{ .namespace = tree.namespace, .tree_id = tree.tree_id };
+    }
+};
+
 /// updateCompactCandidate recomputes which level most needs compaction and
 /// stores the result in self.compact_candidate. Called after open and after
 /// every compaction so the candidate is always fresh.
@@ -388,12 +440,28 @@ pub fn updateCompactCandidate_(self: *Tree, held: Lock.Exclusive) !void {
 /// views it was picked as.
 fn setCandidate(self: *Tree, c: CompactCandidate) !void {
     const owned = try c.dupe(self.allocator);
-    self.clearCandidate();
+    errdefer owned.job.deinit(self.allocator);
+    // The post replaces this tree's entry, so the old one is not
+    // withdrawn first: the tree never leaves the queue, and a failed
+    // post leaves the old candidate standing.
+    if (self.compact_queue) |queue| try queue.post(self, owned.score);
+    if (self.compact_candidate) |old| old.job.deinit(self.allocator);
     self.compact_candidate = owned;
+}
+
+/// For a tree a drop or split has taken out of its table: its entry
+/// goes, and no job it finishes posts it again. A split's left half
+/// has its key, and a retired tree's post would replace the half's.
+pub fn leaveQueue(self: *Tree) void {
+    const held = self.mu.hold(.exclusive, @src());
+    defer held.release();
+    if (self.compact_queue) |queue| queue.withdraw(self);
+    self.compact_queue = null;
 }
 
 pub fn clearCandidate(self: *Tree) void {
     const c = self.compact_candidate orelse return;
+    if (self.compact_queue) |queue| queue.withdraw(self);
     c.job.deinit(self.allocator);
     self.compact_candidate = null;
 }

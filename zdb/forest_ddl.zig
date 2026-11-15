@@ -42,6 +42,7 @@ pub fn installTree(self: *Forest, namespace_id: u64, tree_id: u64) !void {
         tree_id,
         &self.manifest,
         &self.table_cache,
+        &self.compact_queue,
     );
     errdefer tree.release();
 
@@ -207,7 +208,10 @@ fn dropTree(self: *Forest, tc: _manifest.TreeChange) void {
         break :blk trees.removeTree(held, tc.tree_id);
     };
 
-    if (gone) |tree| tree.release();
+    if (gone) |tree| {
+        tree.leaveQueue();
+        tree.release();
+    }
 }
 
 /// buildNsBranch is Phase A of CREATE DATABASE `name` TEMPLATE
@@ -626,6 +630,7 @@ pub fn applySplit(
         old_tree_id,
         &self.manifest,
         &self.table_cache,
+        &self.compact_queue,
     );
     errdefer left.release();
     const right = try Tree.open(
@@ -635,6 +640,7 @@ pub fn applySplit(
         new_tree_id,
         &self.manifest,
         &self.table_cache,
+        &self.compact_queue,
     );
     errdefer right.release();
 
@@ -676,7 +682,14 @@ pub fn applySplit(
 
     // The list's ref on the old object. Readers that still hold it keep
     // its full range and tables; the last of them closes it.
+    old.leaveQueue();
     old.release();
+
+    // The old tree shares the left half's key, so `leaveQueue` took
+    // the half's entry out with its own. The old tree posts no more,
+    // so this post stands. The half's next install posts it if this
+    // cannot.
+    left.updateCompactCandidate() catch {};
 }
 
 /// splitTreeForTests splits the given tree at the median key of its

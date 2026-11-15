@@ -16,6 +16,7 @@ const _table = @import("table.zig");
 const _cache = @import("cache.zig");
 const vfs = @import("vfs");
 const _tree = @import("tree.zig");
+const _compaction = @import("compaction.zig");
 const _skl = @import("skl/skiplist.zig");
 const _metrics = @import("metrics.zig");
 const zroar = @import("zroar");
@@ -587,6 +588,8 @@ pub const Forest = struct {
     /// `getTable` needs no lock and its result never dangles.
     tables: fiber.SafeHashMap(TableKey, *TableTrees),
     table_cache: TableCache,
+    /// The trees with a compaction job, posted by each tree.
+    compact_queue: _compaction.CompactQueue,
     memtables: Memtables,
     /// The installed raft snapshot's timestamp, the oldest a reader
     /// may ask for: builds discard shadowed versions below it and the
@@ -670,6 +673,7 @@ pub const Forest = struct {
             .tables = fiber.SafeHashMap(TableKey, *TableTrees).init(allocator),
             .compactions = fiber.SafeHashMap(u64, u64).init(allocator),
             .table_cache = TableCache.init(allocator, store),
+            .compact_queue = _compaction.CompactQueue.init(allocator),
             .memtables = Memtables.init(allocator, mt),
             .snapshot_ts = std.atomic.Value(u64).init(0),
             .read_marks = .{},
@@ -718,6 +722,7 @@ pub const Forest = struct {
         }
         self.tables.deinit();
         self.compactions.deinit();
+        self.compact_queue.deinit();
 
         self.manifest.deinit();
         self.table_cache.deinit();
@@ -1165,29 +1170,7 @@ pub const Forest = struct {
     /// and the job taken is whatever the tree wants then. A key can also
     /// travel to a peer; a pointer cannot.
     pub fn bestTreeToCompact(self: *Forest) ?TreeKey {
-        var best: ?TreeKey = null;
-        var best_score: f64 = 0;
-        var tables_it = self.tables.iterator();
-        defer tables_it.deinit();
-        while (tables_it.next()) |kv| {
-            const trees = kv.value_ptr.*;
-            const held = trees.mu.hold(.shared, @src());
-            defer held.release();
-            for (trees.list(held)) |tree| {
-                const th = tree.mu.hold(.shared, @src());
-                defer th.release();
-
-                const candidate = tree.compact_candidate orelse continue;
-                if (best == null or candidate.score > best_score) {
-                    best = .{
-                        .namespace = tree.namespace,
-                        .tree_id = tree.tree_id,
-                    };
-                    best_score = candidate.score;
-                }
-            }
-        }
-        return best;
+        return self.compact_queue.best();
     }
 
     /// Check if the current memtable should be frozen.
