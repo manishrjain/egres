@@ -61,13 +61,11 @@ const num_writers = 4;
 const rows_per_writer = 48;
 
 const num_tellers = 3;
-const num_accounts = 8;
 /// Account `a` is a row of table `a % bank_tables`, so most transfers
 /// span two tables.
 const bank_tables = 2;
-/// What all accounts hold between them, for the whole run. It starts
-/// in account 0.
-const bank_total = 300;
+/// What account 0 opens with when the others open with nothing.
+const account0_opening = 300;
 /// The most one transfer moves.
 const max_transfer = 10;
 /// What a transfer that backs out writes first. No account ever
@@ -100,6 +98,13 @@ const Shape = struct {
     drop_first_after: ?u32 = null,
     /// Every database left at the end must have compacted.
     compacts: bool = false,
+    /// Accounts across the bank tables.
+    accounts: u32 = 8,
+    /// What each account opens with. Null puts all of
+    /// `account0_opening` in account 0.
+    opening: ?i64 = null,
+    /// Each bank table of a database left at the end has split.
+    splits: bool = false,
 };
 
 /// Every kind of error, each off one time in two: a seed runs some of
@@ -122,6 +127,10 @@ fn drawRate() u16 {
 /// and `memoOf`.
 var body_max: usize = 450;
 var memo_max: usize = 200;
+/// `Shape.accounts` of the run, and what its accounts hold between
+/// them for the whole run, for the tellers and `expectBank`.
+var num_accounts: u32 = 8;
+var bank_total: i64 = account0_opening;
 /// Writer `w` has the ids and the seqs in [w * span, (w + 1) * span).
 const span = 1_000_000;
 /// A site's writers take their seqs from its own slice of that range,
@@ -628,7 +637,11 @@ fn createDatabase(alloc: std.mem.Allocator, db: String) !void {
     ), "CREATE DATABASE");
 }
 
-fn createTable(alloc: std.mem.Allocator, db: String) !void {
+fn createTable(
+    alloc: std.mem.Allocator,
+    db: String,
+    opening: ?i64,
+) !void {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     var client = try connect(alloc, db);
@@ -645,13 +658,23 @@ fn createTable(alloc: std.mem.Allocator, db: String) !void {
         "CREATE INDEX kv_seq ON kv (seq)",
         "CREATE INDEX",
     );
-    try createBank(&client, arena.allocator());
+    try createBank(&client, arena.allocator(), opening);
 }
 
+// TODO: CREATE INDEX and DROP INDEX on a bank table while the tellers
+// run, each followed by the audit by index. Every index here is made
+// before any load, so a backfill and its merge of the rows written
+// during the build never meet a transfer.
+
 /// The tellers' tables, each with an index that moves with every
-/// transfer, and all the money in account 0. The memo gives a row
+/// transfer, and the accounts that open with money: each with
+/// `opening`, or account 0 with all of it. The memo gives a row
 /// bytes, so these tables flush and compact as the writers' does.
-fn createBank(client: *pgwire.Client, arloc: std.mem.Allocator) !void {
+fn createBank(
+    client: *pgwire.Client,
+    arloc: std.mem.Allocator,
+    opening: ?i64,
+) !void {
     for (0..bank_tables) |tbl| {
         try exec(client, arloc, try std.fmt.allocPrint(
             arloc,
@@ -665,11 +688,44 @@ fn createBank(client: *pgwire.Client, arloc: std.mem.Allocator) !void {
             .{ tbl, tbl },
         ), "CREATE INDEX");
     }
-    try exec(client, arloc, try std.fmt.allocPrint(
+    const each = opening orelse
+        return insertAccounts(client, arloc, 0, &.{0}, bank_total);
+    for (0..bank_tables) |tbl| {
+        var ids: std.ArrayList(u32) = .empty;
+        var id: u32 = @intCast(tbl);
+        while (id < num_accounts) : (id += bank_tables)
+            try ids.append(arloc, id);
+        var rest = ids.items;
+        while (rest.len > 0) {
+            const batch = rest[0..@min(rest.len, insert_rows)];
+            rest = rest[batch.len..];
+            try insertAccounts(client, arloc, tbl, batch, each);
+        }
+    }
+}
+
+/// The most accounts one INSERT opens.
+const insert_rows = 64;
+
+/// One INSERT of accounts `ids`, all in table `tbl`, each with `each`.
+fn insertAccounts(
+    client: *pgwire.Client,
+    arloc: std.mem.Allocator,
+    tbl: usize,
+    ids: []const u32,
+    each: i64,
+) !void {
+    var text: std.ArrayList(u8) = .empty;
+    try text.print(
         arloc,
-        "INSERT INTO bank0 (id, balance, memo) VALUES (0, {d}, '{s}')",
-        .{ bank_total, try memoOf(arloc, 0, bank_total) },
-    ), "INSERT 0 1");
+        "INSERT INTO bank{d} (id, balance, memo) VALUES",
+        .{tbl},
+    );
+    for (ids, 0..) |id, nth| try text.print(arloc, "{s} ({d}, {d}, '{s}')", .{
+        if (nth == 0) "" else ",", id, each, try memoOf(arloc, id, each),
+    });
+    const tag = try std.fmt.allocPrint(arloc, "INSERT 0 {d}", .{ids.len});
+    try exec(client, arloc, text.items, tag);
 }
 
 /// One row's write in a statement; `seq` null is a delete.
@@ -1146,8 +1202,8 @@ const Writer = struct {
     }
 };
 
-/// What each account holds: null for no row.
-const Balances = [num_accounts]?i64;
+/// What each account holds, null for no row: `num_accounts` of them.
+const Balances = []?i64;
 
 /// The SQLSTATEs the server ends a transaction with for meeting
 /// another one: a serialization failure, a deadlock, a key the other
@@ -1379,17 +1435,19 @@ const Teller = struct {
     /// rows, each with a balance over zero and the memo of that
     /// balance, and `bank_total` in all.
     fn readAll(self: *Teller, arloc: std.mem.Allocator) !void {
-        var by_key: Balances = @splat(null);
-        var by_index: Balances = @splat(null);
+        const by_key: Balances = try arloc.alloc(?i64, num_accounts);
+        @memset(by_key, null);
+        const by_index: Balances = try arloc.alloc(?i64, num_accounts);
+        @memset(by_index, null);
         try self.execute(arloc, "BEGIN", "BEGIN");
         for (0..bank_tables) |tbl| {
-            try self.readTable(arloc, &by_key, try std.fmt.allocPrint(
+            try self.readTable(arloc, by_key, try std.fmt.allocPrint(
                 arloc,
                 "SELECT id, balance, memo FROM bank{d}",
                 .{tbl},
             ));
             // Wide enough for a balance `backOut` wrote, if one leaks.
-            try self.readTable(arloc, &by_index, try std.fmt.allocPrint(
+            try self.readTable(arloc, by_index, try std.fmt.allocPrint(
                 arloc,
                 "SELECT id, balance FROM bank{d}" ++
                     " WHERE balance >= {d} AND balance <= {d}",
@@ -1411,7 +1469,7 @@ const Teller = struct {
     fn readTable(
         self: *Teller,
         arloc: std.mem.Allocator,
-        found: *Balances,
+        found: Balances,
         text: String,
     ) !void {
         const reply = try self.query(arloc, text);
@@ -1440,7 +1498,9 @@ fn balanceOf(text: ?String) !i64 {
 
 /// One read of all accounts, by key and by index.
 fn expectBank(by_key: Balances, by_index: Balances) !void {
-    if (!std.meta.eql(by_key, by_index)) return error.BankIndexDiffers;
+    for (by_key, by_index) |key_has, index_has| {
+        if (!std.meta.eql(key_has, index_has)) return error.BankIndexDiffers;
+    }
     var total: i64 = 0;
     for (by_key) |held| {
         const amount = held orelse continue;
@@ -1570,6 +1630,28 @@ const Site = struct {
         const forest = inst.eng.forest;
         const ns = forest.manifest.lookupNamespace(self.db) orelse return;
         self.compactions += forest.compactionsIn(ns);
+    }
+
+    /// Each bank table here has more than one tree.
+    fn expectSplit(self: *const Site, inst: *Instance) !void {
+        const forest = inst.eng.forest;
+        const ns = forest.manifest.lookupNamespace(self.db) orelse
+            return error.DatabaseGone;
+        for (0..bank_tables) |tbl| {
+            var name_buf: [16]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "bank{d}", .{tbl});
+            const table_id = forest.manifest.lookupTable(ns, name) orelse
+                return error.BankTableGone;
+            const trees = forest.getTable(.{
+                .namespace = ns,
+                .table_id = table_id,
+            }) orelse return error.BankTableGone;
+            const held = trees.mu.hold(.shared, @src());
+            defer held.release();
+            const count = trees.list(held).len;
+            log.info("{s}: {s} has {d} trees", .{ self.db, name, count });
+            if (count < 2) return error.BankNeverSplit;
+        }
     }
 
     /// After a crash and a restart: each writer's rows with or
@@ -1881,11 +1963,31 @@ test "BIG: sim: sql branches a database under disk errors" {
     });
 }
 
+// Opt-in: bank tables that split while transfers run, so a transfer's
+// two rows are in two trees of one table as often as in two tables.
+test "BIG: sim: sql splits the bank tables under transfers" {
+    try run(.{
+        .crashes = 10,
+        .stretch_ms = 500,
+        .stretch_more_ms = 4000,
+        .accounts = 1024,
+        .opening = 50,
+        .memo_max = 3000,
+        .faults = true,
+        .splits = true,
+    });
+}
+
 fn run(shape: Shape) !void {
     const sim = fiber.simDisk() orelse return error.SkipZigTest;
     const alloc = testing.allocator;
     body_max = shape.body_max;
     memo_max = shape.memo_max;
+    num_accounts = shape.accounts;
+    bank_total = if (shape.opening) |each|
+        each * shape.accounts
+    else
+        account0_opening;
 
     // Four times what the waits of this shape add up to at their
     // longest. A run past it is stuck and ends with its fibers
@@ -1929,7 +2031,7 @@ fn run(shape: Shape) !void {
 
     if (!std.mem.eql(u8, shape.db, sql.default_database))
         try createDatabase(alloc, shape.db);
-    try createTable(alloc, shape.db);
+    try createTable(alloc, shape.db, shape.opening);
 
     for (0..shape.crashes) |crashes| {
         const crash: CrashAt = .{
@@ -2018,6 +2120,8 @@ fn run(shape: Shape) !void {
         });
         if (shape.compacts and site.state == .live)
             try testing.expect(site.compactions > 0);
+        if (shape.splits and site.state == .live)
+            try site.expectSplit(booted.?);
     }
     stale_changes += booted.?.eng.staleChanges();
     try testing.expectEqual(@as(u64, 0), stale_changes);
