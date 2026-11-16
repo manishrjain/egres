@@ -3,7 +3,7 @@
 
 //! Reconstructing a user table's schema from its catalog rows.
 //!
-//! CREATE TABLE writes one catalog row per column (server.writeCatalogRows);
+//! CREATE TABLE writes one catalog row per column (ddl.catalogRows);
 //! this reads them back so INSERT/SELECT can encode/decode the table's rows.
 //! The catalog tree (catalog.table_id) holds every table's columns keyed
 //! (table_id, column_id) big-endian, so the 4-byte table_id prefix scans
@@ -252,6 +252,36 @@ pub const Table = struct {
     }
 };
 
+/// The marshaled key of the column row for `column_id` of `table`, in
+/// its namespace's column catalog (table 1), on `alloc`.
+pub fn columnRowKey(
+    alloc: std.mem.Allocator,
+    table: TableKey,
+    column_id: u32,
+) !String {
+    const primary = _catalog.encodeKey(table.table_id, column_id);
+    return (Key{
+        .namespace = table.namespace,
+        .table_id = _catalog.table_id,
+        .primary = &primary,
+    }).marshal(alloc);
+}
+
+/// The marshaled key of the index row for `index_table_id` of the base
+/// table `base`, in its namespace's index catalog (table 2), on `alloc`.
+pub fn indexRowKey(
+    alloc: std.mem.Allocator,
+    base: TableKey,
+    index_table_id: u32,
+) !String {
+    const primary = _catalog.encodeIndexKey(base.table_id, index_table_id);
+    return (Key{
+        .namespace = base.namespace,
+        .table_id = _catalog.index_table_id,
+        .primary = &primary,
+    }).marshal(alloc);
+}
+
 /// The scan window selecting every catalog row owned by `owner_id` in
 /// the catalog table `table_key`. Keys are (owner_id, member_id) BE pairs and
 /// member ids are 1-based, so the window is [owner.0, (owner+1).0) — an
@@ -296,7 +326,7 @@ const CatalogWindow = struct {
 pub fn loadColumnRows(
     arloc: std.mem.Allocator,
     forest: *Forest,
-    catalog_ps: *const _schema.PhysicalSchema,
+    catalogs: *const _catalog.Layouts,
     table_key: TableKey,
 ) ![]_schema.LogicalColumn {
     // `win` owns the boundary key bytes, so it lives for the whole
@@ -311,10 +341,8 @@ pub fn loadColumnRows(
     var all: std.ArrayList(_schema.LogicalColumn) = .empty;
     var scratch: _value.Row = .{}; // reused across catalog rows
     while (try cur.next()) |item| {
-        // Decode every catalog cell (column_id order = SELECT *).
         const val = item.newest().value;
-        try _row.unmarshalRow(arloc, catalog_ps, val, &.{}, &scratch);
-        var lc = (try _catalog.decodeColumn(&scratch)).column;
+        var lc = try catalogs.readColumn(arloc, val, &scratch);
         // The name borrows the row buffer, which the next item
         // overwrites.
         lc.name = try arloc.dupe(u8, lc.name);
@@ -327,21 +355,20 @@ pub fn loadColumnRows(
     return all.items;
 }
 
-/// Load `table_key`'s schema from its namespace's catalog. `catalog_ps` is
-/// the caller's compiled catalog layout (Server.catalog_ps). Returns
+/// Load `table_key`'s schema from its namespace's catalogs, read with
+/// the caller's compiled layouts (Server.catalogs). Returns
 /// `error.UndefinedTable` if the table has no catalog rows.
 pub fn loadTableSchema(
     alloc: std.mem.Allocator,
     forest: *Forest,
-    catalog_ps: *const _schema.PhysicalSchema,
-    index_catalog_ps: *const _schema.PhysicalSchema,
+    catalogs: *const _catalog.Layouts,
     table_key: TableKey,
 ) !Table {
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     const a = arena.allocator();
 
-    const all = try loadColumnRows(a, forest, catalog_ps, table_key);
+    const all = try loadColumnRows(a, forest, catalogs, table_key);
     // compile() derives the layout from the full history; reconstruct()
     // derives current_version across all columns.
     const logical = _catalog.reconstruct(all);
@@ -370,7 +397,7 @@ pub fn loadTableSchema(
     // an index naming a column the table doesn't have is corrupt
     // catalog state. The pointers target the arena-owned `columns`
     // slice, so they survive the Table being moved into the cache.
-    const defs = try loadIndexes(a, forest, index_catalog_ps, table_key);
+    const defs = try loadIndexes(a, forest, catalogs, table_key);
     const indexes = try a.alloc(Index, defs.len);
     for (defs, indexes) |def, *idx| {
         const col = for (columns) |*c| {
@@ -400,7 +427,7 @@ pub fn loadTableSchema(
 pub fn loadIndexes(
     alloc: std.mem.Allocator,
     forest: *Forest,
-    index_catalog_ps: *const _schema.PhysicalSchema,
+    catalogs: *const _catalog.Layouts,
     table_key: TableKey,
 ) ![]_catalog.IndexDef {
     const win = CatalogWindow.init(.{
@@ -416,8 +443,7 @@ pub fn loadIndexes(
     defer scratch.deinit(alloc);
     while (try cur.next()) |item| {
         const value = item.newest().value;
-        try _row.unmarshalRow(alloc, index_catalog_ps, value, &.{}, &scratch);
-        try out.append(alloc, try _catalog.decodeIndex(&scratch));
+        try out.append(alloc, try catalogs.readIndex(alloc, value, &scratch));
     }
     return out.toOwnedSlice(alloc);
 }

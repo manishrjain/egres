@@ -51,12 +51,8 @@ pub const Op = schema.EnumDef(&.{
 // range. `tree_id` is namespace-local and packs (table_id << 32) | split_id, so
 // the tree's SQL table is derived from it (Key.treeTableId) and never
 // stored separately. `namespace_id` + `tree_id` together are the tree's global
-// identity (Key.TreeKey).
-//
-// `name` names the object a CREATE introduces: the namespace's name on an
-// ns_create (its tree_id-0 change, live and in snapshots), a table's name on
-// a create_tree (future). Empty everywhere else (splits, drops, legacy admin
-// namespaces).
+// identity (Key.TreeKey). A tree has no name: a table's is on its
+// `TableChange`, a database's on its `Namespace` record.
 /// What a tree's primary keys are. The builder picks the SST filter by
 /// it: an `egid` tree's keys are 8-byte big-endian row ids, kept exactly
 /// in a roaring bitmap; a `bytes` tree's keys go through a hash into a
@@ -81,11 +77,23 @@ pub const TreeChange = schema.Table(&.{
     .{ .id = 3, .name = "tree_id", .ty = schema.U64 },
     .{ .id = 4, .name = "left_key", .ty = schema.Bytes },
     .{ .id = 5, .name = "right_key", .ty = schema.Bytes },
-    .{ .id = 6, .name = "name", .ty = schema.Bytes },
+    // id 6 was the table's name, now on TableChange.
     // create only: fixed for the tree's life, inherited by a split.
     .{ .id = 7, .name = "kind", .ty = TreeKind },
     // branch_table only: the table whose trees this table lists again.
     .{ .id = 8, .name = "from_table_id", .ty = schema.U32 },
+});
+
+// TableChange names a SQL table or index: the entity its trees belong
+// to. A create_tree, branch_table or snapshot carries one CREATE per
+// table with its name; a drop_tree one DELETE per table, and the apply
+// forgets the name by id. The name is the table's, not a tree's, so a
+// split leaves it alone.
+pub const TableChange = schema.Table(&.{
+    .{ .id = 1, .name = "op", .ty = Op }, // 0=CREATE, 1=DELETE
+    .{ .id = 2, .name = "namespace_id", .ty = schema.U64 },
+    .{ .id = 3, .name = "table_id", .ty = schema.U32 },
+    .{ .id = 4, .name = "name", .ty = schema.Bytes },
 });
 
 // SSTableChange records one SST file (`sst_id`) entering or leaving a tree at a
@@ -114,11 +122,11 @@ pub const SSTableChange = schema.Table(&.{
     .{ .id = 9, .name = "raft_index", .ty = schema.U64 },
 });
 
-// Per-namespace manifest state, persisted ONLY inside a snapshot (a
-// serialized Manifest): the next-free table_id high-water-mark (so a
-// re-elected leader never re-issues an id even after a DROP) and the
-// database name (SQL CREATE DATABASE; empty for unnamed legacy namespaces).
-// Live (non-snapshot) ManifestChanges leave `namespaces` empty.
+// A namespace: its id, its database name (SQL CREATE DATABASE; empty
+// for an unnamed admin namespace) and, in a snapshot, the next-free
+// table_id high-water-mark, so a re-elected leader never re-issues an
+// id even after a DROP. A create_ns or branch_ns carries the one it
+// makes, counter unset; a snapshot carries them all.
 pub const Namespace = schema.Table(&.{
     .{ .id = 1, .name = "id", .ty = schema.U64 },
     .{ .id = 2, .name = "next_table_id", .ty = schema.U32 },
@@ -163,12 +171,21 @@ pub const ManifestChange = schema.Table(&.{
     .{ .id = 3, .name = "cmd", .ty = Command },
     // for flush: which memtable was flushed
     .{ .id = 4, .name = "memtable_id", .ty = schema.U64 },
-    // snapshot only
+    // create_ns and branch_ns: the one namespace made, with its name;
+    // a snapshot: every namespace, with its counter too.
     .{ .id = 5, .name = "namespaces", .ty = schema.Array(Namespace) },
     // snapshot only: global namespace counter
     .{ .id = 6, .name = "next_ns_id", .ty = schema.U64 },
     // branch_ns only: the namespace copied.
     .{ .id = 7, .name = "branch_from", .ty = schema.U64 },
+    // create_tree, branch_table, drop_tree: the tables named; a
+    // snapshot: every table.
+    .{ .id = 8, .name = "table_changes", .ty = schema.Array(TableChange) },
+    // The rows a DDL writes with its trees, a table's catalog rows or a
+    // dropped table's tombstones: applied before the change's trees and
+    // names, in the same entry, so a name never resolves without its
+    // rows. Applied as a .data entry's `Mutations` is.
+    .{ .id = 9, .name = "mutations", .ty = Mutations },
 });
 
 /// A single key-value write. `key` is a marshaled zdb key
@@ -256,6 +273,7 @@ pub const records: []const schema.Named = &.{
     .{ .name = "Mutations", .ty = Mutations, .id = tableId(8) },
     .{ .name = "Namespace", .ty = Namespace, .id = tableId(9) },
     .{ .name = "RoaringDelta", .ty = RoaringDelta, .id = tableId(10) },
+    .{ .name = "TableChange", .ty = TableChange, .id = tableId(11) },
 
     // Packed records: no message id.
     .{ .name = "BlockVersion", .ty = BlockVersion },

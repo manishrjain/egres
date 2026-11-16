@@ -263,9 +263,8 @@ test "manifest serialize/restoreFrom round-trip" {
     try src.commit(1, &.{}, &.{
         createTreeChange(1, 7, a_raw, m_raw, .posting_index),
         egid_tree,
-        // A named user table, split into two trees — the name must survive
-        // the round-trip via its FIRST tree (the one with the open left
-        // bound; serialize stamps only that one).
+        // A named user table, split into two trees: the name rides the
+        // snapshot once, on the table's record, not on either tree.
         createTreeChange(
             zdb.kv.makeTreeId(16, 0),
             7,
@@ -328,7 +327,7 @@ test "manifest serialize/restoreFrom round-trip" {
     try std.testing.expectEqual(_manifest.TreeKind.rows, t2.kind);
     try std.testing.expectEqual(_manifest.TreeKind.posting_index, t1.kind);
 
-    // The table name rode the snapshot (stamped on its tree's change).
+    // The table name rode the snapshot on its table record.
     try std.testing.expectEqual(@as(?u32, 16), dst.lookupTable(7, "users"));
 }
 
@@ -409,7 +408,7 @@ test "manifest: a snapshot restores the same manifest" {
     const users_email = zdb.kv.makeTreeId(17, 0);
     try src.commit(1, &.{}, &.{
         createTreeChange(0, 7, &.{}, &.{}, .rows),
-        // A table split in two: only its first tree carries the name.
+        // A table split in two: one name for both trees.
         createTreeChange(users, 7, &.{}, m_raw, .rows),
         createTreeChange(users_right, 7, m_raw, &.{}, .rows),
         createTreeChange(users_email, 7, &.{}, &.{}, .unique_index),
@@ -920,9 +919,11 @@ test "manifest serialize round-trip preserves raft_index" {
 // -------------------------------------------------------------------------
 
 /// The ns_create change a namespace create proposes: one tree for the
-/// namespace's default table, carrying the database name.
+/// namespace's default table and the namespace's record, carrying the
+/// database name.
 fn nsCreateChange(
     tcs: *[1]_manifest.TreeChange,
+    ns_recs: *[1]_manifest.NamespaceRecord,
     namespace: u64,
     name: []const u8,
 ) _manifest.ManifestChange {
@@ -933,14 +934,19 @@ fn nsCreateChange(
         &.{},
         .posting_index,
     );
-    tcs[0].name = name;
-    return .{ .tree_changes = tcs, .cmd = .create_ns };
+    ns_recs[0] = .{ .id = namespace, .name = name };
+    return .{
+        .tree_changes = tcs,
+        .namespaces = ns_recs,
+        .cmd = .create_ns,
+    };
 }
 
 /// The create_tree change a CREATE TABLE proposes: one tree at split 0 for
-/// `table_key`'s table, carrying the table name.
+/// `table_key`'s table and the table's record, carrying its name.
 fn createTreeCmd(
     tcs: *[1]_manifest.TreeChange,
+    table_recs: *[1]_manifest.TableChange,
     table_key: zdb.kv.TableKey,
     name: []const u8,
 ) _manifest.ManifestChange {
@@ -951,8 +957,16 @@ fn createTreeCmd(
         &.{},
         .posting_index,
     );
-    tcs[0].name = name;
-    return .{ .tree_changes = tcs, .cmd = .create_tree };
+    table_recs[0] = _manifest.createTableChange(
+        table_key.namespace,
+        table_key.table_id,
+        name,
+    );
+    return .{
+        .tree_changes = tcs,
+        .table_changes = table_recs,
+        .cmd = .create_tree,
+    };
 }
 
 test "manifest apply create_ns registers the name and advances next_ns_id" {
@@ -961,7 +975,8 @@ test "manifest apply create_ns registers the name and advances next_ns_id" {
     defer manifest.deinit();
 
     var tcs: [1]_manifest.TreeChange = undefined;
-    try manifest.apply(5, nsCreateChange(&tcs, 100, "shop"));
+    var ns_recs: [1]_manifest.NamespaceRecord = undefined;
+    try manifest.apply(5, nsCreateChange(&tcs, &ns_recs, 100, "shop"));
 
     try std.testing.expect(manifest.trees.contains(tk(100, 0)));
     try std.testing.expectEqual(
@@ -980,8 +995,10 @@ test "manifest apply create_tree registers the name and advances the table id" {
     defer manifest.deinit();
 
     var tcs: [1]_manifest.TreeChange = undefined;
+    var table_recs: [1]_manifest.TableChange = undefined;
     try manifest.apply(6, createTreeCmd(
         &tcs,
+        &table_recs,
         .{ .namespace = 7, .table_id = first },
         "users",
     ));
@@ -1005,7 +1022,8 @@ test "manifest apply is idempotent for a re-applied create" {
     // second must leave one tree and leak nothing (std.testing.allocator
     // fails the test if the first tree's keys are dropped on the floor).
     var tcs: [1]_manifest.TreeChange = undefined;
-    const mc = nsCreateChange(&tcs, 100, "shop");
+    var ns_recs: [1]_manifest.NamespaceRecord = undefined;
+    const mc = nsCreateChange(&tcs, &ns_recs, 100, "shop");
     try manifest.apply(5, mc);
     try manifest.apply(5, mc);
 
@@ -1023,16 +1041,26 @@ test "manifest apply drop_tree removes the table name" {
     defer manifest.deinit();
 
     var tcs: [1]_manifest.TreeChange = undefined;
+    var table_recs: [1]_manifest.TableChange = undefined;
     try manifest.apply(6, createTreeCmd(
         &tcs,
+        &table_recs,
         .{ .namespace = 7, .table_id = first },
         "users",
     ));
 
+    // The tree delete drops the tree; the table record forgets the name.
     var dtcs = [_]_manifest.TreeChange{
         deleteTreeChange(zdb.kv.makeTreeId(first, 0), 7),
     };
-    try manifest.apply(7, .{ .tree_changes = &dtcs, .cmd = .drop_tree });
+    var dtables = [_]_manifest.TableChange{
+        _manifest.deleteTableChange(7, first),
+    };
+    try manifest.apply(7, .{
+        .tree_changes = &dtcs,
+        .table_changes = &dtables,
+        .cmd = .drop_tree,
+    });
 
     try std.testing.expect(manifest.lookupTable(7, "users") == null);
     try std.testing.expectEqual(@as(u32, 0), manifest.trees.count());
@@ -1046,7 +1074,8 @@ test "manifest apply drop_ns removes the namespace name" {
     defer manifest.deinit();
 
     var tcs: [1]_manifest.TreeChange = undefined;
-    try manifest.apply(5, nsCreateChange(&tcs, 100, "shop"));
+    var ns_recs: [1]_manifest.NamespaceRecord = undefined;
+    try manifest.apply(5, nsCreateChange(&tcs, &ns_recs, 100, "shop"));
 
     var dtcs = [_]_manifest.TreeChange{deleteTreeChange(0, 100)};
     try manifest.apply(8, .{ .tree_changes = &dtcs, .cmd = .drop_ns });

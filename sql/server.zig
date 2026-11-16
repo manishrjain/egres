@@ -53,16 +53,9 @@ pub const Server = struct {
     /// the next lane worker (see runListener). Only the accept loop
     /// touches it.
     conn_seq: u64 = 0,
-    /// Compiled layout of the CATALOG table's own rows — NOT a user-table
-    /// schema. Every namespace's catalog (table 1) has the identical
-    /// compiled-in schema (catalog.logical_schema; it can't live in a
-    /// catalog, that would be circular), so one compile serves all
-    /// databases. User tables' schemas live as rows inside each catalog
-    /// and get their own per-(table, version) compiles when reads land.
-    catalog_ps: _schema.PhysicalSchema,
-    /// Compiled layout of the INDEX catalog table's rows (table 2), the
-    /// same compiled-in schema in every namespace — one compile serves all.
-    index_catalog_ps: _schema.PhysicalSchema,
+    /// The compiled layouts of the system catalogs' rows, the same in
+    /// every database (see catalog.Layouts).
+    catalogs: _catalog.Layouts,
     /// Serializes DDL: the leader-side name-uniqueness checks in
     /// buildNsCreate/buildCreateTable are only sound if one DDL
     /// runs at a time.
@@ -90,25 +83,13 @@ pub const Server = struct {
         errdefer alloc.destroy(self);
 
         const listen_addr = try fiber.net.IpAddress.parseIpAndPort(addr);
-        var catalog_ps = try _schema.compile(
-            alloc,
-            _catalog.logical_schema,
-            _catalog.logical_schema.current_version,
-        );
-        errdefer catalog_ps.deinit(alloc);
-
-        var index_catalog_ps = try _schema.compile(
-            alloc,
-            _catalog.index_logical_schema,
-            _catalog.index_logical_schema.current_version,
-        );
-        errdefer index_catalog_ps.deinit(alloc);
+        var catalogs = try _catalog.Layouts.init(alloc);
+        errdefer catalogs.deinit(alloc);
         const oracle = try Oracle.init(alloc, Oracle.default_max_keys);
         self.* = .{
             .engine = eng,
             .listen_addr = listen_addr,
-            .catalog_ps = catalog_ps,
-            .index_catalog_ps = index_catalog_ps,
+            .catalogs = catalogs,
             .databases = std.AutoHashMap(u64, *Database).init(alloc),
             .oracle = oracle,
         };
@@ -126,8 +107,7 @@ pub const Server = struct {
     /// After `eng.stop`: the apply loop calls the hook until then.
     pub fn deinit(self: *Server) void {
         const alloc = self.engine.allocator;
-        self.catalog_ps.deinit(alloc);
-        self.index_catalog_ps.deinit(alloc);
+        self.catalogs.deinit(alloc);
         var dbs = self.databases.valueIterator();
         while (dbs.next()) |d| {
             d.*.deinit();
@@ -207,8 +187,7 @@ pub const Server = struct {
         var loaded = try _table.loadTableSchema(
             self.engine.allocator,
             self.engine.forest,
-            &self.catalog_ps,
-            &self.index_catalog_ps,
+            &self.catalogs,
             .{ .namespace = db.ns, .table_id = table_id },
         );
         errdefer loaded.deinit();

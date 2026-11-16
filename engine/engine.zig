@@ -184,53 +184,22 @@ pub const StorageImpl = struct {
                 defer items.deinit(self.allocator);
                 try items.ensureTotalCapacity(self.allocator, count);
 
-                var total_bytes: u64 = 0;
                 for (0..count) |i| {
                     const kv = try ms.kvsAt(@intCast(i));
-                    // Wire keys are marshaled keys (self-describing
-                    // ns/tid), with no timestamp: the commit timestamp is
-                    // the entry's HLC. Minimum: 12-byte prefix + 1
-                    // primary byte. A short key — or a key whose
-                    // namespace disagrees with the entry's — means an
-                    // encoder bug; skipping keeps apply deterministic
-                    // across nodes without wedging the loop on a poison
-                    // entry.
-                    if (kv.key().len < 13) {
-                        log.err("on_apply: short wire key at index={d} kv={d} len={d}", .{ entry.index, i, kv.key().len });
-                        continue;
-                    }
-                    const key = Key.init(kv.key());
-                    if (key.namespace != ns) {
-                        log.err("on_apply: key ns={d} != entry ns={d} at index={d} kv={d}", .{ key.namespace, ns, entry.index, i });
-                        continue;
-                    }
-                    items.appendAssumeCapacity(.{
-                        .key = key,
-                        .versions = .{ .one = .{
-                            .ts = entry.timestamp,
-                            .meta = Meta.fromByte(kv.meta()),
-                            .value = kv.value(),
-                        } },
-                    });
-                    total_bytes += kv.value().len;
+                    const it = item(
+                        entry,
+                        ns,
+                        i,
+                        kv.key(),
+                        kv.value(),
+                        kv.meta(),
+                    );
+                    if (it) |row| items.appendAssumeCapacity(row);
                 }
-
-                // Write this to Forest.
-                try self.forest.put(items.items);
-
-                // Feed the committed rows to any front-end cache (SQL's
-                // per-table max row id) — on every node, so a new leader
-                // inherits it without a re-scan.
-                if (self.apply_observer) |obs|
-                    obs.onData(obs.ctx, ns, items.items);
-
-                try metrics.g().bytes_written.incrBy(.{
-                    .source = "user",
-                    .namespace_id = ns,
-                }, total_bytes);
+                try self.putItems(ns, items.items);
             },
             .ManifestChange => |mc| {
-                try self.applyManifestChange(entry.index, entry.timestamp, mc);
+                try self.applyManifestChange(entry, mc);
             },
             else => {
                 log.err("on_apply: unhandled message type at index={d}", .{entry.index});
@@ -238,14 +207,86 @@ pub const StorageImpl = struct {
         }
     }
 
+    /// One wire key-value as the item its entry commits, or null for one
+    /// that is skipped. Wire keys are marshaled keys (self-describing
+    /// ns/tid), with no timestamp: the commit timestamp is the entry's
+    /// HLC. Minimum: 12-byte prefix + 1 primary byte. A short key — or a
+    /// key whose namespace disagrees with the entry's — means an encoder
+    /// bug; skipping keeps apply deterministic across nodes without
+    /// wedging the loop on a poison entry.
+    fn item(
+        entry: raft.Entry,
+        ns: u64,
+        i: usize,
+        wire_key: String,
+        value: String,
+        meta: u8,
+    ) ?Item {
+        if (wire_key.len < 13) {
+            log.err("on_apply: short wire key at index={d} kv={d} len={d}", .{
+                entry.index, i, wire_key.len,
+            });
+            return null;
+        }
+        const key = Key.init(wire_key);
+        if (key.namespace != ns) {
+            log.err("on_apply: key ns={d} != entry ns={d} at index={d} " ++
+                "kv={d}", .{ key.namespace, ns, entry.index, i });
+            return null;
+        }
+        return .{
+            .key = key,
+            .versions = .{ .one = .{
+                .ts = entry.timestamp,
+                .meta = Meta.fromByte(meta),
+                .value = value,
+            } },
+        };
+    }
+
+    /// Committed rows of one namespace into the forest, then to any
+    /// front-end cache (SQL's per-table max row id) — on every node, so
+    /// a new leader inherits it without a re-scan.
+    fn putItems(self: *StorageImpl, ns: u64, items: []const Item) !void {
+        try self.forest.put(items);
+        if (self.apply_observer) |obs| obs.onData(obs.ctx, ns, items);
+
+        var total_bytes: u64 = 0;
+        for (items) |it| total_bytes += it.newest().value.len;
+        try metrics.g().bytes_written.incrBy(.{
+            .source = "user",
+            .namespace_id = ns,
+        }, total_bytes);
+    }
+
+    /// The rows a DDL's change carries (`ManifestChange.mutations`): a
+    /// table's catalog rows, or a dropped table's tombstones. Applied
+    /// as a .data entry's are, the recovery shortcut included.
+    fn applyRows(
+        self: *StorageImpl,
+        entry: raft.Entry,
+        ms: zdb_bufs.MutationsStruct,
+    ) !void {
+        if (entry.index < self.oldest_memtable_index) return;
+        var items: std.ArrayList(Item) = .empty;
+        defer items.deinit(self.allocator);
+        try items.ensureTotalCapacity(self.allocator, ms.kvs.len);
+        for (ms.kvs, 0..) |kv, i| {
+            if (item(entry, ms.namespace, i, kv.key, kv.value, kv.meta)) |it|
+                items.appendAssumeCapacity(it);
+        }
+        try self.putItems(ms.namespace, items.items);
+    }
+
     /// `ts` is the entry's commit timestamp: what a branch takes as its
     /// as-of point.
     fn applyManifestChange(
         self: *StorageImpl,
-        index: u64,
-        ts: u64,
+        entry: raft.Entry,
         mc: zdb_bufs.ManifestChangeReader,
     ) !void {
+        const index = entry.index;
+        const ts = entry.timestamp;
         const mcs = try mc.toStruct(self.allocator);
         defer {
             mcs.deinit(self.allocator);
@@ -288,6 +329,11 @@ pub const StorageImpl = struct {
             return;
         }
 
+        // The rows before the trees and names, so a name never resolves
+        // without its rows, though a tree install below may park. A put
+        // needs no tree, and the memtable it lands in freezes only at a
+        // later entry, so no flush meets the rows before their trees.
+        if (mcs.mutations) |ms| try self.applyRows(entry, ms);
         switch (mcs.cmd) {
             .new_memtable => try self.forest.newMemtable(index),
             .flush => try self.forest.applyFlush(index, mcs.sstable_changes, mcs.memtable_id),
@@ -1765,6 +1811,11 @@ pub const Engine = struct {
     /// tree the caller's DDL lock keeps. A drop lists trees, so it is
     /// built under the hold: `dropTables`, `dropNamespace`.
     pub fn proposeMC(self: *Engine, mc: _manifest.ManifestChange) !void {
+        // Rows would land in the startup placeholder memtable, which the
+        // first new memtable drops, so they wait for a real one as a
+        // data proposal does: before the hold, which that bootstrap
+        // proposal needs. A real memtable never goes back.
+        if (mc.mutations != null) try self.node.waitReady();
         const held = try self.holdChanges(@src());
         defer held.release();
         try self.proposeHeld(held, mc);
@@ -1772,21 +1823,27 @@ pub const Engine = struct {
 
     /// DROP TABLE and DROP INDEX: one change for every tree of
     /// `table_ids`, listed and proposed under one hold, so no split
-    /// gives a table a tree the change does not name.
+    /// gives a table a tree the change does not name. `kvs` are the
+    /// dropped tables' catalog tombstones, applied with the change.
     pub fn dropTables(
         self: *Engine,
         namespace: u64,
         table_ids: []const u32,
+        kvs: []zdb_bufs.KeyValueStruct,
     ) !void {
+        // As proposeMC: rows wait for a real memtable, before the hold.
+        if (kvs.len > 0) try self.node.waitReady();
         const held = try self.holdChanges(@src());
         defer held.release();
 
-        const mc = try self.forest.buildTableDrop(
+        var mc = try self.forest.buildTableDrop(
             self.allocator,
             namespace,
             table_ids,
         );
         defer self.allocator.free(mc.tree_changes);
+        defer self.allocator.free(mc.table_changes);
+        if (kvs.len > 0) mc.mutations = .{ .namespace = namespace, .kvs = kvs };
         try self.proposeHeld(held, mc);
     }
 
@@ -1843,8 +1900,8 @@ fn seedGenesis(
     if (wal.lastIndex() != 0) return;
 
     // Same trees as forest.buildNsCreate — one per system table,
-    // posting indexes as there; tree 0 (the raw-KV default table)
-    // carries the database name.
+    // posting indexes as there — and the namespace record with the
+    // database name.
     const sys = zdb.manifest.namespace_system_table_ids;
     var tc: [sys.len]zdb.manifest.TreeChange = undefined;
     for (sys, &tc) |table_id, *c|
@@ -1855,11 +1912,15 @@ fn seedGenesis(
             "",
             .posting_index,
         );
-    tc[0].name = @constCast(name);
+    var ns = [_]zdb.manifest.NamespaceRecord{.{
+        .id = zdb.manifest.first_namespace,
+        .name = name,
+    }};
     const mc: _manifest.ManifestChange = .{
         .cmd = .create_ns,
         .tree_changes = &tc,
         .sstable_changes = &.{},
+        .namespaces = &ns,
         .memtable_id = 0,
     };
     const payload = try zdb_bufs.marshalRoot(allocator, mc);

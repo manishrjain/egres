@@ -849,27 +849,16 @@ pub const Manifest = struct {
         }
 
         switch (mc.cmd) {
-            .create_ns => for (mc.tree_changes) |tc| {
-                if (tc.op != .create) continue;
-                self.advanceNamespace(tc.namespace_id);
-                try self.registerNamespaceName(tc.namespace_id, tc.name);
+            .create_ns => for (mc.namespaces) |n| {
+                self.advanceNamespace(n.id);
+                try self.registerNamespaceName(n.id, n.name);
             },
-            .create_tree => for (mc.tree_changes) |tc| {
-                if (tc.op != .create) continue;
-                const table_key: TableKey = .{
-                    .namespace = tc.namespace_id,
-                    .table_id = treeTableId(tc.tree_id),
-                };
-                try self.advanceTableId(table_key);
-                try self.registerTableName(table_key, tc.name);
-            },
-            .drop_tree => for (mc.tree_changes) |tc| {
+            .create_tree => try self.createTables(mc.table_changes),
+            .drop_tree => for (mc.table_changes) |tc| {
                 if (tc.op != .delete) continue;
-                // The first delete of a multi-tree table removes the name;
-                // the rest are no-ops.
                 self.dropTable(.{
                     .namespace = tc.namespace_id,
-                    .table_id = treeTableId(tc.tree_id),
+                    .table_id = tc.table_id,
                 });
             },
             .drop_ns => if (mc.tree_changes.len > 0) {
@@ -881,7 +870,7 @@ pub const Manifest = struct {
         }
     }
 
-    /// branch_ns: the target namespace (`mc.tree_changes[0]`, which
+    /// branch_ns: the target namespace (`mc.namespaces[0]`, which
     /// carries its id and name) gets a tree for every tree of
     /// `mc.branch_from` with the same id, range, kind and files. A
     /// file listed again keeps its record and its raft_index, so the
@@ -893,9 +882,9 @@ pub const Manifest = struct {
     /// index. A target that already has trees was applied before
     /// (replay): nothing changes.
     fn applyNsBranch(self: *Manifest, mc: ManifestChange) !void {
-        std.debug.assert(mc.tree_changes.len == 1);
-        const target = mc.tree_changes[0];
-        const dst = target.namespace_id;
+        std.debug.assert(mc.namespaces.len == 1);
+        const target = mc.namespaces[0];
+        const dst = target.id;
         const src = mc.branch_from;
         {
             const held = self.mu.hold(.exclusive, @src());
@@ -937,12 +926,13 @@ pub const Manifest = struct {
         try self.registerNamespaceName(dst, target.name);
     }
 
-    /// branch_table: each change names a new table (its tree-0 change,
-    /// for the id and name) and `from_table_id`, the table whose trees
+    /// branch_table: each tree change names a new table (its tree-0
+    /// change, for the id) and `from_table_id`, the table whose trees
     /// it lists again, split by split, with the same ranges, kinds and
-    /// files, as applyBranch does for a namespace. Then the name and
-    /// the counter, as a create_tree. A new table that already has
-    /// trees was applied before (replay): nothing changes.
+    /// files, as applyBranch does for a namespace. Then the counters and
+    /// the names from the table changes, as a create_tree. A new table
+    /// that already has trees was applied before (replay): nothing
+    /// changes.
     fn applyTableBranch(self: *Manifest, mc: ManifestChange) !void {
         {
             const held = self.mu.hold(.exclusive, @src());
@@ -966,10 +956,17 @@ pub const Manifest = struct {
                 });
             }
         }
-        for (mc.tree_changes) |tc| {
+        try self.createTables(mc.table_changes);
+    }
+
+    /// What a create_tree or branch_table does for each table it makes:
+    /// advance the namespace's id counter past it and record its name.
+    fn createTables(self: *Manifest, tables: []const TableChange) !void {
+        for (tables) |tc| {
+            if (tc.op != .create) continue;
             const table_key: TableKey = .{
                 .namespace = tc.namespace_id,
-                .table_id = treeTableId(tc.tree_id),
+                .table_id = tc.table_id,
             };
             try self.advanceTableId(table_key);
             try self.registerTableName(table_key, tc.name);
@@ -1042,7 +1039,8 @@ pub const Manifest = struct {
     ///
     /// Wire format reuses the existing `ManifestChange` zbuf shape: a list of
     /// `tree_changes` (CREATE per tree), `sstable_changes` (CREATE per SST),
-    /// and `next_table_ids` (one per namespace).
+    /// `table_changes` (CREATE per named table) and `namespaces` (one per
+    /// namespace, with its name and counter).
     ///
     /// Written record by record into one buffer through the zbuf writers.
     /// Building the changes as structs and marshalling them after took one
@@ -1057,31 +1055,15 @@ pub const Manifest = struct {
         defer arena.deinit();
         const a = arena.allocator();
 
-        // Reverse map (ns, table_id) → table name, so a tree's CREATE change
-        // below can carry its table's name — the same vehicle the live
-        // create_tree apply uses (TreeChange.name).
-        // A snapshot build serializes every tree, on a worker sessions
-        // share: with 26,000 tenants this and the replay were 93 ms.
-        var tnames = std.AutoHashMap(TableKey, String).init(a);
-        var nit = self.namespaces.iterator();
-        while (nit.next()) |kv| {
-            try fiber.ctx().meter();
-            var tit = kv.value_ptr.tables.iterator();
-            while (tit.next()) |t| {
-                // t.key = table name. t.value = uint32 table id.
-                try tnames.put(.{
-                    .namespace = kv.key_ptr.*,
-                    .table_id = t.value_ptr.*,
-                }, t.key_ptr.*);
-            }
-        }
-
         // Sized up front: growing a buffer of tens of MB copies all of
         // it, in a step that does not yield. Names and split keys are
         // not counted, so it may still grow once.
         const ssts: usize = self.ssts.count();
         const trees: usize = self.trees.count();
         const spaces: usize = self.namespaces.count();
+        var tables: usize = 0;
+        var nit = self.namespaces.valueIterator();
+        while (nit.next()) |n| tables += n.tables.count();
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
         try out.ensureTotalCapacity(
@@ -1089,6 +1071,7 @@ pub const Manifest = struct {
             _zen.ManifestChangeWriter.SIZE_BYTES + 4 +
                 ssts * (_zen.SSTableChangeWriter.SIZE_BYTES + 4) +
                 trees * (_zen.TreeChangeWriter.SIZE_BYTES + 4) +
+                tables * (_zen.TableChangeWriter.SIZE_BYTES + 4) +
                 spaces * (_zen.NamespaceWriter.SIZE_BYTES + 4),
         );
         // The root first, at offset 0 as a message needs it; every
@@ -1111,16 +1094,6 @@ pub const Manifest = struct {
                 .right_key = try tree.right.marshal(a),
                 .kind = tree.kind,
             });
-            // Only the table's FIRST tree carries the name — exactly one
-            // tree per table has the open left bound (splits leave it with
-            // the leftmost child), so a heavily-split table doesn't copy
-            // its name into every TreeChange.
-            if (tree.left.isInf()) {
-                if (tnames.get(.{
-                    .namespace = tk.namespace,
-                    .table_id = treeTableId(tk.tree_id),
-                })) |n| try rec.setName(n);
-            }
             try tree_offsets.append(a, (try rec.finish()).offset);
         }
         // The files after every tree, as the struct marshal laid them out:
@@ -1154,10 +1127,27 @@ pub const Manifest = struct {
             }
         }
 
+        // Every named table, then every namespace: the name map is the
+        // table's, so a split changes nothing here.
+        var table_offsets = try std.ArrayList(u32).initCapacity(a, tables);
         var ns_offsets = try std.ArrayList(u32).initCapacity(a, spaces);
         var cit = self.namespaces.iterator();
         while (cit.next()) |kv| {
             try fiber.ctx().meter();
+            var tit = kv.value_ptr.tables.iterator();
+            while (tit.next()) |t| {
+                var rec = try _zen.TableChangeWriter.initWithBuf(
+                    allocator,
+                    &out,
+                );
+                try rec.set(.{
+                    .op = .create,
+                    .namespace_id = kv.key_ptr.*,
+                    .table_id = t.value_ptr.*,
+                    .name = t.key_ptr.*,
+                });
+                try table_offsets.append(a, (try rec.finish()).offset);
+            }
             var rec = try _zen.NamespaceWriter.initWithBuf(allocator, &out);
             try rec.set(.{
                 .id = kv.key_ptr.*,
@@ -1170,6 +1160,7 @@ pub const Manifest = struct {
         try root.set(.{
             .tree_changes = tree_offsets.items,
             .sstable_changes = sst_offsets.items,
+            .table_changes = table_offsets.items,
             .namespaces = ns_offsets.items,
             .next_ns_id = self.next_ns_id,
         });
@@ -1270,19 +1261,17 @@ pub const Manifest = struct {
             self.next_ns_id = @max(reader.nextNsId(), first_namespace);
         }
 
-        // Names: serialize stamps a table's name onto its tree's change
-        // (only user tables carry one; empty is a no-op), and each
-        // namespace record carries the database name.
-        const tc_len = reader.treeChangesLen();
+        // Names: one table record per named table, and each namespace
+        // record carries the database name.
+        const tbls_len = reader.tableChangesLen();
         var i: u32 = 0;
-        while (i < tc_len) : (i += 1) {
+        while (i < tbls_len) : (i += 1) {
             try fiber.ctx().meter();
-            const tc = try reader.treeChangesAt(i);
-            if (tc.op() == .create)
-                try self.registerTableName(.{
-                    .namespace = tc.namespaceId(),
-                    .table_id = treeTableId(tc.treeId()),
-                }, tc.name());
+            const tc = try reader.tableChangesAt(i);
+            try self.registerTableName(.{
+                .namespace = tc.namespaceId(),
+                .table_id = tc.tableId(),
+            }, tc.name());
         }
         const ns_len = reader.namespacesLen();
         i = 0;
@@ -1312,6 +1301,8 @@ pub const Manifest = struct {
 
 pub const SSTableChange = _zen.SSTableChangeStruct;
 pub const TreeChange = _zen.TreeChangeStruct;
+pub const TableChange = _zen.TableChangeStruct;
+pub const NamespaceRecord = _zen.NamespaceStruct;
 pub const ManifestChange = _zen.ManifestChangeStruct;
 pub const Command = _zen.CommandEnum;
 
@@ -1365,14 +1356,28 @@ pub fn createTreeChange(
     };
 }
 
-/// A table to create, for Forest.buildTables: `kind` for a create,
-/// `from_table_id` (set after) for a branch; the builder fills the ids.
-/// `name` must outlive the change.
-pub fn newTableChange(name: String, kind: TreeKind) TreeChange {
+/// A table's name record, for a create_tree or branch_table. `name`
+/// must outlive the change.
+pub fn createTableChange(
+    namespace_id: u64,
+    table_id: u32,
+    name: String,
+) TableChange {
     return .{
         .op = .create,
-        .name = @constCast(name),
-        .kind = kind,
+        .namespace_id = namespace_id,
+        .table_id = table_id,
+        .name = name,
+    };
+}
+
+/// A table's name record for a drop_tree: the apply forgets the name
+/// by id.
+pub fn deleteTableChange(namespace_id: u64, table_id: u32) TableChange {
+    return .{
+        .op = .delete,
+        .namespace_id = namespace_id,
+        .table_id = table_id,
     };
 }
 

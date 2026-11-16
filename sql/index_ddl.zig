@@ -30,7 +30,7 @@ const log = std.log.scoped(.sql);
 const replyError = _server.replyError;
 const replyErrorCode = _server.replyErrorCode;
 const replyLockErr = _server.replyLockErr;
-const writeCatalogRows = _ddl.writeCatalogRows;
+const catalogRows = _ddl.catalogRows;
 
 /// CREATE [UNIQUE] INDEX — the online-backfill protocol. Blocks the
 /// issuing session until the index is built and valid (the reply
@@ -153,14 +153,14 @@ pub fn createIndex(
     // what's needed.
     const column_id = col.column_id;
 
-    var changes = [_]zdb.manifest.TreeChange{zdb.manifest.newTableChange(
-        name,
-        if (ci.unique) .unique_index else .posting_index,
-    )};
-    const created = eng.forest.buildTables(
+    const specs = [_]zdb.forest.Forest.TableSpec{.{
+        .name = name,
+        .kind = if (ci.unique) .unique_index else .posting_index,
+    }};
+    var created = eng.forest.buildTables(
         arloc,
         ns,
-        &changes,
+        &specs,
         .create_tree,
     ) catch |err| switch (err) {
         error.NameExists => return replyErrorCode(
@@ -173,19 +173,7 @@ pub fn createIndex(
             return replyError(state, "create index failed");
         },
     };
-    eng.proposeMC(created.change) catch |err| {
-        logCreateIndexErr(name, "propose tree", err);
-        return replyError(state, "create index failed");
-    };
     const index_tid = created.table_ids[0];
-
-    const tree_key = zdb.kv.TreeKey{
-        .namespace = ns,
-        .tree_id = zdb.kv.makeTreeId(index_tid, 0),
-    };
-    try eng.reserveTree(tree_key);
-    defer eng.releaseTree(tree_key);
-
     const db = try self.srv.database(ns);
 
     // The barrier: the base table's exclusive lock, taken at steps
@@ -212,14 +200,39 @@ pub fn createIndex(
     build.takeBarrier();
     defer build.dropBarrier();
 
-    // TODO: This can return the timestamp the catalog was written at, so we
-    // don't need to run build.readTs.
-    writeCatalogRows(self, arloc, base_key, &.{}, &.{def}) catch |err| {
+    // The tree, the name and the building descriptor in one change,
+    // under the barrier: no statement straddles the descriptor's
+    // timestamp with a schema that lacks the index, so every row
+    // committed after `read_ts` is maintained by its writer. A failed
+    // proposal made nothing: nothing to remove.
+    const def_row = catalogRows(
+        self,
+        arloc,
+        base_key,
+        &.{},
+        &.{def},
+    ) catch |err| {
         logCreateIndexErr(name, "catalog row", err);
         return replyError(state, "create index failed");
     };
+    created.change.mutations = .{ .namespace = ns, .kvs = def_row };
+    eng.proposeMC(created.change) catch |err| {
+        logCreateIndexErr(name, "propose", err);
+        return replyError(state, "create index failed");
+    };
+    // From here the index exists, named and building: every failure
+    // goes through `fail`, which removes it.
+    const tree_key = zdb.kv.TreeKey{
+        .namespace = ns,
+        .tree_id = zdb.kv.makeTreeId(index_tid, 0),
+    };
+    eng.reserveTree(tree_key) catch |err|
+        return build.fail("reserve tree", err);
+    defer eng.releaseTree(tree_key);
     self.srv.forgetTable(base_key) catch |err|
         return build.fail("forget table", err);
+    // TODO: proposeMC could return the change's commit timestamp, the
+    // descriptor row's, so readTs need not read it back.
     build.read_ts = build.readTs() catch |err|
         return build.fail("read read_ts", err);
     // The backfill reads at read_ts until the index is valid: counted
@@ -575,15 +588,13 @@ const IndexBuild = struct {
     /// The commit HLC of the index's catalog row, read back from it.
     fn readTs(self: *IndexBuild) !u64 {
         const eng = self.handler.srv.engine;
-        const ck = _catalog.encodeIndexKey(
-            self.def.base_table_id,
-            self.def.index_table_id,
-        );
-        const found = try eng.forest.get(eng.allocator, .{ .key = .{
+        const wire_key = try _table.indexRowKey(self.a, .{
             .namespace = self.ns,
-            .table_id = _catalog.index_table_id,
-            .primary = &ck,
-        } }) orelse return error.RowMissing;
+            .table_id = self.def.base_table_id,
+        }, self.def.index_table_id);
+        const found = try eng.forest.get(eng.allocator, .{
+            .key = zdb.kv.Key.init(wire_key),
+        }) orelse return error.RowMissing;
         defer found.free(eng.allocator);
         return found.newest().ts;
     }
@@ -752,13 +763,15 @@ const IndexBuild = struct {
             .namespace = self.ns,
             .table_id = self.def.base_table_id,
         };
-        try writeCatalogRows(
+        const rows = try catalogRows(
             self.handler,
             self.a,
             base_key,
             &.{},
             &.{vdef},
         );
+        const eng = self.handler.srv.engine;
+        try eng.proposeWrites(self.ns, rows, .apply);
         try self.handler.srv.forgetTable(base_key);
     }
 };
@@ -852,13 +865,12 @@ pub fn dropIndex(
     try state.sendCommandComplete("DROP INDEX");
 }
 
-/// Remove an index: tombstone its catalog row, drop its tree, reload
-/// the base table's schema. Order matters: the catalog row FIRST —
-/// the reverse would leave a live IndexDef pointing at a dead tree
-/// (reads would see silently-empty results), and unlike dropTable's
-/// tolerated catalog garbage, a live IndexDef row would resurrect
-/// the index on the next schema load. The caller holds the base
-/// table's exclusive lock; this must not take it.
+/// Remove an index: drop its tree and its name with its catalog row's
+/// tombstone in one change, then reload the base table's schema. One
+/// entry, so no schema load ever finds a live IndexDef pointing at a
+/// dead tree (reads would see silently-empty results) or a tree no
+/// IndexDef names. The caller holds the base table's exclusive lock;
+/// this must not take it.
 fn removeIndex(
     self: *Handler,
     a: std.mem.Allocator,
@@ -867,20 +879,14 @@ fn removeIndex(
     index_tid: u32,
 ) !void {
     const eng = self.srv.engine;
-    const ck = _catalog.encodeIndexKey(base_tid, index_tid);
-    const wire_key = try (zdb.kv.Key{
-        .namespace = ns,
-        .table_id = _catalog.index_table_id,
-        .primary = &ck,
-    }).marshal(a);
     var kvs = [_]zen.KeyValueStruct{.{
-        .key = wire_key,
-        .value = "",
+        .key = try _table.indexRowKey(a, .{
+            .namespace = ns,
+            .table_id = base_tid,
+        }, index_tid),
         .meta = (zdb.kv.Meta{ .kind = .deleted }).toByte(),
     }};
-    try eng.proposeWrites(ns, &kvs, .apply);
-
-    try eng.dropTables(ns, &.{index_tid});
+    try eng.dropTables(ns, &.{index_tid}, &kvs);
     try self.srv.forgetTable(.{ .namespace = ns, .table_id = base_tid });
 }
 

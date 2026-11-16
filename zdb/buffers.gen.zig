@@ -69,6 +69,7 @@ pub fn parseMessageWithTail(buf: []const u8) Error!MessageReader {
         MutationsReader.TABLE_ID => .{ .Mutations = try MutationsReader.init(payload_buf, 0) },
         NamespaceReader.TABLE_ID => .{ .Namespace = try NamespaceReader.init(payload_buf, 0) },
         RoaringDeltaReader.TABLE_ID => .{ .RoaringDelta = try RoaringDeltaReader.init(payload_buf, 0) },
+        TableChangeReader.TABLE_ID => .{ .TableChange = try TableChangeReader.init(payload_buf, 0) },
         else => zbuf.Error.Invalid,
     };
 }
@@ -84,6 +85,7 @@ pub const MessageReader = union(enum) {
     Mutations: MutationsReader,
     Namespace: NamespaceReader,
     RoaringDelta: RoaringDeltaReader,
+    TableChange: TableChangeReader,
 };
 
 pub const BlockIndexStruct = struct {
@@ -767,7 +769,6 @@ pub const TreeChangeStruct = struct {
     tree_id: u64 = 0,
     left_key: []const u8 = &.{},
     right_key: []const u8 = &.{},
-    name: []const u8 = &.{},
     kind: TreeKindEnum = @enumFromInt(0),
     from_table_id: u32 = 0,
     pub fn deinit(self: *TreeChangeStruct, alloc: std.mem.Allocator) void {
@@ -775,8 +776,6 @@ pub const TreeChangeStruct = struct {
         self.left_key = &.{};
         alloc.free(self.right_key);
         self.right_key = &.{};
-        alloc.free(self.name);
-        self.name = &.{};
     }
 
     pub fn destroy(self: *TreeChangeStruct, alloc: std.mem.Allocator) void {
@@ -795,7 +794,6 @@ pub const TreeChangeStruct = struct {
         errdefer s.deinit(alloc);
         s.left_key = try alloc.dupe(u8, self.left_key);
         s.right_key = try alloc.dupe(u8, self.right_key);
-        s.name = try alloc.dupe(u8, self.name);
         return s;
     }
 
@@ -813,7 +811,6 @@ pub const TreeChangeStruct = struct {
         try writer.setTreeId(self.tree_id);
         try writer.setLeftKey(self.left_key);
         try writer.setRightKey(self.right_key);
-        try writer.setName(self.name);
         try writer.setKind(self.kind);
         try writer.setFromTableId(self.from_table_id);
         const result = try writer.finish();
@@ -826,7 +823,7 @@ pub const TreeChangeReader = struct {
     t: zbuf.Table,
 
     pub const TABLE_ID: u16 = 46596;
-    pub const SIZE_BYTES: u16 = 48;
+    pub const SIZE_BYTES: u16 = 40;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
@@ -856,16 +853,12 @@ pub const TreeChangeReader = struct {
         return self.t.bytes(27);
     }
 
-    pub fn name(self: Self) []const u8 {
-        return self.t.bytes(35);
-    }
-
     pub fn kind(self: Self) TreeKindEnum {
-        return @enumFromInt(self.t.scalar(u8, 43));
+        return @enumFromInt(self.t.scalar(u8, 35));
     }
 
     pub fn fromTableId(self: Self) u32 {
-        return self.t.scalar(u32, 44);
+        return self.t.scalar(u32, 36);
     }
 
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
@@ -875,7 +868,6 @@ pub const TreeChangeReader = struct {
         try writer.setTreeId(self.treeId());
         try writer.setLeftKey(self.leftKey());
         try writer.setRightKey(self.rightKey());
-        try writer.setName(self.name());
         try writer.setKind(self.kind());
         try writer.setFromTableId(self.fromTableId());
         const result = try writer.finish();
@@ -886,7 +878,6 @@ pub const TreeChangeReader = struct {
         try self.t.verifyHeader();
         try self.t.verifyBytes(19);
         try self.t.verifyBytes(27);
-        try self.t.verifyBytes(35);
     }
     pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!TreeChangeStruct {
         var s = TreeChangeStruct{
@@ -899,7 +890,6 @@ pub const TreeChangeReader = struct {
         errdefer s.deinit(alloc);
         s.left_key = try alloc.dupe(u8, self.leftKey());
         s.right_key = try alloc.dupe(u8, self.rightKey());
-        s.name = try alloc.dupe(u8, self.name());
         return s;
     }
     pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*TreeChangeStruct {
@@ -917,7 +907,7 @@ pub const TreeChangeWriter = struct {
     w: zbuf.TableWriter,
 
     pub const TABLE_ID: u16 = 46596;
-    pub const SIZE_BYTES: u16 = 48;
+    pub const SIZE_BYTES: u16 = 40;
     /// Slots of nested tables, null until set.
     const child_slots = [_]u16{};
 
@@ -949,16 +939,12 @@ pub const TreeChangeWriter = struct {
         return self.w.setBytes(27, data);
     }
 
-    pub fn setName(self: *Self, data: []const u8) Error!void {
-        return self.w.setBytes(35, data);
-    }
-
     pub fn setKind(self: *Self, v: TreeKindEnum) Error!void {
-        return self.w.setScalar(u8, 43, @intFromEnum(v));
+        return self.w.setScalar(u8, 35, @intFromEnum(v));
     }
 
     pub fn setFromTableId(self: *Self, v: u32) Error!void {
-        return self.w.setScalar(u32, 44, v);
+        return self.w.setScalar(u32, 36, v);
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -971,7 +957,6 @@ pub const TreeChangeWriter = struct {
         if (@hasField(Values, "tree_id")) try self.setTreeId(@field(values, "tree_id"));
         if (@hasField(Values, "left_key")) try self.setLeftKey(@field(values, "left_key"));
         if (@hasField(Values, "right_key")) try self.setRightKey(@field(values, "right_key"));
-        if (@hasField(Values, "name")) try self.setName(@field(values, "name"));
         if (@hasField(Values, "kind")) try self.setKind(@field(values, "kind"));
         if (@hasField(Values, "from_table_id")) try self.setFromTableId(@field(values, "from_table_id"));
     }
@@ -1238,6 +1223,8 @@ pub const ManifestChangeStruct = struct {
     namespaces: []NamespaceStruct = &.{},
     next_ns_id: u64 = 0,
     branch_from: u64 = 0,
+    table_changes: []TableChangeStruct = &.{},
+    mutations: ?MutationsStruct = null,
     pub fn deinit(self: *ManifestChangeStruct, alloc: std.mem.Allocator) void {
         for (self.tree_changes) |*_b| _b.deinit(alloc);
         alloc.free(self.tree_changes);
@@ -1248,6 +1235,11 @@ pub const ManifestChangeStruct = struct {
         for (self.namespaces) |*_b| _b.deinit(alloc);
         alloc.free(self.namespaces);
         self.namespaces = &.{};
+        for (self.table_changes) |*_b| _b.deinit(alloc);
+        alloc.free(self.table_changes);
+        self.table_changes = &.{};
+        if (self.mutations) |*_bf| _bf.deinit(alloc);
+        self.mutations = null;
     }
 
     pub fn destroy(self: *ManifestChangeStruct, alloc: std.mem.Allocator) void {
@@ -1283,6 +1275,16 @@ pub const ManifestChangeStruct = struct {
             for (self.namespaces, 0..) |_child, _i| {
                 s.namespaces[_i] = try _child.cloneValue(alloc);
             }
+        }
+        {
+            s.table_changes = try alloc.alloc(TableChangeStruct, self.table_changes.len);
+            @memset(s.table_changes, .{});
+            for (self.table_changes, 0..) |_child, _i| {
+                s.table_changes[_i] = try _child.cloneValue(alloc);
+            }
+        }
+        if (self.mutations) |_child| {
+            s.mutations = try _child.cloneValue(alloc);
         }
         return s;
     }
@@ -1324,6 +1326,18 @@ pub const ManifestChangeStruct = struct {
         }
         try writer.setNextNsId(self.next_ns_id);
         try writer.setBranchFrom(self.branch_from);
+        if (self.table_changes.len > 0) {
+            const offsets = try alloc.alloc(u32, self.table_changes.len);
+            defer alloc.free(offsets);
+            for (self.table_changes, 0..) |child, ci| {
+                offsets[ci] = try child.marshalTo(alloc, out);
+            }
+            try writer.setTableChanges(offsets);
+        }
+        if (self.mutations) |child| {
+            const child_off = try child.marshalTo(alloc, out);
+            try writer.setMutations(child_off);
+        }
         const result = try writer.finish();
         return result.offset;
     }
@@ -1334,7 +1348,7 @@ pub const ManifestChangeReader = struct {
     t: zbuf.Table,
 
     pub const TABLE_ID: u16 = 46598;
-    pub const SIZE_BYTES: u16 = 51;
+    pub const SIZE_BYTES: u16 = 63;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
@@ -1384,6 +1398,19 @@ pub const ManifestChangeReader = struct {
         return self.t.scalar(u64, 43);
     }
 
+    pub fn tableChangesLen(self: Self) u32 {
+        return self.t.arrayLen(51, 4);
+    }
+
+    pub fn tableChangesAt(self: Self, i: u32) Error!TableChangeReader {
+        return TableChangeReader.init(self.t.buf, try self.t.arrayChild(51, i));
+    }
+
+    pub fn mutations(self: Self) ?MutationsReader {
+        const off = self.t.child(59) orelse return null;
+        return MutationsReader.init(self.t.buf, off) catch null;
+    }
+
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try ManifestChangeWriter.initWithBuf(alloc, out);
         const count_treeChanges: u32 = self.treeChangesLen();
@@ -1423,6 +1450,21 @@ pub const ManifestChangeReader = struct {
         }
         try writer.setNextNsId(self.nextNsId());
         try writer.setBranchFrom(self.branchFrom());
+        const count_tableChanges: u32 = self.tableChangesLen();
+        if (count_tableChanges != 0) {
+            var child_offsets_tableChanges = try alloc.alloc(u32, @intCast(count_tableChanges));
+            defer alloc.free(child_offsets_tableChanges);
+            var i_tableChanges: u32 = 0;
+            while (i_tableChanges < count_tableChanges) : (i_tableChanges += 1) {
+                const child = try self.tableChangesAt(i_tableChanges);
+                child_offsets_tableChanges[@intCast(i_tableChanges)] = try child.cloneInto(alloc, out);
+            }
+            try writer.setTableChanges(child_offsets_tableChanges);
+        }
+        if (self.mutations()) |child| {
+            const child_off = try child.cloneInto(alloc, out);
+            try writer.setMutations(child_off);
+        }
         const result = try writer.finish();
         return result.offset;
     }
@@ -1441,6 +1483,11 @@ pub const ManifestChangeReader = struct {
         for (0..self.namespacesLen()) |i| {
             try (try self.namespacesAt(@intCast(i))).verify();
         }
+        try self.t.verifyArray(51, 4);
+        for (0..self.tableChangesLen()) |i| {
+            try (try self.tableChangesAt(@intCast(i))).verify();
+        }
+        if (self.mutations()) |child_view| try child_view.verify();
     }
     pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!ManifestChangeStruct {
         var s = ManifestChangeStruct{
@@ -1477,6 +1524,18 @@ pub const ManifestChangeReader = struct {
                 s.namespaces[_i] = try _child.toStructValue(alloc);
             }
         }
+        {
+            const _cnt = self.tableChangesLen();
+            s.table_changes = try alloc.alloc(TableChangeStruct, @intCast(_cnt));
+            @memset(s.table_changes, .{});
+            for (0.._cnt) |_i| {
+                const _child = try self.tableChangesAt(@intCast(_i));
+                s.table_changes[_i] = try _child.toStructValue(alloc);
+            }
+        }
+        if (self.mutations()) |_child| {
+            s.mutations = try _child.toStructValue(alloc);
+        }
         return s;
     }
     pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*ManifestChangeStruct {
@@ -1494,9 +1553,9 @@ pub const ManifestChangeWriter = struct {
     w: zbuf.TableWriter,
 
     pub const TABLE_ID: u16 = 46598;
-    pub const SIZE_BYTES: u16 = 51;
+    pub const SIZE_BYTES: u16 = 63;
     /// Slots of nested tables, null until set.
-    const child_slots = [_]u16{};
+    const child_slots = [_]u16{59};
 
     pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {
         return .{ .w = try zbuf.TableWriter.initWithBuf(alloc, buf, SIZE_BYTES, &child_slots) };
@@ -1534,6 +1593,14 @@ pub const ManifestChangeWriter = struct {
         return self.w.setScalar(u64, 43, v);
     }
 
+    pub fn setTableChanges(self: *Self, values: []const u32) Error!void {
+        return self.w.setArray(u32, 51, values);
+    }
+
+    pub fn setMutations(self: *Self, child_off: u32) Error!void {
+        return self.w.setChild(59, child_off);
+    }
+
     pub fn set(self: *Self, values: anytype) Error!void {
         const Values = @TypeOf(values);
         if (@typeInfo(Values) != .@"struct") {
@@ -1546,6 +1613,8 @@ pub const ManifestChangeWriter = struct {
         if (@hasField(Values, "namespaces")) try self.setNamespaces(@field(values, "namespaces"));
         if (@hasField(Values, "next_ns_id")) try self.setNextNsId(@field(values, "next_ns_id"));
         if (@hasField(Values, "branch_from")) try self.setBranchFrom(@field(values, "branch_from"));
+        if (@hasField(Values, "table_changes")) try self.setTableChanges(@field(values, "table_changes"));
+        if (@hasField(Values, "mutations")) try self.setMutations(@field(values, "mutations"));
     }
 
     pub fn finish(self: *Self) Error!ManifestChangeBuffer {
@@ -2211,6 +2280,175 @@ pub const RoaringDeltaWriter = struct {
     /// first on an empty buffer.
     pub fn finishWithTail(self: *Self) Error!RoaringDeltaBuffer {
         return self.w.finishWithTail(RoaringDeltaBuffer, TABLE_ID);
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.w.deinit();
+    }
+};
+
+pub const TableChangeStruct = struct {
+    pub const TABLE_ID: u16 = 46603;
+    op: OpEnum = @enumFromInt(0),
+    namespace_id: u64 = 0,
+    table_id: u32 = 0,
+    name: []const u8 = &.{},
+    pub fn deinit(self: *TableChangeStruct, alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        self.name = &.{};
+    }
+
+    pub fn destroy(self: *TableChangeStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: TableChangeStruct, alloc: std.mem.Allocator) Error!TableChangeStruct {
+        var s = TableChangeStruct{
+            .op = self.op,
+            .namespace_id = self.namespace_id,
+            .table_id = self.table_id,
+        };
+        errdefer s.deinit(alloc);
+        s.name = try alloc.dupe(u8, self.name);
+        return s;
+    }
+
+    pub fn clone(self: TableChangeStruct, alloc: std.mem.Allocator) Error!*TableChangeStruct {
+        const ptr = try alloc.create(TableChangeStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: TableChangeStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try TableChangeWriter.initWithBuf(alloc, out);
+        try writer.setOp(self.op);
+        try writer.setNamespaceId(self.namespace_id);
+        try writer.setTableId(self.table_id);
+        try writer.setName(self.name);
+        const result = try writer.finish();
+        return result.offset;
+    }
+};
+
+pub const TableChangeReader = struct {
+    const Self = @This();
+    t: zbuf.Table,
+
+    pub const TABLE_ID: u16 = 46603;
+    pub const SIZE_BYTES: u16 = 23;
+
+    pub fn parseRoot(buf: []const u8) Error!Self {
+        return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
+    }
+
+    pub fn init(buf: []const u8, base: u32) Error!Self {
+        return .{ .t = try zbuf.Table.init(buf, base) };
+    }
+
+    pub fn op(self: Self) OpEnum {
+        return @enumFromInt(self.t.scalar(u8, 2));
+    }
+
+    pub fn namespaceId(self: Self) u64 {
+        return self.t.scalar(u64, 3);
+    }
+
+    pub fn tableId(self: Self) u32 {
+        return self.t.scalar(u32, 11);
+    }
+
+    pub fn name(self: Self) []const u8 {
+        return self.t.bytes(15);
+    }
+
+    pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try TableChangeWriter.initWithBuf(alloc, out);
+        try writer.setOp(self.op());
+        try writer.setNamespaceId(self.namespaceId());
+        try writer.setTableId(self.tableId());
+        try writer.setName(self.name());
+        const result = try writer.finish();
+        return result.offset;
+    }
+
+    pub fn verify(self: Self) Error!void {
+        try self.t.verifyHeader();
+        try self.t.verifyBytes(15);
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!TableChangeStruct {
+        var s = TableChangeStruct{
+            .op = self.op(),
+            .namespace_id = self.namespaceId(),
+            .table_id = self.tableId(),
+        };
+        errdefer s.deinit(alloc);
+        s.name = try alloc.dupe(u8, self.name());
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*TableChangeStruct {
+        const ptr = try alloc.create(TableChangeStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
+    }
+};
+
+pub const TableChangeBuffer = zbuf.Buffer(TableChangeReader);
+
+pub const TableChangeWriter = struct {
+    const Self = @This();
+    w: zbuf.TableWriter,
+
+    pub const TABLE_ID: u16 = 46603;
+    pub const SIZE_BYTES: u16 = 23;
+    /// Slots of nested tables, null until set.
+    const child_slots = [_]u16{};
+
+    pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {
+        return .{ .w = try zbuf.TableWriter.initWithBuf(alloc, buf, SIZE_BYTES, &child_slots) };
+    }
+
+    pub fn init(alloc: std.mem.Allocator) Error!Self {
+        return .{ .w = try zbuf.TableWriter.init(alloc, SIZE_BYTES, &child_slots) };
+    }
+
+    pub fn setOp(self: *Self, v: OpEnum) Error!void {
+        return self.w.setScalar(u8, 2, @intFromEnum(v));
+    }
+
+    pub fn setNamespaceId(self: *Self, v: u64) Error!void {
+        return self.w.setScalar(u64, 3, v);
+    }
+
+    pub fn setTableId(self: *Self, v: u32) Error!void {
+        return self.w.setScalar(u32, 11, v);
+    }
+
+    pub fn setName(self: *Self, data: []const u8) Error!void {
+        return self.w.setBytes(15, data);
+    }
+
+    pub fn set(self: *Self, values: anytype) Error!void {
+        const Values = @TypeOf(values);
+        if (@typeInfo(Values) != .@"struct") {
+            @compileError("set() expects a struct literal like .{ .field = value }");
+        }
+        if (@hasField(Values, "op")) try self.setOp(@field(values, "op"));
+        if (@hasField(Values, "namespace_id")) try self.setNamespaceId(@field(values, "namespace_id"));
+        if (@hasField(Values, "table_id")) try self.setTableId(@field(values, "table_id"));
+        if (@hasField(Values, "name")) try self.setName(@field(values, "name"));
+    }
+
+    pub fn finish(self: *Self) Error!TableChangeBuffer {
+        return self.w.finish(TableChangeBuffer);
+    }
+
+    /// Root must be at payload offset 0: initialize the root writer
+    /// first on an empty buffer.
+    pub fn finishWithTail(self: *Self) Error!TableChangeBuffer {
+        return self.w.finishWithTail(TableChangeBuffer, TABLE_ID);
     }
 
     pub fn deinit(self: *Self) void {

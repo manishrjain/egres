@@ -17,7 +17,6 @@ const Item = zdb.kv.Item;
 
 const catalog = sql.catalog;
 const schema = sql.schema;
-const row = sql.row;
 const Type = sql.Type;
 
 // Write one catalog row per column into namespace `ns`'s catalog tree, keyed
@@ -49,14 +48,8 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
         .table_id = catalog.index_table_id,
     }, .{}, .posting_index);
 
-    var catalog_ps = try schema.compile(
-        alloc,
-        catalog.logical_schema,
-        catalog.logical_schema.current_version,
-    );
-    defer catalog_ps.deinit(alloc);
-    var index_ps = try schema.compile(alloc, catalog.index_logical_schema, catalog.index_logical_schema.current_version);
-    defer index_ps.deinit(alloc);
+    var catalogs = try catalog.Layouts.init(alloc);
+    defer catalogs.deinit(alloc);
 
     // Synthetic table: (id int4 PRIMARY KEY, name text).
     const cols = [_]schema.LogicalColumn{
@@ -72,16 +65,16 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
     defer buf.deinit(alloc);
     var items: std.ArrayList(Item) = .empty;
     defer items.deinit(alloc);
+    const user: zdb.kv.TableKey = .{
+        .namespace = ns,
+        .table_id = user_table_id,
+    };
     for (cols) |c| {
-        const cells = catalog.encodeColumn(user_table_id, c);
-        const bytes = try row.marshalRow(alloc, &catalog_ps, &cells, &buf);
-        const key = catalog.encodeKey(user_table_id, c.column_id);
+        const bytes = try catalogs.columnRow(alloc, user_table_id, c, &buf);
         try items.append(alloc, .{
-            .key = .{
-                .namespace = ns,
-                .table_id = catalog.table_id,
-                .primary = try a.dupe(u8, &key),
-            },
+            .key = Key.init(
+                try sql.table.columnRowKey(a, user, c.column_id),
+            ),
             .versions = .{ .one = .{
                 .ts = 1,
                 .meta = .{},
@@ -99,15 +92,11 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
             .unique = true,
             .valid_ts = 7,
         };
-        const cells = catalog.encodeIndex(def);
-        const bytes = try row.marshalRow(alloc, &index_ps, &cells, &buf);
-        const ikey = catalog.encodeIndexKey(user_table_id, pkey_index_id);
+        const bytes = try catalogs.indexRow(alloc, def, &buf);
         try items.append(alloc, .{
-            .key = .{
-                .namespace = ns,
-                .table_id = catalog.index_table_id,
-                .primary = try a.dupe(u8, &ikey),
-            },
+            .key = Key.init(
+                try sql.table.indexRowKey(a, user, pkey_index_id),
+            ),
             .versions = .{ .one = .{
                 .ts = 1,
                 .meta = .{},
@@ -117,7 +106,7 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
     }
     try f.put(items.items);
 
-    var t = try sql.table.loadTableSchema(alloc, f, &catalog_ps, &index_ps, .{
+    var t = try sql.table.loadTableSchema(alloc, f, &catalogs, .{
         .namespace = ns,
         .table_id = user_table_id,
     });
@@ -230,20 +219,13 @@ test "sql.table: load returns UndefinedTable when no catalog rows exist" {
         .table_id = catalog.table_id,
     }, .{}, .posting_index);
 
-    var catalog_ps = try schema.compile(
-        alloc,
-        catalog.logical_schema,
-        catalog.logical_schema.current_version,
-    );
-    defer catalog_ps.deinit(alloc);
-    var index_ps = try schema.compile(alloc, catalog.index_logical_schema, catalog.index_logical_schema.current_version);
-    defer index_ps.deinit(alloc);
+    var catalogs = try catalog.Layouts.init(alloc);
+    defer catalogs.deinit(alloc);
 
     try testing.expectError(error.UndefinedTable, sql.table.loadTableSchema(
         alloc,
         f,
-        &catalog_ps,
-        &index_ps,
+        &catalogs,
         .{ .namespace = ns, .table_id = 999 },
     ));
 }

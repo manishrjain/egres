@@ -635,6 +635,7 @@ pub const Forest = struct {
     pub const buildNsBranch = _ddl.buildNsBranch;
     pub const applyNsBranch = _ddl.applyNsBranch;
     pub const applyTableBranch = _ddl.applyTableBranch;
+    pub const TableSpec = _ddl.TableSpec;
     pub const TableResult = _ddl.TableResult;
     pub const buildTables = _ddl.buildTables;
     pub const buildTableDrop = _ddl.buildTableDrop;

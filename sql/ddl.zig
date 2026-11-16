@@ -1,11 +1,11 @@
 // Copyright 2026 Manish R Jain
 // SPDX-License-Identifier: Apache-2.0
 
-//! DDL execution: CREATE/DROP DATABASE and TABLE. Each is a
-//! choreography over the forest's manifest (name reservation, tree
-//! creation, catalog rows) replicated through raft — the data plane
-//! proper lives in dml.zig, and CREATE/DROP INDEX with the online
-//! backfill in index_ddl.zig.
+//! DDL execution: CREATE/DROP DATABASE and TABLE. Each is one manifest
+//! change replicated through raft: the trees it makes or drops, the
+//! names it records or forgets, and the catalog rows it writes, all in
+//! one entry — the data plane proper lives in dml.zig, and CREATE/DROP
+//! INDEX with the online backfill in index_ddl.zig.
 //!
 //! These take `*Handler` rather than being its methods: Zig keeps a
 //! struct's methods in one file, and the handler's DDL half is its own
@@ -20,7 +20,6 @@ const zen = zdb.buffers;
 const _catalog = @import("catalog.zig");
 const _parse = @import("parse.zig");
 const _key = @import("key.zig");
-const _row = @import("row.zig");
 const _schema = @import("schema.zig");
 const _table = @import("table.zig");
 const _value = @import("value.zig");
@@ -158,10 +157,10 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
     // all created with the table in one atomic change; a name
     // collision on any of them fails the CREATE.
     const columns = try a.alloc(_schema.LogicalColumn, ct.columns.len);
-    // The base table's rows tree, then a unique index tree per primary
-    // key or UNIQUE column.
-    var changes: std.ArrayList(zdb.manifest.TreeChange) = .empty;
-    try changes.append(a, zdb.manifest.newTableChange(ct.name, .rows));
+    // The base table, then a unique index per primary key or UNIQUE
+    // column.
+    var specs: std.ArrayList(zdb.forest.Forest.TableSpec) = .empty;
+    try specs.append(a, .{ .name = ct.name, .kind = .rows });
 
     var unique_cols: std.ArrayList(u32) = .empty;
     for (ct.columns, columns, 1..) |c, *lc, id| {
@@ -190,16 +189,13 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
             c.name,
             if (c.pkey) .pkey else .unique,
         );
-        try changes.append(
-            a,
-            zdb.manifest.newTableChange(index_name, .unique_index),
-        );
+        try specs.append(a, .{ .name = index_name, .kind = .unique_index });
     }
 
-    const created = eng.forest.buildTables(
+    var created = eng.forest.buildTables(
         a,
         ns,
-        changes.items,
+        specs.items,
         .create_tree,
     ) catch |err| switch (err) {
         error.NameExists => return replyErrorCode(state, pgwire.sqlstate.duplicate_table, "table or index name already exists"),
@@ -208,26 +204,11 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
             return replyError(state, "create table failed");
         },
     };
-    // Held from before the name is visible until the column rows are
-    // in, so a statement that finds the name waits (dmlTxn) and loads
-    // the whole schema. The id is new, so this take never waits.
+    // The column rows and the index descriptor rows ride the change
+    // and apply before its names, so no statement finds the table
+    // without its columns. An index made with its table is valid from
+    // ts 0: no row precedes it.
     const table_id = created.table_ids[0];
-    const db = self.srv.database(ns) catch
-        return replyError(state, "internal error: database state");
-    const table_lock = db.tableLock(table_id) catch
-        return replyError(state, "internal error: lock state");
-    table_lock.lock(@src());
-    defer table_lock.unlock();
-
-    eng.proposeMC(created.change) catch |err| {
-        log.err("create table '{s}': propose: {s}", .{ ct.name, @errorName(err) });
-        return replyError(state, "create table proposal failed");
-    };
-    // Phase 2: the table's column rows (+ the index descriptor rows)
-    // into the namespace's catalogs — one proposal, atomic. A crash
-    // between the two proposals leaves a named, column-less table (DROP
-    // TABLE cleans it up) — acceptable pre-production. An index made
-    // with its table is valid from ts 0: no row precedes it.
     const indexes = try a.alloc(_catalog.IndexDef, unique_cols.items.len);
     for (unique_cols.items, created.table_ids[1..], indexes) |col, tid, *def| {
         def.* = .{
@@ -237,12 +218,18 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
             .unique = true,
         };
     }
-    writeCatalogRows(self, a, .{
+    created.change.mutations = .{
         .namespace = ns,
-        .table_id = table_id,
-    }, columns, indexes) catch |err| {
-        log.err("create table '{s}': catalog rows: {s}", .{ ct.name, @errorName(err) });
-        return replyError(state, "create table failed writing catalog rows");
+        .kvs = try catalogRows(self, a, .{
+            .namespace = ns,
+            .table_id = table_id,
+        }, columns, indexes),
+    };
+    eng.proposeMC(created.change) catch |err| {
+        log.err("create table '{s}': propose: {s}", .{
+            ct.name, @errorName(err),
+        });
+        return replyError(state, "create table proposal failed");
     };
 
     log.info(
@@ -309,7 +296,7 @@ pub fn createTableAs(
     const columns = _table.loadColumnRows(
         arloc,
         eng.forest,
-        &self.srv.catalog_ps,
+        &self.srv.catalogs,
         src_key,
     ) catch |err| {
         log.err("create table as '{s}': catalog rows: {s}", .{
@@ -320,14 +307,15 @@ pub fn createTableAs(
 
     // The new tables: the base, then one per index, each a branch of
     // its source table (or, WITH NO DATA, an empty tree of its kind).
-    // Index changes pair with `src_indexes` by position, for their
+    // Index specs pair with `src_indexes` by position, for their
     // catalog rows below.
-    var changes: std.ArrayList(zdb.manifest.TreeChange) = .empty;
+    var specs: std.ArrayList(zdb.forest.Forest.TableSpec) = .empty;
     var src_indexes: std.ArrayList(_table.Index) = .empty;
-
-    var base = zdb.manifest.newTableChange(cta.name, .rows);
-    base.from_table_id = src_tid;
-    try changes.append(arloc, base);
+    try specs.append(arloc, .{
+        .name = cta.name,
+        .kind = .rows,
+        .from_table_id = src_tid,
+    });
 
     for (src.indexes) |idx| {
         if (idx.isBuilding())
@@ -336,23 +324,21 @@ pub fn createTableAs(
                 pgwire.sqlstate.object_in_use,
                 "source table has an index still being built",
             );
-
-        var tc = zdb.manifest.newTableChange(
-            try idx.nameFor(arloc, cta.name),
-            idx.treeKind(),
-        );
-        tc.from_table_id = idx.index_table_id;
-        try changes.append(arloc, tc);
+        try specs.append(arloc, .{
+            .name = try idx.nameFor(arloc, cta.name),
+            .kind = idx.treeKind(),
+            .from_table_id = idx.index_table_id,
+        });
         try src_indexes.append(arloc, idx);
     }
 
     const built = eng.forest.buildTables(
         arloc,
         ns,
-        changes.items,
+        specs.items,
         if (cta.with_data) .branch_table else .create_tree,
     );
-    const created = built catch |err| switch (err) {
+    var created = built catch |err| switch (err) {
         error.NameExists => return replyErrorCode(
             state,
             pgwire.sqlstate.duplicate_table,
@@ -363,26 +349,12 @@ pub fn createTableAs(
             return replyError(state, "create table failed");
         },
     };
-    // Exclusive table lock across both proposals, as createTable.
+    // The catalog rows under the new ids ride the change, as in
+    // createTable. The column ids stay the source's, so the index
+    // descriptors and the shared rows keep naming the same columns. A
+    // branched index is valid from when its source was; an empty one
+    // from the start.
     const table_id = created.table_ids[0];
-    const db = self.srv.database(ns) catch
-        return replyError(state, "internal error: database state");
-    const table_lock = db.tableLock(table_id) catch
-        return replyError(state, "internal error: lock state");
-    table_lock.lock(@src());
-    defer table_lock.unlock();
-
-    eng.proposeMC(created.change) catch |err| {
-        log.err("create table as '{s}': propose: {s}", .{
-            cta.name, @errorName(err),
-        });
-        return replyError(state, "create table proposal failed");
-    };
-
-    // Phase 2, as createTable: the catalog rows under the new ids. The
-    // column ids stay the source's, so the index descriptors and the
-    // shared rows keep naming the same columns. A branched index is
-    // valid from when its source was; an empty one from the start.
     const indexes = try arloc.alloc(_catalog.IndexDef, src_indexes.items.len);
     for (src_indexes.items, created.table_ids[1..], indexes) |idx, tid, *def| {
         def.* = .{
@@ -393,14 +365,18 @@ pub fn createTableAs(
             .valid_ts = if (cta.with_data) idx.valid_ts else 0,
         };
     }
-    writeCatalogRows(self, arloc, .{
+    created.change.mutations = .{
         .namespace = ns,
-        .table_id = table_id,
-    }, columns, indexes) catch |err| {
-        log.err("create table as '{s}': catalog rows: {s}", .{
+        .kvs = try catalogRows(self, arloc, .{
+            .namespace = ns,
+            .table_id = table_id,
+        }, columns, indexes),
+    };
+    eng.proposeMC(created.change) catch |err| {
+        log.err("create table as '{s}': propose: {s}", .{
             cta.name, @errorName(err),
         });
-        return replyError(state, "create table failed writing catalog rows");
+        return replyError(state, "create table proposal failed");
     };
 
     log.info(
@@ -411,58 +387,82 @@ pub fn createTableAs(
     try state.sendCommandComplete("CREATE TABLE AS");
 }
 
-/// Marshal one catalog row per column plus one per index descriptor and
-/// replicate the batch into the namespace's catalog trees, waiting for
-/// local apply. Column rows land in table 1, index rows in table 2 —
-/// mixed table_ids in one atomic proposal. `columns` carry their minted
-/// ids (createTable assigns them); nothing is derived here.
-pub fn writeCatalogRows(
+/// Marshal one catalog row per column plus one per index descriptor, in
+/// `a`: the rows a DDL's change carries (`ManifestChange.mutations`), or
+/// an index's descriptor turning valid. Column rows land in table 1,
+/// index rows in table 2. `columns` carry their minted ids (createTable
+/// assigns them); nothing is derived here.
+pub fn catalogRows(
     self: *Handler,
     a: std.mem.Allocator,
     table_key: zdb.kv.TableKey,
     columns: []const _schema.LogicalColumn,
     indexes: []const _catalog.IndexDef,
-) !void {
+) ![]zen.KeyValueStruct {
     const eng = self.srv.engine;
     const n = columns.len + indexes.len;
-    if (n == 0) return;
-
     const kvs = try a.alloc(zen.KeyValueStruct, n);
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(eng.allocator);
+    const catalogs = &self.srv.catalogs;
     for (columns, 0..) |lc, i| {
-        const cells = _catalog.encodeColumn(table_key.table_id, lc);
-        const bytes = try _row.marshalRow(eng.allocator, &self.srv.catalog_ps, &cells, &buf);
-        const primary = _catalog.encodeKey(
-            table_key.table_id,
-            lc.column_id,
-        );
-        const k = zdb.kv.Key{
-            .namespace = table_key.namespace,
-            .table_id = _catalog.table_id,
-            .primary = &primary,
-        };
-        // marshalRow reuses `buf` — copy the row out; marshal copies
-        // the key.
-        kvs[i] = .{ .key = try k.marshal(a), .value = try a.dupe(u8, bytes) };
-    }
-    for (indexes, columns.len..) |idx, i| {
-        const cells = _catalog.encodeIndex(idx);
-        const bytes = try _row.marshalRow(
+        const bytes = try catalogs.columnRow(
             eng.allocator,
-            &self.srv.index_catalog_ps,
-            &cells,
+            table_key.table_id,
+            lc,
             &buf,
         );
-        const primary = _catalog.encodeIndexKey(idx.base_table_id, idx.index_table_id);
-        const k = zdb.kv.Key{
-            .namespace = table_key.namespace,
-            .table_id = _catalog.index_table_id,
-            .primary = &primary,
+        // The row is a view of `buf`, which the next one reuses.
+        kvs[i] = .{
+            .key = try _table.columnRowKey(a, table_key, lc.column_id),
+            .value = try a.dupe(u8, bytes),
         };
-        kvs[i] = .{ .key = try k.marshal(a), .value = try a.dupe(u8, bytes) };
     }
-    try eng.proposeWrites(table_key.namespace, kvs, .apply);
+    for (indexes, columns.len..) |idx, i| {
+        const bytes = try catalogs.indexRow(eng.allocator, idx, &buf);
+        const base: zdb.kv.TableKey = .{
+            .namespace = table_key.namespace,
+            .table_id = idx.base_table_id,
+        };
+        kvs[i] = .{
+            .key = try _table.indexRowKey(a, base, idx.index_table_id),
+            .value = try a.dupe(u8, bytes),
+        };
+    }
+    return kvs;
+}
+
+/// Tombstones for a dropped table's catalog rows, in `a`: its column
+/// rows (table 1) and its index descriptors (table 2). A table with no
+/// column rows yields only the descriptors.
+pub fn catalogTombstones(
+    self: *Handler,
+    a: std.mem.Allocator,
+    ns: u64,
+    table_id: u32,
+    index_tids: []const u32,
+) ![]zen.KeyValueStruct {
+    const table: zdb.kv.TableKey = .{ .namespace = ns, .table_id = table_id };
+    const columns = _table.loadColumnRows(
+        a,
+        self.srv.engine.forest,
+        &self.srv.catalogs,
+        table,
+    ) catch |err| switch (err) {
+        error.UndefinedTable => &.{},
+        else => return err,
+    };
+    const deleted = (zdb.kv.Meta{ .kind = .deleted }).toByte();
+    var kvs: std.ArrayList(zen.KeyValueStruct) = .empty;
+    for (columns) |lc| try kvs.append(a, .{
+        .key = try _table.columnRowKey(a, table, lc.column_id),
+        .meta = deleted,
+    });
+    for (index_tids) |index_tid| try kvs.append(a, .{
+        .key = try _table.indexRowKey(a, table, index_tid),
+        .meta = deleted,
+    });
+    return kvs.items;
 }
 
 pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: _parse.DropTable) !void {
@@ -511,12 +511,22 @@ pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: _parse.DropTable)
     table_lock.lock(@src());
     defer table_lock.unlock();
 
-    // The table and its index tables drop together, in one atomic change
-    // — order is irrelevant. Their rows in the CATALOG trees stay behind
-    // as unreachable garbage (ids are never reused). TODO: issue
-    // tombstones for them.
+    // The table and its index tables drop together, in one atomic
+    // change, their names and their catalog rows with them.
+    const tombstones = catalogTombstones(
+        self,
+        a,
+        ns,
+        table_id,
+        scan.table_ids.items,
+    ) catch |err| {
+        log.err("drop table '{s}': catalog rows: {s}", .{
+            dt.name, @errorName(err),
+        });
+        return replyError(state, "drop table failed");
+    };
     try scan.table_ids.append(a, table_id);
-    eng.dropTables(ns, scan.table_ids.items) catch |err| {
+    eng.dropTables(ns, scan.table_ids.items, tombstones) catch |err| {
         log.err("drop table '{s}': {s}", .{ dt.name, @errorName(err) });
         return replyError(state, "drop table failed");
     };

@@ -32,12 +32,94 @@ const _value = @import("value.zig");
 const String = _value.String;
 const _schema = @import("schema.zig");
 const _key = @import("key.zig");
+const _row = @import("row.zig");
 
 const Type = _value.Type;
 const Value = _value.Value;
 const Row = _value.Row;
 const LogicalColumn = _schema.LogicalColumn;
 const LogicalSchema = _schema.LogicalSchema;
+const PhysicalSchema = _schema.PhysicalSchema;
+
+/// The compiled layouts of the catalogs' rows. Each catalog has the same
+/// compiled-in schema in every namespace, so one compile of each serves
+/// every database: the server owns one `Layouts`, and the catalog
+/// readers and writers take it by pointer. User tables' schemas live as
+/// rows inside the column catalog and get their own per-(table,
+/// version) compiles when reads land.
+pub const Layouts = struct {
+    /// Table 1, the column catalog.
+    columns: PhysicalSchema,
+    /// Table 2, the index catalog.
+    indexes: PhysicalSchema,
+
+    pub fn init(alloc: std.mem.Allocator) !Layouts {
+        var columns = try compile(alloc, logical_schema);
+        errdefer columns.deinit(alloc);
+        const indexes = try compile(alloc, index_logical_schema);
+        return .{ .columns = columns, .indexes = indexes };
+    }
+
+    pub fn deinit(self: *Layouts, alloc: std.mem.Allocator) void {
+        self.columns.deinit(alloc);
+        self.indexes.deinit(alloc);
+    }
+
+    /// The column row describing `column` of `owner_table_id`, marshaled
+    /// into `buf`. The bytes are a view of `buf`, which the next call
+    /// reuses: copy them out to keep them.
+    pub fn columnRow(
+        self: *const Layouts,
+        alloc: std.mem.Allocator,
+        owner_table_id: u32,
+        column: LogicalColumn,
+        buf: *std.ArrayList(u8),
+    ) !String {
+        const cells = encodeColumn(owner_table_id, column);
+        return _row.marshalRow(alloc, &self.columns, &cells, buf);
+    }
+
+    /// The index row describing `def`, marshaled into `buf`, as
+    /// `columnRow`.
+    pub fn indexRow(
+        self: *const Layouts,
+        alloc: std.mem.Allocator,
+        def: IndexDef,
+        buf: *std.ArrayList(u8),
+    ) !String {
+        const cells = encodeIndex(def);
+        return _row.marshalRow(alloc, &self.indexes, &cells, buf);
+    }
+
+    /// The column a column row's `value` describes, decoded through
+    /// `scratch`. Its name borrows `value`: dupe it to keep it past the
+    /// buffer.
+    pub fn readColumn(
+        self: *const Layouts,
+        alloc: std.mem.Allocator,
+        value: String,
+        scratch: *Row,
+    ) !LogicalColumn {
+        try _row.unmarshalRow(alloc, &self.columns, value, &.{}, scratch);
+        return (try decodeColumn(scratch)).column;
+    }
+
+    /// The index an index row's `value` describes, decoded through
+    /// `scratch`.
+    pub fn readIndex(
+        self: *const Layouts,
+        alloc: std.mem.Allocator,
+        value: String,
+        scratch: *Row,
+    ) !IndexDef {
+        try _row.unmarshalRow(alloc, &self.indexes, value, &.{}, scratch);
+        return decodeIndex(scratch);
+    }
+
+    fn compile(alloc: std.mem.Allocator, ls: LogicalSchema) !PhysicalSchema {
+        return _schema.compile(alloc, ls, ls.current_version);
+    }
+};
 
 /// Every namespace reserves table_id 1 for its column catalog and table_id 2
 /// for its index catalog (0 is the raw-KV default table; tids 3–15 stay

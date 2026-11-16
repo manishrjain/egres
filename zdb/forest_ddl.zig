@@ -98,7 +98,7 @@ pub const NsId = union(enum) {
 };
 
 /// A namespace create or branch: the id it takes and the change to
-/// propose. Caller owns `change.tree_changes`.
+/// propose. Caller owns `change.tree_changes` and `change.namespaces`.
 pub const NsResult = struct {
     namespace: u64,
     change: _manifest.ManifestChange,
@@ -107,11 +107,12 @@ pub const NsResult = struct {
 /// buildNsCreate is Phase A of the Raft-replicated namespace create:
 /// returns a ManifestChange with one TreeChange per system table
 /// (manifest.namespace_system_table_ids) — the namespace's default
-/// (raw-KV) table (table_id 0, tree_id 0, carrying the namespace's `name`:
-/// a SQL database name; empty for unnamed namespaces) and its SQL
-/// catalogs — all with an infinite range (empty left+right). No state
-/// mutates, so a failed propose costs nothing. Caller owns the returned
-/// slice; `name` must outlive the change (it is marshalled at propose).
+/// (raw-KV) table (table_id 0, tree_id 0) and its SQL catalogs — all
+/// with an infinite range (empty left+right), and one Namespace record
+/// carrying `name` (a SQL database name; empty for unnamed namespaces).
+/// No state mutates, so a failed propose costs nothing. Caller owns the
+/// returned slices; `name` must outlive the change (it is marshalled at
+/// propose).
 ///
 /// Errors with `NamespaceAlreadyExists` if a given id's default table
 /// already exists, `NameExists` if another namespace holds `name`.
@@ -135,6 +136,7 @@ pub fn buildNsCreate(
     // (ns, table_id) has no tree.
     const ids = _manifest.namespace_system_table_ids;
     const tree_changes = try alloc.alloc(_manifest.TreeChange, ids.len);
+    errdefer alloc.free(tree_changes);
     // Bytes keys, and the raw-KV table takes roaring values from the
     // admin protocol: a posting index for both.
     for (ids, tree_changes) |table_id, *tc|
@@ -145,14 +147,15 @@ pub fn buildNsCreate(
             "",
             .posting_index,
         );
-    // table_id 0 carries the namespace's name.
-    tree_changes[0].name = @constCast(name);
+    const namespaces = try alloc.alloc(_manifest.NamespaceRecord, 1);
+    namespaces[0] = .{ .id = namespace_id, .name = name };
 
     return .{
         .namespace = namespace_id,
         .change = .{
             .tree_changes = tree_changes,
             .sstable_changes = &.{},
+            .namespaces = namespaces,
             .cmd = .create_ns,
             .memtable_id = 0,
         },
@@ -213,7 +216,7 @@ fn dropTree(self: *Forest, tc: _manifest.TreeChange) void {
 /// apply (Manifest.applyBranch), so nothing here goes stale between
 /// propose and apply. Errors `NamespaceNotFound` for a source that
 /// does not exist and `NameExists` for a taken name. Caller owns
-/// `change.tree_changes`; `name` must outlive the change.
+/// `change.namespaces`; `name` must outlive the change.
 pub fn buildNsBranch(
     self: *Forest,
     alloc: std.mem.Allocator,
@@ -224,22 +227,16 @@ pub fn buildNsBranch(
     if (self.ground.manifest.lookupNamespace(name)) |_| return error.NameExists;
 
     const namespace = self.ground.manifest.nextNamespace();
-    // A carrier for the target's id and name: the branch's trees take
-    // the source's kinds (Manifest.applyBranch).
-    const tree_changes = try alloc.alloc(_manifest.TreeChange, 1);
-    tree_changes[0] = _manifest.createTreeChange(
-        makeTreeId(0, 0),
-        namespace,
-        "",
-        "",
-        .none,
-    );
-    tree_changes[0].name = @constCast(name);
+    // The target's id and name; its trees take the source's
+    // (Manifest.applyBranch).
+    const namespaces = try alloc.alloc(_manifest.NamespaceRecord, 1);
+    namespaces[0] = .{ .id = namespace, .name = name };
     return .{
         .namespace = namespace,
         .change = .{
-            .tree_changes = tree_changes,
+            .tree_changes = &.{},
             .sstable_changes = &.{},
+            .namespaces = namespaces,
             .cmd = .branch_ns,
             .memtable_id = 0,
             .branch_from = source,
@@ -262,7 +259,7 @@ pub fn applyNsBranch(
     mc: _manifest.ManifestChange,
 ) !void {
     try self.ground.manifest.apply(index, mc);
-    const dst = mc.tree_changes[0].namespace_id;
+    const dst = mc.namespaces[0].id;
     const keys = try self.ground.manifest.treeKeys(self.allocator, dst);
     defer self.allocator.free(keys);
     for (keys) |tk| {
@@ -283,9 +280,18 @@ pub fn applyNsBranch(
     });
 }
 
-/// Result of buildTables: one allocated table_id per change (same
-/// order) plus the single ManifestChange creating them all, listing
-/// the caller's changes. Caller owns `table_ids`.
+/// A table for buildTables to make: its name, and its kind for a
+/// create or its source for a branch.
+pub const TableSpec = struct {
+    name: String,
+    kind: _manifest.TreeKind = .none,
+    from_table_id: u32 = 0,
+};
+
+/// Result of buildTables: one allocated table_id per spec (same order)
+/// plus the single ManifestChange creating them all. Caller owns
+/// `table_ids`, `change.tree_changes` and `change.table_changes`, and
+/// may set `change.mutations` before proposing.
 pub const TableResult = struct {
     table_ids: []u32,
     change: _manifest.ManifestChange,
@@ -333,53 +339,70 @@ pub fn applyTableBranch(
 /// buildTables is Phase A of CREATE TABLE and CREATE INDEX (`cmd`
 /// create_tree) and of CREATE TABLE AS TABLE (branch_table): N sibling
 /// tables in ONE change — a SQL table plus its index tables, so they
-/// commit atomically. `changes` are the caller's
-/// (`manifest.newTableChange`), `name` set, and `kind` for a create or
-/// `from_table_id` for a branch; each gets a freshly allocated table_id
-/// here. A create's apply installs one empty tree of its kind per
+/// commit atomically. Each spec gets a freshly allocated table_id, one
+/// tree change for its tree at split 0 and one table change for its
+/// name. A create's apply installs one empty tree of its kind per
 /// table and registers every name → table_id on all nodes, advancing
 /// the id counter past each. A branch's apply lists its source's trees
-/// again, files shared (Manifest.applyTableBranch), so a branch change
-/// names no kind. A non-empty name already taken in the namespace
+/// again, files shared (Manifest.applyTableBranch), so a branch's
+/// trees name no kind. A non-empty name already taken in the namespace
 /// errors `NameExists` (sound while the caller serializes DDL); an
 /// empty name registers nothing (system trees). Names must be pairwise
 /// distinct — an intra-batch duplicate is the caller's bug (the second
 /// would install unnamed). A branch of a table with no trees errors
-/// `TableNotFound`. Caller owns `table_ids` and `changes`, which the
-/// result's change lists; each name must outlive the change
-/// (marshalled at propose).
+/// `TableNotFound`. Each name must outlive the change (marshalled at
+/// propose).
 pub fn buildTables(
     self: *Forest,
     alloc: std.mem.Allocator,
     namespace_id: u64,
-    changes: []_manifest.TreeChange,
+    specs: []const TableSpec,
     cmd: _manifest.Command,
 ) !TableResult {
     std.debug.assert(cmd == .create_tree or cmd == .branch_table);
-    for (changes) |tc| {
-        if (tc.name.len > 0 and
-            self.ground.manifest.lookupTable(namespace_id, tc.name) != null)
+    for (specs) |spec| {
+        if (spec.name.len > 0 and
+            self.ground.manifest.lookupTable(namespace_id, spec.name) != null)
             return error.NameExists;
         if (cmd == .branch_table and !self.hasTable(.{
             .namespace = namespace_id,
-            .table_id = tc.from_table_id,
+            .table_id = spec.from_table_id,
         })) return error.TableNotFound;
     }
 
-    const table_ids = try alloc.alloc(u32, changes.len);
+    const table_ids = try alloc.alloc(u32, specs.len);
     errdefer alloc.free(table_ids);
-    for (changes, table_ids) |*tc, *table_id| {
+    const tree_changes = try alloc.alloc(_manifest.TreeChange, specs.len);
+    errdefer alloc.free(tree_changes);
+    const table_changes = try alloc.alloc(_manifest.TableChange, specs.len);
+    errdefer alloc.free(table_changes);
+    for (
+        specs,
+        table_ids,
+        tree_changes,
+        table_changes,
+    ) |spec, *table_id, *tree, *table| {
         table_id.* = try self.ground.manifest.nextTableId(namespace_id);
-        tc.op = .create;
-        tc.namespace_id = namespace_id;
-        tc.tree_id = makeTreeId(table_id.*, 0);
-        if (cmd == .branch_table) tc.kind = .none;
+        tree.* = _manifest.createTreeChange(
+            makeTreeId(table_id.*, 0),
+            namespace_id,
+            "",
+            "",
+            if (cmd == .branch_table) .none else spec.kind,
+        );
+        if (cmd == .branch_table) tree.from_table_id = spec.from_table_id;
+        table.* = _manifest.createTableChange(
+            namespace_id,
+            table_id.*,
+            spec.name,
+        );
     }
     return .{
         .table_ids = table_ids,
         .change = .{
-            .tree_changes = changes,
+            .tree_changes = tree_changes,
             .sstable_changes = &.{},
+            .table_changes = table_changes,
             .cmd = cmd,
             .memtable_id = 0,
         },
@@ -389,27 +412,31 @@ pub fn buildTables(
 /// buildTableDrop is Phase A of DROP TABLE: emit a delete change for
 /// every tree of every given table_id — a table can span >1 tree after
 /// splits, and a SQL table drops alongside its index tables in one atomic
-/// change. table_id counters are NOT rewound (ids are never reused, since
-/// a dropped SST may still be clone-shared). drop_tree. Returns an empty
-/// change set if none of the tables have trees. Caller owns the slice.
-///
-/// The dropped tables' rows in the namespace's CATALOG trees are NOT
-/// touched — with their names gone and table_ids never reused they are
-/// unreachable garbage. TODO: issue tombstones for them.
+/// change — and one table change per table_id, which forgets its name.
+/// table_id counters are NOT rewound (ids are never reused, since a
+/// dropped SST may still be clone-shared). drop_tree. Caller owns
+/// `tree_changes` and `table_changes`, and may set `mutations`, the
+/// dropped tables' catalog tombstones, before proposing.
 pub fn buildTableDrop(
     self: *Forest,
     alloc: std.mem.Allocator,
     namespace_id: u64,
     table_ids: []const u32,
 ) !_manifest.ManifestChange {
+    const tree_changes = try buildTreeDeletes(
+        self,
+        alloc,
+        namespace_id,
+        table_ids,
+    );
+    errdefer alloc.free(tree_changes);
+    const table_changes = try alloc.alloc(_manifest.TableChange, table_ids.len);
+    for (table_ids, table_changes) |table_id, *tc|
+        tc.* = _manifest.deleteTableChange(namespace_id, table_id);
     return .{
-        .tree_changes = try buildTreeDeletes(
-            self,
-            alloc,
-            namespace_id,
-            table_ids,
-        ),
+        .tree_changes = tree_changes,
         .sstable_changes = &.{},
+        .table_changes = table_changes,
         .cmd = .drop_tree,
         .memtable_id = 0,
     };
