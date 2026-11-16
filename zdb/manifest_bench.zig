@@ -22,13 +22,9 @@ const vfs = zdb.vfs;
 
 const Manifest = zdb.manifest.Manifest;
 
-/// The server's allocator. The harness's page allocator maps a page
-/// per allocation, and a restore makes millions of small ones.
-const gpa = galloc.allocator();
-
 /// The manifest the snapshot holds, restored into `m` (a fresh `init`,
 /// at its final address: the restore takes its lock).
-fn load(m: *Manifest) !void {
+fn load(gpa: std.mem.Allocator, m: *Manifest) !void {
     const env = std.c.getenv("EGRES_SNAPSHOT_BIN") orelse
         return error.SkipZigTest;
     const path: String = std.mem.span(env);
@@ -40,10 +36,14 @@ fn load(m: *Manifest) !void {
 }
 
 test "BENCH: snapshot manifest serialize" {
+    // The server's allocator: the harness's page allocator maps a page
+    // per allocation, and a restore makes millions of small ones. Taken
+    // at run time, since on macOS it first registers jemalloc's zone.
+    const gpa = galloc.allocator();
     const b = bench.current();
     var src = Manifest.init(gpa);
     defer src.deinit();
-    try load(&src);
+    try load(gpa, &src);
     b.resetTimer();
     var i: u64 = 0;
     while (i < b.n) : (i += 1) {
@@ -55,7 +55,7 @@ test "BENCH: snapshot manifest serialize" {
 
 // A restore as the snapshot build makes one: a draft on an arena, freed
 // whole.
-fn restore(bytes: String) !void {
+fn restore(gpa: std.mem.Allocator, bytes: String) !void {
     var arloc = std.heap.ArenaAllocator.init(gpa);
     defer arloc.deinit();
     var draft = Manifest.init(arloc.allocator());
@@ -64,20 +64,21 @@ fn restore(bytes: String) !void {
 }
 
 test "BENCH: snapshot manifest restore" {
+    const gpa = galloc.allocator();
     const b = bench.current();
     var src = Manifest.init(gpa);
     defer src.deinit();
-    try load(&src);
+    try load(gpa, &src);
     const bytes = try src.serialize(gpa);
     defer gpa.free(bytes);
     // Untimed: the first restore is slower by up to 80 ms with 84,000
     // tenants, by an amount set by what allocated before it, not by
     // the bytes.
-    try restore(bytes);
+    try restore(gpa, bytes);
     b.resetTimer();
     var i: u64 = 0;
     while (i < b.n) : (i += 1) {
-        try restore(bytes);
+        try restore(gpa, bytes);
         b.addBytes(bytes.len);
     }
 }
