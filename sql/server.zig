@@ -627,7 +627,7 @@ pub const Handler = struct {
     ) !void {
         const requested = params.database orelse "";
         const name = if (requested.len > 0) requested else default_database;
-        const manifest = &self.srv.engine.forest.manifest;
+        const manifest = &self.srv.engine.forest.ground.manifest;
         self.namespace = manifest.lookupNamespace(name) orelse {
             const msg = try std.fmt.allocPrint(
                 self.alloc,
@@ -1178,7 +1178,7 @@ pub const Handler = struct {
         ns: u64,
         table: String,
     ) !?DmlTxn {
-        const manifest = &self.srv.engine.forest.manifest;
+        const manifest = &self.srv.engine.forest.ground.manifest;
         if (manifest.lookupTable(ns, table)) |table_id| {
             const tx = try self.statementTxn(ns);
             tx.lockTable(table_id, .shared) catch |err| {

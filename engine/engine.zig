@@ -277,7 +277,7 @@ pub const StorageImpl = struct {
         // until here (`Engine.proposeHeld`), so a stale change is one
         // that went around the lock. Skipped whole, as a snapshot draft
         // skips it (`Manifest.apply`): the trees stay the same on both.
-        if (self.forest.manifest.isStale(mcs.*)) {
+        if (self.forest.ground.manifest.isStale(mcs.*)) {
             _ = self.stale_changes.fetchAdd(1, .monotonic);
             log.err(
                 "manifest change idx={d} cmd={t} is for a tree that is " ++
@@ -834,7 +834,7 @@ pub const Engine = struct {
         if (snap.index == 0 or snap.data.len == 0) return;
 
         log.info("recovery: restoring manifest from snapshot index={d} bytes={d}", .{ snap.index, snap.data.len });
-        try self.forest.manifest.restoreFrom(snap.data);
+        try self.forest.ground.manifest.restoreFrom(snap.data);
         oldest_idx = snap.oldest_memtable_index;
         _ = self.forest.setSnapshotTs(snap.timestamp);
 
@@ -1717,7 +1717,7 @@ pub const Engine = struct {
         mc: _manifest.ManifestChange,
     ) !void {
         self.change_mu.assertHeld(held);
-        if (self.forest.manifest.isStale(mc)) return error.StaleChange;
+        if (self.forest.ground.manifest.isStale(mc)) return error.StaleChange;
         // The whole change: a branch names its source in `branch_from`.
         const payload = try zdb_bufs.marshalRoot(self.allocator, mc);
         defer self.allocator.free(payload);

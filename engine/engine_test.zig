@@ -245,7 +245,7 @@ const ApplyFixture = struct {
         const alloc = testing.allocator;
         self.forest.close();
         self.forest = try Forest.open(alloc, self.live, self.store);
-        try self.forest.manifest.restoreFrom(snap_bytes);
+        try self.forest.ground.manifest.restoreFrom(snap_bytes);
         _ = self.forest.setSnapshotTs(snap_ts);
         try self.forest.openTablesFromManifest();
         self.impl = .{

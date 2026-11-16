@@ -55,7 +55,7 @@ pub fn createDatabase(
     defer arena.deinit();
     var src: ?u64 = null;
     if (cd.source) |src_name| {
-        src = eng.forest.manifest.lookupNamespace(src_name) orelse
+        src = eng.forest.ground.manifest.lookupNamespace(src_name) orelse
             return replyErrorCode(
                 state,
                 pgwire.sqlstate.invalid_catalog_name,
@@ -93,7 +93,7 @@ pub fn dropDatabase(self: *Handler, state: *pgwire.ConnState, name: String) !voi
 
     if (std.mem.eql(u8, name, default_database))
         return replyError(state, "cannot drop the default database");
-    const ns = eng.forest.manifest.lookupNamespace(name) orelse
+    const ns = eng.forest.ground.manifest.lookupNamespace(name) orelse
         return replyErrorCode(
             state,
             pgwire.sqlstate.invalid_catalog_name,
@@ -140,7 +140,7 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
     if (!try self.ddlReady(state)) return;
 
     const ns = try self.sessionNamespace(state) orelse return;
-    if (eng.forest.manifest.lookupTable(ns, ct.name) != null) {
+    if (eng.forest.ground.manifest.lookupTable(ns, ct.name) != null) {
         if (ct.if_not_exists) return state.sendCommandComplete("CREATE TABLE");
         return replyErrorCode(state, pgwire.sqlstate.duplicate_table, "table already exists");
     }
@@ -274,7 +274,7 @@ pub fn createTableAs(
     if (!try self.ddlReady(state)) return;
 
     const ns = try self.sessionNamespace(state) orelse return;
-    if (eng.forest.manifest.lookupTable(ns, cta.name) != null) {
+    if (eng.forest.ground.manifest.lookupTable(ns, cta.name) != null) {
         if (cta.if_not_exists)
             return state.sendCommandComplete("CREATE TABLE AS");
         return replyErrorCode(
@@ -283,7 +283,10 @@ pub fn createTableAs(
             "table already exists",
         );
     }
-    const src_tid = eng.forest.manifest.lookupTable(ns, cta.source) orelse
+    const src_tid = eng.forest.ground.manifest.lookupTable(
+        ns,
+        cta.source,
+    ) orelse
         return replyErrorCode(
             state,
             pgwire.sqlstate.undefined_table,
@@ -469,7 +472,10 @@ pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: _parse.DropTable)
     if (!try self.ddlReady(state)) return;
 
     const ns = try self.sessionNamespace(state) orelse return;
-    const table_id = eng.forest.manifest.lookupTable(ns, dt.name) orelse {
+    const table_id = eng.forest.ground.manifest.lookupTable(
+        ns,
+        dt.name,
+    ) orelse {
         if (dt.missing_ok) return state.sendCommandComplete("DROP TABLE");
         return replyErrorCode(state, pgwire.sqlstate.undefined_table, "table does not exist");
     };

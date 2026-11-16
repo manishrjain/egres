@@ -307,7 +307,7 @@ pub fn writeNamespaceStats(self: *Forest, w: *std.Io.Writer, ns_id: u64) !void {
     // Tree keys come out under the manifest lock (the map they live in
     // is the apply loop's to rehash); writeTreeStats then takes each
     // tree's own lock.
-    const keys = try self.manifest.treeKeys(self.allocator, ns_id);
+    const keys = try self.ground.manifest.treeKeys(self.allocator, ns_id);
     defer self.allocator.free(keys);
     for (keys) |tk| {
         any = true;

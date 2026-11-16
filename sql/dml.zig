@@ -973,7 +973,7 @@ pub fn describeRows(
 ) !void {
     const eng = self.srv.engine;
     const ns = try self.sessionNamespace(state) orelse return;
-    const table_id = eng.forest.manifest.lookupTable(ns, table) orelse
+    const table_id = eng.forest.ground.manifest.lookupTable(ns, table) orelse
         return replyErrorCode(
             state,
             pgwire.sqlstate.undefined_table,

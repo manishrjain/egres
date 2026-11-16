@@ -503,7 +503,7 @@ test "forest: drop_ns removes every table and forgets the id counter" {
     }));
     try std.testing.expectEqual(
         @as(?u64, 7),
-        f.manifest.lookupNamespace("seven"),
+        f.ground.manifest.lookupNamespace("seven"),
     );
 
     const sys = try buildCreateTree(f, alloc, .{
@@ -522,7 +522,7 @@ test "forest: drop_ns removes every table and forgets the id counter" {
     try std.testing.expectEqual(_manifest.first_table_id, ct.table_ids[0]);
     try std.testing.expectEqual(
         @as(?u32, ct.table_ids[0]),
-        f.manifest.lookupTable(7, "users"),
+        f.ground.manifest.lookupTable(7, "users"),
     );
 
     // Drop the namespace: one delete per tree across all five tables.
@@ -540,8 +540,8 @@ test "forest: drop_ns removes every table and forgets the id counter" {
     }));
     // Names — database and table — died with the namespace and are free
     // for a re-CREATE.
-    try std.testing.expect(f.manifest.lookupNamespace("seven") == null);
-    try std.testing.expect(f.manifest.lookupTable(7, "users") == null);
+    try std.testing.expect(f.ground.manifest.lookupNamespace("seven") == null);
+    try std.testing.expect(f.ground.manifest.lookupTable(7, "users") == null);
     try std.testing.expect(!f.hasTable(.{
         .namespace = 7,
         .table_id = ct.table_ids[0],
@@ -569,7 +569,7 @@ test "forest: drop_ns removes every table and forgets the id counter" {
     try std.testing.expectEqual(_manifest.first_table_id, ct2.table_ids[0]);
     try std.testing.expectEqual(
         @as(?u64, 7),
-        f.manifest.lookupNamespace("seven"),
+        f.ground.manifest.lookupNamespace("seven"),
     );
 }
 
@@ -761,7 +761,7 @@ test "forest: drop_tree keeps an SST shared with another tree" {
             try t.applyCompaction(1, &chb);
         }
     }
-    try std.testing.expect(f.table_cache.contains(1));
+    try std.testing.expect(f.ground.cache.contains(1));
 
     // Drop table A. The shared SST must survive — table B still references it,
     // so the refcount stays > 0 and the *Table is neither freed nor evicted.
@@ -771,7 +771,7 @@ test "forest: drop_tree keeps an SST shared with another tree" {
 
     try std.testing.expect(!f.hasTree(2, treeA));
     try std.testing.expect(f.hasTree(2, treeB));
-    try std.testing.expect(f.table_cache.contains(1));
+    try std.testing.expect(f.ground.cache.contains(1));
     {
         const t = f.getTree(2, treeB).?;
         defer t.release();
@@ -869,11 +869,11 @@ test "forest: buildNsCreate allocates global namespace ids" {
     // Names resolve to their namespaces; a taken name is rejected at build.
     try std.testing.expectEqual(
         @as(?u64, first),
-        f.manifest.lookupNamespace("one"),
+        f.ground.manifest.lookupNamespace("one"),
     );
     try std.testing.expectEqual(
         @as(?u64, first + 1),
-        f.manifest.lookupNamespace("two"),
+        f.ground.manifest.lookupNamespace("two"),
     );
     try std.testing.expectError(
         error.NameExists,
@@ -907,7 +907,7 @@ fn readRow(
 }
 
 fn sstRefs(f: *Forest, sst_id: u64) u32 {
-    return f.manifest.ssts.get(sst_id).?.refs;
+    return f.ground.manifest.ssts.get(sst_id).?.refs;
 }
 
 fn expectRow(
@@ -976,11 +976,11 @@ test "forest: branch_ns shares the files and forks the memtables as of its ts" {
     try std.testing.expect(f.hasNamespace(dst));
     try std.testing.expectEqual(
         @as(?u64, dst),
-        f.manifest.lookupNamespace("eight"),
+        f.ground.manifest.lookupNamespace("eight"),
     );
     try std.testing.expectEqual(
         @as(?u32, ct.table_ids[0]),
-        f.manifest.lookupTable(dst, "users"),
+        f.ground.manifest.lookupTable(dst, "users"),
     );
     try std.testing.expect(f.hasTable(.{
         .namespace = dst,
@@ -1031,11 +1031,11 @@ test "forest: branch_ns shares the files and forks the memtables as of its ts" {
     try f.applyTrees(10, dc);
     try std.testing.expect(!f.hasNamespace(src));
     try std.testing.expectEqual(@as(u32, 1), sstRefs(f, shared_sst));
-    try std.testing.expect(f.table_cache.contains(shared_sst));
+    try std.testing.expect(f.ground.cache.contains(shared_sst));
     try expectRow(f, alloc, dst, "a", "a20");
 
     // The snapshot manifest carries the branch: trees, files and names.
-    const bytes = try f.manifest.serialize(alloc);
+    const bytes = try f.ground.manifest.serialize(alloc);
     defer alloc.free(bytes);
     var restored = _manifest.Manifest.init(alloc);
     defer restored.deinit();
@@ -1280,11 +1280,11 @@ test "forest: branch_table shares files and forks memtables as of its ts" {
     try std.testing.expect(dst.table_id > src.table_id);
     try std.testing.expectEqual(
         @as(?u32, dst.table_id),
-        f.manifest.lookupTable(ns, "users2"),
+        f.ground.manifest.lookupTable(ns, "users2"),
     );
     try std.testing.expectEqual(
         @as(?u32, dst_idx.table_id),
-        f.manifest.lookupTable(ns, "users2_name_idx"),
+        f.ground.manifest.lookupTable(ns, "users2_name_idx"),
     );
     try std.testing.expect(f.hasTable(dst));
     try std.testing.expect(f.hasTable(dst_idx));
@@ -1336,7 +1336,7 @@ test "forest: branch_table shares files and forks memtables as of its ts" {
     try expectTableRow(f, alloc, dst, "a", "a20");
 
     // The snapshot manifest carries the branch: trees, files and names.
-    const bytes = try f.manifest.serialize(alloc);
+    const bytes = try f.ground.manifest.serialize(alloc);
     defer alloc.free(bytes);
     var restored = _manifest.Manifest.init(alloc);
     defer restored.deinit();
@@ -1418,7 +1418,7 @@ test "forest: table names — create registers, duplicate rejects, drop frees" {
     try f.applyTrees(1, ct.change);
     try std.testing.expectEqual(
         @as(?u32, ct.table_ids[0]),
-        f.manifest.lookupTable(3, "users"),
+        f.ground.manifest.lookupTable(3, "users"),
     );
 
     // A taken name is rejected at build; re-applying the create is a no-op.
@@ -1432,14 +1432,14 @@ test "forest: table names — create registers, duplicate rejects, drop frees" {
     try f.applyTrees(1, ct.change);
     try std.testing.expectEqual(
         @as(?u32, ct.table_ids[0]),
-        f.manifest.lookupTable(3, "users"),
+        f.ground.manifest.lookupTable(3, "users"),
     );
 
     // DROP frees the name for a re-CREATE, which gets a fresh id.
     const dc = try f.buildTableDrop(alloc, 3, &.{ct.table_ids[0]});
     defer alloc.free(dc.tree_changes);
     try f.applyTrees(1, dc);
-    try std.testing.expect(f.manifest.lookupTable(3, "users") == null);
+    try std.testing.expect(f.ground.manifest.lookupTable(3, "users") == null);
 
     var ct2_tc = [_]_manifest.TreeChange{
         _manifest.newTableChange("users", .posting_index),
@@ -1450,7 +1450,7 @@ test "forest: table names — create registers, duplicate rejects, drop frees" {
     try std.testing.expect(ct2.table_ids[0] > ct.table_ids[0]);
     try std.testing.expectEqual(
         @as(?u32, ct2.table_ids[0]),
-        f.manifest.lookupTable(3, "users"),
+        f.ground.manifest.lookupTable(3, "users"),
     );
 }
 
@@ -1497,7 +1497,7 @@ test "forest: snapshot manifest round-trip" {
             .namespace = 43,
             .table_id = 0,
         }, .{}, .posting_index);
-        try src.manifest.registerNamespaceName(42, "answers");
+        try src.ground.manifest.registerNamespaceName(42, "answers");
 
         // Drop one SST into the ns=42 tree's L1, in the store and the
         // manifest.
@@ -1510,7 +1510,7 @@ test "forest: snapshot manifest round-trip" {
         };
         try tree1.applyCompaction(1, &changes);
 
-        break :blk try src.manifest.serialize(alloc);
+        break :blk try src.ground.manifest.serialize(alloc);
     };
     defer alloc.free(bytes);
 
@@ -1520,7 +1520,7 @@ test "forest: snapshot manifest round-trip" {
     const dst = try Forest.open(alloc, dst_live, &store);
     defer dst.close();
 
-    try dst.manifest.restoreFrom(bytes);
+    try dst.ground.manifest.restoreFrom(bytes);
     try dst.openTablesFromManifest();
 
     // Both trees present — same namespace-local tree_id 0, distinct namespaces.
@@ -1529,7 +1529,7 @@ test "forest: snapshot manifest round-trip" {
     // Database names ride the snapshot.
     try std.testing.expectEqual(
         @as(?u64, 42),
-        dst.manifest.lookupNamespace("answers"),
+        dst.ground.manifest.lookupNamespace("answers"),
     );
     try std.testing.expect(dst.hasTree(43, 0));
 
@@ -3842,7 +3842,7 @@ test "forest: deleteFiles unlinks compaction inputs at the retire index" {
 
     // And the pinned input still serves a read off its open descriptor,
     // although the cache dropped it and the file is gone.
-    try std.testing.expect(!f.table_cache.contains(pinned.file_id));
+    try std.testing.expect(!f.ground.cache.contains(pinned.file_id));
     {
         var it = zdb.table.TableIterator.init(
             alloc,
@@ -3890,19 +3890,19 @@ test "table cache: a table loaded for an install survives an evict before it is 
     // the way a follower's prefetch does: the cache's ref is its only one.
     const pending: u64 = 0x5eed;
     const ext = try copySst(alloc, f, listed, pending);
-    try std.testing.expect(f.table_cache.contains(pending));
+    try std.testing.expect(f.ground.cache.contains(pending));
 
     // An apply looks the table up for its install...
     var needs = [_]zdb.tree.TableNeed{
         .{ .id = pending, .level = 0, .extent = ext },
     };
-    try f.table_cache.loadTables(&needs);
+    try f.ground.cache.loadTables(&needs);
     const t = needs[0].table orelse return error.TestExpectedTable;
 
     // ...and before it installs it, the orphan scan evicts that id: the
     // manifest does not list it yet. The cache's ref goes.
-    f.table_cache.evict(pending);
-    try std.testing.expect(!f.table_cache.contains(pending));
+    f.ground.cache.evict(pending);
+    try std.testing.expect(!f.ground.cache.contains(pending));
 
     // The loader's own ref keeps the table open and readable.
     try std.testing.expectEqual(@as(i32, 1), t.ref.load(.acquire));
@@ -3978,7 +3978,7 @@ test "forest: removeOrphans unlinks only unknown files at or before the cutoff" 
     const prewarmed: u64 = 0xabcd;
     {
         _ = try copySst(alloc, f, listed, prewarmed);
-        try std.testing.expect(f.table_cache.contains(prewarmed));
+        try std.testing.expect(f.ground.cache.contains(prewarmed));
         const path = try sstFilePath(alloc, dir_path, prewarmed);
         defer alloc.free(path);
         try backdate(path, now - 2 * std.time.s_per_hour);
@@ -4003,7 +4003,7 @@ test "forest: removeOrphans unlinks only unknown files at or before the cutoff" 
     for (old_junk) |id|
         try std.testing.expect(!try sstExists(alloc, &store, id));
     try std.testing.expect(!try sstExists(alloc, &store, prewarmed));
-    try std.testing.expect(!f.table_cache.contains(prewarmed));
+    try std.testing.expect(!f.ground.cache.contains(prewarmed));
     try std.testing.expect(try sstExists(alloc, &store, young_junk));
     try std.testing.expect(try sstExists(alloc, &store, listed));
     try vfs.access(other);
@@ -4109,9 +4109,9 @@ test "forest: evictTables evicts a compacted-away file; its blocks go with the t
     try tree.applyCompaction(20, comp.items);
 
     // The apply unlisted both inputs; the purge evicts them.
-    for (in_ids) |id| try std.testing.expect(f.table_cache.contains(id));
+    for (in_ids) |id| try std.testing.expect(f.ground.cache.contains(id));
     try f.evictTables();
-    for (in_ids) |id| try std.testing.expect(!f.table_cache.contains(id));
+    for (in_ids) |id| try std.testing.expect(!f.ground.cache.contains(id));
 
     // What the last `decrRef` does: drop exactly this table's blocks.
     for (pinned) |t| try std.testing.expectEqual(
@@ -4131,7 +4131,7 @@ test "forest: evictTables evicts a compacted-away file; its blocks go with the t
         out_id = c.sst_id;
     };
     try f.evictTables();
-    try std.testing.expect(f.table_cache.contains(out_id));
+    try std.testing.expect(f.ground.cache.contains(out_id));
 }
 
 // ---------------------------------------------------------------------------
@@ -4326,7 +4326,7 @@ test "forest: an L0 to L0 merge folds small tables into one and keeps L0's read 
     };
     try std.testing.expectEqual(
         newest_index,
-        f.manifest.ssts.get(merged_id).?.raft_index,
+        f.ground.manifest.ssts.get(merged_id).?.raft_index,
     );
 }
 

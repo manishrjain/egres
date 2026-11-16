@@ -35,7 +35,7 @@ pub fn createTree(
     const right_raw = try range.right.marshal(f.allocator);
     defer f.allocator.free(right_raw);
 
-    try f.manifest.commit(0, &.{}, &.{
+    try f.ground.manifest.commit(0, &.{}, &.{
         _manifest.createTreeChange(
             tree_id,
             table_key.namespace,

@@ -382,7 +382,7 @@ pub const Emitter = struct {
         dest: usize,
         snapshot_ts: u64,
     ) !Emitter {
-        const opts = tree.live.cur();
+        const opts = tree.ground.live.cur();
         const cfg = _table.builder.Config{
             .block_bytes = opts.block_bytes,
             .codec = opts.codecFor(dest),
@@ -494,7 +494,7 @@ pub const Emitter = struct {
         }
 
         const tree = e.tree;
-        const id = tree.manifest.newFileId();
+        const id = tree.ground.manifest.newFileId();
         e.inflight.send({}) catch return error.FlushFailed;
         errdefer _ = e.inflight.tryReceive() catch {};
         // The fiber owns `tb` from here: the builder's next table is
@@ -509,16 +509,19 @@ pub const Emitter = struct {
         try e.flush();
         const tree = e.tree;
         var changes: std.ArrayList(_manifest.SSTableChange) = .empty;
-        errdefer changes.deinit(tree.allocator);
+        errdefer changes.deinit(tree.ground.allocator);
         for (e.group.wait()) |r_opt| {
             const r = r_opt orelse return error.FlushFailed;
-            try changes.append(tree.allocator, _manifest.createSSTableChange(
-                r.file_id,
-                tree.namespace,
-                tree.tree_id,
-                @intCast(e.dest),
-                r.extent,
-            ));
+            try changes.append(
+                tree.ground.allocator,
+                _manifest.createSSTableChange(
+                    r.file_id,
+                    tree.namespace,
+                    tree.tree_id,
+                    @intCast(e.dest),
+                    r.extent,
+                ),
+            );
         }
         return .{ .changes = changes, .stats = e.stats };
     }
@@ -538,7 +541,7 @@ fn putFile(
     defer _ = e.inflight.tryReceive() catch {};
     const name = _table.table.sstName(tb.allocator, file_id) catch return null;
     defer tb.allocator.free(name);
-    e.tree.cache.store.put(name, tb.bytes) catch |err| {
+    e.tree.ground.cache.store.put(name, tb.bytes) catch |err| {
         log.err("put {s}: {s}", .{ name, @errorName(err) });
         return null;
     };

@@ -32,6 +32,7 @@ const treeTableId = @import("kv.zig").treeTableId;
 const treeSplitId = @import("kv.zig").treeSplitId;
 const Tree = _tree.Tree;
 const TableCache = _tree.TableCache;
+const Ground = _tree.Ground;
 const Table = _table.Table;
 const Item = _table.table.Item;
 const ItemRef = _table.table.ItemRef;
@@ -579,7 +580,7 @@ pub const Forest = struct {
     live: *flags.Live(_config.Config),
     /// Where every SST lives. The caller keeps it alive past `close`.
     store: *vfs.Store,
-    manifest: _manifest.Manifest,
+    ground: Ground,
     /// One TableTrees per table, keyed by its `{namespace, table_id}` identity.
     /// The TableTreess own the live `*Tree` objects (in their sorted entries);
     /// there is no separate tree map. Look a tree up by id via `getTree`.
@@ -587,9 +588,6 @@ pub const Forest = struct {
     /// (a dropped table's stays, empty — see `TableTrees.hasTrees`), so
     /// `getTable` needs no lock and its result never dangles.
     tables: fiber.SafeHashMap(TableKey, *TableTrees),
-    table_cache: TableCache,
-    /// The trees with a compaction job, posted by each tree.
-    compact_queue: _compaction.CompactQueue,
     memtables: Memtables,
     /// The installed raft snapshot's timestamp, the oldest a reader
     /// may ask for: builds discard shadowed versions below it and the
@@ -653,9 +651,6 @@ pub const Forest = struct {
         live: *flags.Live(_config.Config),
         store: *vfs.Store,
     ) !*Forest {
-        var manifest = _manifest.Manifest.init(allocator);
-        errdefer manifest.deinit();
-
         const self = try allocator.create(Forest);
         errdefer allocator.destroy(self);
 
@@ -669,11 +664,9 @@ pub const Forest = struct {
             .allocator = allocator,
             .live = live,
             .store = store,
-            .manifest = manifest,
+            .ground = Ground.init(allocator, live, store),
             .tables = fiber.SafeHashMap(TableKey, *TableTrees).init(allocator),
             .compactions = fiber.SafeHashMap(u64, u64).init(allocator),
-            .table_cache = TableCache.init(allocator, store),
-            .compact_queue = _compaction.CompactQueue.init(allocator),
             .memtables = Memtables.init(allocator, mt),
             .snapshot_ts = std.atomic.Value(u64).init(0),
             .read_marks = .{},
@@ -722,10 +715,7 @@ pub const Forest = struct {
         }
         self.tables.deinit();
         self.compactions.deinit();
-        self.compact_queue.deinit();
-
-        self.manifest.deinit();
-        self.table_cache.deinit();
+        self.ground.deinit();
         self.allocator.destroy(self);
     }
 
@@ -1051,7 +1041,7 @@ pub const Forest = struct {
         var removed: usize = 0;
         for (changes) |c| {
             if (c.op != .create) continue;
-            if (self.manifest.knowsFile(c.sst_id)) continue;
+            if (self.ground.manifest.knowsFile(c.sst_id)) continue;
 
             const name = try sstName(self.allocator, c.sst_id);
             defer self.allocator.free(name);
@@ -1095,13 +1085,13 @@ pub const Forest = struct {
                 .extent = .{ .size = c.size, .index_offset = c.index_offset },
             });
         }
-        try self.table_cache.loadTables(needed.items);
+        try self.ground.cache.loadTables(needed.items);
         defer TableCache.decrRefs(needed.items);
 
         // Manifest and levels change together, both in memory; the entry
         // itself is already durable in the raft log.
         if (changes.len > 0) {
-            try self.manifest.commit(index, changes, &.{});
+            try self.ground.manifest.commit(index, changes, &.{});
         }
 
         // Install each loaded table into its tree's level. We zip changes and
@@ -1170,7 +1160,7 @@ pub const Forest = struct {
     /// and the job taken is whatever the tree wants then. A key can also
     /// travel to a peer; a pointer cannot.
     pub fn bestTreeToCompact(self: *Forest) ?TreeKey {
-        return self.compact_queue.best();
+        return self.ground.compact_queue.best();
     }
 
     /// Check if the current memtable should be frozen.
@@ -1230,7 +1220,7 @@ pub const Forest = struct {
     /// open concurrently; a hit costs nothing, so a retry after a
     /// partial failure only opens what is still missing.
     pub fn prefetch(self: *Forest, needed: []_tree.TableNeed) !void {
-        try self.table_cache.loadTables(needed);
+        try self.ground.cache.loadTables(needed);
         TableCache.decrRefs(needed);
     }
 
@@ -1245,11 +1235,11 @@ pub const Forest = struct {
     /// when the table closes, which a shutdown also does. The files
     /// themselves wait for `deleteFiles`.
     pub fn evictTables(self: *Forest) !void {
-        const ids = try self.manifest.takeToEvict();
+        const ids = try self.ground.manifest.takeToEvict();
         defer self.allocator.free(ids);
 
         for (ids) |id| {
-            self.table_cache.evict(id);
+            self.ground.cache.evict(id);
             const name = try sstName(self.allocator, id);
             defer self.allocator.free(name);
             self.store.forget(name);
@@ -1269,7 +1259,7 @@ pub const Forest = struct {
     /// local inputs: every node sweeps its own copies off its own snapshot
     /// index.
     pub fn deleteFiles(self: *Forest, snapshot_index: u64) !void {
-        const to_delete = try self.manifest.takeToDelete(
+        const to_delete = try self.ground.manifest.takeToDelete(
             self.allocator,
             snapshot_index,
         );
@@ -1336,7 +1326,10 @@ pub const Forest = struct {
             const arloc = arena.allocator();
 
             const entries = try self.store.list(arloc, .names);
-            break :blk try self.manifest.unknownFiles(self.allocator, entries);
+            break :blk try self.ground.manifest.unknownFiles(
+                self.allocator,
+                entries,
+            );
         };
         defer self.allocator.free(unknowns);
 
@@ -1372,7 +1365,7 @@ pub const Forest = struct {
     /// that never applied would keep its blocks until the process exits.
     /// False when the file was gone already.
     fn removeFile(self: *Forest, name: String, id: u64) !bool {
-        self.table_cache.evict(id);
+        self.ground.cache.evict(id);
         self.store.delete(name) catch |err| switch (err) {
             error.FileNotFound => return false,
             else => return err,

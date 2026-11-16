@@ -227,7 +227,7 @@ fn movable(
     dest: usize,
     e: TableEntry,
 ) bool {
-    if (dest + 1 >= self.live.cur().max_levels) return false;
+    if (dest + 1 >= self.ground.live.cur().max_levels) return false;
     if (!canMove(self)) return false;
     return !self.levels[dest].overlapsAny(held, tableRange(e));
 }
@@ -374,8 +374,9 @@ pub fn updateCompactCandidate_(self: *Tree, held: Lock.Exclusive) !void {
     // the split verdict stays, buildSplit returns null, proposeSplit skips.
     // When infeasible, fall through to compaction, which drains data into
     // Lmax until a split becomes possible.
-    const lmax_tables = self.levels[self.live.cur().max_levels - 1].numTables(rd);
-    const split_bytes = self.live.cur().splitBytes();
+    const lmax_idx = self.ground.live.cur().max_levels - 1;
+    const lmax_tables = self.levels[lmax_idx].numTables(rd);
+    const split_bytes = self.ground.live.cur().splitBytes();
     const busy = self.busy_levels;
     if (total > split_bytes and
         lmax_tables >= min_lmax_tables_for_split)
@@ -416,7 +417,7 @@ pub fn updateCompactCandidate_(self: *Tree, held: Lock.Exclusive) !void {
     // A level with a job running on it, or on the level it writes to,
     // offers nothing until that job is done.
     var best: ?CompactCandidate = null;
-    for (0..self.live.cur().max_levels) |level| {
+    for (0..self.ground.live.cur().max_levels) |level| {
         if (busy.isSet(level) or busy.isSet(level + 1)) continue;
         const c = pickJob(self, rd, level) orelse continue;
         if (best == null or c.score > best.?.score) best = c;
@@ -439,13 +440,13 @@ pub fn updateCompactCandidate_(self: *Tree, held: Lock.Exclusive) !void {
 /// The verdict, with a copy of the job's tables in place of the level
 /// views it was picked as.
 fn setCandidate(self: *Tree, c: CompactCandidate) !void {
-    const owned = try c.dupe(self.allocator);
-    errdefer owned.job.deinit(self.allocator);
+    const owned = try c.dupe(self.ground.allocator);
+    errdefer owned.job.deinit(self.ground.allocator);
     // The post replaces this tree's entry, so the old one is not
     // withdrawn first: the tree never leaves the queue, and a failed
     // post leaves the old candidate standing.
-    if (self.compact_queue) |queue| try queue.post(self, owned.score);
-    if (self.compact_candidate) |old| old.job.deinit(self.allocator);
+    if (self.queued) try self.ground.compact_queue.post(self, owned.score);
+    if (self.compact_candidate) |old| old.job.deinit(self.ground.allocator);
     self.compact_candidate = owned;
 }
 
@@ -455,14 +456,14 @@ fn setCandidate(self: *Tree, c: CompactCandidate) !void {
 pub fn leaveQueue(self: *Tree) void {
     const held = self.mu.hold(.exclusive, @src());
     defer held.release();
-    if (self.compact_queue) |queue| queue.withdraw(self);
-    self.compact_queue = null;
+    if (self.queued) self.ground.compact_queue.withdraw(self);
+    self.queued = false;
 }
 
 pub fn clearCandidate(self: *Tree) void {
     const c = self.compact_candidate orelse return;
-    if (self.compact_queue) |queue| queue.withdraw(self);
-    c.job.deinit(self.allocator);
+    if (self.queued) self.ground.compact_queue.withdraw(self);
+    c.job.deinit(self.ground.allocator);
     self.compact_candidate = null;
 }
 
@@ -475,8 +476,8 @@ pub fn reserveJob(self: *Tree) !?CompactCandidate {
     defer held.release();
 
     const c = self.compact_candidate orelse return null;
-    const owned = try c.dupe(self.allocator);
-    errdefer owned.job.deinit(self.allocator);
+    const owned = try c.dupe(self.ground.allocator);
+    errdefer owned.job.deinit(self.ground.allocator);
 
     self.busy_levels.setUnion(owned.levelSet());
     try self.updateCompactCandidate_(held);
@@ -486,7 +487,7 @@ pub fn reserveJob(self: *Tree) !?CompactCandidate {
 /// Frees a job from `reserveJob`, done or abandoned, and recomputes the
 /// candidate: a job its levels blocked can be offered now.
 pub fn releaseJob(self: *Tree, c: CompactCandidate) void {
-    defer c.job.deinit(self.allocator);
+    defer c.job.deinit(self.ground.allocator);
 
     const held = self.mu.hold(.exclusive, @src());
     defer held.release();
@@ -539,7 +540,7 @@ fn rewriteScore(r: f64) f64 {
 /// tables. At exactly 1.0 it does not win the pick and waits for the
 /// tree to be idle.
 fn pickL0Merge(self: *Tree, held: Lock.Shared) ?CompactCandidate {
-    const opts = self.live.cur();
+    const opts = self.ground.live.cur();
     const run = l0MergeRun(opts, self.levels[0].entries(held)) orelse
         return null;
     const score = ratio(run.len, opts.l0_merge_min_tables);
@@ -571,7 +572,7 @@ fn pickJob(self: *Tree, held: Lock.Shared, src: usize) ?CompactCandidate {
     const entries = self.levels[src].entries(held);
     if (entries.len == 0) return null;
 
-    const opts = self.live.cur();
+    const opts = self.ground.live.cur();
     const dest = src + 1;
     if (dest >= opts.max_levels) return null;
 
@@ -580,10 +581,10 @@ fn pickJob(self: *Tree, held: Lock.Shared, src: usize) ?CompactCandidate {
     const pool: []const TableEntry =
         if (src == 0) entries[0..1] else entries;
     var movables: std.ArrayList(TableEntry) = .empty;
-    defer movables.deinit(self.allocator);
+    defer movables.deinit(self.ground.allocator);
     for (pool) |e| {
         if (movable(self, held, dest, e))
-            movables.append(self.allocator, e) catch unreachable;
+            movables.append(self.ground.allocator, e) catch unreachable;
     }
 
     if (movables.items.len > 0) {
@@ -631,7 +632,7 @@ fn randomIndex(n: usize) usize {
 /// drain a single L0 table.
 fn mergeDownRun(self: *Tree, held: Lock.Shared, src: usize) []const TableEntry {
     const entries = self.levels[src].entries(held);
-    const budget = self.live.cur().job_max_bytes;
+    const budget = self.ground.live.cur().job_max_bytes;
     const start = if (src == 0) 0 else randomIndex(entries.len);
 
     // The run is entries[lo..hi], `kr` the union of its key ranges and
@@ -715,22 +716,22 @@ pub fn buildCompaction(
         const entries = self.levels[cand.level].entries(held);
         const named = cand.job.tables();
 
-        const srcs = try self.allocator.alloc(TableEntry, named.len);
-        errdefer self.allocator.free(srcs);
+        const srcs = try self.ground.allocator.alloc(TableEntry, named.len);
+        errdefer self.ground.allocator.free(srcs);
 
         for (named, srcs) |n, *e| {
             e.* = findEntry(entries, n.id) orelse {
                 log.info("compact tree={d} L{d} stale: sst={d} gone", .{
                     self.tree_id, cand.level, n.id,
                 });
-                self.allocator.free(srcs);
+                self.ground.allocator.free(srcs);
                 return .empty;
             };
         }
         for (srcs) |e| e.table.incrRef();
         break :blk srcs;
     };
-    defer Level.releaseTables(self.allocator, srcs);
+    defer Level.releaseTables(self.ground.allocator, srcs);
 
     const src: usize = cand.level;
     switch (cand.job) {
@@ -780,11 +781,11 @@ fn mergeDown(
         defer held.release();
         break :blk try self.levels[dest].overlappingTables(
             held,
-            self.allocator,
+            self.ground.allocator,
             kr orelse return .empty,
         );
     };
-    defer Level.releaseTables(self.allocator, bot);
+    defer Level.releaseTables(self.ground.allocator, bot);
 
     return self.mergeAndWrite(.{
         .src_level = src,
@@ -815,10 +816,10 @@ fn moveDown(
     }
 
     var changes = try std.ArrayList(_manifest.SSTableChange).initCapacity(
-        self.allocator,
+        self.ground.allocator,
         2,
     );
-    errdefer changes.deinit(self.allocator);
+    errdefer changes.deinit(self.ground.allocator);
     changes.appendAssumeCapacity(_manifest.deleteSSTableChange(
         e.id,
         self.namespace,
@@ -894,7 +895,7 @@ fn partitions(
         .namespace = self.namespace,
         .table_id = self.tableId(),
     };
-    const window = self.live.cur().compaction_window_bytes;
+    const window = self.ground.live.cur().compaction_window_bytes;
     const tloc = fiber.allocator(.tenant);
     for (bot, bot_iters) |e, *it| {
         it.* = TableIterator.init(tloc, e.table, table_key, .forward);
@@ -947,7 +948,7 @@ pub fn mergeAndWrite(
 ) !std.ArrayList(_manifest.SSTableChange) {
     const src = job.src_level;
     const dest = job.dest_level;
-    const opts = self.live.cur();
+    const opts = self.ground.live.cur();
 
     // The bottom iterators outlive the fibers: each partition's merge
     // releases its own at deinit, the slice is freed here after. The
@@ -966,7 +967,7 @@ pub fn mergeAndWrite(
     );
 
     var group = try fiber.Group(?Emitter.Result).initCapacity(
-        self.allocator,
+        self.ground.allocator,
         parts.len,
     );
     defer group.deinit();
@@ -983,18 +984,18 @@ pub fn mergeAndWrite(
     // Copied into `changes` below, or dropped when the job fails.
     defer for (results) |r_opt| {
         var r = r_opt orelse continue;
-        r.changes.deinit(self.allocator);
+        r.changes.deinit(self.ground.allocator);
     };
 
     // Every partition's puts are done; this makes their names durable.
-    try self.cache.store.sync();
+    try self.ground.cache.store.sync();
 
     // The manifest changes: every partition's CREATEs, in partition
     // order and listed at the job's raft index, then the DELETEs of
     // the inputs (the manifest applies creates first whatever the
     // order). The stats are summed.
     var changes: std.ArrayList(_manifest.SSTableChange) = .empty;
-    errdefer changes.deinit(self.allocator);
+    errdefer changes.deinit(self.ground.allocator);
 
     var stats: Metrics = .{};
     var failed = false;
@@ -1006,7 +1007,7 @@ pub fn mergeAndWrite(
         for (r.changes.items) |create| {
             var tc = create;
             tc.raft_index = job.out_raft_index;
-            try changes.append(self.allocator, tc);
+            try changes.append(self.ground.allocator, tc);
         }
         stats.merge(r.stats);
     }
@@ -1014,7 +1015,7 @@ pub fn mergeAndWrite(
     try reportJob(self, job, parts.len, &stats, snapshot_ts);
 
     for (job.src) |e| try changes.append(
-        self.allocator,
+        self.ground.allocator,
         _manifest.deleteSSTableChange(
             e.id,
             self.namespace,
@@ -1023,7 +1024,7 @@ pub fn mergeAndWrite(
         ),
     );
     for (job.bot) |e| try changes.append(
-        self.allocator,
+        self.ground.allocator,
         _manifest.deleteSSTableChange(
             e.id,
             self.namespace,
@@ -1141,7 +1142,7 @@ fn runPartition_(
         .namespace = self.namespace,
         .table_id = self.tableId(),
     };
-    const window = self.live.cur().compaction_window_bytes;
+    const window = self.ground.live.cur().compaction_window_bytes;
     for (job.src, 0..) |e, i| {
         var it = TableIterator.init(tloc, e.table, table_key, .forward);
         it.window_bytes = window;

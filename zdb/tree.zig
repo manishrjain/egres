@@ -299,6 +299,43 @@ pub const TableCache = struct {
     }
 };
 
+/// What a forest's trees share: held by the forest at a fixed address,
+/// which every tree of it points at, and outliving them. A test opens
+/// trees on a Ground of its own, without a forest.
+pub const Ground = struct {
+    allocator: std.mem.Allocator,
+    /// The forest's options, read with `cur()` once per job, so an
+    /// admin update reaches the next one; the fields in `Config.fixed`
+    /// never change. The caller keeps it alive past `deinit`.
+    live: *flags.Live(_config.Config),
+    manifest: _manifest.Manifest,
+    cache: TableCache,
+    /// The trees with a compaction job, posted by each tree for the
+    /// forest's pick.
+    compact_queue: _compaction.CompactQueue,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        live: *flags.Live(_config.Config),
+        store: *vfs.Store,
+    ) Ground {
+        return .{
+            .allocator = allocator,
+            .live = live,
+            .manifest = _manifest.Manifest.init(allocator),
+            .cache = TableCache.init(allocator, store),
+            .compact_queue = _compaction.CompactQueue.init(allocator),
+        };
+    }
+
+    /// Once every tree on it is released.
+    pub fn deinit(self: *Ground) void {
+        self.compact_queue.deinit();
+        self.manifest.deinit();
+        self.cache.deinit();
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Tree
 // ---------------------------------------------------------------------------
@@ -313,20 +350,14 @@ pub const TableCache = struct {
 // works way under the API surface, so this is apt.
 
 pub const Tree = struct {
-    allocator: std.mem.Allocator,
-    /// The forest's options, read with `cur()` once per job, so an admin
-    /// update reaches the next one; the fields in `Config.fixed` never
-    /// change.
-    live: *flags.Live(_config.Config),
+    ground: *Ground,
     namespace: u64,
     tree_id: u64,
-    manifest: *_manifest.Manifest,
-    cache: *TableCache,
     levels: []Level,
     compact_candidate: ?CompactCandidate = null,
-    /// Where `compact_candidate` is posted for the forest's pick; null
-    /// for a tree opened outside a forest.
-    compact_queue: ?*_compaction.CompactQueue,
+    /// Whether this tree posts to `ground.compact_queue` and withdraws
+    /// from it: cleared by `leaveQueue` once a drop or split retires it.
+    queued: bool = true,
     /// Levels with a job running on them (`reserveJob`): the candidate
     /// never names one, so two jobs of this tree run at once only on
     /// disjoint levels.
@@ -407,13 +438,13 @@ pub const Tree = struct {
     }
 
     /// Drop a ref; the last one closes the tree and frees it (it must
-    /// have been created with `allocator`, as installTree/applySplit do).
+    /// have been created with `ground.allocator`, as `open` does).
     pub fn release(self: *Tree) void {
         const prev = self.refs.fetchSub(1, .release);
         std.debug.assert(prev > 0);
         if (prev == 1) {
             _ = self.refs.load(.acquire);
-            const allocator = self.allocator;
+            const allocator = self.ground.allocator;
             self.close();
             allocator.destroy(self);
         }
@@ -428,16 +459,10 @@ pub const Tree = struct {
     ///
     /// No lock here: nobody else can see this tree yet, and the caller may
     /// publish it (`TableTrees.addTree`) before the first lock is taken.
-    pub fn open(
-        allocator: std.mem.Allocator,
-        live: *flags.Live(_config.Config),
-        namespace: u64,
-        tree_id: u64,
-        manifest: *_manifest.Manifest,
-        cache: *TableCache,
-        compact_queue: ?*_compaction.CompactQueue,
-    ) !*Tree {
-        const opts = live.cur();
+    pub fn open(ground: *Ground, namespace: u64, tree_id: u64) !*Tree {
+        const allocator = ground.allocator;
+        const manifest = &ground.manifest;
+        const opts = ground.live.cur();
         const self = try allocator.create(Tree);
         errdefer allocator.destroy(self);
 
@@ -483,17 +508,13 @@ pub const Tree = struct {
                 }
             }
         }
-        try cache.loadTables(needed.items);
+        try ground.cache.loadTables(needed.items);
         defer TableCache.decrRefs(needed.items);
 
         self.* = .{
-            .allocator = allocator,
-            .live = live,
+            .ground = ground,
             .namespace = namespace,
             .tree_id = tree_id,
-            .manifest = manifest,
-            .cache = cache,
-            .compact_queue = compact_queue,
             .levels = levels,
             .key_range = kr,
             .kind = kind,
@@ -521,10 +542,10 @@ pub const Tree = struct {
     /// internal half of `release`, which is the teardown callers use.
     fn close(self: *Tree) void {
         for (self.levels) |*h| h.deinit();
-        self.allocator.free(self.levels);
+        self.ground.allocator.free(self.levels);
         self.clearCandidate();
-        self.key_range.left.free(self.allocator);
-        self.key_range.right.free(self.allocator);
+        self.key_range.left.free(self.ground.allocator);
+        self.key_range.right.free(self.ground.allocator);
         self.mu.deinit();
     }
 
@@ -532,11 +553,11 @@ pub const Tree = struct {
     /// version at or below `lookup.read_ts`, tombstone included, or null
     /// if the key is absent. A one-key row MultiGet over this tree alone
     /// (no memtables). The returned item's key and value are duplicated
-    /// with self.allocator; the caller must free them.
+    /// with self.ground.allocator; the caller must free them.
     pub fn get(self: *Tree, lookup: Lookup) !?Item {
         const keys = [_]String{lookup.key.primary};
         var mg = try MultiGet.init(
-            self.allocator,
+            self.ground.allocator,
             lookup.key.tableKey(),
             &keys,
             .{
@@ -547,7 +568,7 @@ pub const Tree = struct {
         defer mg.deinit();
         try mg.walkTree(self, mg.pending.items, 0);
         const found = mg.item(lookup.key.primary) orelse return null;
-        return try found.dupe(self.allocator);
+        return try found.dupe(self.ground.allocator);
     }
 
     /// Build a merge iterator over this tree's data overlapping `range`,
@@ -748,7 +769,7 @@ pub const Tree = struct {
 
         // Candidates: each Lmax table's smallest key but the first, whose
         // smallest is the tree's left bound (nothing would go left).
-        const lmax_idx = self.live.cur().max_levels - 1;
+        const lmax_idx = self.ground.live.cur().max_levels - 1;
         const lmax = self.levels[lmax_idx].entries(held);
         if (lmax.len < min_lmax_tables_for_split) return null;
 
@@ -851,10 +872,10 @@ pub const Tree = struct {
         // (I/O), so it runs before any state changes: a retry of the
         // entry then starts from a clean manifest and clean levels.
         var needed: std.ArrayList(TableNeed) = .empty;
-        defer needed.deinit(self.allocator);
+        defer needed.deinit(self.ground.allocator);
         for (changes) |c| {
             if (c.op == .create) {
-                try needed.append(self.allocator, .{
+                try needed.append(self.ground.allocator, .{
                     .id = c.sst_id,
                     .level = c.level,
                     .extent = .{
@@ -864,12 +885,12 @@ pub const Tree = struct {
                 });
             }
         }
-        try self.cache.loadTables(needed.items);
+        try self.ground.cache.loadTables(needed.items);
         defer TableCache.decrRefs(needed.items);
 
         // Manifest and levels change together, both in memory; the entry
         // itself is already durable in the raft log.
-        try self.manifest.commit(index, changes, &.{});
+        try self.ground.manifest.commit(index, changes, &.{});
 
         // Apply level changes in original order: delete old entries, add new.
         // Track total bytes created and the destination level for metrics.
@@ -957,7 +978,7 @@ pub const Tree = struct {
         changes: []const _manifest.SSTableChange,
     ) !void {
         if (changes.len == 0) return;
-        const bottom: u32 = @intCast(self.live.cur().max_levels - 1);
+        const bottom: u32 = @intCast(self.ground.live.cur().max_levels - 1);
         for (changes) |c| {
             std.debug.assert(c.op == .create);
             std.debug.assert(c.level == bottom);

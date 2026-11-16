@@ -95,7 +95,7 @@ pub fn createIndex(
     if (!try self.ddlReady(state)) return;
 
     const ns = try self.sessionNamespace(state) orelse return;
-    const base_tid = eng.forest.manifest.lookupTable(ns, ci.table) orelse
+    const base_tid = eng.forest.ground.manifest.lookupTable(ns, ci.table) orelse
         return replyErrorCode(
             state,
             pgwire.sqlstate.undefined_table,
@@ -130,7 +130,7 @@ pub fn createIndex(
     // column limit, which is about a SECOND index on the column.
     const name = ci.name orelse
         try _table.indexName(arloc, ci.table, ci.column, .plain);
-    if (eng.forest.manifest.lookupTable(ns, name) != null) {
+    if (eng.forest.ground.manifest.lookupTable(ns, name) != null) {
         if (ci.if_not_exists)
             return state.sendCommandComplete("CREATE INDEX");
         return replyErrorCode(
@@ -779,7 +779,10 @@ pub fn dropIndex(
     if (!try self.ddlReady(state)) return;
 
     const ns = try self.sessionNamespace(state) orelse return;
-    const index_tid = eng.forest.manifest.lookupTable(ns, di.name) orelse {
+    const index_tid = eng.forest.ground.manifest.lookupTable(
+        ns,
+        di.name,
+    ) orelse {
         if (di.missing_ok) return state.sendCommandComplete("DROP INDEX");
         return replyErrorCode(
             state,

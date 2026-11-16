@@ -26,6 +26,7 @@ const KeyRange = zdb.kv.KeyRange;
 
 const Tree = zdb.tree.Tree;
 const TableCache = zdb.tree.TableCache;
+const Ground = zdb.tree.Ground;
 
 const config = zdb.config;
 const buildCompaction = @import("testing.zig").buildCompaction;
@@ -42,7 +43,7 @@ const push_lmax: i64 = 1;
 /// proposal.
 fn compact(tree: *Tree, index: u64, snapshot_ts: u64) !void {
     var changes = try buildCompaction(tree, snapshot_ts);
-    defer changes.deinit(tree.allocator);
+    defer changes.deinit(tree.ground.allocator);
     try tree.applyCompaction(index, changes.items);
 }
 
@@ -502,6 +503,9 @@ test "levels: open" {
     const dir_path = tmp.path;
     var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
+    const opts = config.Config{};
+    var live = flags.Live(config.Config).initFrom(alloc, opts);
+    defer live.deinit();
 
     // Write SST 1 at L0, SST 2 at L1.
     {
@@ -525,30 +529,17 @@ test "levels: open" {
 
     // Create manifest with table 1 at L0, table 2 at L1.
     const test_tree_id: u64 = 1;
-    var manifest = _manifest.Manifest.init(alloc);
-    defer manifest.deinit();
-    try manifest.commit(1, &.{}, &.{
+    var ground = Ground.init(alloc, &live, &store);
+    defer ground.deinit();
+    try ground.manifest.commit(1, &.{}, &.{
         createTreeChange(test_tree_id, 0, &.{}, &.{}, .posting_index),
     });
-    try manifest.commit(2, &.{
+    try ground.manifest.commit(2, &.{
         createSSTableChange(1, 0, test_tree_id, 0, try storedExtent(&store, 1)),
         createSSTableChange(2, 0, test_tree_id, 1, try storedExtent(&store, 2)),
     }, &.{});
 
-    const opts = config.Config{};
-    var cache = TableCache.init(alloc, &store);
-    defer cache.deinit();
-    var live = flags.Live(config.Config).initFrom(alloc, opts);
-    defer live.deinit();
-    const tree = try Tree.open(
-        alloc,
-        &live,
-        0,
-        test_tree_id,
-        &manifest,
-        &cache,
-        null,
-    );
+    const tree = try Tree.open(&ground, 0, test_tree_id);
     defer tree.release();
 
     try std.testing.expectEqual(@as(usize, 1), tree.numTablesAt(0));
@@ -571,32 +562,21 @@ test "levels: pick compact level" {
     const dir_path = tmp.path;
     var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
-
-    // Create an empty manifest (no SST files needed for this test).
-    const test_tree_id: u64 = 1;
-    var manifest = _manifest.Manifest.init(alloc);
-    defer manifest.deinit();
-
     // Targets cascade from `lmax_target_bytes`; setting it to a single
     // byte makes every level's target tiny so one table in L1 exceeds it
     // and becomes the compaction candidate.
     const opts = config.Config{
         .lmax_target_bytes = 1,
     };
-
-    var cache = TableCache.init(alloc, &store);
-    defer cache.deinit();
     var live = flags.Live(config.Config).initFrom(alloc, opts);
     defer live.deinit();
-    const tree = try Tree.open(
-        alloc,
-        &live,
-        0,
-        test_tree_id,
-        &manifest,
-        &cache,
-        null,
-    );
+
+    // Create an empty manifest (no SST files needed for this test).
+    const test_tree_id: u64 = 1;
+    var ground = Ground.init(alloc, &live, &store);
+    defer ground.deinit();
+
+    const tree = try Tree.open(&ground, 0, test_tree_id);
     defer tree.release();
 
     // Manually plant a large table in L1.
@@ -606,7 +586,7 @@ test "levels: pick compact level" {
     });
     defer tb.deinit();
     const t = try openTableOwned(alloc, &tb);
-    _ = try cache.own(999, t);
+    _ = try ground.cache.own(999, t);
     {
         const h = tree.mu.hold(.exclusive, @src());
         defer h.release();
@@ -626,24 +606,21 @@ test "levels: a retired tree never retakes a split's left half's key" {
     defer tmp.deinit();
     var store = try vfs.Store.initFile(alloc, tmp.path, vfs.g());
     defer store.deinit();
-    var manifest = _manifest.Manifest.init(alloc);
-    defer manifest.deinit();
-    var cache = TableCache.init(alloc, &store);
-    defer cache.deinit();
     // As in the test above: one table in L1 is over its target.
     var live = flags.Live(config.Config).initFrom(alloc, .{
         .lmax_target_bytes = 1,
     });
     defer live.deinit();
-    var queue = zdb.compaction.CompactQueue.init(alloc);
-    defer queue.deinit();
+    var ground = Ground.init(alloc, &live, &store);
+    defer ground.deinit();
+    const queue = &ground.compact_queue;
 
     // Two trees under one key, as a split's left tree takes the id of
     // the tree it replaces while that one is still open.
-    const old = try Tree.open(alloc, &live, 0, 1, &manifest, &cache, &queue);
+    const old = try Tree.open(&ground, 0, 1);
     var old_open = true;
     defer if (old_open) old.release();
-    const left = try Tree.open(alloc, &live, 0, 1, &manifest, &cache, &queue);
+    const left = try Tree.open(&ground, 0, 1);
     defer left.release();
     try std.testing.expect(queue.best() == null);
 
@@ -653,7 +630,7 @@ test "levels: a retired tree never retakes a split's left half's key" {
     });
     defer tb.deinit();
     const t = try openTableOwned(alloc, &tb);
-    _ = try cache.own(999, t);
+    _ = try ground.cache.own(999, t);
     for ([_]*Tree{ old, left }) |tree| {
         const h = tree.mu.hold(.exclusive, @src());
         defer h.release();
@@ -697,6 +674,13 @@ test "levels: compact L0 L1" {
     const dir_path = tmp.path;
     var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
+    // Use max_levels=2 so base_level=1 and the compaction goes L0→L1.
+    const opts = config.Config{
+        .max_levels = 2,
+        .lmax_target_bytes = push_lmax,
+    };
+    var live = flags.Live(config.Config).initFrom(alloc, opts);
+    defer live.deinit();
 
     // Write three L0 SST files with non-overlapping keys.
     const l0_data = [_]struct { id: u64, key: String, val: String }{
@@ -706,8 +690,8 @@ test "levels: compact L0 L1" {
     };
 
     const test_tree_id: u64 = 1;
-    var manifest = _manifest.Manifest.init(alloc);
-    defer manifest.deinit();
+    var ground = Ground.init(alloc, &live, &store);
+    defer ground.deinit();
 
     for (l0_data) |d| {
         var tb = try buildTable(alloc, &.{
@@ -718,33 +702,16 @@ test "levels: compact L0 L1" {
         defer alloc.free(name);
         try store.put(name, tb.bytes);
     }
-    try manifest.commit(1, &.{}, &.{
+    try ground.manifest.commit(1, &.{}, &.{
         createTreeChange(test_tree_id, 0, &.{}, &.{}, .posting_index),
     });
-    try manifest.commit(2, &.{
+    try ground.manifest.commit(2, &.{
         createSSTableChange(1, 0, test_tree_id, 0, try storedExtent(&store, 1)),
         createSSTableChange(2, 0, test_tree_id, 0, try storedExtent(&store, 2)),
         createSSTableChange(3, 0, test_tree_id, 0, try storedExtent(&store, 3)),
     }, &.{});
 
-    // Use max_levels=2 so base_level=1 and the compaction goes L0→L1.
-    const opts = config.Config{
-        .max_levels = 2,
-        .lmax_target_bytes = push_lmax,
-    };
-    var cache = TableCache.init(alloc, &store);
-    defer cache.deinit();
-    var live = flags.Live(config.Config).initFrom(alloc, opts);
-    defer live.deinit();
-    const tree = try Tree.open(
-        alloc,
-        &live,
-        0,
-        test_tree_id,
-        &manifest,
-        &cache,
-        null,
-    );
+    const tree = try Tree.open(&ground, 0, test_tree_id);
     defer tree.release();
 
     // All three tables should be in L0 before compaction.
@@ -778,10 +745,17 @@ test "levels: compact L0 L1 with dest overlap" {
     const dir_path = tmp.path;
     var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
+    // max_levels=2: L0 compacts directly to L1 (base_level=1).
+    const opts = config.Config{
+        .max_levels = 2,
+        .lmax_target_bytes = push_lmax,
+    };
+    var live = flags.Live(config.Config).initFrom(alloc, opts);
+    defer live.deinit();
 
     const test_tree_id: u64 = 1;
-    var manifest = _manifest.Manifest.init(alloc);
-    defer manifest.deinit();
+    var ground = Ground.init(alloc, &live, &store);
+    defer ground.deinit();
 
     // L0 table 1: {aa→vaa}
     {
@@ -814,33 +788,16 @@ test "levels: compact L0 L1 with dest overlap" {
         defer alloc.free(name);
         try store.put(name, tb.bytes);
     }
-    try manifest.commit(1, &.{}, &.{
+    try ground.manifest.commit(1, &.{}, &.{
         createTreeChange(test_tree_id, 0, &.{}, &.{}, .posting_index),
     });
-    try manifest.commit(2, &.{
+    try ground.manifest.commit(2, &.{
         createSSTableChange(1, 0, test_tree_id, 0, try storedExtent(&store, 1)),
         createSSTableChange(2, 0, test_tree_id, 0, try storedExtent(&store, 2)),
         createSSTableChange(3, 0, test_tree_id, 1, try storedExtent(&store, 3)),
     }, &.{});
 
-    // max_levels=2: L0 compacts directly to L1 (base_level=1).
-    const opts = config.Config{
-        .max_levels = 2,
-        .lmax_target_bytes = push_lmax,
-    };
-    var cache = TableCache.init(alloc, &store);
-    defer cache.deinit();
-    var live = flags.Live(config.Config).initFrom(alloc, opts);
-    defer live.deinit();
-    const tree = try Tree.open(
-        alloc,
-        &live,
-        0,
-        test_tree_id,
-        &manifest,
-        &cache,
-        null,
-    );
+    const tree = try Tree.open(&ground, 0, test_tree_id);
     defer tree.release();
 
     try std.testing.expectEqual(@as(usize, 2), tree.numTablesAt(0));
@@ -875,13 +832,20 @@ test "levels: an L0 push splits into a fiber per L1 range" {
     const dir_path = tmp.path;
     var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
+    const opts = config.Config{
+        .max_levels = 2,
+        .lmax_target_bytes = push_lmax,
+        .compaction_fibers = 3,
+    };
+    var live = flags.Live(config.Config).initFrom(alloc, opts);
+    defer live.deinit();
 
     // L0 holds aa, cc, ee, gg in two tables; L1 holds bb, dd, ff, one
     // table each. Three fibers get [-inf, dd), [dd, ff) and [ff, inf):
     // one output each, every key present afterwards.
     const test_tree_id: u64 = 1;
-    var manifest = _manifest.Manifest.init(alloc);
-    defer manifest.deinit();
+    var ground = Ground.init(alloc, &live, &store);
+    defer ground.deinit();
     const l0 = [_][]const MetaEntry{
         &.{ .{ .key = "aa", .ts = 1, .val = "vaa" }, .{ .key = "ee", .ts = 1, .val = "vee" } },
         &.{ .{ .key = "cc", .ts = 1, .val = "vcc" }, .{ .key = "gg", .ts = 1, .val = "vgg" } },
@@ -914,29 +878,12 @@ test "levels: an L0 push splits into a fiber per L1 range" {
             id += 1;
         }
     }
-    try manifest.commit(1, &.{}, &.{
+    try ground.manifest.commit(1, &.{}, &.{
         createTreeChange(test_tree_id, 0, &.{}, &.{}, .posting_index),
     });
-    try manifest.commit(2, changes.items, &.{});
+    try ground.manifest.commit(2, changes.items, &.{});
 
-    const opts = config.Config{
-        .max_levels = 2,
-        .lmax_target_bytes = push_lmax,
-        .compaction_fibers = 3,
-    };
-    var cache = TableCache.init(alloc, &store);
-    defer cache.deinit();
-    var live = flags.Live(config.Config).initFrom(alloc, opts);
-    defer live.deinit();
-    const tree = try Tree.open(
-        alloc,
-        &live,
-        0,
-        test_tree_id,
-        &manifest,
-        &cache,
-        null,
-    );
+    const tree = try Tree.open(&ground, 0, test_tree_id);
     defer tree.release();
 
     try std.testing.expectEqual(@as(usize, 2), tree.numTablesAt(0));
@@ -962,6 +909,14 @@ test "levels: an L1 merge splits into a fiber per L2 range" {
     const dir_path = tmp.path;
     var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
+    // A one-byte bottom target puts L1 over its target; L0 is empty.
+    const opts = config.Config{
+        .max_levels = 3,
+        .lmax_target_bytes = push_lmax,
+        .compaction_fibers = 3,
+    };
+    var live = flags.Live(config.Config).initFrom(alloc, opts);
+    defer live.deinit();
 
     // L1 holds aa, cc, ee, gg in one table; L2 holds bb, dd, ff, one
     // table each. The L1 table overlaps all three, so it merges down,
@@ -972,8 +927,8 @@ test "levels: an L1 merge splits into a fiber per L2 range" {
     // that a seek key carries the tree's own table id (a tree id of 1
     // has table id 0, which the bare keys matched by accident).
     const test_tree_id: u64 = 16 << 32;
-    var manifest = _manifest.Manifest.init(alloc);
-    defer manifest.deinit();
+    var ground = Ground.init(alloc, &live, &store);
+    defer ground.deinit();
     const l1 = [_][]const MetaEntry{
         &.{
             .{ .key = "aa", .ts = 1, .val = "vaa" },
@@ -1013,30 +968,12 @@ test "levels: an L1 merge splits into a fiber per L2 range" {
             id += 1;
         }
     }
-    try manifest.commit(1, &.{}, &.{
+    try ground.manifest.commit(1, &.{}, &.{
         createTreeChange(test_tree_id, 0, &.{}, &.{}, .posting_index),
     });
-    try manifest.commit(2, changes.items, &.{});
+    try ground.manifest.commit(2, changes.items, &.{});
 
-    // A one-byte bottom target puts L1 over its target; L0 is empty.
-    const opts = config.Config{
-        .max_levels = 3,
-        .lmax_target_bytes = push_lmax,
-        .compaction_fibers = 3,
-    };
-    var cache = TableCache.init(alloc, &store);
-    defer cache.deinit();
-    var live = flags.Live(config.Config).initFrom(alloc, opts);
-    defer live.deinit();
-    const tree = try Tree.open(
-        alloc,
-        &live,
-        0,
-        test_tree_id,
-        &manifest,
-        &cache,
-        null,
-    );
+    const tree = try Tree.open(&ground, 0, test_tree_id);
     defer tree.release();
 
     try std.testing.expectEqual(@as(usize, 1), tree.numTablesAt(1));
@@ -1068,6 +1005,14 @@ test "levels: compact L1 L2" {
     const dir_path = tmp.path;
     var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
+    // max_levels=3, and a one-byte bottom target puts L1 over its
+    // target: L1 is the candidate, so it goes L1→L2.
+    const opts = config.Config{
+        .max_levels = 3,
+        .lmax_target_bytes = push_lmax,
+    };
+    var live = flags.Live(config.Config).initFrom(alloc, opts);
+    defer live.deinit();
 
     // L1: {aa, bb}; L2: {cc} — non-overlapping, so compacting L1 doesn't
     // touch the L2 table; both survive in L2 after compaction. L1's
@@ -1078,8 +1023,8 @@ test "levels: compact L1 L2" {
     const vaa = "vaa" ++ "." ** 3072;
     const vbb = "vbb" ++ "." ** 3072;
     const test_tree_id: u64 = 1;
-    var manifest = _manifest.Manifest.init(alloc);
-    defer manifest.deinit();
+    var ground = Ground.init(alloc, &live, &store);
+    defer ground.deinit();
 
     {
         var tb1 = try buildTable(alloc, &.{
@@ -1099,33 +1044,15 @@ test "levels: compact L1 L2" {
         defer alloc.free(name2);
         try store.put(name2, tb2.bytes);
     }
-    try manifest.commit(1, &.{}, &.{
+    try ground.manifest.commit(1, &.{}, &.{
         createTreeChange(test_tree_id, 0, &.{}, &.{}, .posting_index),
     });
-    try manifest.commit(2, &.{
+    try ground.manifest.commit(2, &.{
         createSSTableChange(1, 0, test_tree_id, 1, try storedExtent(&store, 1)),
         createSSTableChange(2, 0, test_tree_id, 2, try storedExtent(&store, 2)),
     }, &.{});
 
-    // max_levels=3, and a one-byte bottom target puts L1 over its
-    // target: L1 is the candidate, so it goes L1→L2.
-    const opts = config.Config{
-        .max_levels = 3,
-        .lmax_target_bytes = push_lmax,
-    };
-    var cache = TableCache.init(alloc, &store);
-    defer cache.deinit();
-    var live = flags.Live(config.Config).initFrom(alloc, opts);
-    defer live.deinit();
-    const tree = try Tree.open(
-        alloc,
-        &live,
-        0,
-        test_tree_id,
-        &manifest,
-        &cache,
-        null,
-    );
+    const tree = try Tree.open(&ground, 0, test_tree_id);
     defer tree.release();
 
     try std.testing.expectEqual(@as(usize, 1), tree.numTablesAt(1));
@@ -1164,25 +1091,15 @@ test "levels: get L0 shadows L1" {
     const dir_path = tmp.path;
     var store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
-
-    const test_tree_id: u64 = 1;
-    var manifest = _manifest.Manifest.init(alloc);
-    defer manifest.deinit();
-
     const opts = config.Config{};
-    var cache = TableCache.init(alloc, &store);
-    defer cache.deinit();
     var live = flags.Live(config.Config).initFrom(alloc, opts);
     defer live.deinit();
-    const tree = try Tree.open(
-        alloc,
-        &live,
-        0,
-        test_tree_id,
-        &manifest,
-        &cache,
-        null,
-    );
+
+    const test_tree_id: u64 = 1;
+    var ground = Ground.init(alloc, &live, &store);
+    defer ground.deinit();
+
+    const tree = try Tree.open(&ground, 0, test_tree_id);
     defer tree.release();
 
     // Plant in-memory tables directly into the level handlers.
@@ -1193,7 +1110,7 @@ test "levels: get L0 shadows L1" {
     );
     defer tb_l1.deinit();
     const t_l1 = try openTableOwned(alloc, &tb_l1);
-    _ = try cache.own(1, t_l1);
+    _ = try ground.cache.own(1, t_l1);
     {
         const h = tree.mu.hold(.exclusive, @src());
         defer h.release();
@@ -1208,7 +1125,7 @@ test "levels: get L0 shadows L1" {
     );
     defer tb_l0.deinit();
     const t_l0 = try openTableOwned(alloc, &tb_l0);
-    _ = try cache.own(2, t_l0);
+    _ = try ground.cache.own(2, t_l0);
     {
         const h = tree.mu.hold(.exclusive, @src());
         defer h.release();
@@ -1292,18 +1209,16 @@ test "levels: overlappingTables finds a dest table sharing the boundary primary"
 /// Open a one-tree forest-less Tree over `dir_path` with `max_levels`, holding
 /// a single L0 SST built from `entries`. Returns the tree; caller closes it.
 const TombstoneFixture = struct {
-    manifest: _manifest.Manifest,
     store: vfs.Store,
-    cache: TableCache,
     live: flags.Live(config.Config),
+    ground: Ground,
     tree: *Tree,
 
     fn deinit(self: *TombstoneFixture) void {
         self.tree.release();
-        self.cache.deinit();
+        self.ground.deinit();
         self.store.deinit();
         self.live.deinit();
-        self.manifest.deinit();
     }
 };
 
@@ -1317,33 +1232,23 @@ fn setupTombstoneTree(
     const tree_id: u64 = 1;
     fx.store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     errdefer fx.store.deinit();
-    fx.manifest = _manifest.Manifest.init(alloc);
-    errdefer fx.manifest.deinit();
-    try fx.manifest.commit(1, &.{}, &.{
+    const opts = config.Config{
+        .max_levels = max_levels,
+        .lmax_target_bytes = push_lmax,
+    };
+    fx.live = flags.Live(config.Config).initFrom(alloc, opts);
+    errdefer fx.live.deinit();
+    fx.ground = Ground.init(alloc, &fx.live, &fx.store);
+    errdefer fx.ground.deinit();
+    try fx.ground.manifest.commit(1, &.{}, &.{
         createTreeChange(tree_id, 0, &.{}, &.{}, .posting_index),
     });
 
     var tb = try buildTableMeta(alloc, entries);
     defer tb.deinit();
-    try installTable(alloc, &fx.manifest, &fx.store, &tb, 1, tree_id, 0);
+    try installTable(alloc, &fx.ground.manifest, &fx.store, &tb, 1, tree_id, 0);
 
-    const opts = config.Config{
-        .max_levels = max_levels,
-        .lmax_target_bytes = push_lmax,
-    };
-    fx.cache = TableCache.init(alloc, &fx.store);
-    errdefer fx.cache.deinit();
-    fx.live = flags.Live(config.Config).initFrom(alloc, opts);
-    errdefer fx.live.deinit();
-    fx.tree = try Tree.open(
-        alloc,
-        &fx.live,
-        0,
-        tree_id,
-        &fx.manifest,
-        &fx.cache,
-        null,
-    );
+    fx.tree = try Tree.open(&fx.ground, 0, tree_id);
 }
 
 /// One SST for `setupPlacedTree`: its id (also the log index it is listed
@@ -1384,10 +1289,12 @@ fn setupPlacedTreeCfg(
     const tree_id: u64 = 1;
     fx.store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     errdefer fx.store.deinit();
-    fx.manifest = _manifest.Manifest.init(alloc);
-    errdefer fx.manifest.deinit();
+    fx.live = flags.Live(config.Config).initFrom(alloc, opts);
+    errdefer fx.live.deinit();
+    fx.ground = Ground.init(alloc, &fx.live, &fx.store);
+    errdefer fx.ground.deinit();
     const tc = createTreeChange(tree_id, 0, &.{}, &.{}, kind);
-    try fx.manifest.commit(1, &.{}, &.{tc});
+    try fx.ground.manifest.commit(1, &.{}, &.{tc});
     for (tables) |pt| {
         var b = Builder.init(alloc, .{
             .block_bytes = 4 * 1024,
@@ -1404,7 +1311,7 @@ fn setupPlacedTreeCfg(
         defer tb.deinit();
         try installTable(
             alloc,
-            &fx.manifest,
+            &fx.ground.manifest,
             &fx.store,
             &tb,
             pt.id,
@@ -1412,19 +1319,7 @@ fn setupPlacedTreeCfg(
             pt.level,
         );
     }
-    fx.cache = TableCache.init(alloc, &fx.store);
-    errdefer fx.cache.deinit();
-    fx.live = flags.Live(config.Config).initFrom(alloc, opts);
-    errdefer fx.live.deinit();
-    fx.tree = try Tree.open(
-        alloc,
-        &fx.live,
-        0,
-        tree_id,
-        &fx.manifest,
-        &fx.cache,
-        null,
-    );
+    fx.tree = try Tree.open(&fx.ground, 0, tree_id);
 }
 
 /// The SST ids a level lists, ascending.
@@ -1482,7 +1377,10 @@ test "compaction: a push that overlaps nothing below moves its oldest table" {
     const ids = try levelIds(alloc, fx.tree, 1);
     defer alloc.free(ids);
     try std.testing.expectEqualSlices(u64, &.{ 2, 3, 4 }, ids);
-    try std.testing.expectEqual(@as(u32, 0), fx.manifest.to_delete.count());
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        fx.ground.manifest.to_delete.count(),
+    );
     try expectEgids(alloc, fx.tree, &.{ 1, 2, 3, 4 });
 }
 
@@ -1505,7 +1403,10 @@ test "compaction: a unique index tree moves like a rows tree" {
     const ids = try levelIds(alloc, fx.tree, 1);
     defer alloc.free(ids);
     try std.testing.expectEqualSlices(u64, &.{2}, ids);
-    try std.testing.expectEqual(@as(u32, 0), fx.manifest.to_delete.count());
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        fx.ground.manifest.to_delete.count(),
+    );
     try expectEgids(alloc, fx.tree, &.{1});
 }
 
@@ -1568,7 +1469,10 @@ test "compaction: a table overlapping nothing below moves down a middle level" {
     const ids = try levelIds(alloc, fx.tree, 2);
     defer alloc.free(ids);
     try std.testing.expectEqualSlices(u64, &.{ 2, 3 }, ids);
-    try std.testing.expectEqual(@as(u32, 0), fx.manifest.to_delete.count());
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        fx.ground.manifest.to_delete.count(),
+    );
     try expectEgids(alloc, fx.tree, &.{ 1, 2, 5 });
 }
 
@@ -2358,9 +2262,11 @@ fn setupTreeWithTables(
     const tree_id: u64 = 1;
     fx.store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     errdefer fx.store.deinit();
-    fx.manifest = _manifest.Manifest.init(alloc);
-    errdefer fx.manifest.deinit();
-    try fx.manifest.commit(1, &.{}, &.{
+    fx.live = flags.Live(config.Config).initFrom(alloc, cfg);
+    errdefer fx.live.deinit();
+    fx.ground = Ground.init(alloc, &fx.live, &fx.store);
+    errdefer fx.ground.deinit();
+    try fx.ground.manifest.commit(1, &.{}, &.{
         createTreeChange(tree_id, 0, &.{}, &.{}, .posting_index),
     });
 
@@ -2369,7 +2275,7 @@ fn setupTreeWithTables(
         defer tb.deinit();
         try installTable(
             alloc,
-            &fx.manifest,
+            &fx.ground.manifest,
             &fx.store,
             &tb,
             sst_id,
@@ -2377,20 +2283,7 @@ fn setupTreeWithTables(
             0,
         );
     }
-
-    fx.cache = TableCache.init(alloc, &fx.store);
-    errdefer fx.cache.deinit();
-    fx.live = flags.Live(config.Config).initFrom(alloc, cfg);
-    errdefer fx.live.deinit();
-    fx.tree = try Tree.open(
-        alloc,
-        &fx.live,
-        0,
-        tree_id,
-        &fx.manifest,
-        &fx.cache,
-        null,
-    );
+    fx.tree = try Tree.open(&fx.ground, 0, tree_id);
 }
 
 fn encodeDelta(
@@ -2784,9 +2677,11 @@ fn setupTreeMulti(
     const tree_id: u64 = 1;
     fx.store = try vfs.Store.initFile(alloc, dir_path, vfs.g());
     errdefer fx.store.deinit();
-    fx.manifest = _manifest.Manifest.init(alloc);
-    errdefer fx.manifest.deinit();
-    try fx.manifest.commit(1, &.{}, &.{
+    fx.live = flags.Live(config.Config).initFrom(alloc, cfg);
+    errdefer fx.live.deinit();
+    fx.ground = Ground.init(alloc, &fx.live, &fx.store);
+    errdefer fx.ground.deinit();
+    try fx.ground.manifest.commit(1, &.{}, &.{
         createTreeChange(tree_id, 0, &.{}, &.{}, .posting_index),
     });
 
@@ -2795,7 +2690,7 @@ fn setupTreeMulti(
         defer tb.deinit();
         try installTable(
             alloc,
-            &fx.manifest,
+            &fx.ground.manifest,
             &fx.store,
             &tb,
             id,
@@ -2803,20 +2698,7 @@ fn setupTreeMulti(
             t.level,
         );
     }
-
-    fx.cache = TableCache.init(alloc, &fx.store);
-    errdefer fx.cache.deinit();
-    fx.live = flags.Live(config.Config).initFrom(alloc, cfg);
-    errdefer fx.live.deinit();
-    fx.tree = try Tree.open(
-        alloc,
-        &fx.live,
-        0,
-        tree_id,
-        &fx.manifest,
-        &fx.cache,
-        null,
-    );
+    fx.tree = try Tree.open(&fx.ground, 0, tree_id);
 }
 
 test "compaction: shadowed delta chains are never re-rolled" {

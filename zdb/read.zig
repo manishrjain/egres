@@ -435,7 +435,7 @@ pub const MultiGet = struct {
         var pending: std.ArrayList(*Node) = .empty;
         try pending.appendSlice(arloc, run);
 
-        const max_levels = tree.live.cur().max_levels;
+        const max_levels = tree.ground.live.cur().max_levels;
         var lvl = from_level;
         while (lvl < max_levels) : (lvl += 1) {
             removeDone(&pending);

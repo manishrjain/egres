@@ -35,15 +35,7 @@ const Tree = @import("tree.zig").Tree;
 /// plus one list append under the table's lock, and the tree is
 /// invisible until that append.
 pub fn installTree(self: *Forest, namespace_id: u64, tree_id: u64) !void {
-    const tree = try Tree.open(
-        self.allocator,
-        self.live,
-        namespace_id,
-        tree_id,
-        &self.manifest,
-        &self.table_cache,
-        &self.compact_queue,
-    );
+    const tree = try Tree.open(&self.ground, namespace_id, tree_id);
     errdefer tree.release();
 
     const tbl_trees = try self.getOrCreateTable(.{
@@ -55,7 +47,8 @@ pub fn installTree(self: *Forest, namespace_id: u64, tree_id: u64) !void {
     try tbl_trees.addTree(held, tree);
 }
 
-/// Walk `self.manifest.trees` and install each tree (Tree + TableTrees entries).
+/// Walk the manifest's trees and install each one (Tree + TableTrees
+/// entries).
 /// Used after `Manifest.restoreFrom(snapshot.data)` at recovery — the
 /// manifest already names every tree and table, but the in-memory Tree
 /// objects and TableTrees need to be rebuilt from it. Tree ids are
@@ -66,7 +59,7 @@ pub fn installTree(self: *Forest, namespace_id: u64, tree_id: u64) !void {
 pub fn openTablesFromManifest(self: *Forest) !void {
     // installTree opens each Tree (which dupes its key range from the
     // manifest), so we only need the keys here.
-    const keys = try self.manifest.treeKeys(self.allocator, null);
+    const keys = try self.ground.manifest.treeKeys(self.allocator, null);
     defer self.allocator.free(keys);
 
     const install: Install = .{ .forest = self, .keys = keys };
@@ -129,12 +122,12 @@ pub fn buildNsCreate(
     name: String,
 ) !NsResult {
     const namespace_id = switch (id) {
-        .next => self.manifest.nextNamespace(),
+        .next => self.ground.manifest.nextNamespace(),
         .given => |n| n,
     };
     std.debug.assert(namespace_id > 0);
     if (self.hasNamespace(namespace_id)) return error.NamespaceAlreadyExists;
-    if (self.manifest.lookupNamespace(name)) |_| return error.NameExists;
+    if (self.ground.manifest.lookupNamespace(name)) |_| return error.NameExists;
 
     // One tree per system table: the default (raw-KV) table plus the SQL
     // catalogs, born with the namespace — catalog rows must never race
@@ -178,7 +171,7 @@ pub fn applyTrees(
     index: u64,
     mc: _manifest.ManifestChange,
 ) !void {
-    try self.manifest.apply(index, mc);
+    try self.ground.manifest.apply(index, mc);
     for (mc.tree_changes) |tc| switch (tc.op) {
         .create => {
             if (self.hasTree(tc.namespace_id, tc.tree_id)) continue;
@@ -228,9 +221,9 @@ pub fn buildNsBranch(
     name: String,
 ) !NsResult {
     if (!self.hasNamespace(source)) return error.NamespaceNotFound;
-    if (self.manifest.lookupNamespace(name)) |_| return error.NameExists;
+    if (self.ground.manifest.lookupNamespace(name)) |_| return error.NameExists;
 
-    const namespace = self.manifest.nextNamespace();
+    const namespace = self.ground.manifest.nextNamespace();
     // A carrier for the target's id and name: the branch's trees take
     // the source's kinds (Manifest.applyBranch).
     const tree_changes = try alloc.alloc(_manifest.TreeChange, 1);
@@ -268,9 +261,9 @@ pub fn applyNsBranch(
     ts: u64,
     mc: _manifest.ManifestChange,
 ) !void {
-    try self.manifest.apply(index, mc);
+    try self.ground.manifest.apply(index, mc);
     const dst = mc.tree_changes[0].namespace_id;
-    const keys = try self.manifest.treeKeys(self.allocator, dst);
+    const keys = try self.ground.manifest.treeKeys(self.allocator, dst);
     defer self.allocator.free(keys);
     for (keys) |tk| {
         if (self.hasTree(tk.namespace, tk.tree_id)) continue;
@@ -310,11 +303,11 @@ pub fn applyTableBranch(
     ts: u64,
     mc: _manifest.ManifestChange,
 ) !void {
-    try self.manifest.apply(index, mc);
+    try self.ground.manifest.apply(index, mc);
     for (mc.tree_changes) |tc| {
         const ns = tc.namespace_id;
         const dst_tid = treeTableId(tc.tree_id);
-        const keys = try self.manifest.treeKeys(self.allocator, ns);
+        const keys = try self.ground.manifest.treeKeys(self.allocator, ns);
         defer self.allocator.free(keys);
 
         for (keys) |tk| {
@@ -365,7 +358,7 @@ pub fn buildTables(
     std.debug.assert(cmd == .create_tree or cmd == .branch_table);
     for (changes) |tc| {
         if (tc.name.len > 0 and
-            self.manifest.lookupTable(namespace_id, tc.name) != null)
+            self.ground.manifest.lookupTable(namespace_id, tc.name) != null)
             return error.NameExists;
         if (cmd == .branch_table and !self.hasTable(.{
             .namespace = namespace_id,
@@ -376,7 +369,7 @@ pub fn buildTables(
     const table_ids = try alloc.alloc(u32, changes.len);
     errdefer alloc.free(table_ids);
     for (changes, table_ids) |*tc, *table_id| {
-        table_id.* = try self.manifest.nextTableId(namespace_id);
+        table_id.* = try self.ground.manifest.nextTableId(namespace_id);
         tc.op = .create;
         tc.namespace_id = namespace_id;
         tc.tree_id = makeTreeId(table_id.*, 0);
@@ -507,11 +500,11 @@ pub fn buildSplit(
     // The old tree's bounds, copied out under the manifest lock: this
     // runs on the split-propose fiber while the apply loop may commit
     // (rehashing the map, freeing a dropped tree's keys).
-    const old_range = try self.manifest.treeRange(alloc, .{
+    const old_range = try self.ground.manifest.treeRange(alloc, .{
         .namespace = namespace_id,
         .tree_id = tree_id,
     }) orelse return null;
-    const old_kind = self.manifest.treeKind(.{
+    const old_kind = self.ground.manifest.treeKind(.{
         .namespace = namespace_id,
         .tree_id = tree_id,
     }) orelse return null;
@@ -601,7 +594,7 @@ pub fn applySplit(
     mc: _manifest.ManifestChange,
 ) !void {
     // Commit MANIFEST so we can recover from a crash.
-    try self.manifest.commit(index, mc.sstable_changes, mc.tree_changes);
+    try self.ground.manifest.commit(index, mc.sstable_changes, mc.tree_changes);
 
     // Find the old tree_id (UPDATE) and new tree_id (CREATE) from tree_changes.
     // Both changes carry the same namespace (a split stays within one).
@@ -623,25 +616,9 @@ pub fn applySplit(
     // manifest too: the left's right edge is the split key.
     // Refs start at 1, so releasing a half that never gets published
     // closes and frees it.
-    const left = try Tree.open(
-        self.allocator,
-        self.live,
-        namespace_id,
-        old_tree_id,
-        &self.manifest,
-        &self.table_cache,
-        &self.compact_queue,
-    );
+    const left = try Tree.open(&self.ground, namespace_id, old_tree_id);
     errdefer left.release();
-    const right = try Tree.open(
-        self.allocator,
-        self.live,
-        namespace_id,
-        new_tree_id,
-        &self.manifest,
-        &self.table_cache,
-        &self.compact_queue,
-    );
+    const right = try Tree.open(&self.ground, namespace_id, new_tree_id);
     errdefer right.release();
 
     // Fresh candidates against the post-split state. Without this the

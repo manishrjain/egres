@@ -1628,19 +1628,20 @@ const Site = struct {
     /// Before `inst` goes: what it compacted here.
     fn countCompactions(self: *Site, inst: *Instance) void {
         const forest = inst.eng.forest;
-        const ns = forest.manifest.lookupNamespace(self.db) orelse return;
+        const ns = forest.ground.manifest.lookupNamespace(self.db) orelse
+            return;
         self.compactions += forest.compactionsIn(ns);
     }
 
     /// Each bank table here has more than one tree.
     fn expectSplit(self: *const Site, inst: *Instance) !void {
         const forest = inst.eng.forest;
-        const ns = forest.manifest.lookupNamespace(self.db) orelse
+        const ns = forest.ground.manifest.lookupNamespace(self.db) orelse
             return error.DatabaseGone;
         for (0..bank_tables) |tbl| {
             var name_buf: [16]u8 = undefined;
             const name = try std.fmt.bufPrint(&name_buf, "bank{d}", .{tbl});
-            const table_id = forest.manifest.lookupTable(ns, name) orelse
+            const table_id = forest.ground.manifest.lookupTable(ns, name) orelse
                 return error.BankTableGone;
             const trees = forest.getTable(.{
                 .namespace = ns,
