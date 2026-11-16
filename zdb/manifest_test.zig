@@ -332,6 +332,122 @@ test "manifest serialize/restoreFrom round-trip" {
     try std.testing.expectEqual(@as(?u32, 16), dst.lookupTable(7, "users"));
 }
 
+fn expectSameKey(want: zdb.kv.Key, got: zdb.kv.Key) !void {
+    try std.testing.expectEqual(want.bound, got.bound);
+    try std.testing.expectEqual(want.namespace, got.namespace);
+    try std.testing.expectEqual(want.table_id, got.table_id);
+    try std.testing.expectEqualStrings(want.primary, got.primary);
+}
+
+/// Every tree, file, namespace and name of `want` is in `got` the same,
+/// and nothing else is.
+fn expectSameManifest(
+    want: *_manifest.Manifest,
+    got: *_manifest.Manifest,
+) !void {
+    const expectEqual = std.testing.expectEqual;
+    try expectEqual(want.trees.count(), got.trees.count());
+    var it = want.trees.iterator();
+    while (it.next()) |kv| {
+        const w = kv.value_ptr;
+        const g = got.trees.getPtr(kv.key_ptr.*) orelse
+            return error.TestExpectedEqual;
+        try expectEqual(w.namespace_id, g.namespace_id);
+        try expectEqual(w.kind, g.kind);
+        try expectSameKey(w.left, g.left);
+        try expectSameKey(w.right, g.right);
+        try expectEqual(w.levels.items.len, g.levels.items.len);
+        for (w.levels.items, g.levels.items) |wl, gl| {
+            try expectEqual(wl.tables.count(), gl.tables.count());
+            var tit = wl.tables.keyIterator();
+            while (tit.next()) |id| {
+                try std.testing.expect(gl.tables.contains(id.*));
+            }
+        }
+    }
+    try expectEqual(want.ssts.count(), got.ssts.count());
+    var sit = want.ssts.iterator();
+    while (sit.next()) |kv| {
+        const g = got.ssts.get(kv.key_ptr.*) orelse
+            return error.TestExpectedEqual;
+        try expectEqual(kv.value_ptr.*, g);
+    }
+    try expectEqual(want.namespaces.count(), got.namespaces.count());
+    var nit = want.namespaces.iterator();
+    while (nit.next()) |kv| {
+        const w = kv.value_ptr;
+        const g = got.namespaces.getPtr(kv.key_ptr.*) orelse
+            return error.TestExpectedEqual;
+        try expectEqual(w.next_table_id, g.next_table_id);
+        try std.testing.expectEqualStrings(w.name, g.name);
+        try expectEqual(w.tables.count(), g.tables.count());
+        var tit = w.tables.iterator();
+        while (tit.next()) |t| {
+            try expectEqual(t.value_ptr.*, g.tables.get(t.key_ptr.*).?);
+        }
+    }
+    try expectEqual(want.names.count(), got.names.count());
+    var name_it = want.names.iterator();
+    while (name_it.next()) |kv| {
+        try expectEqual(kv.value_ptr.*, got.names.get(kv.key_ptr.*).?);
+    }
+    try expectEqual(want.next_ns_id, got.next_ns_id);
+}
+
+// `serialize` writes each record through the zbuf writers; what it
+// writes restores to the manifest it came from, field for field.
+test "manifest: a snapshot restores the same manifest" {
+    const alloc = std.testing.allocator;
+    var src = _manifest.Manifest.init(alloc);
+    defer src.deinit();
+
+    const Key = zdb.kv.Key;
+    const m_raw = try (Key{ .primary = "mmm" }).marshal(alloc);
+    defer alloc.free(m_raw);
+    const users = zdb.kv.makeTreeId(16, 0);
+    const users_right = zdb.kv.makeTreeId(16, 1);
+    const users_email = zdb.kv.makeTreeId(17, 0);
+    try src.commit(1, &.{}, &.{
+        createTreeChange(0, 7, &.{}, &.{}, .rows),
+        // A table split in two: only its first tree carries the name.
+        createTreeChange(users, 7, &.{}, m_raw, .rows),
+        createTreeChange(users_right, 7, m_raw, &.{}, .rows),
+        createTreeChange(users_email, 7, &.{}, &.{}, .unique_index),
+        createTreeChange(0, 8, &.{}, &.{}, .rows),
+    });
+    try src.registerNamespaceName(7, "shop");
+    try src.registerNamespaceName(8, "blog");
+    try src.registerTableName(.{ .namespace = 7, .table_id = 16 }, "users");
+    try src.registerTableName(
+        .{ .namespace = 7, .table_id = 17 },
+        "users_email",
+    );
+    try src.advanceTableId(.{ .namespace = 7, .table_id = 17 });
+    src.advanceNamespace(8);
+    const shared: _manifest.Extent = .{ .size = 300, .index_offset = 250 };
+    try src.commit(2, &.{
+        createSSTableChange(10, 7, users, 0, .{
+            .size = 100,
+            .index_offset = 60,
+        }),
+        createSSTableChange(11, 7, users, 2, .{
+            .size = 200,
+            .index_offset = 150,
+        }),
+        // A file both halves of the split list.
+        createSSTableChange(12, 7, users, 3, shared),
+        createSSTableChange(12, 7, users_right, 3, shared),
+        createSSTableChange(20, 8, 0, 0, .{ .size = 50, .index_offset = 40 }),
+    }, &.{});
+
+    const bytes = try src.serialize(alloc);
+    defer alloc.free(bytes);
+    var dst = _manifest.Manifest.init(alloc);
+    defer dst.deinit();
+    try dst.restoreFrom(bytes);
+    try expectSameManifest(&src, &dst);
+}
+
 // -------------------------------------------------------------------------
 // Restoring into a non-empty state replaces (not merges) the contents
 // -------------------------------------------------------------------------

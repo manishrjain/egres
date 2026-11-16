@@ -1043,15 +1043,19 @@ pub const Manifest = struct {
     /// Wire format reuses the existing `ManifestChange` zbuf shape: a list of
     /// `tree_changes` (CREATE per tree), `sstable_changes` (CREATE per SST),
     /// and `next_table_ids` (one per namespace).
+    ///
+    /// Written record by record into one buffer through the zbuf writers.
+    /// Building the changes as structs and marshalling them after took one
+    /// call that could not yield: 43 MB for 84,000 tenants, on a worker
+    /// sessions share. Here every record is a yield point.
     pub fn serialize(self: *Manifest, allocator: std.mem.Allocator) ![]u8 {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
+        // The name lookup, key bytes and offset lists; the output is on
+        // `allocator`.
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const a = arena.allocator();
-
-        var tree_changes: std.ArrayList(TreeChange) = .empty;
-        var table_changes: std.ArrayList(SSTableChange) = .empty;
 
         // Reverse map (ns, table_id) → table name, so a tree's CREATE change
         // below can carry its table's name — the same vehicle the live
@@ -1072,20 +1076,41 @@ pub const Manifest = struct {
             }
         }
 
+        // Sized up front: growing a buffer of tens of MB copies all of
+        // it, in a step that does not yield. Names and split keys are
+        // not counted, so it may still grow once.
+        const ssts: usize = self.ssts.count();
+        const trees: usize = self.trees.count();
+        const spaces: usize = self.namespaces.count();
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        try out.ensureTotalCapacity(
+            allocator,
+            _zen.ManifestChangeWriter.SIZE_BYTES + 4 +
+                ssts * (_zen.SSTableChangeWriter.SIZE_BYTES + 4) +
+                trees * (_zen.TreeChangeWriter.SIZE_BYTES + 4) +
+                spaces * (_zen.NamespaceWriter.SIZE_BYTES + 4),
+        );
+        // The root first, at offset 0 as a message needs it; every
+        // record lands behind it.
+        var root = try _zen.ManifestChangeWriter.initWithBuf(allocator, &out);
+
+        var tree_offsets = try std.ArrayList(u32).initCapacity(a, trees);
+        var sst_offsets = try std.ArrayList(u32).initCapacity(a, ssts);
         var it = self.trees.iterator();
         while (it.next()) |kv| {
             try fiber.ctx().meter();
             const tk = kv.key_ptr.*;
-            const tree = kv.value_ptr.*;
-            const left_raw = try tree.left.marshal(a);
-            const right_raw = try tree.right.marshal(a);
-            var change = createTreeChange(
-                tk.tree_id,
-                tk.namespace,
-                left_raw,
-                right_raw,
-                tree.kind,
-            );
+            const tree = kv.value_ptr;
+            var rec = try _zen.TreeChangeWriter.initWithBuf(allocator, &out);
+            try rec.set(.{
+                .op = .create,
+                .namespace_id = tk.namespace,
+                .tree_id = tk.tree_id,
+                .left_key = try tree.left.marshal(a),
+                .right_key = try tree.right.marshal(a),
+                .kind = tree.kind,
+            });
             // Only the table's FIRST tree carries the name — exactly one
             // tree per table has the open left bound (splits leave it with
             // the leftmost child), so a heavily-split table doesn't copy
@@ -1094,46 +1119,62 @@ pub const Manifest = struct {
                 if (tnames.get(.{
                     .namespace = tk.namespace,
                     .table_id = treeTableId(tk.tree_id),
-                })) |n|
-                    change.name = @constCast(n);
+                })) |n| try rec.setName(n);
             }
-            try tree_changes.append(a, change);
-            for (tree.levels.items, 0..) |lm, level_idx| {
-                var tit = lm.tables.iterator();
-                while (tit.next()) |tkv| {
-                    const info = self.ssts.get(tkv.key_ptr.*).?;
-                    var sst_change = createSSTableChange(
-                        tkv.key_ptr.*,
-                        tk.namespace,
-                        tk.tree_id,
-                        @intCast(level_idx),
-                        info.extent,
+            try tree_offsets.append(a, (try rec.finish()).offset);
+        }
+        // The files after every tree, as the struct marshal laid them out:
+        // 88 ms for 84,000 tenants, against 110 ms with each tree's files
+        // behind it.
+        it = self.trees.iterator();
+        while (it.next()) |kv| {
+            const tk = kv.key_ptr.*;
+            const tree = kv.value_ptr;
+            for (tree.levels.items, 0..) |lm, level| {
+                var tit = lm.tables.keyIterator();
+                while (tit.next()) |id| {
+                    try fiber.ctx().meter();
+                    const info = self.ssts.get(id.*).?;
+                    var sst = try _zen.SSTableChangeWriter.initWithBuf(
+                        allocator,
+                        &out,
                     );
-                    sst_change.raft_index = info.raft_index;
-                    try table_changes.append(a, sst_change);
+                    try sst.set(.{
+                        .op = .create,
+                        .level = @as(u32, @intCast(level)),
+                        .sst_id = id.*,
+                        .tree_id = tk.tree_id,
+                        .namespace_id = tk.namespace,
+                        .size = info.extent.size,
+                        .index_offset = info.extent.index_offset,
+                        .raft_index = info.raft_index,
+                    });
+                    try sst_offsets.append(a, (try sst.finish()).offset);
                 }
             }
         }
 
-        var namespaces: std.ArrayList(_zen.NamespaceStruct) = .empty;
+        var ns_offsets = try std.ArrayList(u32).initCapacity(a, spaces);
         var cit = self.namespaces.iterator();
         while (cit.next()) |kv| {
             try fiber.ctx().meter();
-            try namespaces.append(a, .{
+            var rec = try _zen.NamespaceWriter.initWithBuf(allocator, &out);
+            try rec.set(.{
                 .id = kv.key_ptr.*,
                 .next_table_id = kv.value_ptr.next_table_id,
-                .name = @constCast(kv.value_ptr.name),
+                .name = kv.value_ptr.name,
             });
+            try ns_offsets.append(a, (try rec.finish()).offset);
         }
 
-        // The arena holds the source changes; marshalRoot copies them into a
-        // fresh `allocator`-owned payload, so the arena can be torn down after.
-        return _zen.marshalRoot(allocator, ManifestChange{
-            .tree_changes = tree_changes.items,
-            .sstable_changes = table_changes.items,
-            .namespaces = namespaces.items,
+        try root.set(.{
+            .tree_changes = tree_offsets.items,
+            .sstable_changes = sst_offsets.items,
+            .namespaces = ns_offsets.items,
             .next_ns_id = self.next_ns_id,
         });
+        _ = try root.finishWithTail();
+        return out.toOwnedSlice(allocator);
     }
 
     /// Replace the receiver's tree contents with the deserialized state from
@@ -1166,8 +1207,20 @@ pub const Manifest = struct {
             // A snapshot of 26,000 tenants took 90 ms to restore, on a
             // worker sessions share: each loop here gives way.
 
-            // Order matters: trees must exist before tables can attach to them.
+            // Each map is sized for its records first. They come in the
+            // order the serialized map held them, and a linear-probing
+            // map fed keys in its own slot order while it is smaller
+            // than the one they came from packs them into long runs:
+            // 386,775 trees took up to 76 ms per 256 that way, 0.5 ms
+            // pre-sized.
             const tc_len = reader.treeChangesLen();
+            const tbl_len = reader.sstableChangesLen();
+            const ns_len = reader.namespacesLen();
+            try self.trees.ensureTotalCapacity(tc_len);
+            try self.ssts.ensureTotalCapacity(tbl_len);
+            try self.namespaces.ensureTotalCapacity(ns_len);
+
+            // Order matters: trees must exist before tables can attach to them.
             var i: u32 = 0;
             while (i < tc_len) : (i += 1) {
                 try fiber.ctx().meter();
@@ -1186,7 +1239,6 @@ pub const Manifest = struct {
                 });
             }
 
-            const tbl_len = reader.sstableChangesLen();
             i = 0;
             while (i < tbl_len) : (i += 1) {
                 try fiber.ctx().meter();
@@ -1206,7 +1258,6 @@ pub const Manifest = struct {
                 });
             }
 
-            const ns_len = reader.namespacesLen();
             i = 0;
             while (i < ns_len) : (i += 1) {
                 try fiber.ctx().meter();
