@@ -1663,6 +1663,48 @@ test "diskwal findIndexOlderThan returns larger of bytes and age" {
     try std.testing.expectEqual(@as(?u64, 3), ds.findIndexOlderThan(3 * 1024, 60));
 }
 
+test "diskwal bytesBetween sums the entries in (lo, hi]" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
+    defer ds.deinit();
+    try std.testing.expectEqual(@as(u64, 0), ds.bytesBetween(0, 10));
+
+    // Entry i carries 100 * i bytes, so each range sums differently.
+    const payload = "x" ** 1000;
+    for (1..11) |i| {
+        var entry = try makeLogEntryWithTimestamp(
+            alloc,
+            @intCast(i),
+            1,
+            0,
+            payload[0 .. 100 * i],
+        );
+        defer entry.deinit();
+        try ds.addEntries(&[_]zen.LogEntryBuffer{entry});
+    }
+    // A slot counts the whole stored entry, not only its data.
+    var sizes: [11]u64 = undefined;
+    var all: u64 = 0;
+    for (1..11) |i| {
+        sizes[i] = (try ds.slotAt(i)).?.data_len;
+        all += sizes[i];
+    }
+
+    try std.testing.expectEqual(all, ds.bytesBetween(0, 10));
+    try std.testing.expectEqual(
+        sizes[3] + sizes[4] + sizes[5],
+        ds.bytesBetween(2, 5),
+    );
+    try std.testing.expectEqual(sizes[10], ds.bytesBetween(9, 100));
+    try std.testing.expectEqual(@as(u64, 0), ds.bytesBetween(10, 10));
+}
+
 test "diskwal findIndexOlderThan returns null on empty WAL" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);

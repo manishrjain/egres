@@ -24,13 +24,14 @@ pub const SnapshotCfg = struct {
     max_txn_age_seconds: u64 = 60 * 60,
 
     pub const docs = .{
-        .self = "Raft snapshot triggers. Leader proposes a snapshot when WAL" ++
-            " tail bytes from head reach min_bytes OR an entry crosses" ++
-            " min_age_seconds.",
-        .min_bytes = "Snapshot triggers once WAL tail-bytes-from-head reach" ++
-            " this.",
-        .min_age_seconds = "Snapshot triggers when an entry is at least this" ++
-            " many seconds older than wall clock.",
+        .self = "Raft snapshot triggers. The leader cuts a snapshot at the" ++
+            " newest entry min_age_seconds old or with min_bytes of log" ++
+            " after it, once min_age_seconds have passed since its last" ++
+            " snapshot or the log the new one folds in reaches min_bytes.",
+        .min_bytes = "Log kept after a snapshot's cut; a snapshot that" ++
+            " folds in this much is due before min_age_seconds.",
+        .min_age_seconds = "A snapshot is cut at an entry at least this" ++
+            " many seconds old, and is due this long after the last.",
         .poll_interval_seconds = "How often the snapshot loop checks the" ++
             " criteria.",
         .orphan_min_age_seconds = "SST files the manifest does not know are" ++
@@ -871,6 +872,10 @@ pub const Engine = struct {
         // the manifest now knows every file this node needs.
         var last_scan_ms: i64 = 0;
 
+        // When this node last proposed a snapshot; 0 lets its first tick
+        // as leader take one.
+        var last_snap_ms: i64 = 0;
+
         // Sweep only when a snapshot has been installed since the last
         // look: a retire becomes deletable only by the snapshot index
         // passing it, so nothing changes in between.
@@ -899,9 +904,11 @@ pub const Engine = struct {
                 };
             }
 
-            self.maybeProposeSnapshot() catch |err| {
+            if (self.maybeProposeSnapshot(now_ms - last_snap_ms)) |proposed| {
+                if (proposed) last_snap_ms = now_ms;
+            } else |err| {
                 log.warn("maybeProposeSnapshot: {s}", .{@errorName(err)});
-            };
+            }
         }
     }
 
@@ -970,9 +977,9 @@ pub const Engine = struct {
     /// momentarily unreachable on the follower. After 160, all good.
     /// This is normal Raft follower-catchup eventual consistency, not
     /// data loss.
-    fn maybeProposeSnapshot(self: *Engine) !void {
+    fn maybeProposeSnapshot(self: *Engine, since_last_ms: i64) !bool {
         const oldest = self.forest.memtables.oldestInMemoryLogIndex();
-        if (oldest == 0) return; // no real memtable yet — nothing pinned
+        if (oldest == 0) return false; // no real memtable yet — nothing pinned
 
         // See the replay-safety invariant above. Two caps, both required:
         //   1. `oldest - 1`: every in-memory memtable's mutation history
@@ -986,17 +993,29 @@ pub const Engine = struct {
 
         const wal = self.node.log;
         const cfg = self.snapshot_cfg.cur();
-        const found = wal.findIndexOlderThan(cfg.min_bytes, cfg.min_age_seconds) orelse return;
+        const found = wal.findIndexOlderThan(
+            cfg.min_bytes,
+            cfg.min_age_seconds,
+        ) orelse return false;
         const target = @min(@min(found, memtable_cap), apply_cap);
 
         const prev_snap = wal.snapshot();
-        if (target <= prev_snap.index) return;
+        if (target <= prev_snap.index) return false;
+
+        // The target trails the head, so under steady writes it moves on
+        // every tick, and each snapshot rewrites the whole manifest: 24 MB
+        // with 50,000 databases. One is due only once min_age_seconds have
+        // passed since the last, or the log it folds in reaches min_bytes.
+        const age_due = since_last_ms >= cfg.min_age_seconds * 1000;
+        if (!age_due and
+            wal.bytesBetween(prev_snap.index, target) < cfg.min_bytes)
+            return false;
 
         // Asked of the log by index: the range read below returns
         // manifest entries only, and the target is rarely one.
         const target_slot = (try wal.slotAt(target)) orelse {
             log.warn("maybeProposeSnapshot: no slot for index={d}", .{target});
-            return;
+            return false;
         };
         const target_term = target_slot.term;
         // `Snapshot.timestamp`: `Forest.snapshot_ts` once this applies.
@@ -1032,7 +1051,7 @@ pub const Engine = struct {
         defer result.deinit();
         if (!result.eof) {
             log.warn("maybeProposeSnapshot: entries truncated by max_bytes — aborting", .{});
-            return;
+            return false;
         }
 
         var scratch: std.ArrayList(u8) = .empty;
@@ -1101,6 +1120,7 @@ pub const Engine = struct {
             .timestamp = target_ts,
         });
         log.info("snapshot proposed: index={d} term={d} bytes={d}", .{ target, target_term, data.len });
+        return true;
     }
 
     /// Single-purpose loop: when leader, propose a `newMemtable` whenever

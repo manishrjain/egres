@@ -1063,6 +1063,28 @@ pub const DiskWAL = struct {
         return null;
     }
 
+    /// Bytes of the entries in (lo, hi], from the slots alone: what a
+    /// snapshot at hi folds in past one at lo.
+    pub fn bytesBetween(self: *DiskWAL, lo: u64, hi: u64) u64 {
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
+
+        var bytes: u64 = 0;
+        var fi: usize = self.wal_store.files.items.len;
+        while (fi > 0) {
+            fi -= 1;
+            const f = &self.wal_store.files.items[fi];
+            var si: usize = f.slots.items.len;
+            while (si > 0) {
+                si -= 1;
+                const slot = f.slots.items[si];
+                if (slot.index <= lo) return bytes;
+                if (slot.index <= hi) bytes += slot.data_len;
+            }
+        }
+        return bytes;
+    }
+
     pub fn firstIndex(self: *DiskWAL) u64 {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
