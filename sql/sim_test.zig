@@ -173,6 +173,10 @@ const snapshot_cfg: engine.SnapshotCfg = .{
     .min_bytes = 256 << 10,
     .min_age_seconds = 2,
     .poll_interval_seconds = 1,
+    // Short enough that a seed's run removes orphans, and longer than a
+    // compaction from its first output to its apply, as the scan needs.
+    .orphan_min_age_seconds = 10,
+    .orphan_scan_interval_seconds = 5,
 };
 /// A log file is a 16 MiB header and then entries: 2 MiB of them here.
 const wal_opts: raft.diskwal.OpenOptions = .{
@@ -1198,6 +1202,8 @@ const Writer = struct {
         self.client = try connect(self.alloc, self.db);
         defer self.client.close();
         const found = try self.readAll(arena.allocator());
+        // A branch made as the last stretch ended, before its first read.
+        if (self.origin != null) return self.adopt(found);
         try expectRows(self.id, "restart", self.acked, found);
     }
 };
@@ -1712,6 +1718,11 @@ const Brancher = struct {
             if (after == crashes) self.branches += 1;
         }
         if (shape.drop_first_after == crashes) self.drop = true;
+        self.arm(ms);
+    }
+
+    /// Before a stretch of `ms`: when in it what is due is sent.
+    fn arm(self: *Brancher, ms: u64) void {
         if (self.due() == null) return;
         self.wait_ms = fiber.random().uintLessThan(u64, ms);
     }
@@ -1800,8 +1811,9 @@ const Brancher = struct {
         return site;
     }
 
-    /// After a restart, before the sites recover: a DROP not
-    /// acknowledged took the whole database or left all of it.
+    /// After a restart, before the sites recover, or once the faults
+    /// are over: a DROP not acknowledged took the whole database or
+    /// left all of it.
     fn recoverDrop(self: *Brancher) !void {
         if (!self.sent or self.due() != .drop) return;
         self.sent = false;
@@ -1810,9 +1822,10 @@ const Brancher = struct {
         first.state = .dropped;
     }
 
-    /// After the sites recovered: a branch not acknowledged is there
-    /// whole, one moment of its source, or not at all. Then it is
-    /// sent again in the next stretch.
+    /// After the sites recovered, or once the faults are over: a
+    /// branch not acknowledged is there whole, one moment of its
+    /// source, or not at all. Then it is sent again in the next
+    /// stretch.
     fn recoverBranch(self: *Brancher) !void {
         if (!self.sent) return;
         self.sent = false;
@@ -1964,14 +1977,32 @@ test "BIG: sim: sql branches a database under disk errors" {
     });
 }
 
+// Opt-in, up to two hours a seed: the test above over 80 crashes, so
+// one run passes over a hundred snapshots, restores and orphan scans,
+// with the branches and the drop in it.
+test "BIG: sim: sql runs long with branches under disk errors" {
+    try run(.{
+        .db = "src",
+        .crashes = 80,
+        .stretch_ms = 500,
+        .stretch_more_ms = 4000,
+        .body_max = 6000,
+        .faults = true,
+        .branch_after = &.{ 1, 40 },
+        .drop_first_after = 60,
+        .compacts = true,
+    });
+}
+
 // Opt-in: bank tables that split while transfers run, so a transfer's
 // two rows are in two trees of one table as often as in two tables.
+// The live rows of a table alone pass the split size.
 test "BIG: sim: sql splits the bank tables under transfers" {
     try run(.{
         .crashes = 10,
         .stretch_ms = 500,
         .stretch_more_ms = 4000,
-        .accounts = 1024,
+        .accounts = 2048,
         .opening = 50,
         .memo_max = 3000,
         .faults = true,
@@ -2063,11 +2094,11 @@ fn run(shape: Shape) !void {
         for (sites.items) |*site| try site.recover();
         try brancher.recoverBranch();
     }
-    // Every branch and the drop of this shape happened.
-    try testing.expect(brancher.due() == null);
 
-    // A last stretch, a clean stop, and a restart that must lose nothing.
+    // A last stretch, a clean stop, and a restart that must lose
+    // nothing. What a crash or a refusal left due is sent in it.
     resources.endShutdowns();
+    brancher.arm(1000);
     try resources.start();
     try runClients(
         alloc,
@@ -2078,11 +2109,17 @@ fn run(shape: Shape) !void {
         endWithoutCrash,
     );
     try firstFailure(sites.items);
+    if (brancher.failed) |err| return err;
     try stillUp(booted.?);
     try resources.clear();
     if (shape.faults) {
         // The faults are over: every statement is answered again, the
-        // first of each writer the read of what it had in flight.
+        // first of each writer the read of what it had in flight. What
+        // the brancher had in flight is looked up, and what is still
+        // due is sent once more, where a refusal fails the run.
+        try brancher.recoverDrop();
+        try brancher.recoverBranch();
+        brancher.arm(500);
         try runClients(
             alloc,
             sites.items,
@@ -2092,7 +2129,10 @@ fn run(shape: Shape) !void {
             stillUp,
         );
         try firstFailure(sites.items);
+        if (brancher.failed) |err| return err;
     }
+    // Every branch and the drop of this shape happened.
+    try testing.expect(brancher.due() == null);
     close(sites.items, booted.?);
     booted = null;
     booted = try Instance.open(alloc, dir);

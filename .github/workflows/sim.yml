@@ -25,7 +25,8 @@ on:
     inputs:
       hours:
         description: >-
-          Whole hours of seeds per job, at most 3. Empty: each
+          Whole hours of seeds per job, cut to what fits beside the
+          variant's limit: at most 3, and 1 for long. Empty: each
           variant's own.
         default: ''
 
@@ -35,7 +36,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [errors, many-crashes, branches]
+        variant: [errors, many-crashes, branches, long]
         shard: [0, 1]
         include:
           # Four crashes, with disk errors while the writers run.
@@ -58,6 +59,13 @@ jobs:
             filter: 'BIG: sim: sql branches'
             hours: 3
             limit_s: 7200
+          # The branches test over 80 crashes: a seed takes up to two
+          # hours here, so seeds start in the first hour and each gets
+          # four.
+          - variant: long
+            filter: 'BIG: sim: sql runs long'
+            hours: 1
+            limit_s: 14400
     runs-on: ubuntu-latest
     # The build, the hours, and the last seeds in flight, each up to
     # its limit: five hours of seeds for every variant. Under the
@@ -89,7 +97,10 @@ jobs:
           LIMIT_S: ${{ matrix.limit_s }}
         run: |
           first=$((GITHUB_RUN_NUMBER * 1000000 + SHARD * 100000 + 1))
-          scripts/sim_soak.sh "$RUNNER_TEMP/sim" "$HOURS" "$(nproc)" \
+          # The hours and the last seed's limit fit in five hours.
+          most=$(((5 * 3600 - LIMIT_S) / 3600))
+          hours=$((HOURS < most ? HOURS : most))
+          scripts/sim_soak.sh "$RUNNER_TEMP/sim" "$hours" "$(nproc)" \
               "$FILTER" "$first" "$LIMIT_S"
 
       - name: Summary
