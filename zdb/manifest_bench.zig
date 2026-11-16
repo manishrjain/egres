@@ -2,22 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! A snapshot's manifest written and read back, on a real one: the
-//! snapshot in `snapshot.bin` from a server's WAL directory, named by
-//! EGRES_SNAPSHOT_BIN (skipped when it is not set), its manifest read
-//! from the store directory EGRES_STORE_DIR names. A snapshot.bin from
-//! before the manifest moved to the store holds it inline and needs no
-//! store. The tenancy benchmark's 84,000 databases give a 43 MB
-//! manifest.
+//! snapshot in the raft log of the WAL directory EGRES_WAL_DIR names
+//! (skipped when it is not set), its manifest read from the store
+//! directory EGRES_STORE_DIR names. The WAL opens as the server opens
+//! it, so point it at a stopped server's directory or a copy. The
+//! tenancy benchmark's 84,000 databases give a 43 MB manifest.
 //!
-//! Run with `EGRES_SNAPSHOT_BIN=<wal>/snapshot.bin
-//! EGRES_STORE_DIR=<store> zig build bench -Drelease -- --filter
-//! "snapshot manifest"`.
+//! Run with `EGRES_WAL_DIR=<wal> EGRES_STORE_DIR=<store> zig build
+//! bench -Drelease -- --filter "snapshot manifest"`.
 
 const std = @import("std");
 const utils = @import("utils");
 const String = utils.String;
 const zdb = @import("zdb");
-const zbuf = @import("zbuf").zbuf;
 const raft = @import("raft");
 const fiber = @import("zfiber");
 const galloc = @import("galloc");
@@ -34,23 +31,23 @@ fn load(gpa: std.mem.Allocator, m: *Manifest) !void {
     try m.restoreFrom(raw);
 }
 
-/// The serialized manifest of the snapshot EGRES_SNAPSHOT_BIN names.
-/// Caller frees.
+/// The serialized manifest of the snapshot in the log EGRES_WAL_DIR
+/// names. Caller frees.
 fn loadRaw(gpa: std.mem.Allocator) ![]u8 {
-    const env = std.c.getenv("EGRES_SNAPSHOT_BIN") orelse
+    const wal_dir = std.c.getenv("EGRES_WAL_DIR") orelse
         return error.SkipZigTest;
-    const path: String = std.mem.span(env);
-    const file = try vfs.readFile(path, gpa);
-    defer gpa.free(file);
-    const payload = try zbuf.Frame.read(file);
-    const raft_snap = try raft.buffers.SnapshotReader.parseRoot(payload);
-    // Not a SnapshotObject: the manifest itself, from before it moved.
-    const snap = zdb.buffers.SnapshotObjectReader.parseRoot(
-        raft_snap.data(),
-    ) catch return gpa.dupe(u8, raft_snap.data());
-    const dir = std.c.getenv("EGRES_STORE_DIR") orelse
+    const store_dir = std.c.getenv("EGRES_STORE_DIR") orelse
         return error.SkipZigTest;
-    var store = try vfs.Store.initFile(gpa, std.mem.span(dir), vfs.g());
+
+    var wal = try raft.DiskWAL.openPath(std.mem.span(wal_dir), gpa, .{});
+    defer wal.deinit();
+    const raft_snap = wal.snapshot();
+    if (raft_snap.data.len == 0) return error.NoSnapshot;
+    const snap = try zdb.buffers.SnapshotObjectReader.parseRoot(
+        raft_snap.data,
+    );
+
+    var store = try vfs.Store.initFile(gpa, std.mem.span(store_dir), vfs.g());
     defer store.deinit();
     return zdb.snapshot.read(gpa, &store, try snap.toStructValue(gpa));
 }

@@ -190,8 +190,8 @@ pub const ManifestChange = schema.Table(&.{
 
 // What a raft snapshot's `data` holds: where its manifest is. The
 // manifest is an object in the store, put before the snapshot is
-// proposed (zdb/snapshot.zig), so the log and each node's
-// snapshot.bin carry these bytes and not the manifest's tens of MB.
+// proposed (zdb/snapshot.zig), so the log carries these bytes and not
+// the manifest's tens of MB.
 pub const SnapshotObject = schema.Table(&.{
     // The object is named `<id:016x>.snap`.
     .{ .id = 1, .name = "id", .ty = schema.U64 },

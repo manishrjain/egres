@@ -13,19 +13,12 @@ const String = utils.String;
 const _meta = @import("meta.zig");
 
 // DiskWAL handles disk access and writes for the Raft write-ahead log.
-// Directory layout contains `wal.meta` and `<start-idx>.wal` log files.
+// The directory holds `state.bin`, the HardState (raft/meta.zig), and
+// the `<start-idx>.wal` log files.
 //
-// === wal.meta file ===
-// This file is small and intended to stay in one page.
-//
-// Layout:
-// 00-08 bytes: Raft ID
-// 08-16 bytes: Group ID
-// 16-24 bytes: Checkpoint index
-// 512 bytes: HardState (marshalled)
-// 1024-1032 bytes: Snapshot index
-// 1032-1040 bytes: Snapshot term
-// 1040 bytes: Snapshot (marshalled)
+// The snapshot is an entry in the log: the `.snapshot` entry that
+// `HardState.snapshot_entry_index` names, read back at open. It sits
+// above the index it covers, so the cleanup below keeps it.
 //
 // --- cleanup ---
 // If snapshot index is `idx_s`, keep the first log file whose first entry is <= `idx_s`,
@@ -75,7 +68,6 @@ pub const HardStateUpdate = struct {
     current_term: ?u64 = null,
     voted_for: ?u64 = null,
     raft_id: ?u64 = null,
-    checkpoint_index: ?u64 = null,
     commit_index: ?u64 = null,
 };
 
@@ -901,9 +893,11 @@ pub const wal = struct {
 
 pub const DiskWAL = struct {
     allocator: std.mem.Allocator,
-    /// MetaStore owns the in-memory authoritative HardState + Snapshot, so
-    /// the old `hard_state_cache` + `snapshot_cache` pointers go away.
+    /// The durable HardState, and the in-memory copy of it.
     meta: _meta.MetaStore,
+    /// The installed snapshot, as its `.snapshot` entry in the log
+    /// carries it (`setSnapshot`). Heap-owned: replaced whole.
+    snap: *Snapshot,
     wal_store: wal,
     /// Single rwlock guarding all DiskWAL state — covers both `meta` and
     /// `wal_store` since the public API (hardState/snapshot/append/...)
@@ -943,12 +937,19 @@ pub const DiskWAL = struct {
         var wf = try wal.openPath(path, allocator, opts);
         errdefer wf.deinit();
 
+        const snap = try openSnapshot(
+            &wf,
+            allocator,
+            ms.hardState().snapshot_entry_index,
+        );
+        errdefer snap.destroy(allocator);
+
         // Verify the WAL forms an unbroken chain from snap.index+1
         // forward. Pre-snapshot entries on disk are fine — apply_index
         // jumps over them. A gap is data loss past the snapshot; the
         // verify routine truncates the stranded tail and lets raft
         // re-replicate from the leader.
-        try wf.verifyChain(ms.snapshotState().index + 1);
+        try wf.verifyChain(snap.index + 1);
 
         // Recovery: every entry the wal just discovered is on disk and durable.
         wf.buf.setSynced(wf.lastIndex());
@@ -956,12 +957,64 @@ pub const DiskWAL = struct {
         return .{
             .allocator = allocator,
             .meta = ms,
+            .snap = snap,
             .wal_store = wf,
         };
     }
 
+    /// The snapshot the `.snapshot` entry at `index` carries, read from
+    /// `wf`; an empty one when `index` is 0, before the first snapshot.
+    /// error.SnapshotEntryMissing when the log does not hold that entry:
+    /// HardState names one only once it is on disk.
+    fn openSnapshot(
+        wf: *wal,
+        alloc: std.mem.Allocator,
+        index: u64,
+    ) !*Snapshot {
+        if (index == 0) {
+            const empty = try alloc.create(Snapshot);
+            empty.* = .{};
+            return empty;
+        }
+
+        var result = try readEntry(wf, alloc, index);
+        defer result.deinit();
+        if (result.entries.len != 1 or result.entries[0].index != index)
+            return error.SnapshotEntryMissing;
+
+        const ent = try zen.LogEntryReader.parseRoot(result.entries[0].bytes);
+        if (ent.entryType() != .snapshot) return error.SnapshotEntryMissing;
+
+        // Stored as `Node.propose` stored it, compressed when that paid.
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(alloc);
+        const payload = try utils.compression.maybeUnpack(
+            alloc,
+            ent.codec(),
+            ent.data(),
+            &scratch,
+        );
+        return (try zen.SnapshotReader.parseRoot(payload)).toStruct(alloc);
+    }
+
+    /// The entry at `index` from `wf`, as `entriesRange` reads one.
+    fn readEntry(
+        wf: *wal,
+        alloc: std.mem.Allocator,
+        index: u64,
+    ) !EntriesResult {
+        var planned = try wf.planEntries(alloc, .{
+            .lo = index,
+            .hi = index + 1,
+        });
+        errdefer planned.arena.deinit();
+        defer wf.pins.unpin(planned.pin);
+        return wf.readPlanned(&planned);
+    }
+
     pub fn deinit(self: *DiskWAL) void {
         self.wal_store.deinit();
+        self.snap.destroy(self.allocator);
         self.meta.deinit();
         // `mu` is .tracked — unlink it from the lock registry before the
         // struct's memory dies, else a later dumpLocks/unregister walk dangles.
@@ -1005,21 +1058,51 @@ pub const DiskWAL = struct {
         if (update.current_term) |v| next.current_term = v;
         if (update.voted_for) |v| next.voted_for = v;
         if (update.raft_id) |v| next.raft_id = v;
-        if (update.checkpoint_index) |v| next.checkpoint_index = v;
         if (update.commit_index) |v| next.commit_index = v;
         self.meta.setHardState(next) catch |err| return mapToRaftLogError(err);
     }
 
+    /// The installed snapshot. Valid until the next `setSnapshot`.
     pub fn snapshot(self: *DiskWAL) *const Snapshot {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
-        return self.meta.snapshotState();
+        return self.snap;
     }
 
-    pub fn setSnapshot(self: *DiskWAL, snap: Snapshot) RaftLogError!void {
+    /// Install `snap`, which the `.snapshot` entry at `entry_index`
+    /// carries. That entry is the durable copy: HardState is pointed at
+    /// it, an open reads it back, and the caller may cut the log below
+    /// `snap.index` once this returns. The entry is above `snap.index`,
+    /// so that cut keeps it until a later snapshot's passes it, by when
+    /// HardState names the later one's entry.
+    pub fn setSnapshot(
+        self: *DiskWAL,
+        snap: Snapshot,
+        entry_index: u64,
+    ) RaftLogError!void {
+        // Applied means committed, which a leader's followers can settle
+        // before its own write of the entry lands: HardState must not
+        // name an entry a crash here could still lose. A reset is a
+        // truncation, which only takes entries above a committed one.
+        const buf = &self.wal_store.buf;
+        while (true) {
+            buf.waitSynced(entry_index) catch |err| switch (err) {
+                error.Reset => continue,
+                else => return mapToRaftLogError(err),
+            };
+            break;
+        }
+        const copy = try snap.clone(self.allocator);
+        errdefer copy.destroy(self.allocator);
+
         self.mu.lock(@src());
         defer self.mu.unlock();
-        self.meta.setSnapshot(snap) catch |err| return mapToRaftLogError(err);
+
+        var next = self.meta.hardState().*;
+        next.snapshot_entry_index = entry_index;
+        self.meta.setHardState(next) catch |err| return mapToRaftLogError(err);
+        self.snap.destroy(self.allocator);
+        self.snap = copy;
     }
 
     /// Find the highest raft index whose tail (slots from there to the head)
@@ -1107,7 +1190,7 @@ pub const DiskWAL = struct {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         const last_idx = self.wal_store.lastIndex();
-        const snap_term = self.meta.snapshotState().term;
+        const snap_term = self.snap.term;
         if (last_idx == 0) return snap_term;
         return self.wal_store.term(last_idx) catch snap_term;
     }
@@ -1217,9 +1300,8 @@ pub const DiskWAL = struct {
     /// (a follower truncating a conflicting suffix): what was waited for
     /// is then gone, or is being re-appended and gets waited for anew.
     pub fn sync(self: *DiskWAL) RaftLogError!void {
-        // MetaStore writes are durable inline (state.bin opens with O_DSYNC,
-        // snapshot.bin uses tmp+rename+dir-sync), so only the WAL needs an
-        // explicit sync here.
+        // MetaStore writes are durable inline (state.bin opens with
+        // O_DSYNC), so only the WAL needs an explicit sync here.
         while (true) {
             const index = self.lastIndex();
             self.wal_store.buf.waitSynced(index) catch |err| switch (err) {

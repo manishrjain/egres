@@ -1,18 +1,14 @@
 // Copyright 2026 Manish R Jain
 // SPDX-License-Identifier: Apache-2.0
 
-// MetaStore — durable HardState + Snapshot for the Raft log.
+// MetaStore — durable HardState for the Raft log.
 //
 //   state.bin     — 8 KiB, two-slot double-buffered HardState. Opened with
 //                   O_DSYNC so each pwrite is durable on return — no
 //                   explicit fdatasync syscall per write.
-//   snapshot.bin  — variable size, atomically replaced via `snapshot.tmp` +
-//                   rename + dir-fsync. The tmp file is also O_DSYNC, so a
-//                   single write is durable on return (POSIX guarantees the
-//                   file-size update is part of data-integrity sync, since
-//                   without it the new bytes wouldn't be retrievable). The
-//                   payload is wrapped in a zbuf frame so we detect torn
-//                   bytes on read.
+//
+// The snapshot has no file of its own: it is the `.snapshot` entry in the
+// log that `HardState.snapshot_entry_index` names (DiskWAL.setSnapshot).
 //
 // The double-buffer protects HardState against torn writes: each slot is a
 // zbuf frame around a serialized HardState, and HardState carries its own
@@ -21,9 +17,8 @@
 // fails the frame's hash check and recovery silently returns the previous
 // (older) durable state.
 //
-// HardState changes (votes, term bumps) are durable when `setHardState`
-// returns. Snapshots are durable when `setSnapshot` returns. There is no
-// separate `MetaStore.sync()`
+// HardState changes (votes, term bumps, the snapshot's entry) are durable
+// when `setHardState` returns. There is no separate `MetaStore.sync()`.
 //
 // All file I/O goes through `vfs`. Directory creation and existence checks
 // use `std.fs.cwd()` because they're path-metadata operations, not data I/O.
@@ -40,34 +35,22 @@ const slot_count: usize = 2;
 const state_file_size: usize = slot_size * slot_count;
 
 const state_file_name = "state.bin";
-const snapshot_file_name = "snapshot.bin";
-const snapshot_tmp_name = "snapshot.tmp";
 
 pub const Error = error{
     MetaCorrupt,
-    SnapshotCorrupt,
     PayloadTooLarge,
     InvalidEncoding,
 };
 
 pub const MetaStore = struct {
     allocator: std.mem.Allocator,
-    /// Owned dup of the directory path. All file paths are derived from this.
-    dir_path: []u8,
-    /// Open with O_DSYNC so per-write fdatasync is implicit.
-    /// What the files open through: the WAL device's VFS.
-    vfs: *const _vfs.VFS,
+    /// Open with O_DSYNC so per-write fdatasync is implicit, through the
+    /// WAL device's VFS.
     state_file: _vfs.FileHandle,
 
     /// Authoritative in-memory state. Updated only after the corresponding
-    /// disk write has been durable.
-    /// HardState is stored by value because all its fields are scalars; copy
-    /// is free. Snapshot is heap-owned because it carries `data: String`
-    /// (and a `conf_state` with its own peers slice) — keeping a single
-    /// `*Snapshot` lets the swap path use `clone`/`destroy`, which is what
-    /// the legacy metaFile did and avoids any shallow-copy ownership puzzles.
+    /// disk write has been durable. By value: all its fields are scalars.
     hard_state: zen.HardStateStruct,
-    snapshot: *zen.SnapshotStruct,
 
     /// Index of the currently-durable slot (0 = slot A at offset 0,
     /// 1 = slot B at offset 4096). The next write goes to `1 - active_slot`.
@@ -83,9 +66,6 @@ pub const MetaStore = struct {
             error.FileNotFound => try _vfs.createDirPath(path),
             else => return err,
         };
-
-        const dir_path = try alloc.dupe(u8, path);
-        errdefer alloc.free(dir_path);
 
         const state_path = try std.fs.path.join(alloc, &.{ path, state_file_name });
         defer alloc.free(state_path);
@@ -118,21 +98,10 @@ pub const MetaStore = struct {
             try _vfs.syncDir(path);
         }
 
-        // Allocate a default-empty Snapshot pointer up front so subsequent
-        // `recoverSnapshot` / `setSnapshot` calls have a uniform "destroy
-        // old, install new" path. The empty struct has `.data = &.{}` so
-        // `destroy` is a no-op for the default.
-        const empty_snap = try alloc.create(zen.SnapshotStruct);
-        errdefer alloc.destroy(empty_snap);
-        empty_snap.* = .{};
-
         var ms: MetaStore = .{
             .allocator = alloc,
-            .dir_path = dir_path,
-            .vfs = vfs,
             .state_file = state_file,
             .hard_state = .{},
-            .snapshot = empty_snap,
             .active_slot = 0,
         };
 
@@ -147,40 +116,17 @@ pub const MetaStore = struct {
             try ms.recoverHardState();
         }
 
-        // Clean up a stale snapshot.tmp left by a previous crashed setSnapshot.
-        // The old snapshot.bin (if any) is unaffected because rename hadn't
-        // run yet — the half-written tmp is just discarded.
-        const tmp_path = try std.fs.path.join(alloc, &.{ dir_path, snapshot_tmp_name });
-        defer alloc.free(tmp_path);
-        _vfs.deleteFile(tmp_path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
-
-        try ms.recoverSnapshot();
-
         return ms;
     }
 
     pub fn deinit(self: *MetaStore) void {
-        // destroy walks deinit (frees data + conf_state peers) then the
-        // outer allocator.destroy. Safe even for the default-empty pointer.
-        self.snapshot.destroy(self.allocator);
         self.state_file.close();
-        self.allocator.free(self.dir_path);
     }
 
     /// Returns a pointer to the in-memory authoritative HardState. Valid
     /// until the next setHardState call. Cheap; no allocation.
     pub fn hardState(self: *const MetaStore) *const zen.HardStateStruct {
         return &self.hard_state;
-    }
-
-    /// Returns a pointer to the in-memory authoritative Snapshot. Valid
-    /// until the next setSnapshot call. The pointed-to Snapshot's `data`
-    /// slice is owned by MetaStore and must not be freed by the caller.
-    pub fn snapshotState(self: *const MetaStore) *const zen.SnapshotStruct {
-        return self.snapshot;
     }
 
     /// Persist a new HardState. Returns only after the new value is durable
@@ -197,61 +143,6 @@ pub const MetaStore = struct {
         try self.writeSlot(next, inactive_slot);
         self.hard_state = next;
         self.active_slot = inactive_slot;
-    }
-
-    /// Persist a new Snapshot. Variable-size payload, so we use the
-    /// `tmp + rename + dir-fsync` atomic-replace pattern. The tmp file is
-    /// O_DSYNC-opened so the bytes (and the file-size update) are durable
-    /// on `write()` return — no explicit tmp.sync() syscall. dir-fsync is
-    /// still required to make the rename itself crash-safe.
-    pub fn setSnapshot(self: *MetaStore, snap: zen.SnapshotStruct) !void {
-        // Serialize the snapshot via the struct's own marshalTo, then append
-        // the zbuf tail. Passing `off` lets zbuf validate the root-at-zero
-        // invariant even though the tail only stores the table id.
-        var zbuf_bytes: std.ArrayList(u8) = .empty;
-        defer zbuf_bytes.deinit(self.allocator);
-        // marshalTo on an empty buffer puts the root at offset 0, which is
-        // what the tail-only-table_id format requires.
-        const off = try snap.marshalTo(self.allocator, &zbuf_bytes);
-        // TODO: Use zen.addTail
-        try zbuf.appendMessageTail(&zbuf_bytes, self.allocator, zen.SnapshotReader.TABLE_ID, off);
-
-        // Wrap with a zbuf frame so we detect a torn pwrite (e.g. a power
-        // loss mid-write of a multi-MB snapshot) on the next recovery.
-        var file_buf: std.ArrayList(u8) = .empty;
-        defer file_buf.deinit(self.allocator);
-        _ = try zbuf.Frame.append(&file_buf, self.allocator, zbuf_bytes.items);
-
-        const tmp_path = try std.fs.path.join(self.allocator, &.{ self.dir_path, snapshot_tmp_name });
-        defer self.allocator.free(tmp_path);
-        const final_path = try std.fs.path.join(self.allocator, &.{ self.dir_path, snapshot_file_name });
-        defer self.allocator.free(final_path);
-
-        // Stage the bytes in snapshot.tmp. O_DSYNC means write() returns
-        // only after the bytes AND the file-size update are durable.
-        {
-            var tmp = try self.vfs.createFile(tmp_path, .{
-                .flags = .{ .writable = true, .truncate = true, .dsync = true },
-            });
-            defer tmp.close();
-            try tmp.write(file_buf.items, 0);
-        }
-
-        // Atomic rename — POSIX guarantees the directory entry flips
-        // either fully to the new inode or stays at the old one.
-        try _vfs.renameFile(tmp_path, final_path);
-
-        // The rename is durable only after the directory's sync. Until
-        // it is, the caller must not act on the new snapshot: a power
-        // cut can bring the old one back, and it needs its files.
-        try _vfs.syncDir(self.dir_path);
-
-        // Replace the in-memory snapshot. clone returns a heap-allocated
-        // *SnapshotStruct that deeply owns its data + conf_state, so after
-        // destroying the old pointer we just install the new one.
-        const new_snap = try snap.clone(self.allocator);
-        self.snapshot.destroy(self.allocator);
-        self.snapshot = new_snap;
     }
 
     // --- internals -----------------------------------------------------
@@ -329,41 +220,5 @@ pub const MetaStore = struct {
     fn parseSlot(slot: String) ?zen.HardStateReader {
         const payload = zbuf.Frame.read(slot) catch return null;
         return zen.HardStateReader.parseRoot(payload) catch null;
-    }
-
-    fn recoverSnapshot(self: *MetaStore) !void {
-        const final_path = try std.fs.path.join(self.allocator, &.{ self.dir_path, snapshot_file_name });
-        defer self.allocator.free(final_path);
-
-        var handle = self.vfs.openFile(
-            self.allocator,
-            final_path,
-            .{},
-        ) catch |err| switch (err) {
-            error.FileNotFound => return, // No snapshot yet; keep default-zero.
-            else => return err,
-        };
-        defer handle.close();
-
-        if (handle.file_size == 0) return; // Treat empty file as no snapshot.
-
-        const result = try handle.readAligned(
-            self.allocator,
-            0,
-            @intCast(handle.file_size),
-        );
-        defer result.free();
-        const buf = result.data;
-
-        // zbuf.frame validates length-fits-in-buf and verifies the hash
-        // in one pass; either failure mode means the snapshot is corrupt.
-        const payload = zbuf.Frame.read(buf) catch return Error.SnapshotCorrupt;
-
-        const reader = try zen.SnapshotReader.parseRoot(payload);
-        // toStruct returns a *SnapshotStruct that owns its data + conf_state.
-        // Same destroy/install pattern as setSnapshot.
-        const new_snap = try reader.toStruct(self.allocator);
-        self.snapshot.destroy(self.allocator);
-        self.snapshot = new_snap;
     }
 };

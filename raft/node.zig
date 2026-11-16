@@ -903,13 +903,19 @@ pub const Node = struct {
 
     /// Build the current conf state from the peers map (including self).
     /// Caller must deinit the returned ConfState.
-    /// Apply a `.snapshot` log entry: parse the marshalled SnapshotStruct,
-    /// install via `setSnapshot`, then trim log files below it. Idempotent —
-    /// skips if the snapshot index is at or below the current snapshot.
+    /// Apply a `.snapshot` log entry, at `entry_index`: parse the
+    /// marshalled SnapshotStruct, install it via `setSnapshot`, which
+    /// keeps the entry as its durable copy, then trim log files below
+    /// it. Idempotent — skips if the snapshot index is at or below the
+    /// current snapshot, as a restart's replay of the installed one is.
     /// The state machine's data is not touched (the Forest is updated by
     /// the normal `.manifest` applies; this only affects WAL state), but
     /// it is told (`snapshotInstalled`), in log order.
-    fn applySnapshotEntry(self: *Node, payload: String) !void {
+    fn applySnapshotEntry(
+        self: *Node,
+        payload: String,
+        entry_index: u64,
+    ) !void {
         const new_snap = try zen.SnapshotReader.parseRoot(payload);
         const cur = self.log.snapshot();
         if (new_snap.index() <= cur.index) return;
@@ -919,7 +925,7 @@ pub const Node = struct {
             snap_ptr.deinit(self.allocator);
             self.allocator.destroy(snap_ptr);
         }
-        try self.log.setSnapshot(snap_ptr.*);
+        try self.log.setSnapshot(snap_ptr.*, entry_index);
         self.log.compactUntil(snap_ptr.index) catch |err| {
             raft_log.warn("compactUntil({d}): {s}", .{ snap_ptr.index, @errorName(err) });
         };
@@ -2050,7 +2056,7 @@ pub const Node = struct {
                         );
                     }
                 } else if (ety == .snapshot and data.len > 0) {
-                    self.applySnapshotEntry(data) catch |err| {
+                    self.applySnapshotEntry(data, entry.index) catch |err| {
                         raft_log.err("applySnapshotEntry at index={d}: {s}", .{ entry.index, @errorName(err) });
                     };
                 }

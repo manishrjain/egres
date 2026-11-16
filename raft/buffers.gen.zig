@@ -2190,7 +2190,7 @@ pub const HardStateStruct = struct {
     current_term: u64 = 0,
     voted_for: u64 = 0,
     raft_id: u64 = 0,
-    checkpoint_index: u64 = 0,
+    snapshot_entry_index: u64 = 0,
     commit_index: u64 = 0,
     pub fn deinit(self: *HardStateStruct, alloc: std.mem.Allocator) void {
         _ = self;
@@ -2208,7 +2208,7 @@ pub const HardStateStruct = struct {
             .current_term = self.current_term,
             .voted_for = self.voted_for,
             .raft_id = self.raft_id,
-            .checkpoint_index = self.checkpoint_index,
+            .snapshot_entry_index = self.snapshot_entry_index,
             .commit_index = self.commit_index,
         };
         errdefer s.deinit(alloc);
@@ -2228,7 +2228,7 @@ pub const HardStateStruct = struct {
         try writer.setCurrentTerm(self.current_term);
         try writer.setVotedFor(self.voted_for);
         try writer.setRaftId(self.raft_id);
-        try writer.setCheckpointIndex(self.checkpoint_index);
+        try writer.setSnapshotEntryIndex(self.snapshot_entry_index);
         try writer.setCommitIndex(self.commit_index);
         const result = try writer.finish();
         return result.offset;
@@ -2266,7 +2266,7 @@ pub const HardStateReader = struct {
         return self.t.scalar(u64, 26);
     }
 
-    pub fn checkpointIndex(self: Self) u64 {
+    pub fn snapshotEntryIndex(self: Self) u64 {
         return self.t.scalar(u64, 34);
     }
 
@@ -2280,7 +2280,7 @@ pub const HardStateReader = struct {
         try writer.setCurrentTerm(self.currentTerm());
         try writer.setVotedFor(self.votedFor());
         try writer.setRaftId(self.raftId());
-        try writer.setCheckpointIndex(self.checkpointIndex());
+        try writer.setSnapshotEntryIndex(self.snapshotEntryIndex());
         try writer.setCommitIndex(self.commitIndex());
         const result = try writer.finish();
         return result.offset;
@@ -2295,7 +2295,7 @@ pub const HardStateReader = struct {
             .current_term = self.currentTerm(),
             .voted_for = self.votedFor(),
             .raft_id = self.raftId(),
-            .checkpoint_index = self.checkpointIndex(),
+            .snapshot_entry_index = self.snapshotEntryIndex(),
             .commit_index = self.commitIndex(),
         };
         errdefer s.deinit(alloc);
@@ -2344,7 +2344,7 @@ pub const HardStateWriter = struct {
         return self.w.setScalar(u64, 26, v);
     }
 
-    pub fn setCheckpointIndex(self: *Self, v: u64) Error!void {
+    pub fn setSnapshotEntryIndex(self: *Self, v: u64) Error!void {
         return self.w.setScalar(u64, 34, v);
     }
 
@@ -2361,7 +2361,7 @@ pub const HardStateWriter = struct {
         if (@hasField(Values, "current_term")) try self.setCurrentTerm(@field(values, "current_term"));
         if (@hasField(Values, "voted_for")) try self.setVotedFor(@field(values, "voted_for"));
         if (@hasField(Values, "raft_id")) try self.setRaftId(@field(values, "raft_id"));
-        if (@hasField(Values, "checkpoint_index")) try self.setCheckpointIndex(@field(values, "checkpoint_index"));
+        if (@hasField(Values, "snapshot_entry_index")) try self.setSnapshotEntryIndex(@field(values, "snapshot_entry_index"));
         if (@hasField(Values, "commit_index")) try self.setCommitIndex(@field(values, "commit_index"));
     }
 

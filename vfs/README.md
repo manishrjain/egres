@@ -110,9 +110,8 @@ and bytes from before the failed sync and nothing from after it.
 ## The rules in the code
 
 1. A rename is followed by `syncDir` on its directory before anything
-   depends on the new name: the raft snapshot
-   (`MetaStore.setSnapshot`) and the WAL file prepared ahead of a
-   rotation (`NextLog.rename`).
+   depends on the new name: the WAL file prepared ahead of a rotation
+   (`NextLog.rename`).
 2. A file created under its final name gets `syncDir` as well: an SST
    (`Store.sync`, once per batch of puts), the WAL file created at a
    rotation and the raft state file. On ext4 and XFS its own sync

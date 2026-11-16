@@ -1,8 +1,8 @@
 // Copyright 2026 Manish R Jain
 // SPDX-License-Identifier: Apache-2.0
 
-//! A raft snapshot's manifest, as an object in the store. The log and
-//! each node's snapshot.bin carry only a `SnapshotObject` naming it.
+//! A raft snapshot's manifest, as an object in the store. The log
+//! carries only a `SnapshotObject` naming it.
 //! Inline, the manifest, 43 MB with 84,000 databases, was written to
 //! every node's WAL and sent to every follower, after one lz4 call
 //! over all of it that held its worker.

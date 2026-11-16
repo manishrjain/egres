@@ -88,6 +88,21 @@ fn makeTypedEntry(
     return writer.finishWithTail();
 }
 
+/// A `.snapshot` entry at `index` carrying `snap`, as
+/// `Node.proposeSnapshot` proposes one.
+fn appendSnapshot(
+    alloc: std.mem.Allocator,
+    log: *raft.DiskWAL,
+    index: u64,
+    snap: raft.diskwal.Snapshot,
+) !void {
+    const payload = try zen.marshalRoot(alloc, snap);
+    defer alloc.free(payload);
+    var entry = try makeTypedEntry(alloc, index, .snapshot, payload);
+    defer entry.deinit();
+    try log.addEntries(&[_]zen.LogEntryBuffer{entry});
+}
+
 fn appendEntry(
     alloc: std.mem.Allocator,
     log: *raft.DiskWAL,
@@ -643,10 +658,10 @@ test "diskwal drops malformed trailing wal files on reopen" {
 }
 
 test "diskwal tolerates WAL firstIndex below snapshot+1 on reopen" {
-    // Crash recovery scenario: meta-store records a snapshot at index N,
-    // but WAL compaction (which deletes pre-snapshot files) hadn't
-    // completed before the kill. On reopen we should accept the WAL —
-    // the extra pre-snapshot entries are harmless because apply_index
+    // Crash recovery scenario: a snapshot at index N is installed, but
+    // the compaction after it (which deletes pre-snapshot files) hadn't
+    // run before the kill. On reopen we should accept the WAL — the
+    // extra pre-snapshot entries are harmless because apply_index
     // initializes to snap.index, skipping them. Only a true gap
     // (firstIndex > snap.index+1, missing entries) is data loss.
     const alloc = std.testing.allocator;
@@ -656,17 +671,125 @@ test "diskwal tolerates WAL firstIndex below snapshot+1 on reopen" {
         alloc.free(wal_dir);
     }
 
+    const snap: raft.diskwal.Snapshot = .{
+        .index = 5,
+        .term = 1,
+        .data = "snap",
+    };
     {
         var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
         defer ds.deinit();
-        const log = &ds;
-        try log.setSnapshot(.{ .index = 5, .term = 2, .data = "snap" });
-        try log.sync();
+        try appendRange(alloc, &ds, 1, 5, 1);
+        try appendSnapshot(alloc, &ds, 6, snap);
+        try ds.setSnapshot(snap, 6);
     }
 
     // Used to error.CorruptLogFile; now succeeds.
     var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
     defer ds.deinit();
+    try std.testing.expectEqual(@as(u64, 5), ds.snapshot().index);
+    try std.testing.expectEqual(@as(u64, 1), ds.firstIndex());
+}
+
+test "diskwal: the snapshot is its log entry, read back on open" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+
+    const data = try alloc.alloc(u8, 4096);
+    defer alloc.free(data);
+    @memset(data, 'm');
+    var peers = [_]zen.ConfStatePeerStruct{
+        .{ .id = 1, .role = .voter },
+        .{ .id = 2, .role = .voter },
+    };
+    const snap: raft.diskwal.Snapshot = .{
+        .index = 40,
+        .term = 3,
+        .data = data,
+        .conf_state = .{ .peers = &peers },
+        .oldest_memtable_index = 41,
+        .timestamp = 77,
+    };
+    {
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
+        defer ds.deinit();
+        try appendRange(alloc, &ds, 1, 44, 3);
+
+        // Stored compressed, as `Node.propose` stores one that shrinks.
+        const raw = try zen.marshalRoot(alloc, snap);
+        defer alloc.free(raw);
+        var lz4_bytes: std.ArrayList(u8) = .empty;
+        defer lz4_bytes.deinit(alloc);
+        _ = try utils.compression.compress(alloc, .lz4, raw, &lz4_bytes);
+        var writer = try zen.LogEntryWriter.init(alloc);
+        defer writer.deinit();
+        try writer.set(.{
+            .index = 45,
+            .term = 3,
+            .data = lz4_bytes.items,
+            .entry_type = zen.EntryTypeEnum.snapshot,
+            .conf_change = zen.NullOffset,
+            .codec = @intFromEnum(utils.compression.Codec.lz4),
+        });
+        var entry = try writer.finishWithTail();
+        defer entry.deinit();
+        try ds.addEntries(&[_]zen.LogEntryBuffer{entry});
+
+        try ds.setSnapshot(snap, 45);
+        try std.testing.expectEqual(
+            @as(u64, 45),
+            ds.hardState().snapshot_entry_index,
+        );
+        // The cut the snapshot allows keeps its entry.
+        try ds.compactUntil(snap.index);
+    }
+
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
+    defer ds.deinit();
+    const got = ds.snapshot();
+    try std.testing.expectEqual(@as(u64, 40), got.index);
+    try std.testing.expectEqual(@as(u64, 3), got.term);
+    try std.testing.expectEqualSlices(u8, data, got.data);
+    try std.testing.expectEqual(@as(u64, 41), got.oldest_memtable_index);
+    try std.testing.expectEqual(@as(u64, 77), got.timestamp);
+    try std.testing.expectEqual(@as(usize, 2), got.conf_state.?.peers.len);
+    try std.testing.expectEqual(@as(u64, 45), ds.lastIndex());
+}
+
+test "diskwal: an open fails when HardState names no snapshot entry" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+
+    // Past the log's end, and an entry that is not a snapshot's.
+    for ([_]u64{ 9, 2 }) |named| {
+        {
+            var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
+            defer ds.deinit();
+            if (ds.lastIndex() == 0) try appendRange(alloc, &ds, 1, 3, 1);
+            try ds.sync();
+            var hs = ds.hardState().*;
+            hs.snapshot_entry_index = named;
+            try ds.meta.setHardState(hs);
+        }
+        try std.testing.expectError(
+            error.SnapshotEntryMissing,
+            raft.DiskWAL.openPath(wal_dir, alloc, .{}),
+        );
+        // Reset for the next case.
+        var ms = try raft.meta.MetaStore.openPath(vfs.g(), wal_dir, alloc);
+        defer ms.deinit();
+        var hs = ms.hardState().*;
+        hs.snapshot_entry_index = 0;
+        try ms.setHardState(hs);
+    }
 }
 
 test "BIG: diskwal storage" {
@@ -2045,6 +2168,30 @@ test "diskwal: an unfilled log file rotates once the prepared one is ready" {
     try checkRange(&ds, 1, 5);
 }
 
+// `appendPrepared`'s record at `index` as the `.snapshot` entry of a
+// snapshot at `snap_index`, installed: a cut at `snap_index` then
+// leaves a log a reopen takes, where with no snapshot it finds the log
+// starting past index 1 and wipes it. As large as the other records,
+// so the files fill as they would.
+fn appendPreparedSnapshot(
+    alloc: std.mem.Allocator,
+    ds: *raft.DiskWAL,
+    payload: []u8,
+    index: u64,
+    snap_index: u64,
+) !void {
+    ds.wal_store.next.prepare();
+    awaitReady(&ds.wal_store.next);
+    fillLargePayload(payload, index);
+    const snap: raft.diskwal.Snapshot = .{
+        .index = snap_index,
+        .term = 1,
+        .data = payload,
+    };
+    try appendSnapshot(alloc, ds, index, snap);
+    try ds.setSnapshot(snap, index);
+}
+
 // One 300 KiB record, appended with the next log file already
 // prepared: a rotation then always finds it, and no file is handed
 // out unfilled.
@@ -2081,15 +2228,15 @@ test "diskwal: a trimmed log file is reused, its old records unread" {
         defer ds.deinit();
         const spares = &ds.wal_store.next.spares;
         // Files 1 to 4. File 5 is prepared after record 12, new.
-        for (1..13) |i| {
+        for (1..12) |i| {
             try appendPrepared(alloc, &ds, payload, @intCast(i));
         }
+        try appendPreparedSnapshot(alloc, &ds, payload, 12, 8);
         try ds.sync();
         try std.testing.expectEqual(@as(usize, 4), try countWalFiles(wal_dir));
 
-        // A snapshot at 8 drops files 1 and 2. Three rotations since
-        // the start, so the pool keeps both, as spares.
-        try ds.setSnapshot(.{ .index = 8, .term = 1, .data = "snap" });
+        // A cut at 8 drops files 1 and 2. Three rotations since the
+        // start, so the pool keeps both, as spares.
         try ds.compactUntil(8);
         try std.testing.expectEqual(@as(usize, 2), try countWalFiles(wal_dir));
         try std.testing.expectEqual(@as(usize, 2), spares.items.len);
@@ -2155,7 +2302,6 @@ test "diskwal: a pooled log file nobody took goes at the next trim" {
         try appendPrepared(alloc, &ds, payload, @intCast(i));
     }
     try ds.sync();
-    try ds.setSnapshot(.{ .index = 8, .term = 1, .data = "snap" });
     try ds.compactUntil(8);
     try std.testing.expectEqual(@as(usize, 2), spares.items.len);
 
@@ -2186,7 +2332,6 @@ test "diskwal: the pool keeps at most max_spare_log_files" {
     }
     try ds.sync();
     // Files 1 and 2 are dropped after three rotations: one is kept.
-    try ds.setSnapshot(.{ .index = 8, .term = 1, .data = "snap" });
     try ds.compactUntil(8);
     try std.testing.expectEqual(
         @as(usize, 1),
@@ -2210,11 +2355,10 @@ test "diskwal: spare log files are taken up again after a restart" {
     {
         var ds = try raft.DiskWAL.openPath(wal_dir, alloc, reuse_opts);
         defer ds.deinit();
-        for (1..13) |i| {
+        for (1..12) |i| {
             try appendPrepared(alloc, &ds, payload, @intCast(i));
         }
-        try ds.sync();
-        try ds.setSnapshot(.{ .index = 8, .term = 1, .data = "snap" });
+        try appendPreparedSnapshot(alloc, &ds, payload, 12, 8);
         try ds.compactUntil(8);
     }
     // Left on disk: the two pooled files and the one that was prepared.
@@ -2224,6 +2368,7 @@ test "diskwal: spare log files are taken up again after a restart" {
 
     var ds = try raft.DiskWAL.openPath(wal_dir, alloc, reuse_opts);
     defer ds.deinit();
+    try std.testing.expectEqual(@as(u64, 8), ds.snapshot().index);
     const next = &ds.wal_store.next;
     try std.testing.expectEqual(@as(usize, 3), next.spares.items.len);
     // No new file takes a fid a spare holds.
