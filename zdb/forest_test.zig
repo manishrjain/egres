@@ -3997,6 +3997,27 @@ test "forest: removeOrphans unlinks only unknown files at or before the cutoff" 
     try vfs.writeFile(other, "keep me");
     try backdate(other, now - 2 * std.time.s_per_hour);
 
+    // Snapshot manifest objects: the installed snapshot's and another
+    // backdated two hours, and a young one, as a snapshot whose
+    // proposal is in flight leaves.
+    const installed_snap: u64 = 0x5a5a;
+    const old_snap: u64 = 0x6b6b;
+    const young_snap: u64 = 0x7c7c;
+    for ([_]u64{ installed_snap, old_snap, young_snap }, 0..) |id, i| {
+        const name = try zdb.snapshot.objectName(alloc, id);
+        defer alloc.free(name);
+        const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
+            dir_path, name,
+        });
+        defer alloc.free(path);
+        try vfs.writeFile(path, "not a real manifest");
+        const age_s: i64 = if (i < 2)
+            2 * std.time.s_per_hour
+        else
+            std.time.s_per_min;
+        try backdate(path, now - age_s);
+    }
+
     // A real SST pre-opened into the table cache for a create that never
     // applies (the follower prefetch path): the scan must evict it, or
     // its open fd keeps the unlinked file's blocks.
@@ -4013,18 +4034,21 @@ test "forest: removeOrphans unlinks only unknown files at or before the cutoff" 
     // an orphan.
     for ([_]bool{ false, true }) |with_snapshot| {
         if (with_snapshot) snapshotAt(f, now - 3 * std.time.s_per_hour);
-        try f.removeOrphans(0);
+        try f.removeOrphans(0, installed_snap);
         for (old_junk) |id|
             try std.testing.expect(try sstExists(alloc, &store, id));
         try std.testing.expect(try sstExists(alloc, &store, prewarmed));
         try std.testing.expect(try sstExists(alloc, &store, young_junk));
+        for ([_]u64{ installed_snap, old_snap, young_snap }) |id|
+            try std.testing.expect(try snapExists(alloc, &store, id));
     }
 
     // A snapshot between the old files and the young one.
     snapshotAt(f, now - std.time.s_per_hour);
-    try f.removeOrphans(0);
+    try f.removeOrphans(0, installed_snap);
 
-    // Only the old unknown SSTs go, the pre-opened one with its cache entry.
+    // Only the old unknown SSTs go, the pre-opened one with its cache
+    // entry, and the old snapshot object that is not the installed one.
     for (old_junk) |id|
         try std.testing.expect(!try sstExists(alloc, &store, id));
     try std.testing.expect(!try sstExists(alloc, &store, prewarmed));
@@ -4032,6 +4056,9 @@ test "forest: removeOrphans unlinks only unknown files at or before the cutoff" 
     try std.testing.expect(try sstExists(alloc, &store, young_junk));
     try std.testing.expect(try sstExists(alloc, &store, listed));
     try vfs.access(other);
+    try std.testing.expect(try snapExists(alloc, &store, installed_snap));
+    try std.testing.expect(!try snapExists(alloc, &store, old_snap));
+    try std.testing.expect(try snapExists(alloc, &store, young_snap));
 
     // A listed file is left alone however old it is.
     {
@@ -4039,22 +4066,31 @@ test "forest: removeOrphans unlinks only unknown files at or before the cutoff" 
         defer alloc.free(path);
         try backdate(path, now - 2 * std.time.s_per_hour);
     }
-    try f.removeOrphans(0);
+    try f.removeOrphans(0, installed_snap);
     try std.testing.expect(try sstExists(alloc, &store, listed));
     try std.testing.expect(try sstExists(alloc, &store, young_junk));
 
     // A snapshot past the young file does not remove it while it is
     // younger than the minimum age.
     snapshotAt(f, now);
-    try f.removeOrphans(std.time.s_per_hour);
+    try f.removeOrphans(std.time.s_per_hour, installed_snap);
     try std.testing.expect(try sstExists(alloc, &store, young_junk));
+    try std.testing.expect(try snapExists(alloc, &store, young_snap));
 
     // Without that age it goes too, and still nothing the manifest
-    // lists.
-    try f.removeOrphans(0);
+    // lists, nor the installed snapshot's object.
+    try f.removeOrphans(0, installed_snap);
     try std.testing.expect(!try sstExists(alloc, &store, young_junk));
     try std.testing.expect(try sstExists(alloc, &store, listed));
     try vfs.access(other);
+    try std.testing.expect(!try snapExists(alloc, &store, young_snap));
+    try std.testing.expect(try snapExists(alloc, &store, installed_snap));
+}
+
+fn snapExists(alloc: std.mem.Allocator, store: *vfs.Store, id: u64) !bool {
+    const name = try zdb.snapshot.objectName(alloc, id);
+    defer alloc.free(name);
+    return store.exists(name);
 }
 
 test "forest: evictTables evicts a compacted-away file; its blocks go with the table" {

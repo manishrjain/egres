@@ -61,6 +61,27 @@ test "lz4 compression roundtrip" {
     try expectRoundTrip(std.testing.allocator, .lz4, data);
 }
 
+test "compressTo and decompressTo: a fixed buffer of bound bytes holds it" {
+    const alloc = std.testing.allocator;
+    const data = try makePayload(alloc, 64 * 1024);
+    defer alloc.free(data);
+    for ([_]compress.Codec{ .none, .zstd, .lz4 }) |codec| {
+        const enc = try alloc.alloc(u8, compress.bound(codec, data.len));
+        defer alloc.free(enc);
+        const enc_sz = try compress.compressTo(codec, data, enc);
+
+        const dec = try alloc.alloc(u8, data.len);
+        defer alloc.free(dec);
+        const dec_sz = try compress.decompressTo(codec, enc[0..enc_sz], dec);
+        try std.testing.expectEqualSlices(u8, data, dec[0..dec_sz]);
+
+        // One byte short of the input is too small to decode into.
+        try std.testing.expect(std.meta.isError(
+            compress.decompressTo(codec, enc[0..enc_sz], dec[1..]),
+        ));
+    }
+}
+
 test "lz4 detects truncated frame" {
     const data = "hello world hello world hello world";
     var enc_buf = std.ArrayList(u8).empty;

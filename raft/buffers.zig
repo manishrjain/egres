@@ -69,6 +69,9 @@ pub const HardState = schema.Table(&.{
 pub const Snapshot = schema.Table(&.{
     .{ .id = 1, .name = "index", .ty = schema.U64 },
     .{ .id = 2, .name = "term", .ty = schema.U64 },
+    // The state machine's, opaque here: where it keeps the state as of
+    // `index`, not the state itself, so the entry and snapshot.bin stay
+    // small. The engine's is a zdb `SnapshotObject`.
     .{ .id = 3, .name = "data", .ty = schema.Bytes },
     .{ .id = 4, .name = "conf_state", .ty = ConfState },
     // Recovery hint for the state machine: log index of the oldest in-memory

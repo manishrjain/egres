@@ -49,6 +49,7 @@ pub const SnapshotCfg = struct {
 
 const zdb_bufs = zdb.buffers;
 const _manifest = zdb.manifest;
+const _snapshot = zdb.snapshot;
 const Forest = zdb.forest.Forest;
 const ReadMarks = zdb.forest.ReadMarks;
 const Item = zdb.kv.Item;
@@ -864,9 +865,10 @@ pub const Engine = struct {
         }
     }
 
-    /// Restore the manifest from `wal.snapshot().data` and bring the
-    /// in-memory trees online, opening every SST it lists from the
-    /// store. No-op when there is no snapshot on disk.
+    /// Restore the manifest of the snapshot on disk, read from the
+    /// store object its `data` names, and bring the in-memory trees
+    /// online, opening every SST it lists from the store. No-op when
+    /// there is no snapshot on disk.
     ///
     /// The apply loop tolerates a brief window where this hasn't
     /// completed: `applyEntry` errors retry until the manifest is in
@@ -877,13 +879,23 @@ pub const Engine = struct {
         var oldest_idx: u64 = 0;
         defer self.storage_impl.markRecovered(oldest_idx);
 
-        const snap = self.node.log.snapshot();
-        if (snap.index == 0 or snap.data.len == 0) return;
+        const raft_snap = self.node.log.snapshot();
+        if (raft_snap.index == 0 or raft_snap.data.len == 0) return;
 
-        log.info("recovery: restoring manifest from snapshot index={d} bytes={d}", .{ snap.index, snap.data.len });
-        try self.forest.ground.manifest.restoreFrom(snap.data);
-        oldest_idx = snap.oldest_memtable_index;
-        _ = self.forest.setSnapshotTs(snap.timestamp);
+        const snap = try (try zdb_bufs.SnapshotObjectReader.parseRoot(
+            raft_snap.data,
+        )).toStructValue(self.allocator);
+        log.info("recovery: restoring manifest from snapshot index={d} " ++
+            "object={x:0>16} bytes={d} raw={d}", .{
+            raft_snap.index, snap.id, snap.size, snap.raw_size,
+        });
+
+        const raw = try _snapshot.read(self.allocator, self.forest.store, snap);
+        defer self.allocator.free(raw);
+
+        try self.forest.ground.manifest.restoreFrom(raw);
+        oldest_idx = raft_snap.oldest_memtable_index;
+        _ = self.forest.setSnapshotTs(raft_snap.timestamp);
 
         try self.forest.openTablesFromManifest();
         log.info("recovery: snapshot manifest installed", .{});
@@ -898,7 +910,8 @@ pub const Engine = struct {
     /// `waitForQuorum` below holds a node here until it is leader, and
     /// every tick is skipped while it is not. Whenever the installed
     /// snapshot index has advanced since the last tick the leader unlinks
-    /// the SSTs queued for deletion at or below it (`Forest.deleteFiles`),
+    /// the SSTs queued for deletion at or below it (`Forest.deleteFiles`)
+    /// and the manifest object of the snapshot it saw installed before,
     /// and every `orphan_scan_interval_seconds` it rescans the data
     /// directory for files the manifest does not know
     /// (`Forest.removeOrphans`); the first tick as leader runs a scan.
@@ -927,25 +940,46 @@ pub const Engine = struct {
         // passing it, so nothing changes in between.
         var swept_upto: u64 = 0;
 
+        // The manifest object of the snapshot installed at `swept_upto`,
+        // 0 for none seen. Once the next one is installed no restart
+        // reads it, as with the files `deleteFiles` takes; one this
+        // loop never saw, from before it led, is the orphan scan's.
+        var swept_object: u64 = 0;
+
         while (!self.node.isShuttingDown()) {
             const cfg = self.snapshot_cfg.cur();
             const poll_ms = cfg.poll_interval_seconds * 1000;
             if (self.node.shutdown.waitForStart(.shutdown, poll_ms)) return;
             if (!self.node.isLeader()) continue;
 
-            const snap_index = self.node.log.snapshot().index;
+            const snap = self.node.log.snapshot();
+            const snap_index = snap.index;
+            const snap_object = snapshotObjectId(snap) catch |err| {
+                // Unknown, the installed manifest could be taken for an
+                // orphan: no sweep and no snapshot until it parses.
+                utils.logEvery(.err, 60, "snapshot index={d}: {s}", .{
+                    snap_index, @errorName(err),
+                });
+                continue;
+            };
             if (snap_index > swept_upto) {
                 self.forest.deleteFiles(snap_index) catch |err| {
                     log.warn("deleteFiles: {s}", .{@errorName(err)});
                 };
+                if (swept_object != 0 and swept_object != snap_object)
+                    self.deleteSnapshotObject(swept_object);
                 swept_upto = snap_index;
+                swept_object = snap_object;
             }
 
             const now_ms = utils.coarseMs();
             if (now_ms - last_scan_ms >= cfg.orphan_scan_interval_seconds * 1000) {
                 last_scan_ms = now_ms;
                 const min_age_secs = cfg.orphan_min_age_seconds;
-                self.forest.removeOrphans(min_age_secs) catch |err| {
+                self.forest.removeOrphans(
+                    min_age_secs,
+                    snap_object,
+                ) catch |err| {
                     log.warn("removeOrphans: {s}", .{@errorName(err)});
                 };
             }
@@ -958,12 +992,33 @@ pub const Engine = struct {
         }
     }
 
+    /// The id of the manifest object `snap` names, 0 when there is no
+    /// snapshot yet.
+    fn snapshotObjectId(snap: *const raft.Snapshot) !u64 {
+        if (snap.data.len == 0) return 0;
+        return (try zdb_bufs.SnapshotObjectReader.parseRoot(snap.data)).id();
+    }
+
+    /// Unlink a snapshot's manifest object. One that fails stays for
+    /// the orphan scan.
+    fn deleteSnapshotObject(self: *Engine, id: u64) void {
+        const name = _snapshot.objectName(self.allocator, id) catch return;
+        defer self.allocator.free(name);
+        self.forest.store.delete(name) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => log.warn("delete snapshot object {s}: {s}", .{
+                name, @errorName(err),
+            }),
+        };
+    }
+
     /// Leader-only. Pick a target snapshot index from WAL size/age (capped by
     /// the oldest in-memory memtable so replay can reconstruct memtable state),
-    /// build snapshot bytes by replaying manifest entries onto a draft seeded
-    /// from the previous snapshot, then propose the marshalled SnapshotStruct
-    /// through Raft. Every node (including the leader) installs via
-    /// `Node.applySnapshotEntry` when the proposal is committed and applied.
+    /// build the manifest as of it by replaying manifest entries onto a
+    /// draft seeded from the previous snapshot's, put it in the store,
+    /// then propose a SnapshotStruct naming it through Raft. Every node
+    /// (including the leader) installs via `Node.applySnapshotEntry`
+    /// when the proposal is committed and applied.
     ///
     /// === Replay-safety invariant ===
     ///
@@ -971,7 +1026,7 @@ pub const Engine = struct {
     /// For recovery to reconstruct correct state, every committed mutation
     /// must have AT LEAST ONE surviving representation:
     ///    (a) a log entry at index >= I (preserved by `compactUntil`), OR
-    ///    (b) an SST referenced either by `snap.data`'s manifest, or by a
+    ///    (b) an SST referenced either by the snapshot's manifest, or by a
     ///        `flush` proposal whose log index >= I (so replay installs it).
     ///
     /// The cap below — `min(oldest_in_memory - 1, apply_index)` — is the
@@ -990,8 +1045,8 @@ pub const Engine = struct {
     ///   - Mutations in already-flushed memtables (SST on disk):
     ///       The flush proposal at log index F either survives compaction
     ///       (F >= I) — replay reaches F and installs the SST → (b) — or
-    ///       was already folded into `snap.data` by the build-replay pass
-    ///       (F < I) → (b) via the manifest itself.
+    ///       was already folded into the snapshot's manifest by the
+    ///       build-replay pass (F < I) → (b) via the manifest itself.
     ///
     /// === Worked example ===
     ///
@@ -1006,7 +1061,7 @@ pub const Engine = struct {
     /// We propose snap.index = I = 135 (between the two flushes, valid).
     ///
     /// On follower recovery from this snapshot:
-    ///   - `snap.data` lists SST_a (flush at 125 <= I) but not SST_b (160 > I).
+    ///   - Its manifest lists SST_a (flush at 125 <= I), not SST_b (160 > I).
     ///   - `compactUntil(135)` drops entries 121..134, including 131, 132.
     ///   - Log preserves entries 136..head (including flush at 160).
     ///   - Replay from 136..139 puts mutations into the id=0 placeholder.
@@ -1045,8 +1100,18 @@ pub const Engine = struct {
         ) orelse return false;
         const target = @min(@min(found, memtable_cap), apply_cap);
 
-        const prev_snap = wal.snapshot();
-        if (target <= prev_snap.index) return false;
+        // Copied: the build below yields, and the snapshot `wal.snapshot()`
+        // points at goes with the next one's install.
+        const raft_snap = wal.snapshot();
+        const prev_index = raft_snap.index;
+        const prev_snap: ?zdb_bufs.SnapshotObjectStruct =
+            if (raft_snap.data.len > 0)
+                try (try zdb_bufs.SnapshotObjectReader.parseRoot(
+                    raft_snap.data,
+                )).toStructValue(self.allocator)
+            else
+                null;
+        if (target <= prev_index) return false;
 
         // The target trails the head, so under steady writes it moves on
         // every tick, and each snapshot rewrites the whole manifest: 24 MB
@@ -1054,7 +1119,7 @@ pub const Engine = struct {
         // passed since the last, or the log it folds in reaches min_bytes.
         const age_due = since_last_ms >= cfg.min_age_seconds * 1000;
         if (!age_due and
-            wal.bytesBetween(prev_snap.index, target) < cfg.min_bytes)
+            wal.bytesBetween(prev_index, target) < cfg.min_bytes)
             return false;
 
         // Asked of the log by index: the range read below returns
@@ -1072,7 +1137,7 @@ pub const Engine = struct {
         );
 
         // Seed draft from previous snapshot's manifest, then replay every
-        // manifest-bearing log entry in (prev_snap.index, target]. The
+        // manifest-bearing log entry in (prev_index, target]. The
         // draft is on an arena, freed whole: what the replay's drops and
         // deletes let go of stays until then, one snapshot interval of
         // it at most.
@@ -1081,15 +1146,21 @@ pub const Engine = struct {
         var draft = _manifest.Manifest.init(arloc.allocator());
         defer draft.deinitOnArena();
 
-        if (prev_snap.data.len > 0) {
-            try draft.restoreFrom(prev_snap.data);
+        if (prev_snap) |prev| {
+            const prev_raw = try _snapshot.read(
+                self.allocator,
+                self.forest.store,
+                prev,
+            );
+            defer self.allocator.free(prev_raw);
+            try draft.restoreFrom(prev_raw);
         }
 
         // Only the manifest entries are read: the slot table knows each
         // entry's type, so the data entries between them, the bulk of
         // the log, are never touched.
         var result = try wal.entriesRange(.{
-            .lo = prev_snap.index + 1,
+            .lo = prev_index + 1,
             .hi = target + 1,
             .ty = .manifest,
             .max_bytes = std.math.maxInt(u64),
@@ -1144,7 +1215,29 @@ pub const Engine = struct {
             }
         }
 
-        const data = try draft.serialize(self.allocator);
+        const raw = try draft.serialize(self.allocator);
+        defer self.allocator.free(raw);
+
+        // The manifest goes to the store before the snapshot that names
+        // it is proposed, as an SST does before the change that lists
+        // it, and the log carries the name.
+        var object = try _snapshot.pack(self.allocator, raw);
+        defer object.deinit(self.allocator);
+        const snap: zdb_bufs.SnapshotObjectStruct = .{
+            .id = _snapshot.newId(if (prev_snap) |prev| prev.id else 0),
+            .size = object.bytes.items.len,
+            .raw_size = raw.len,
+            .hash = object.hash,
+        };
+
+        const name = try _snapshot.objectName(self.allocator, snap.id);
+        defer self.allocator.free(name);
+        // Kept when the proposal fails: one that reports a failure can
+        // still commit. One no snapshot names is the orphan scan's.
+        try self.forest.store.put(name, object.bytes.items);
+        try self.forest.store.sync();
+
+        const data = try zdb_bufs.marshalRoot(self.allocator, snap);
         defer self.allocator.free(data);
 
         // Pick the latest conf state. It doesn't need to be as of the snapshot index.
@@ -1165,7 +1258,10 @@ pub const Engine = struct {
             .oldest_memtable_index = oldest,
             .timestamp = target_ts,
         });
-        log.info("snapshot proposed: index={d} term={d} bytes={d}", .{ target, target_term, data.len });
+        log.info("snapshot proposed: index={d} term={d} object={s} " ++
+            "bytes={d} raw={d}", .{
+            target, target_term, name, snap.size, snap.raw_size,
+        });
         return true;
     }
 

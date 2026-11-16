@@ -7,6 +7,7 @@ pub const skl = @import("zdb/skl/skiplist.zig");
 pub const table = @import("zdb/table.zig");
 pub const buffers = @import("zdb/buffers.gen.zig");
 pub const manifest = @import("zdb/manifest.zig");
+pub const snapshot = @import("zdb/snapshot.zig");
 pub const level = @import("zdb/level.zig");
 pub const tree = @import("zdb/tree.zig");
 pub const compaction = @import("zdb/compaction.zig");

@@ -188,6 +188,22 @@ pub const ManifestChange = schema.Table(&.{
     .{ .id = 9, .name = "mutations", .ty = Mutations },
 });
 
+// What a raft snapshot's `data` holds: where its manifest is. The
+// manifest is an object in the store, put before the snapshot is
+// proposed (zdb/snapshot.zig), so the log and each node's
+// snapshot.bin carry these bytes and not the manifest's tens of MB.
+pub const SnapshotObject = schema.Table(&.{
+    // The object is named `<id:016x>.snap`.
+    .{ .id = 1, .name = "id", .ty = schema.U64 },
+    // The object's bytes as put, a page multiple.
+    .{ .id = 2, .name = "size", .ty = schema.U64 },
+    // The serialized manifest's bytes, its blocks decoded.
+    .{ .id = 3, .name = "raw_size", .ty = schema.U64 },
+    // xxhash3 of the serialized manifest. Each block's frame checks
+    // that block; this checks they are the leader's, in its order.
+    .{ .id = 4, .name = "hash", .ty = schema.U64 },
+});
+
 /// A single key-value write. `key` is a marshaled zdb key
 /// [ns:u64 BE][table_id:u32 BE][primary] — self-describing, so one
 /// Mutations entry can span tables. It carries no timestamp: apply
@@ -274,6 +290,7 @@ pub const records: []const schema.Named = &.{
     .{ .name = "Namespace", .ty = Namespace, .id = tableId(9) },
     .{ .name = "RoaringDelta", .ty = RoaringDelta, .id = tableId(10) },
     .{ .name = "TableChange", .ty = TableChange, .id = tableId(11) },
+    .{ .name = "SnapshotObject", .ty = SnapshotObject, .id = tableId(12) },
 
     // Packed records: no message id.
     .{ .name = "BlockVersion", .ty = BlockVersion },

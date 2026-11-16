@@ -143,6 +143,51 @@ pub fn decompress(
     };
 }
 
+/// The most bytes `compressTo` writes for `len` bytes of input: what a
+/// caller sizes a fixed buffer by. 0 when one call cannot take that
+/// many (lz4 past 2 GiB).
+pub fn bound(codec: Codec, len: usize) usize {
+    return switch (codec) {
+        .none => len,
+        .zstd => zstd.ZSTD_compressBound(len),
+        .lz4 => if (len > std.math.maxInt(i32))
+            0
+        else
+            4 + @as(usize, @intCast(lz4.LZ4_compressBound(@intCast(len)))),
+    };
+}
+
+/// `compress` into a fixed buffer: `input` compressed at the start of
+/// `dst`, which `bound` sized. Returns the number of bytes written. For
+/// a caller whose output must stay where it put it, such as a
+/// page-aligned buffer.
+pub fn compressTo(codec: Codec, input: String, dst: []u8) Error!usize {
+    return switch (codec) {
+        .none => {
+            if (dst.len < input.len) return error.CompressionFailed;
+            @memcpy(dst[0..input.len], input);
+            return input.len;
+        },
+        .zstd => compressZstdTo(input, dst),
+        .lz4 => compressLz4To(input, dst),
+    };
+}
+
+/// `decompress` into a fixed buffer: `input` decoded at the start of
+/// `dst`, which must hold all of it. Returns the number of bytes
+/// written.
+pub fn decompressTo(codec: Codec, input: String, dst: []u8) Error!usize {
+    return switch (codec) {
+        .none => {
+            if (dst.len < input.len) return error.DecompressionFailed;
+            @memcpy(dst[0..input.len], input);
+            return input.len;
+        },
+        .zstd => decompressZstdTo(input, dst),
+        .lz4 => decompressLz4To(input, dst),
+    };
+}
+
 fn noneInto(
     alloc: std.mem.Allocator,
     input: String,
@@ -157,13 +202,15 @@ fn compressZstdInto(
     input: String,
     out: *std.ArrayList(u8),
 ) Error!usize {
-    const bound = zstd.ZSTD_compressBound(input.len);
-    const start = out.items.len;
-    try out.ensureUnusedCapacity(alloc, bound);
-    const dst = out.items.ptr[start .. start + bound];
+    try out.ensureUnusedCapacity(alloc, bound(.zstd, input.len));
+    const written = try compressZstdTo(input, out.unusedCapacitySlice());
+    out.items.len += written;
+    return written;
+}
+
+fn compressZstdTo(input: String, dst: []u8) Error!usize {
     const written = zstd.ZSTD_compress(dst.ptr, dst.len, input.ptr, input.len, 1);
     if (zstd.ZSTD_isError(written) != 0) return error.CompressionFailed;
-    out.items.len = start + written;
     return written;
 }
 
@@ -177,13 +224,16 @@ fn decompressZstdInto(
     if (frame_size == shim.egres_zstd_contentsize_unknown()) return error.UnknownFrameSize;
     if (frame_size > std.math.maxInt(usize)) return error.DecompressionFailed;
     const needed: usize = @intCast(frame_size);
-    const start = out.items.len;
     try out.ensureUnusedCapacity(alloc, needed);
-    const dst = out.items.ptr[start .. start + needed];
+    const dst = out.unusedCapacitySlice()[0..needed];
+    const written = try decompressZstdTo(input, dst);
+    out.items.len += written;
+    return written;
+}
+
+fn decompressZstdTo(input: String, dst: []u8) Error!usize {
     const written = zstd.ZSTD_decompress(dst.ptr, dst.len, input.ptr, input.len);
     if (zstd.ZSTD_isError(written) != 0) return error.DecompressionFailed;
-    if (written > needed) return error.DecompressionFailed;
-    out.items.len = start + written;
     return written;
 }
 
@@ -192,24 +242,27 @@ fn compressLz4Into(
     input: String,
     out: *std.ArrayList(u8),
 ) Error!usize {
+    const max = bound(.lz4, input.len);
+    if (max == 0) return error.CompressionFailed;
+    try out.ensureUnusedCapacity(alloc, max);
+    const written = try compressLz4To(input, out.unusedCapacitySlice());
+    out.items.len += written;
+    return written;
+}
+
+fn compressLz4To(input: String, dst: []u8) Error!usize {
     if (input.len > std.math.maxInt(i32)) return error.CompressionFailed;
-    if (input.len > std.math.maxInt(u32)) return error.CompressionFailed;
-    const bound_i32 = lz4.LZ4_compressBound(@intCast(input.len));
-    if (bound_i32 <= 0) return error.CompressionFailed;
-    const bound: usize = @intCast(bound_i32);
-    const start = out.items.len;
-    try out.ensureUnusedCapacity(alloc, 4 + bound);
-    writeU32LE(out.items.ptr[start .. start + 4], @intCast(input.len));
+    if (dst.len < 4) return error.CompressionFailed;
+    writeU32LE(dst[0..4], @intCast(input.len));
+    const room: usize = @min(dst.len - 4, std.math.maxInt(i32));
     const written_i32 = lz4.LZ4_compress_default(
         input.ptr,
-        out.items.ptr[start + 4 .. start + 4 + bound].ptr,
+        dst[4..].ptr,
         @intCast(input.len),
-        bound_i32,
+        @intCast(room),
     );
     if (written_i32 <= 0) return error.CompressionFailed;
-    const total = 4 + @as(usize, @intCast(written_i32));
-    out.items.len = start + total;
-    return total;
+    return 4 + @as(usize, @intCast(written_i32));
 }
 
 fn decompressLz4Into(
@@ -217,14 +270,18 @@ fn decompressLz4Into(
     input: String,
     out: *std.ArrayList(u8),
 ) Error!usize {
-    if (input.len < 4) return error.CorruptFrame;
-    const raw_len: usize = readU32LE(input[0..4]);
-    if (raw_len > std.math.maxInt(i32)) return error.DecompressionFailed;
+    const raw_len = try lz4RawLen(input);
+    try out.ensureUnusedCapacity(alloc, raw_len);
+    const written = try decompressLz4To(input, out.unusedCapacitySlice());
+    out.items.len += written;
+    return written;
+}
+
+fn decompressLz4To(input: String, dst: []u8) Error!usize {
+    const raw_len = try lz4RawLen(input);
+    if (raw_len > dst.len) return error.DecompressionFailed;
     const compressed = input[4..];
     if (compressed.len > std.math.maxInt(i32)) return error.DecompressionFailed;
-    const start = out.items.len;
-    try out.ensureUnusedCapacity(alloc, raw_len);
-    const dst = out.items.ptr[start .. start + raw_len];
     const written_i32 = lz4.LZ4_decompress_safe(
         compressed.ptr,
         dst.ptr,
@@ -233,7 +290,14 @@ fn decompressLz4Into(
     );
     if (written_i32 < 0) return error.DecompressionFailed;
     if (@as(usize, @intCast(written_i32)) != raw_len) return error.CorruptFrame;
-    out.items.len = start + raw_len;
+    return raw_len;
+}
+
+/// The decoded length an lz4 block declares, in its `[u32 raw_len]`.
+fn lz4RawLen(input: String) Error!usize {
+    if (input.len < 4) return error.CorruptFrame;
+    const raw_len: usize = readU32LE(input[0..4]);
+    if (raw_len > std.math.maxInt(i32)) return error.DecompressionFailed;
     return raw_len;
 }
 

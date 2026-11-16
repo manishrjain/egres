@@ -1029,8 +1029,8 @@ pub const Manifest = struct {
         return count;
     }
 
-    /// Serialize the entire Manifest into a self-describing byte blob
-    /// suitable for embedding in a Raft snapshot's `data` field. Captures
+    /// Serialize the entire Manifest into a self-describing byte blob,
+    /// what a snapshot's store object holds (zdb/snapshot.zig). Captures
     /// every tree, every per-level table list, the tree key ranges + namespace
     /// assignments, the per-namespace `next_table_id` high-water-marks, and
     /// each SST's `raft_index` (restore needs it to rebuild L0 order). No

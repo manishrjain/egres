@@ -70,6 +70,7 @@ pub fn parseMessageWithTail(buf: []const u8) Error!MessageReader {
         NamespaceReader.TABLE_ID => .{ .Namespace = try NamespaceReader.init(payload_buf, 0) },
         RoaringDeltaReader.TABLE_ID => .{ .RoaringDelta = try RoaringDeltaReader.init(payload_buf, 0) },
         TableChangeReader.TABLE_ID => .{ .TableChange = try TableChangeReader.init(payload_buf, 0) },
+        SnapshotObjectReader.TABLE_ID => .{ .SnapshotObject = try SnapshotObjectReader.init(payload_buf, 0) },
         else => zbuf.Error.Invalid,
     };
 }
@@ -86,6 +87,7 @@ pub const MessageReader = union(enum) {
     Namespace: NamespaceReader,
     RoaringDelta: RoaringDeltaReader,
     TableChange: TableChangeReader,
+    SnapshotObject: SnapshotObjectReader,
 };
 
 pub const BlockIndexStruct = struct {
@@ -2449,6 +2451,174 @@ pub const TableChangeWriter = struct {
     /// first on an empty buffer.
     pub fn finishWithTail(self: *Self) Error!TableChangeBuffer {
         return self.w.finishWithTail(TableChangeBuffer, TABLE_ID);
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.w.deinit();
+    }
+};
+
+pub const SnapshotObjectStruct = struct {
+    pub const TABLE_ID: u16 = 46604;
+    id: u64 = 0,
+    size: u64 = 0,
+    raw_size: u64 = 0,
+    hash: u64 = 0,
+    pub fn deinit(self: *SnapshotObjectStruct, alloc: std.mem.Allocator) void {
+        _ = self;
+        _ = alloc;
+    }
+
+    pub fn destroy(self: *SnapshotObjectStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: SnapshotObjectStruct, alloc: std.mem.Allocator) Error!SnapshotObjectStruct {
+        var s = SnapshotObjectStruct{
+            .id = self.id,
+            .size = self.size,
+            .raw_size = self.raw_size,
+            .hash = self.hash,
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+
+    pub fn clone(self: SnapshotObjectStruct, alloc: std.mem.Allocator) Error!*SnapshotObjectStruct {
+        const ptr = try alloc.create(SnapshotObjectStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: SnapshotObjectStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try SnapshotObjectWriter.initWithBuf(alloc, out);
+        try writer.setId(self.id);
+        try writer.setSize(self.size);
+        try writer.setRawSize(self.raw_size);
+        try writer.setHash(self.hash);
+        const result = try writer.finish();
+        return result.offset;
+    }
+};
+
+pub const SnapshotObjectReader = struct {
+    const Self = @This();
+    t: zbuf.Table,
+
+    pub const TABLE_ID: u16 = 46604;
+    pub const SIZE_BYTES: u16 = 34;
+
+    pub fn parseRoot(buf: []const u8) Error!Self {
+        return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
+    }
+
+    pub fn init(buf: []const u8, base: u32) Error!Self {
+        return .{ .t = try zbuf.Table.init(buf, base) };
+    }
+
+    pub fn id(self: Self) u64 {
+        return self.t.scalar(u64, 2);
+    }
+
+    pub fn size(self: Self) u64 {
+        return self.t.scalar(u64, 10);
+    }
+
+    pub fn rawSize(self: Self) u64 {
+        return self.t.scalar(u64, 18);
+    }
+
+    pub fn hash(self: Self) u64 {
+        return self.t.scalar(u64, 26);
+    }
+
+    pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try SnapshotObjectWriter.initWithBuf(alloc, out);
+        try writer.setId(self.id());
+        try writer.setSize(self.size());
+        try writer.setRawSize(self.rawSize());
+        try writer.setHash(self.hash());
+        const result = try writer.finish();
+        return result.offset;
+    }
+
+    pub fn verify(self: Self) Error!void {
+        try self.t.verifyHeader();
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!SnapshotObjectStruct {
+        var s = SnapshotObjectStruct{
+            .id = self.id(),
+            .size = self.size(),
+            .raw_size = self.rawSize(),
+            .hash = self.hash(),
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*SnapshotObjectStruct {
+        const ptr = try alloc.create(SnapshotObjectStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
+    }
+};
+
+pub const SnapshotObjectBuffer = zbuf.Buffer(SnapshotObjectReader);
+
+pub const SnapshotObjectWriter = struct {
+    const Self = @This();
+    w: zbuf.TableWriter,
+
+    pub const TABLE_ID: u16 = 46604;
+    pub const SIZE_BYTES: u16 = 34;
+    /// Slots of nested tables, null until set.
+    const child_slots = [_]u16{};
+
+    pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {
+        return .{ .w = try zbuf.TableWriter.initWithBuf(alloc, buf, SIZE_BYTES, &child_slots) };
+    }
+
+    pub fn init(alloc: std.mem.Allocator) Error!Self {
+        return .{ .w = try zbuf.TableWriter.init(alloc, SIZE_BYTES, &child_slots) };
+    }
+
+    pub fn setId(self: *Self, v: u64) Error!void {
+        return self.w.setScalar(u64, 2, v);
+    }
+
+    pub fn setSize(self: *Self, v: u64) Error!void {
+        return self.w.setScalar(u64, 10, v);
+    }
+
+    pub fn setRawSize(self: *Self, v: u64) Error!void {
+        return self.w.setScalar(u64, 18, v);
+    }
+
+    pub fn setHash(self: *Self, v: u64) Error!void {
+        return self.w.setScalar(u64, 26, v);
+    }
+
+    pub fn set(self: *Self, values: anytype) Error!void {
+        const Values = @TypeOf(values);
+        if (@typeInfo(Values) != .@"struct") {
+            @compileError("set() expects a struct literal like .{ .field = value }");
+        }
+        if (@hasField(Values, "id")) try self.setId(@field(values, "id"));
+        if (@hasField(Values, "size")) try self.setSize(@field(values, "size"));
+        if (@hasField(Values, "raw_size")) try self.setRawSize(@field(values, "raw_size"));
+        if (@hasField(Values, "hash")) try self.setHash(@field(values, "hash"));
+    }
+
+    pub fn finish(self: *Self) Error!SnapshotObjectBuffer {
+        return self.w.finish(SnapshotObjectBuffer);
+    }
+
+    /// Root must be at payload offset 0: initialize the root writer
+    /// first on an empty buffer.
+    pub fn finishWithTail(self: *Self) Error!SnapshotObjectBuffer {
+        return self.w.finishWithTail(SnapshotObjectBuffer, TABLE_ID);
     }
 
     pub fn deinit(self: *Self) void {

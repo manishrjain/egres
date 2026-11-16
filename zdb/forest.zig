@@ -8,6 +8,7 @@ const utils = @import("utils");
 const String = utils.String;
 const _config = @import("config.zig");
 const _manifest = @import("manifest.zig");
+const _snapshot = @import("snapshot.zig");
 const _ddl = @import("forest_ddl.zig");
 const _read = @import("read.zig");
 pub const ReadMarks = @import("read_marks.zig").ReadMarks;
@@ -1316,7 +1317,17 @@ pub const Forest = struct {
     /// The store is listed by name only, and only the objects the
     /// manifest does not know are stat'ed: normally a handful out of
     /// hundreds of thousands.
-    pub fn removeOrphans(self: *Forest, min_age_secs: u64) !void {
+    ///
+    /// A snapshot's manifest object (zdb/snapshot.zig) other than
+    /// `snapshot_object`, the installed snapshot's, goes at the same
+    /// cutoff: the leader deletes the one before as the next installs,
+    /// and this catches one a crash or a lost proposal left. One whose
+    /// proposal is still in flight is newer than the cutoff.
+    pub fn removeOrphans(
+        self: *Forest,
+        min_age_secs: u64,
+        snapshot_object: u64,
+    ) !void {
         // Whole seconds on the realtime clock, like a file's mtime.
         const snapshot_hlc = utils.hlc.HLC.fromU64(self.snapshotTs());
         const snapshot_s: i64 = snapshot_hlc.seconds;
@@ -1324,12 +1335,19 @@ pub const Forest = struct {
         const now_s = utils.timestampNow(.realtime, .secs);
         const cutoff_s = @min(snapshot_s, now_s - min_age_s);
 
+        var snapshots: std.ArrayList(u64) = .empty;
+        defer snapshots.deinit(self.allocator);
         const unknowns = blk: {
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
             const arloc = arena.allocator();
 
             const entries = try self.store.list(arloc, .names);
+            for (entries) |entry| {
+                const id = _snapshot.parseName(entry.name) orelse continue;
+                if (id == snapshot_object) continue;
+                try snapshots.append(self.allocator, id);
+            }
             break :blk try self.ground.manifest.unknownFiles(
                 self.allocator,
                 entries,
@@ -1361,6 +1379,29 @@ pub const Forest = struct {
             "removeOrphans: deleted {d} of {d} unknown SST(s) last " ++
                 "written at or before the cutoff",
             .{ removed, unknowns.len },
+        );
+
+        removed = 0;
+        for (snapshots.items) |id| {
+            const name = try _snapshot.objectName(arloc, id);
+            const st = self.store.stat(name) catch continue;
+            if (st.mtime_s > cutoff_s) continue;
+
+            self.store.delete(name) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => {
+                    log.warn(
+                        "removeOrphans: delete {s}: {s}",
+                        .{ name, @errorName(err) },
+                    );
+                    continue;
+                },
+            };
+            removed += 1;
+        }
+        if (removed > 0) log.info(
+            "removeOrphans: deleted {d} of {d} old snapshot object(s)",
+            .{ removed, snapshots.items.len },
         );
     }
 
