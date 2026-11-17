@@ -78,6 +78,9 @@ run_suite() {
     dir=$results/suite-$(date +%Y%m%d-%H%M%S)
     mkdir -p "$dir"
     cp "$suite" "$dir/suite.txt"
+    # From the start, so a look at suite.latest while it runs finds this
+    # one, not the last that finished.
+    ln -sfn "$dir" "$results/suite.latest"
     [ -z "$from" ] && started=1
     local label test words env args w rc t0
     while read -r label test words; do
@@ -105,7 +108,6 @@ run_suite() {
             tee -a "$dir/summary.txt"
     done < <(steps)
     [ -n "$started" ] || { echo "no step $from in $suite" >&2; exit 2; }
-    ln -sfn "$dir" "$results/suite.latest"
 }
 
 case ${1:-} in
