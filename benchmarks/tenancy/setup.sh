@@ -83,8 +83,8 @@ do_assets() {
         "$A/firecracker"
     rmdir "$A/release-$FC_VERSION-x86_64"
     fetch "$KERNEL_URL" "$KERNEL_SHA256" "$A/vmlinux"
-    [ -f "$A/images.txt" ] || "$here/build_images.sh"
-    [ -f "$A/images_big.txt" ] || "$here/build_big_image.sh"
+    # Images from before the blank data image are rebuilt.
+    grep -q blank "$A/images.txt" 2>/dev/null || "$here/build_images.sh"
 }
 
 do_probe() { (cd "$here/probe" && go build -o probe .); }
@@ -116,7 +116,40 @@ harness_rev() {
     echo "$rev"
 }
 
-do_calibrate() { "$here/egres_calibrate.sh"; }
+# Measures the drive once, the way Egres does at start-up, and keeps
+# the result in run/egres_io.flags; every later start is given it and
+# probes nothing. On an idle machine, before the tests. A probe that
+# lands in a drive stall (writes under a tenth of reads) is thrown away
+# and taken again.
+do_calibrate() (
+    export BACKEND=egres EDATA=$WORK/egres-data-calibrate
+    source "$here/common.sh"
+    trap 'egres_stop; rm -rf "$EDATA"' EXIT
+    rm -f "$RUN/egres_io.flags"
+    local try line stalled mib cost
+    for try in 1 2 3 4 5; do
+        egres_stop
+        rm -rf "$EDATA"
+        PROBE=1 egres_launch
+        egres_wait
+        line=$(grep -a "disk calibrated" "$ELOG" | head -1)
+        stalled=$(grep -ac "look like a drive stall" "$ELOG" || true)
+        egres_stop
+        echo "probe $try: ${line#*disk calibrated: }" >&2
+        if [ -z "$line" ] || [ "$stalled" != 0 ]; then
+            sleep 20
+            continue
+        fi
+        mib=$(echo "$line" | sed -n 's/.*bandwidth_bytes=\([0-9]*\)MiB.*/\1/p')
+        cost=$(echo "$line" | sed -n 's/.*write_cost=\([0-9]*\).*/\1/p')
+        printf '%s;%s\n' "auto-calibrate=false;bandwidth-bytes=$((mib << 20))" \
+            "write-cost=$cost" >"$RUN/egres_io.flags"
+        echo "kept: $(cat "$RUN/egres_io.flags")"
+        exit 0
+    done
+    echo "no clean probe in 5 tries; nothing kept" >&2
+    exit 1
+)
 
 missing=0
 ok() { printf '  ok       %s\n' "$*"; }
@@ -171,10 +204,9 @@ do_check() {
         lack "firecracker: ./setup.sh assets"
     sha_ok "$A/vmlinux" "$KERNEL_SHA256" && ok "guest kernel 6.1.155" ||
         lack "guest kernel: ./setup.sh assets"
-    [ -f "$A/images.txt" ] && ok "guest images: $(cat "$A/images.txt")" ||
+    grep -q blank "$A/images.txt" 2>/dev/null &&
+        ok "guest images: $(cat "$A/images.txt")" ||
         lack "guest images: ./setup.sh assets"
-    [ -f "$A/images_big.txt" ] && ok "$(cat "$A/images_big.txt")" ||
-        lack "big tenant image: ./setup.sh assets"
 
     echo "built"
     [ -x "$here/probe/probe" ] && ok "probe" || lack "probe: ./setup.sh probe"

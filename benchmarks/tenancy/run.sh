@@ -9,8 +9,8 @@
 #   output.log   everything the test printed
 #   status.txt   start, end, exit status
 #   *.csv, logs/ the test's rows, and the Egres server's logs
-# <test>.latest beside them points at the newest run of each test.
-#   STEP=2000 ./run.sh egres_test2_density   one test, its settings
+# <test>-<backend>.latest beside them points at the newest run.
+#   BACKEND=egres ./run.sh footprint 1000 10000   one test, its settings
 #   ./run.sh suite [label]    every step of suite.txt (or $SUITE), from
 #                             <label> on
 #   ./run.sh list             the tests, and the suite's steps
@@ -23,16 +23,7 @@ suite=${SUITE:-$here/suite.txt}
 
 usage() { sed -n '5,17p' "$0" >&2; exit 2; }
 
-tests() {
-    local f
-    for f in "$here"/*.sh; do
-        f=${f##*/}
-        case $f in
-        test[0-9]_* | egres_test* | egres_restart* | egres_calibrate* | \
-            pg_* | drive_idle*) echo "${f%.sh}" ;;
-        esac
-    done
-}
+tests() { echo footprint; echo noisy; echo agents; echo drive_idle; }
 
 # The settings a run was given: every NAME the scripts read as
 # ${NAME:-...} or ${NAME:?...} that has a value, here or from local.sh.
@@ -53,13 +44,6 @@ run_one() {
     local dir=$1 test=$2
     shift 2
     [ -x "$here/$test.sh" ] || { echo "no test $test" >&2; return 2; }
-    # The restart is of what the density run left: its tenant count.
-    if [ "$test" = egres_restart ] && [ -z "${TENANTS:-}" ]; then
-        local csv=$results/egres_test2_density.latest/egres_test2_density.csv
-        [ -f "$csv" ] || { echo "no density run to restart" >&2; return 2; }
-        TENANTS=$(tail -1 "$csv" | cut -d, -f1)
-        export TENANTS
-    fi
     mkdir -p "$dir"
     {
         echo "test: $test"
@@ -68,12 +52,10 @@ run_one() {
     } >"$dir/command.txt"
     "$here/machine.sh" >"$dir/machine.txt" 2>/dev/null || true
     local cmd=("$here/$test.sh" "$@")
-    # The micro-VM tests run beside their taps, in the namespace.
-    case $test in
-    test[0-9]_*)
-        [ -e /run/netns/tbench ] && cmd=("$here/in_netns.sh" "${cmd[@]}")
-        ;;
-    esac
+    # The micro-VM side runs beside its taps, in the namespace.
+    if [ "${BACKEND:-}" = vm ] && [ -e /run/netns/tbench ]; then
+        cmd=("$here/in_netns.sh" "${cmd[@]}")
+    fi
     echo "start: $(date -u +%FT%TZ)" >"$dir/status.txt"
     echo "== $test -> $dir"
     local rc=0
@@ -83,7 +65,7 @@ run_one() {
         echo "end: $(date -u +%FT%TZ)"
         echo "exit: $rc"
     } >>"$dir/status.txt"
-    ln -sfn "$dir" "$results/$test.latest"
+    ln -sfn "$dir" "$results/$test${BACKEND:+-$BACKEND}.latest"
     return "$rc"
 }
 
@@ -138,6 +120,7 @@ suite) shift; run_suite "$@" ;;
 *)
     test=$1
     shift
-    run_one "$results/$test-$(date +%Y%m%d-%H%M%S)" "$test" "$@"
+    run_one "$results/$test${BACKEND:+-$BACKEND}-$(date +%Y%m%d-%H%M%S)" \
+        "$test" "$@"
     ;;
 esac

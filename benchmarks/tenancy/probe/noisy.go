@@ -27,25 +27,11 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
-
-func readTargets(path string, limit int) []string {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	t := strings.Fields(string(raw))
-	if limit >= 0 && limit < len(t) {
-		t = t[:limit]
-	}
-	return t
-}
 
 func fill(sql string, rows int) string {
 	if strings.Contains(sql, "{r}") {
@@ -54,8 +40,7 @@ func fill(sql string, rows int) string {
 		sql = strings.ReplaceAll(sql, "{e}", fmt.Sprint(r+999))
 	}
 	if strings.Contains(sql, "{s}") {
-		s := fmt.Sprintf("%016x%016x", rand.Uint64(), rand.Uint64())
-		sql = strings.ReplaceAll(sql, "{s}", s)
+		sql = strings.ReplaceAll(sql, "{s}", randText(nil))
 	}
 	return sql
 }
@@ -101,7 +86,7 @@ func noisy(args []string) {
 		for c := 0; c < *quietHold; c++ {
 			s, err := open(target, 2*time.Second)
 			if err == nil {
-				err = s.exec("SELECT v FROM t WHERE id = 1")
+				err = s.exec(query)
 			}
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "quiet pool:", target, err)
@@ -198,7 +183,7 @@ func noisy(args []string) {
 			} else {
 				ph, err = runTimed(target, q, 2*time.Second, true)
 			}
-			ms := float64(time.Since(due).Microseconds()) / 1000
+			lms := msSince(due)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -206,18 +191,15 @@ func noisy(args []string) {
 				lastErr = err
 				return
 			}
-			lat = append(lat, ms)
-			f := func(d time.Duration) float64 {
-				return float64(d.Microseconds()) / 1000
-			}
-			late = append(late, f(began))
-			conn = append(conn, f(ph.connect))
-			start = append(start, f(ph.startup))
-			qry = append(qry, f(ph.query))
+			lat = append(lat, lms)
+			late = append(late, ms(began))
+			conn = append(conn, ms(ph.connect))
+			start = append(start, ms(ph.startup))
+			qry = append(qry, ms(ph.query))
 			if *traceFile != "" {
 				fmt.Fprintf(&trace, "%.1f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-					f(due.Sub(begin)), ms, f(began), f(ph.connect),
-					f(ph.startup), f(ph.query))
+					ms(due.Sub(begin)), lms, ms(began), ms(ph.connect),
+					ms(ph.startup), ms(ph.query))
 			}
 		}()
 	}
@@ -243,30 +225,25 @@ func noisy(args []string) {
 			name string
 			a    []float64
 		}{{"late", late}, {"connect", conn}, {"startup", start}, {"query", qry}} {
-			sort.Float64s(x.a)
-			if len(x.a) == 0 {
+			a := sorted(x.a)
+			if len(a) == 0 {
 				continue
 			}
 			fmt.Fprintf(os.Stderr, "%-8s p50 %.2f  p90 %.2f  p99 %.2f ms\n",
-				x.name, x.a[len(x.a)/2], x.a[len(x.a)*9/10], x.a[len(x.a)*99/100])
+				x.name, pct(a, 0.5), pct(a, 0.9), pct(a, 0.99))
 		}
 	}
 
-	sort.Float64s(lat)
-	pct := func(p float64) float64 {
-		if len(lat) == 0 {
-			return 0
-		}
-		return lat[int(p*float64(len(lat)-1))]
-	}
+	lat = sorted(lat)
 	heavyMs := 0.0
 	if heavyDone > 0 {
 		heavyMs = float64(heavyUs) / float64(heavyDone) / 1000
 	}
-	// p50_ms,p90_ms,p99_ms,p999_ms,max_ms,ok,errors,
-	// heavy_done,heavy_failed,heavy_mean_ms
-	fmt.Printf("%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.1f\n",
-		pct(0.5), pct(0.9), pct(0.99), pct(0.999), pct(1), len(lat), errs,
+	// p50_ms,p90_ms,p99_ms,ok,errors,heavy_done,heavy_failed,heavy_mean_ms.
+	// No p99.9 or max: a run is a few thousand queries, and its top few
+	// are noise.
+	fmt.Printf("%.2f,%.2f,%.2f,%d,%d,%d,%d,%.1f\n",
+		pct(lat, 0.5), pct(lat, 0.9), pct(lat, 0.99), len(lat), errs,
 		heavyDone, heavyFailed, heavyMs)
 	// The heavy loops are left to die with the process: waiting for a
 	// statement that takes a minute would only delay the next step.

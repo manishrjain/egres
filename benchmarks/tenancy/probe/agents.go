@@ -1,0 +1,712 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
+// agents is the agentic workload, on both platforms. Tenants arrive
+// over time, each creating its database and loading its table through
+// SQL, as an agent setting up its own store would. A share of the
+// tenants (-active) are in a session at any moment, each sending a mix
+// of reads and writes on one connection it keeps; the rest are idle.
+//
+// -backend shared: every tenant is a database, tenant_<i>, on one
+// server (Egres), created on its "egres" database. The server must
+// start with none of them.
+//
+// -backend vm: every tenant is a Firecracker VM, made at its arrival
+// from a blank data image (Postgres initialised, no table) under
+// -run/vm<i>. The taps fctap<i> must exist (netns_setup.sh) and this
+// must run where they are (in_netns.sh). Here the probe is also the
+// platform's control plane (vm.go): it puts idle VMs to sleep when the
+// awake ones hold more than -budget-mib, least recently used first,
+// and a session for a sleeping tenant wakes it.
+//
+// The run grows by arrivals, open loop at -arrive a second, to each
+// count in -steps; there it pauses arrivals for -window, sessions still
+// running, and prints one CSV row (see header). Every latency is from
+// when its statement was due, so a wake is in the latency of the
+// session's first statement and a stalled server cannot hide its tail
+// by slowing the sender.
+package main
+
+import (
+	"bufio"
+	"errors"
+	"flag"
+	"fmt"
+	"math"
+	"math/rand"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+)
+
+const (
+	kPoint = iota
+	kRange
+	kUpdate
+	kInsert
+	kCount
+	numKinds
+)
+
+var kindNames = [numKinds]string{"point", "range", "update", "insert", "count"}
+
+const header = "tenants,awake,pss_mib,disk_mib,arrive_p50_ms,arrive_p99_ms," +
+	"wake_p50_ms,wake_p99_ms,woke_pct,sleeps_per_s,wakes_per_s," +
+	"point_p50_ms,point_p99_ms,range_p50_ms,range_p99_ms," +
+	"update_p50_ms,update_p99_ms,insert_p50_ms,insert_p99_ms," +
+	"count_p50_ms,count_p99_ms,ok,errors"
+
+// Arrivals under way at once. Past this an arrival waits its turn, and
+// the wait is in its latency.
+const maxArriving = 32
+
+// mix is each kind's share of the statements, in percent.
+type mix [numKinds]int
+
+func parseMix(s string) (mix, error) {
+	var m mix
+	seen := [numKinds]bool{}
+	sum := 0
+	for _, part := range strings.Split(s, ",") {
+		name, val, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if !ok {
+			return m, fmt.Errorf("mix: %q is not kind=percent", part)
+		}
+		k := -1
+		for i, n := range kindNames {
+			if n == name {
+				k = i
+			}
+		}
+		if k < 0 {
+			return m, fmt.Errorf("mix: no statement kind %q", name)
+		}
+		if seen[k] {
+			return m, fmt.Errorf("mix: %s given twice", name)
+		}
+		seen[k] = true
+		n, err := strconv.Atoi(val)
+		if err != nil || n < 0 || n > 100 {
+			return m, fmt.Errorf("mix: %s=%s is not a percentage", name, val)
+		}
+		m[k] = n
+		sum += n
+	}
+	if sum != 100 {
+		return m, fmt.Errorf("mix: adds up to %d, not 100", sum)
+	}
+	return m, nil
+}
+
+// pick is the kind for r in 0..99.
+func (m mix) pick(r int) int {
+	for k, n := range m {
+		if r < n {
+			return k
+		}
+		r -= n
+	}
+	return numKinds - 1 // not reached for a mix that adds up to 100
+}
+
+// parseSteps reads the tenant counts to measure at, which must rise.
+func parseSteps(s string) ([]int, error) {
+	var steps []int
+	for _, part := range strings.Split(s, ",") {
+		n, err := strconv.Atoi(strings.TrimSpace(part))
+		if err != nil || n < 1 {
+			return nil, fmt.Errorf("steps: %q is not a tenant count", part)
+		}
+		if len(steps) > 0 && n <= steps[len(steps)-1] {
+			return nil, fmt.Errorf("steps: %d does not follow %d", n,
+				steps[len(steps)-1])
+		}
+		steps = append(steps, n)
+	}
+	return steps, nil
+}
+
+// arrivalDue is when the k-th arrival of a growth begun at begin is due.
+func arrivalDue(begin time.Time, k int, perSec float64) time.Time {
+	return begin.Add(time.Duration(float64(k) * float64(time.Second) / perSec))
+}
+
+// statement is the SQL for one statement of kind: r is a random id in
+// 1..rows, n the tenant's next unused id, text 32 random characters.
+// wantRow says a reply without a row is wrong.
+func statement(kind, r, n int, text string) (sql string, wantRow bool) {
+	switch kind {
+	case kPoint:
+		return fmt.Sprintf("SELECT v FROM t WHERE id = %d", r), true
+	case kRange:
+		return fmt.Sprintf("SELECT id, v FROM t WHERE id BETWEEN %d AND %d",
+			r, r+9), true
+	case kUpdate:
+		return fmt.Sprintf("UPDATE t SET v = '%s' WHERE id = %d", text, r), false
+	case kInsert:
+		return fmt.Sprintf("INSERT INTO t VALUES (%d, '%s')", n, text), false
+	default:
+		return "SELECT count(*) FROM t", true
+	}
+}
+
+type tenant struct {
+	id int
+	// The id the next insert uses. Only the tenant's one session
+	// touches it.
+	nextID int
+}
+
+type sessionRun struct {
+	t *tenant
+	// Every statement of this session due before this time (unix ns)
+	// has finished: what a window's end waits for.
+	mark atomic.Int64
+}
+
+type agentRun struct {
+	addr    string    // shared
+	p       *platform // vm; nil for shared
+	pid     int       // shared: the server's, for its PSS
+	clk     *clock
+	rows    int
+	mix     mix
+	rate    float64
+	sessLen time.Duration
+	active  float64
+	begin   time.Time
+	next    int // the next tenant to arrive; the main goroutine's
+
+	mu      sync.Mutex // guards what follows
+	rng     *rand.Rand
+	tenants []*tenant // by id; nil until it has arrived
+	count   int
+	idle    []int // tenants with no session
+	running map[*sessionRun]bool
+	trace   *bufio.Writer
+	// The window under way: statements due in [winStart, winEnd) are
+	// counted, none when winStart is zero, and winEnd is zero until
+	// the window ends.
+	winStart, winEnd time.Time
+	lat              [numKinds][]float64
+	wakeLat          []float64
+	woke, ok, errs   int
+	lastErr          error
+	// Since the last row.
+	arriveLat []float64
+}
+
+func (a *agentRun) target(id int) string {
+	if a.p != nil {
+		return vmAddr(id)
+	}
+	return fmt.Sprintf("%s/tenant_%d", a.addr, id)
+}
+
+func (a *agentRun) traceLine(due time.Time, id int, kind string, lms float64,
+	woke bool, err error) {
+	if a.trace != nil {
+		fmt.Fprintf(a.trace, "%.1f,%d,%s,%.3f,%t,%t\n",
+			ms(due.Sub(a.begin)), id, kind, lms, woke, err == nil)
+	}
+}
+
+func (a *agentRun) record(id, kind int, due time.Time, lms float64, err error,
+	woke bool, wake time.Duration) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.traceLine(due, id, kindNames[kind], lms, woke, err)
+	if a.winStart.IsZero() || due.Before(a.winStart) ||
+		(!a.winEnd.IsZero() && !due.Before(a.winEnd)) {
+		return
+	}
+	if err != nil {
+		a.errs++
+		a.lastErr = err
+	} else {
+		a.ok++
+		a.lat[kind] = append(a.lat[kind], lms)
+	}
+	if woke {
+		a.woke++
+		a.wakeLat = append(a.wakeLat, ms(wake))
+	}
+}
+
+// schedule keeps about active × tenants in a session: whenever there
+// are fewer, it starts one for a tenant picked at random from the
+// idle ones.
+func (a *agentRun) schedule() {
+	for {
+		time.Sleep(10 * time.Millisecond)
+		a.mu.Lock()
+		want := int(math.Round(a.active * float64(a.count)))
+		for len(a.running) < want && len(a.idle) > 0 {
+			k := a.rng.Intn(len(a.idle))
+			id := a.idle[k]
+			a.idle[k] = a.idle[len(a.idle)-1]
+			a.idle = a.idle[:len(a.idle)-1]
+			s := &sessionRun{t: a.tenants[id]}
+			start := time.Now()
+			s.mark.Store(start.UnixNano())
+			a.running[s] = true
+			go a.session(s, start, a.rng.Int63())
+		}
+		a.mu.Unlock()
+	}
+}
+
+func (a *agentRun) endSession(s *sessionRun) {
+	s.mark.Store(math.MaxInt64)
+	a.mu.Lock()
+	delete(a.running, s)
+	a.idle = append(a.idle, s.t.id)
+	a.mu.Unlock()
+}
+
+// session is one tenant's session: statements open loop at -rate for
+// -session on one connection. A VM is held awake for all of it; a
+// sleeping one is woken first, inside the first statement's latency.
+func (a *agentRun) session(s *sessionRun, start time.Time, seed int64) {
+	defer a.endSession(s)
+	rng := rand.New(rand.NewSource(seed))
+	t := s.t
+	gap := time.Duration(float64(time.Second) / a.rate)
+	var held error // why the tenant could not be had, if it could not
+	woke := false
+	var took time.Duration
+	if a.p != nil {
+		v := a.p.get(t.id)
+		woke, took, held = a.p.acquire(v)
+		if held == nil {
+			defer a.p.release(v)
+		}
+	}
+	var conn *session
+	defer func() {
+		if conn != nil {
+			conn.close()
+		}
+	}()
+	for k := 0; time.Duration(k)*gap < a.sessLen; k++ {
+		due := start.Add(time.Duration(k) * gap)
+		a.clk.wait(due)
+		kind := a.mix.pick(rng.Intn(100))
+		n := t.nextID
+		if kind == kInsert {
+			// Used up even if the insert fails: it may have committed
+			// before the reply was lost.
+			t.nextID++
+		}
+		sql, wantRow := statement(kind, 1+rng.Intn(a.rows), n, randText(rng))
+		err := held
+		if err == nil && conn == nil {
+			conn, err = openRetry(a.target(t.id), time.Now().Add(convTimeout))
+		}
+		if err == nil {
+			var got bool
+			got, err = conn.query(sql)
+			var pe *pgError
+			if err != nil && !errors.As(err, &pe) {
+				conn.close()
+				conn = nil
+			}
+			if err == nil && wantRow && !got {
+				err = errors.New(kindNames[kind] + ": no row")
+			}
+		}
+		a.record(t.id, kind, due, msSince(due), err, woke && k == 0, took)
+		s.mark.Store(due.Add(gap).UnixNano())
+	}
+}
+
+// arrive brings tenant i in: its database (or VM), its table, its
+// rows, and then the first row of a point read, which is where its
+// latency ends.
+func (a *agentRun) arrive(i int, due time.Time) error {
+	if a.p != nil {
+		v, err := a.p.create(i)
+		if err != nil {
+			return err
+		}
+		defer a.p.release(v)
+	} else {
+		err := run(a.addr+"/egres", fmt.Sprintf("CREATE DATABASE tenant_%d", i),
+			2*time.Second, false)
+		if err != nil {
+			return fmt.Errorf("tenant_%d: %w", i, err)
+		}
+	}
+	err := func() error {
+		s, err := openRetry(a.target(i), time.Now().Add(convTimeout))
+		if err != nil {
+			return err
+		}
+		defer s.close()
+		if err := loadRows(s, a.rows); err != nil {
+			return err
+		}
+		got, err := s.query(query)
+		if err == nil && !got {
+			err = errors.New("no row after the load")
+		}
+		return err
+	}()
+	if err != nil {
+		return fmt.Errorf("tenant %d: %w", i, err)
+	}
+	lms := msSince(due)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.traceLine(due, i, "arrive", lms, false, nil)
+	a.arriveLat = append(a.arriveLat, lms)
+	for len(a.tenants) <= i {
+		a.tenants = append(a.tenants, nil)
+	}
+	a.tenants[i] = &tenant{id: i, nextID: a.rows + 1}
+	a.count++
+	a.idle = append(a.idle, i)
+	return nil
+}
+
+// grow adds tenants, open loop at perSec, until `to` have been sent
+// for, and waits for them. It stops short at the host's floors or
+// after an arrival fails, and says why; failed is set for the latter.
+func (a *agentRun) grow(to int, perSec, floorGiB, diskFloorGiB float64) (
+	why string, failed bool) {
+	sem := make(chan struct{}, maxArriving)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+	failure := func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		return firstErr
+	}
+	begin := time.Now()
+	for k := 0; a.next < to; k++ {
+		due := arrivalDue(begin, k, perSec)
+		waitUntil(due)
+		if failure() != nil {
+			break
+		}
+		if avail := memAvailableGiB(); avail < floorGiB {
+			why = fmt.Sprintf("host memory available %.1f GiB, under the "+
+				"floor of %.0f", avail, floorGiB)
+			break
+		}
+		if a.p != nil {
+			if free := diskFreeGiB(a.p.run); free < diskFloorGiB {
+				why = fmt.Sprintf("disk free under -run %.1f GiB, under the "+
+					"floor of %.0f", free, diskFloorGiB)
+				break
+			}
+		}
+		sem <- struct{}{}
+		i := a.next
+		a.next++
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := a.arrive(i, due); err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if err := failure(); err != nil {
+		return "an arrival failed: " + err.Error(), true
+	}
+	return why, false
+}
+
+// A window's row, with the figures the stop rule reads.
+type windowRow struct {
+	csv string
+	// p99 of the reads (point and range), the arrivals' p99, and the
+	// share of statements that failed, all in the window; 0 where there
+	// were no samples.
+	readP99, arriveP99, errPct float64
+}
+
+// window measures for d with arrivals paused and returns the CSV row.
+func (a *agentRun) window(d time.Duration) windowRow {
+	a.mu.Lock()
+	a.winStart, a.winEnd = time.Now(), time.Time{}
+	a.lat = [numKinds][]float64{}
+	a.wakeLat = nil
+	a.woke, a.ok, a.errs, a.lastErr = 0, 0, 0, nil
+	start := a.winStart
+	a.mu.Unlock()
+	if a.p != nil {
+		a.p.measure(true)
+	}
+	end := start.Add(d)
+	var pssSum, pssN int64
+	for time.Now().Before(end) {
+		time.Sleep(min(250*time.Millisecond, time.Until(end)))
+		if a.p == nil && a.pid > 0 {
+			pssSum += pssKB(a.pid)
+			pssN++
+		}
+	}
+
+	a.mu.Lock()
+	a.winEnd = time.Now()
+	stop := a.winEnd
+	var open []*sessionRun
+	for s := range a.running {
+		open = append(open, s)
+	}
+	a.mu.Unlock()
+	var awakeAvg, pssMiB float64
+	var wakes, sleeps int
+	if a.p != nil {
+		awakeAvg, pssMiB, wakes, sleeps = a.p.measure(false)
+	}
+	// A statement due in the window may not have finished yet; the row
+	// waits for it, up to what the statement's own timeouts allow.
+	limit := stop.Add(wakeTimeout + 2*convTimeout)
+	for _, s := range open {
+		for s.mark.Load() < stop.UnixNano() && time.Now().Before(limit) {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	secs := max(stop.Sub(start).Seconds(), 1e-3) // -window 0: no NaN
+	f0 := func(x float64) string { return fmt.Sprintf("%.0f", x) }
+	f2 := func(x float64) string { return fmt.Sprintf("%.2f", x) }
+	arrive := sorted(a.arriveLat)
+	wake := sorted(a.wakeLat)
+	cells := []string{strconv.Itoa(a.count)}
+	if a.p != nil {
+		woke := 0.0
+		if n := a.ok + a.errs; n > 0 {
+			woke = 100 * float64(a.woke) / float64(n)
+		}
+		cells = append(cells, f0(awakeAvg), f0(pssMiB),
+			f0(diskUsedMiB(a.p.run)),
+			pctCell(arrive, 0.5), pctCell(arrive, 0.99),
+			pctCell(wake, 0.5), pctCell(wake, 0.99), f2(woke),
+			f2(float64(sleeps)/secs), f2(float64(wakes)/secs))
+	} else {
+		pss := ""
+		if pssN > 0 {
+			pss = f0(float64(pssSum) / float64(pssN) / 1024)
+		}
+		cells = append(cells, "", pss, "",
+			pctCell(arrive, 0.5), pctCell(arrive, 0.99), "", "", "", "", "")
+	}
+	for k := range numKinds {
+		l := sorted(a.lat[k])
+		cells = append(cells, pctCell(l, 0.5), pctCell(l, 0.99))
+	}
+	cells = append(cells, strconv.Itoa(a.ok), strconv.Itoa(a.errs))
+	row := windowRow{csv: strings.Join(cells, ","),
+		readP99: max(pct(sorted(a.lat[kPoint]), 0.99),
+			pct(sorted(a.lat[kRange]), 0.99)),
+		arriveP99: pct(arrive, 0.99)}
+	if n := a.ok + a.errs; n > 0 {
+		row.errPct = 100 * float64(a.errs) / float64(n)
+	}
+
+	if a.lastErr != nil {
+		fmt.Fprintln(os.Stderr, "agents: last error:", a.lastErr)
+	}
+	a.winStart = time.Time{}
+	a.arriveLat = nil
+	if a.trace != nil {
+		a.trace.Flush()
+	}
+	return row
+}
+
+// stopRule is when a count no longer fits: the reads' p99 over a
+// bound, arrivals too slow, or statements failing. A bound of 0 is
+// off. Returns why, or "".
+type stopRule struct{ readP99, arriveP99, errPct float64 }
+
+func (r stopRule) breached(w windowRow) string {
+	switch {
+	case r.readP99 > 0 && w.readP99 > r.readP99:
+		return fmt.Sprintf("reads' p99 %.1f ms over %.1f", w.readP99, r.readP99)
+	case r.arriveP99 > 0 && w.arriveP99 > r.arriveP99:
+		return fmt.Sprintf("arrivals' p99 %.0f ms over %.0f", w.arriveP99,
+			r.arriveP99)
+	case r.errPct > 0 && w.errPct > r.errPct:
+		return fmt.Sprintf("%.2f%% of statements failed, over %.1f%%",
+			w.errPct, r.errPct)
+	}
+	return ""
+}
+
+func agents(args []string) {
+	fs := flag.NewFlagSet("agents", flag.ExitOnError)
+	backend := fs.String("backend", "", "shared or vm")
+	addr := fs.String("addr", "", "shared: the server, ip:port")
+	pid := fs.Int("pid", 0, "shared: the server's pid, for pss_mib")
+	runDir := fs.String("run", "", "vm: directory for the VMs' vm<i>/")
+	fc := fs.String("fc", "", "vm: the firecracker binary")
+	kernel := fs.String("kernel", "", "vm: the guest kernel")
+	rootfs := fs.String("rootfs", "", "vm: the guest's root image")
+	blank := fs.String("blank", "",
+		"vm: the blank data image, initdb done and no table")
+	memMiB := fs.Int("mem-mib", 128, "vm: guest memory, MiB")
+	wakeBy := fs.String("wake", "restore", "vm: wake by restore or boot")
+	budgetMiB := fs.Int64("budget-mib", 0,
+		"vm: PSS the awake VMs may hold, MiB; 0 = no budget, nothing sleeps")
+	floorGiB := fs.Float64("floor-gib", 16,
+		"stop arrivals when the host's MemAvailable is under this")
+	diskFloorGiB := fs.Float64("disk-floor-gib", 5,
+		"vm: stop arrivals when the disk under -run has less free")
+	stepsFlag := fs.String("steps", "1000,2000,5000,10000,20000,50000,100000",
+		"tenant counts to measure at; arrivals stop at the last")
+	arrive := fs.Float64("arrive", 30, "arrivals per second while growing")
+	window := fs.Duration("window", 2*time.Minute,
+		"measured time at each step, arrivals paused")
+	active := fs.Float64("active", 0.10, "share of tenants in a session at a time")
+	sessLen := fs.Duration("session", 2*time.Minute, "session length")
+	rate := fs.Float64("rate", 1, "statements per second per session")
+	rows := fs.Int("rows", 1000, "rows loaded at arrival; ids are 1..rows")
+	mixFlag := fs.String("mix", "point=60,range=15,update=15,insert=8,count=2",
+		"statement mix, percent")
+	traceFile := fs.String("trace", "",
+		"file for one line per statement: due_ms,tenant,kind,ms,woke,ok"+
+			" (arrivals too, kind arrive)")
+	seed := fs.Int64("seed", 1, "seed for the random choices")
+	stopRead := fs.Float64("stop-p99-ms", 50,
+		"stop growing when the reads' p99 in a window is over this; 0 = never")
+	stopArrive := fs.Float64("stop-arrive-ms", 5000,
+		"stop growing when the arrivals' p99 is over this; 0 = never")
+	stopErr := fs.Float64("stop-errors-pct", 1,
+		"stop growing when more than this share of statements fail; 0 = never")
+	fs.Parse(args)
+
+	fail := func(msg string) {
+		fmt.Fprintln(os.Stderr, "agents:", msg)
+		os.Exit(2)
+	}
+	m, err := parseMix(*mixFlag)
+	if err != nil {
+		fail(err.Error())
+	}
+	steps, err := parseSteps(*stepsFlag)
+	if err != nil {
+		fail(err.Error())
+	}
+	switch {
+	case *backend == "shared" && *addr == "":
+		fail("-backend shared needs -addr")
+	case *backend == "vm" && (*runDir == "" || *fc == "" || *kernel == "" ||
+		*rootfs == "" || *blank == ""):
+		fail("-backend vm needs -run, -fc, -kernel, -rootfs and -blank")
+	case *backend != "shared" && *backend != "vm":
+		fail("need -backend shared|vm")
+	case *wakeBy != "restore" && *wakeBy != "boot":
+		fail("-wake is restore or boot")
+	case *rows < 1 || *rate <= 0 || *arrive <= 0 || *active < 0 || *active > 1:
+		fail("-rows, -rate and -arrive must be positive, -active in 0..1")
+	}
+
+	a := &agentRun{addr: *addr, pid: *pid, clk: newClock(), rows: *rows,
+		mix: m, rate: *rate, sessLen: *sessLen, active: *active,
+		begin: time.Now(), rng: rand.New(rand.NewSource(*seed)),
+		running: map[*sessionRun]bool{}}
+	if *backend == "vm" {
+		if err := os.MkdirAll(*runDir, 0o755); err != nil {
+			fail(err.Error())
+		}
+		a.p = &platform{fc: *fc, kernel: *kernel, rootfs: *rootfs,
+			blank: *blank, run: *runDir, memMiB: *memMiB,
+			boot: *wakeBy == "boot", budget: *budgetMiB * 1024}
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		go func() {
+			<-sig
+			a.p.killAll()
+			os.Exit(1)
+		}()
+		go a.p.control()
+	}
+	var tf *os.File
+	if *traceFile != "" {
+		if tf, err = os.Create(*traceFile); err != nil {
+			fail(err.Error())
+		}
+		a.trace = bufio.NewWriterSize(tf, 1<<20)
+	}
+	exit := func(code int) {
+		a.mu.Lock()
+		if a.trace != nil {
+			a.trace.Flush()
+			tf.Close()
+		}
+		a.mu.Unlock()
+		if a.p != nil {
+			a.p.killAll()
+		}
+		os.Exit(code)
+	}
+	go a.schedule()
+
+	rule := stopRule{*stopRead, *stopArrive, *stopErr}
+	fmt.Println(header)
+	for _, step := range steps {
+		t0 := time.Now()
+		why, failed := a.grow(step, *arrive, *floorGiB, *diskFloorGiB)
+		a.mu.Lock()
+		n := a.count
+		a.mu.Unlock()
+		fmt.Fprintf(os.Stderr, "agents: %d tenants, grown in %s\n", n,
+			time.Since(t0).Round(time.Second))
+		if why != "" {
+			fmt.Fprintf(os.Stderr, "agents: stopping at %d tenants: %s\n", n, why)
+		}
+		if n > 0 {
+			w := a.window(*window)
+			fmt.Println(w.csv)
+			// A breach is measured once more at the same count before it
+			// ends the run: a drive's slow phase can lift one window's
+			// p99 on its own, and a count that fails twice has not fit.
+			// Both rows are printed.
+			if over := rule.breached(w); over != "" && why == "" {
+				fmt.Fprintf(os.Stderr, "agents: %d tenants: %s; measuring "+
+					"again\n", n, over)
+				w = a.window(*window)
+				fmt.Println(w.csv)
+				if over = rule.breached(w); over != "" {
+					why = over + " in two windows"
+					fmt.Fprintf(os.Stderr, "agents: stopping at %d tenants: "+
+						"%s\n", n, why)
+				}
+			}
+		}
+		if a.p != nil {
+			a.p.mu.Lock()
+			if a.p.snapFails > 0 {
+				fmt.Fprintf(os.Stderr, "agents: %d snapshots failed, last: %v\n",
+					a.p.snapFails, a.p.lastSnapErr)
+			}
+			a.p.mu.Unlock()
+		}
+		if failed {
+			exit(1)
+		}
+		if why != "" {
+			break
+		}
+	}
+	exit(0)
+}

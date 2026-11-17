@@ -1,33 +1,45 @@
 # Tenancy benchmark
 
-Micro-VMs against Egres for many small tenants. On one side, each
-tenant is a Firecracker micro-VM running stock Postgres 18 (1 vCPU,
+Many small tenants on one machine, two ways. On one side each tenant
+is a Firecracker micro-VM running stock Postgres 18 (1 vCPU,
 128 MiB). On the other, each tenant is a database on one Egres
-server. Two controls run beside them: one Postgres per tenant with no
-VM around it, and one Postgres holding every tenant as a database.
-The same scripts rerun the whole comparison on another machine and
-record what they ran on.
+server. One control runs beside them: a Postgres per tenant in a
+container with no VM around it, which splits the micro-VM's cost into
+Postgres's part and the VM's. The same scripts rerun the whole
+comparison on another machine and record what they ran on.
+
+Every tenant on every side gets its data the same way, through SQL:
+its database (a VM, on the micro-VM side), table `t`, and rows
+`(id, md5(id))`.
 
 ## The tests
 
-| Test | Micro-VMs | Egres | Measures |
-|---|---|---|---|
-| 1 | `test1_footprint` | `egres_test1_footprint` | Idle cost, memory and disk |
-| 2 | `test2_density` | `egres_test2_density` | Tenants until p99 > 50 ms |
-| 3 | `test3_coldstart` | `egres_test3_coldstart` | Cold tenant to first row |
-| 4 | `test4_sleeping` | `egres_test4_sleeping` | 16 GiB, more than fit awake |
-| 5 | `test5_noisy` | `egres_test5_noisy` | Quiet tenants beside heavy |
+Each test is one script that runs against a platform, `BACKEND=vm`,
+`egres` or `pgsolo`:
 
-- `pg_solo`: one Postgres per tenant in a container, no VM: the
-  control for what the VM itself costs (test 1).
-- `pg_shared`: one Postgres, every tenant a database, idle, under
-  test 2's load and with a connection held per tenant.
-- `egres_restart`: the server restarted with every tenant a density
-  run left, its first touches, and a clean stop.
-- `drive_idle`: whether the drive slows down when idle, which would
-  show in every latency.
-- `egres_calibrate`: measures the drive once, so later Egres starts
-  skip their own 2.5 s probe.
+1. **`noisy`: isolation.** 50 quiet tenants send an occasional point
+   read while 0 to 64 heavy tenants each run one statement flat out,
+   a count over 100,000 rows or an update of 1,000 of them. Reported:
+   the quiet tenants' latency at each heavy count.
+2. **`footprint`: what a tenant costs, and how many fit.** Tenants are
+   brought up to each count in turn; after each, point reads at
+   random tenants, and the memory and disk held. After the last count
+   the memory is sampled for ten minutes as the tenants go quiet,
+   then the platform is restarted on the same data and timed to a
+   first row. `footprint_fit.txt` estimates from the slope how many
+   tenants the host's memory holds.
+3. **`agents`: the workload.** Tenants arrive over time and load their
+   data; a tenth of them are in a session at any moment, sending a
+   mix of reads and writes; the rest are idle. On the micro-VM side
+   the probe is also the control plane: when memory runs out, idle
+   VMs are put to sleep (snapshotted to disk) and woken, by restoring
+   the snapshot or booting afresh, when a session starts for them. At
+   each tenant count: the latency of every statement kind, the time
+   an arrival took to its first row, wakes and sleeps, memory and
+   disk.
+
+`drive_idle` runs first: whether the drive slows down when idle,
+which would show in every latency.
 
 Each script's header says what it does and lists its settings.
 
@@ -38,9 +50,9 @@ Each script's header says what it does and lists its settings.
   records `virtualisation: none`.
 - **About 128 GB of memory.** The tanland rehearsal had 121 GB. The
   micro-VM side stops at the memory floor (`FLOOR_GIB`, 16).
-- **A datacenter NVMe drive, 1 TB free under WORK.** Putting 4,000
-  micro-VMs to sleep in test 4 writes about 663 GiB, 512 GiB of it
-  snapshots. A consumer drive sets test 4's restore results, as
+- **A datacenter NVMe drive, 1 TB free under WORK.** A sleeping
+  micro-VM holds a 128 MiB snapshot; a consumer drive's write stalls
+  set the micro-VM wake times and the Egres write results, as
   tanland's Kingston NV1 did.
 - **Open files: a hard limit of 4 per Egres tenant.** 524,288 allows
   about 131,000 tenants; `./setup.sh check` prints the figure.
@@ -70,24 +82,26 @@ run `sudo ./setup.sh host` again.
   - The kernel is the one Firecracker's getting-started guide
     fetches, `firecracker-ci/v1.15/x86_64/vmlinux-6.1.155`.
   - The images are built from `postgres:18` pinned by digest
-    (`PG_IMAGE` in `env.sh`).
+    (`PG_IMAGE` in `env.sh`): a root filesystem, and a blank data
+    directory every tenant starts from.
 - `probe`: the load and timing client (Go).
 - `egres`: this checkout's server, a ReleaseFast build into
   `$WORK/egres-bin`, its commit beside it. Set `EGRES_BIN` in
   `local.sh` to measure another build.
-- `calibrate`: the drive, once.
+- `calibrate`: the drive, once, so every Egres start is given the
+  same profile and skips its own 2.5 s probe.
 
 ## A run
 
 ```
-./run.sh list                         # the tests and the suite
-./run.sh suite                        # every step of suite.txt
-./run.sh suite density-egres          # the suite from that step on
-STEP=2000 MAX=120000 ./run.sh egres_test2_density   # one test
+./run.sh list                              # the tests and the suite
+./run.sh suite                             # every step of suite.txt
+./run.sh suite footprint-egres             # the suite from that step on
+BACKEND=egres ./run.sh footprint 1000 10000 100000   # one test
 ```
 
 Each run gets a directory under `$WORK/results`, and
-`<test>.latest` points at the newest run of each test. A suite's
+`<test>-<backend>.latest` points at the newest run of each. A suite's
 steps are numbered directories under `suite-<time>`. A suite's
 `summary.txt` lists each step's exit status and duration, and it has
 a copy of the `suite.txt` it ran. A failed step does not stop the
@@ -102,15 +116,11 @@ suite. Each run's directory holds:
 - `output.log` and `status.txt`: what the test printed, and its start,
   end and exit status.
 - The test's CSVs and traces. `logs/` has one server log per Egres
-  start.
+  start; Egres's meter and memory reports are saved after each step
+  of `noisy` and at the end of `agents`.
 
 `suite.txt` holds the settings the tanland rehearsal published.
-Edit it, or point `SUITE` at another file, to change a run. Rough
-durations on tanland:
-- Egres density to 84,000 tenants: 1 h 45 min.
-- Putting 4,000 micro-VMs to sleep: 1 h 30 min.
-- Each test 4 row: 7 min.
-- The noisy-neighbour sweeps: about 20 min per side.
+Edit it, or point `SUITE` at another file, to change a run.
 
 The micro-VM tests run inside the taps' namespace (`in_netns.sh`,
 done by `run.sh`). Egres listens 50 above its own ports (SQL 3260,
@@ -122,12 +132,16 @@ the whole host.
 
 - `env.sh`: where everything lives (`WORK`), read by every script.
 - `local.sh`: this machine's settings (ignored by git).
-- `lib.sh`, `egres_lib.sh`: the micro-VM and Egres sides' shared
-  pieces.
+- `common.sh`: what the tests share, and the backend interface its
+  header lists; it sources `backends/$BACKEND.sh`.
+- `backends/`: `vm.sh`, `egres.sh`, `pgsolo.sh`, one platform each.
+- `footprint.sh`, `noisy.sh`, `agents.sh`, `drive_idle.sh`: the tests.
+- `setup.sh`, `run.sh`, `machine.sh`, `suite.txt`: making a machine
+  ready, and running on it.
 - `netns_setup.sh`, `in_netns.sh`: the taps' namespace, and running a
   command in it.
-- `build_images.sh`, `build_big_image.sh`, `fc-init`: the guest images
-  and the guest's init.
-- `probe/`: the client. `first` times one first row; `load` is
-  open-loop point reads; `fleet` is test 4's traffic and the
-  micro-VMs' control plane; `noisy` is test 5's traffic.
+- `build_images.sh`, `fc-init`: the guest images and the guest's init.
+- `probe/`: the client. `first` times one first row; `sql` runs one
+  statement; `load` is open-loop point reads; `noisy` is test 1's
+  traffic; `agents` is test 3's traffic and the micro-VMs' control
+  plane.

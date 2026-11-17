@@ -5,7 +5,7 @@
 # Runs a command as this user inside the benchmark's network
 # namespace (netns_setup.sh), where the micro-VM taps live, with
 # this shell's environment.
-#   WAKE=boot ./in_netns.sh ./test4_sleeping.sh 100 200
+#   BACKEND=vm ./in_netns.sh ./footprint.sh 100 400
 set -euo pipefail
 ns=/run/netns/tbench
 [ -e "$ns" ] || { echo "no namespace: sudo ./netns_setup.sh" >&2; exit 1; }

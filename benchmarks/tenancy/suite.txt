@@ -1,29 +1,24 @@
 # The whole benchmark, in the order `./run.sh suite` runs it. One step
 # per line: a label, the test (a script here, without .sh), then
-# VAR=value settings and the test's arguments. The settings are the
-# ones the tanland rehearsal published; each script's header says
-# what they mean. Edit to change a run; the copy used is saved with
-# its results.
+# VAR=value settings and the test's arguments. BACKEND picks the
+# platform (vm, egres, pgsolo). Each script's header says what the
+# settings mean. Edit to change a run; the copy used is saved with its
+# results.
 
 drive-idle            drive_idle
 
-footprint-vm          test1_footprint        1 10 100 400 1100
-footprint-pg-solo     pg_solo                1 10 100
-footprint-egres       egres_test1_footprint  1 10 100 400 1100
-footprint-pg-shared   pg_shared              100 400 1100
+# 1. Isolation: a heavy tenant beside quiet ones.
+noisy-vm              noisy      BACKEND=vm
+noisy-egres           noisy      BACKEND=egres
 
-density-vm            test2_density          STEP=100
-density-egres         egres_test2_density    STEP=2000 MAX=120000 CREATE_PAR=1
-# The tenants the density step left, restarted: TENANTS comes from its
-# last row.
-restart-egres         egres_restart
+# 2. What a tenant costs, and how many fit. The micro-VM side stops at
+# the memory floor; pgsolo splits its figure into Postgres and the VM.
+footprint-vm          footprint  BACKEND=vm      1 10 100 400 1100
+footprint-pgsolo      footprint  BACKEND=pgsolo  RESTART=0 1 10 100
+footprint-egres       footprint  BACKEND=egres   1000 10000 50000 100000
 
-coldstart-vm          test3_coldstart        RUNS=20
-coldstart-egres       egres_test3_coldstart  TENANTS=1100 RUNS=20 DROP=1
-
-sleeping-vm-restore   test4_sleeping         WAKE=restore BUDGET_MIB=16384
-sleeping-vm-boot      test4_sleeping         WAKE=boot BUDGET_MIB=16384
-sleeping-egres        egres_test4_sleeping   BUDGET_MIB=16384
-
-noisy-vm              test5_noisy
-noisy-egres           egres_test5_noisy
+# 3. Agents arriving and working, the micro-VMs put to sleep and woken
+# as memory runs out: restored from a snapshot, or booted afresh.
+agents-vm-restore     agents     BACKEND=vm      WAKE=restore
+agents-vm-boot        agents     BACKEND=vm      WAKE=boot
+agents-egres          agents     BACKEND=egres

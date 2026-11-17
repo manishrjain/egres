@@ -9,7 +9,7 @@
 # spun a core; a real micro-VM host keeps its taps away from such
 # daemons too. The micro-VM tests then run inside the namespace:
 #   sudo ./netns_setup.sh [taps]        default 4000
-#   ./in_netns.sh ./test4_sleeping.sh ...
+#   ./in_netns.sh ./footprint.sh ...
 #   sudo ./netns_setup.sh remove
 # Any fctap left on the host is removed first.
 #
