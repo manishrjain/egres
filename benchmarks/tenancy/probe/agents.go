@@ -16,9 +16,9 @@
 // -run/vm<i>. The taps fctap<i> must exist (netns_setup.sh) and this
 // must run where they are (in_netns.sh). Here the probe is also the
 // platform's control plane (vm.go): it puts idle VMs to sleep when the
-// test's cgroup holds more than -budget-mib outside the file cache,
-// least recently used first, and a session for a sleeping tenant
-// wakes it.
+// test's cgroup holds more than -budget-mib (all but the clean,
+// unmapped file cache), least recently used first, holds arrivals
+// until it is under, and a session for a sleeping tenant wakes it.
 //
 // The run grows by arrivals, open loop at -arrive a second, to each
 // count in -steps; there it pauses arrivals for -window, sessions still
@@ -377,9 +377,11 @@ func (a *agentRun) arrive(i int, due time.Time) error {
 
 // grow adds tenants, open loop at perSec, until `to` have been sent
 // for, and waits for them. It stops short at the host's floors or
-// after an arrival fails, and says why; failed is set for the latter.
+// after an arrival fails, and says why. A failed arrival is a stop,
+// not a fault: the platform did not take a tenant in the time
+// allowed, and the count it had is measured.
 func (a *agentRun) grow(to int, perSec, floorGiB, diskFloorGiB float64) (
-	why string, failed bool) {
+	why string) {
 	sem := make(chan struct{}, maxArriving)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -426,9 +428,9 @@ func (a *agentRun) grow(to int, perSec, floorGiB, diskFloorGiB float64) (
 	}
 	wg.Wait()
 	if err := failure(); err != nil {
-		return "an arrival failed: " + err.Error(), true
+		return "an arrival failed: " + err.Error()
 	}
-	return why, false
+	return why
 }
 
 // A window's row, with the figures the stop rule reads.
@@ -576,8 +578,8 @@ func agents(args []string) {
 	memMiB := fs.Int("mem-mib", 128, "vm: guest memory, MiB")
 	wakeBy := fs.String("wake", "restore", "vm: wake by restore or boot")
 	budgetMiB := fs.Int64("budget-mib", 0,
-		"vm: what the cgroup may hold outside the file cache, MiB (the awake "+
-			"VMs' PSS without a cgroup limit); 0 = no budget, nothing sleeps")
+		"vm: what the cgroup may hold, MiB, all but the clean unmapped file "+
+			"cache (the awake VMs' PSS without a cgroup limit); 0 = no budget")
 	floorGiB := fs.Float64("floor-gib", 16,
 		"stop arrivals when the host's MemAvailable is under this")
 	diskFloorGiB := fs.Float64("disk-floor-gib", 5,
@@ -676,7 +678,7 @@ func agents(args []string) {
 	fmt.Println(header)
 	for _, step := range steps {
 		t0 := time.Now()
-		why, failed := a.grow(step, *arrive, *floorGiB, *diskFloorGiB)
+		why := a.grow(step, *arrive, *floorGiB, *diskFloorGiB)
 		a.mu.Lock()
 		n := a.count
 		a.mu.Unlock()
@@ -711,9 +713,6 @@ func agents(args []string) {
 					a.p.snapFails, a.p.lastSnapErr)
 			}
 			a.p.mu.Unlock()
-		}
-		if failed {
-			exit(1)
 		}
 		if why != "" {
 			break

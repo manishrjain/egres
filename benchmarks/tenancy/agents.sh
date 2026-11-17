@@ -12,11 +12,13 @@
 # has the model and the columns).
 #
 # On the micro-VM side the probe is also the platform's control plane:
-# when the test's cgroup holds more than BUDGET_MIB outside the file
-# cache, idle VMs are put to sleep (paused, snapshotted to disk,
-# killed), least recently used first, and a session for a sleeping
-# tenant first wakes it, by restoring the snapshot (WAKE=restore) or
-# booting afresh (WAKE=boot); the wait is in that statement's latency.
+# when the test's cgroup holds more than BUDGET_MIB (all but the clean,
+# unmapped file cache), idle VMs are put to sleep (paused, snapshotted
+# to disk, killed), least recently used first, and arrivals wait for
+# room; a session for a sleeping tenant first wakes it, by restoring
+# the snapshot (WAKE=restore) or booting afresh (WAKE=boot); the wait
+# is in that statement's latency. An arrival the platform does not
+# take in 60 s ends the growth, as a stop, not a fault.
 # The budget is BUDGET_PCT of MEM_GIB, the memory both sides run in
 # and the Egres server is capped at. On Egres nothing is put to sleep
 # or woken: what stays in memory is the server's own choice.

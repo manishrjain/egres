@@ -13,10 +13,10 @@
 # nothing has read since are touched. Ends early at the memory floor.
 #
 # Three memory columns: pss_mib is the tenants' processes; held_mib is
-# the cgroup's all but file cache (the processes with the kernel's
-# own), what the budget is on; cgroup_mib is everything charged, cache
-# included. The per-tenant cost is the slope of held_mib between
-# counts; footprint_fit.txt estimates from it how many tenants fit in
+# what the cgroup holds that the kernel cannot simply drop (all but
+# the clean, unmapped file cache), what the budget is on; cgroup_mib
+# is everything charged. The per-tenant cost is the slope of held_mib
+# between counts; footprint_fit.txt estimates from it how many fit in
 # MEM_GIB's budget. The counts stop when the tenants hold that much.
 #   BACKEND=egres ./footprint.sh [counts...]   default: 1 10 100 300
 #   ROWS=1000 RATE=200 DUR=15s SETTLE=600 SAMPLE=60 RESTART=1 CREATE_PAR=16

@@ -44,8 +44,11 @@ total_kb() { awk '/MemTotal/ {print $2}' /proc/meminfo; }
 # Re-runs the test in a transient cgroup allowed MEM_GIB and no swap
 # (systemd-run; the user's slice has the memory controller on both
 # machines so far). Everything the test starts, the server, the VMs,
-# the probe, is charged to it. CGROUP=0 runs without one. Docker's
-# containers (pgsolo) are the daemon's, outside it.
+# the probe, is charged to it. When it is full the kernel kills one
+# process in it, one tenant's VM or the server; OOMPolicy=continue
+# keeps systemd from then stopping the whole test, whose rows should
+# show the loss. CGROUP=0 runs without one. Docker's containers
+# (pgsolo) are the daemon's, outside it.
 in_cgroup() {
     [ "${CGROUP:-1}" = 1 ] || return 0
     if [ -n "${IN_CGROUP:-}" ]; then
@@ -54,8 +57,8 @@ in_cgroup() {
         return 0
     fi
     export IN_CGROUP=1
-    exec systemd-run --user --scope --quiet \
-        -p MemoryMax=$((MEM_GIB << 30)) -p MemorySwapMax=0 "$0" "$@"
+    exec systemd-run --user --scope --quiet -p MemoryMax=$((MEM_GIB << 30)) \
+        -p MemorySwapMax=0 -p OOMPolicy=continue "$0" "$@"
 }
 cgroup_dir() { echo "/sys/fs/cgroup$(sed -n 's#^0::##p' /proc/self/cgroup)"; }
 cgroup_limited() { [ "$(cat "$(cgroup_dir)/memory.max" 2>/dev/null)" != max ]; }
@@ -64,14 +67,20 @@ cgroup_kb() {
     cgroup_limited || return 0
     echo $(($(cat "$(cgroup_dir)/memory.current") >> 10))
 }
-# What the tenants' processes hold, with the kernel's own: all but the
-# file cache, which is the kernel's to write back and drop. PSS where
-# there is no cgroup limit.
+# What the cgroup holds that the kernel cannot simply drop: all but
+# the clean, unmapped file cache. The tenants' processes with the
+# kernel's own, the snapshot pages a restored VM has mapped, and what
+# is dirty or being written. PSS where there is no cgroup limit.
 mem_held_kb() {
     if cgroup_limited; then
-        awk -v cur="$(cat "$(cgroup_dir)/memory.current")" \
-            '$1 == "file" {print int((cur - $2) / 1024)}' \
-            "$(cgroup_dir)/memory.stat"
+        awk -v cur="$(cat "$(cgroup_dir)/memory.current")" '
+            $1 == "file" {file = $2}
+            $1 ~ /^file_(mapped|dirty|writeback)$/ {pinned += $2}
+            END {
+                clean = file - pinned
+                if (clean < 0) clean = 0
+                print int((cur - clean) / 1024)
+            }' "$(cgroup_dir)/memory.stat"
     else
         tenants_pss_kb
     fi

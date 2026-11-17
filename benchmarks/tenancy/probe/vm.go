@@ -69,6 +69,8 @@ type platform struct {
 	memMiB                         int
 	boot                           bool
 	budget                         int64 // KiB; 0 = no budget, nothing sleeps
+	// Over budget at the last reading: an arrival waits for room.
+	over bool
 
 	// What the measurement window reads; counted while measuring.
 	measuring         bool
@@ -196,11 +198,13 @@ func pssKB(pid int) int64 {
 	return 0
 }
 
-// heldKB is what the probe's cgroup holds outside the file cache: the
-// tenants' processes and the probe with the kernel's own, the figure
-// the harness budgets on (common.sh mem_held_kb). -1 when the cgroup
-// has no memory limit: the test is not under in_cgroup, and a caller
-// falls back to PSS.
+// heldKB is what the probe's cgroup holds that the kernel cannot
+// simply drop: all but the clean, unmapped file cache. That is the
+// tenants' processes and the probe with the kernel's own, the snapshot
+// pages a restored VM has mapped, and what is dirty or being written
+// (a snapshot just taken). The figure the harness budgets on
+// (common.sh mem_held_kb). -1 when the cgroup has no memory limit: the
+// test is not under in_cgroup, and a caller falls back to PSS.
 func heldKB() int64 {
 	raw, err := os.ReadFile("/proc/self/cgroup")
 	if err != nil {
@@ -225,13 +229,21 @@ func heldKB() int64 {
 	if err != nil {
 		return -1
 	}
+	var file, pinned int64
 	for _, line := range strings.Split(string(stat), "\n") {
-		if f := strings.Fields(line); len(f) == 2 && f[0] == "file" {
-			file, _ := strconv.ParseInt(f[1], 10, 64)
-			return (current - file) / 1024
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			continue
+		}
+		n, _ := strconv.ParseInt(f[1], 10, 64)
+		switch f[0] {
+		case "file":
+			file = n
+		case "file_mapped", "file_dirty", "file_writeback":
+			pinned += n
 		}
 	}
-	return -1
+	return (current - max(file-pinned, 0)) / 1024
 }
 
 // memAvailableGiB is the host's MemAvailable.
@@ -366,6 +378,24 @@ func (p *platform) create(i int) (*vm, error) {
 	p.mu.Unlock()
 
 	err := func() error {
+		// Admission: a new VM waits for the budget to have room, as a
+		// platform would hold an arrival rather than run out of memory.
+		// The wait is in the arrival's latency; a platform that cannot
+		// make room in the time a wake is allowed has refused it.
+		deadline := time.Now().Add(wakeTimeout)
+		for {
+			p.mu.Lock()
+			over := p.over
+			p.mu.Unlock()
+			if !over {
+				break
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("no room for an arrival within %s",
+					wakeTimeout)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
 		// Left from an earlier run: this tenant starts blank.
 		if err := os.RemoveAll(v.dir); err != nil {
 			return err
@@ -509,13 +539,19 @@ func (p *platform) sleep(v *vm) {
 	p.mu.Unlock()
 }
 
+// Sleeps under way at once. A sleep writes a 128 MiB snapshot; more
+// at once than the drive takes only queue, as dirty pages that still
+// count against the budget.
+const maxSleeping = 16
+
 // control keeps the VMs within the budget: four times a second it reads
-// what the cgroup holds outside the file cache (without a cgroup
-// limit, the awake VMs' PSS) and, when that is over, puts idle VMs to
-// sleep, least recently used first, until it is a little under. A VM
-// on its way to sleep still holds its memory until its snapshot is
-// written and it is killed; that is taken off the reading, or every
-// tick until then would put more to sleep.
+// what the cgroup holds (heldKB; without a cgroup limit, the awake
+// VMs' PSS) and, when that is over, puts idle VMs to sleep, least
+// recently used first, until it is a little under, and holds arrivals
+// (create) until it is. A VM on its way to sleep still holds its
+// memory until its snapshot is written and it is killed; that is
+// taken off the reading, or every tick until then would put more to
+// sleep.
 func (p *platform) control() {
 	type held struct {
 		v   *vm
@@ -558,14 +594,17 @@ func (p *platform) control() {
 			p.awakeSum += int64(len(up))
 			p.heldSum += sum
 		}
-		if p.budget > 0 && sum > p.budget {
+		p.over = p.budget > 0 && sum > p.budget
+		if p.over {
 			sort.Slice(up, func(a, b int) bool {
 				return up[a].v.last.Before(up[b].v.last)
 			})
+			slots := maxSleeping - len(going)
 			for _, h := range up {
-				if sum <= p.budget*97/100 {
+				if sum <= p.budget*97/100 || slots <= 0 {
 					break
 				}
+				slots--
 				// Changed since it was read: woken again, or held.
 				if h.v.state != awake || h.v.holds > 0 || h.v.cmd == nil ||
 					h.v.cmd.Process.Pid != h.pid {
