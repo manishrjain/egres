@@ -20,7 +20,9 @@ footprint-pgsolo      footprint  BACKEND=pgsolo  RESTART=0 1 10 100
 footprint-egres       footprint  BACKEND=egres   1000 10000 50000 100000
 
 # 3. Agents arriving and working, the micro-VMs put to sleep and woken
-# as memory runs out: restored from a snapshot, or booted afresh.
-agents-vm-restore     agents     BACKEND=vm      WAKE=restore
-agents-vm-boot        agents     BACKEND=vm      WAKE=boot
-agents-egres          agents     BACKEND=egres
+# as memory runs out: restored from a snapshot, or booted afresh. At
+# 30 arrivals a second both sides ran out of onboarding speed before
+# memory or latency gave out (tanland); 10 lets those show.
+agents-vm-restore     agents     BACKEND=vm      WAKE=restore ARRIVE=10
+agents-vm-boot        agents     BACKEND=vm      WAKE=boot    ARRIVE=10
+agents-egres          agents     BACKEND=egres   ARRIVE=10
