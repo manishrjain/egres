@@ -86,11 +86,11 @@ pub const Database = struct {
         allocator: std.mem.Allocator,
         ns: u64,
         oracle: *Oracle,
-    ) !Database {
+    ) Database {
         return .{
             .ns = ns,
             .allocator = allocator,
-            .row_locks = try fiber.SemaphoreMap.init(allocator),
+            .row_locks = fiber.SemaphoreMap.init(allocator),
             .table_locks = fiber.SafeHashMap(u32, *RWMutex).init(allocator),
             .oracle = oracle,
             .tables = std.AutoHashMap(u32, *_table.Table).init(allocator),

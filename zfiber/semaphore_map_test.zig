@@ -43,7 +43,7 @@ fn awaitWaiters(sm: *SemaphoreMap, key: u64, n: usize) void {
 }
 
 test "SemaphoreMap: uncontended acquire/release reclaims the entry" {
-    var sm = try SemaphoreMap.init(gpa);
+    var sm = SemaphoreMap.init(gpa);
     defer sm.deinit();
 
     try std.testing.expect(try acquire(&sm, 1, 1, .exclusive));
@@ -63,8 +63,86 @@ test "SemaphoreMap: uncontended acquire/release reclaims the entry" {
     try std.testing.expectEqual(2, sm.pool.items.len);
 }
 
+/// One statement's worth of row keys, taken and released.
+fn burst(sm: *SemaphoreMap, keys: []const u64, owner_id: u64) !void {
+    var newly: std.ArrayList(u64) = .empty;
+    defer newly.deinit(gpa);
+    try newly.ensureUnusedCapacity(gpa, keys.len);
+    try sm.acquireMany(keys, owner_id, .exclusive, &newly);
+    sm.releaseMany(newly.items, owner_id);
+}
+
+test "SemaphoreMap: a sweep frees a burst after two quiet periods" {
+    var sm = SemaphoreMap.init(gpa);
+    defer sm.deinit();
+
+    const keys = try gpa.alloc(u64, 1000);
+    defer gpa.free(keys);
+    for (keys, 1..) |*k, i| k.* = i;
+
+    // After an INSERT of 1,000 rows the map holds nothing and keeps
+    // what the rows grew.
+    try burst(&sm, keys, 1);
+    try std.testing.expectEqual(0, sm.entries.count());
+    try std.testing.expect(sm.entries.capacity() >= keys.len);
+    const pooled = sm.pool.items.len;
+    try std.testing.expect(pooled > 0);
+
+    // The period of the burst and the one after keep it: the next
+    // statement may be the same size.
+    sm.sweep();
+    sm.sweep();
+    try std.testing.expect(sm.entries.capacity() >= keys.len);
+    try std.testing.expectEqual(pooled, sm.pool.items.len);
+
+    // Another burst in between starts the wait over.
+    try burst(&sm, keys, 1);
+    sm.sweep();
+    sm.sweep();
+    try std.testing.expect(sm.entries.capacity() >= keys.len);
+
+    // Two quiet periods: an idle database holds nothing.
+    sm.sweep();
+    try std.testing.expectEqual(0, sm.entries.capacity());
+    try std.testing.expectEqual(0, sm.pool.items.len);
+    try std.testing.expectEqual(0, sm.pool.capacity);
+
+    // The emptied map still serves the next statement.
+    try burst(&sm, keys[0..8], 1);
+    try std.testing.expectEqual(0, sm.entries.count());
+    try std.testing.expectEqual(8, sm.pool.items.len);
+}
+
+test "SemaphoreMap: a sweep sizes the map for the statements that followed" {
+    var sm = SemaphoreMap.init(gpa);
+    defer sm.deinit();
+
+    const keys = try gpa.alloc(u64, 1000);
+    defer gpa.free(keys);
+    for (keys, 1..) |*k, i| k.* = i;
+    const small = keys[0..40];
+
+    // A burst, then a small statement every period while owner 2 holds
+    // one key throughout: the map never drains, and its use is now
+    // the small statements.
+    try std.testing.expect(try acquire(&sm, 0, 2, .exclusive));
+    try burst(&sm, keys, 1);
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        sm.sweep();
+        try burst(&sm, small, 1);
+    }
+    try std.testing.expect(sm.entries.capacity() >= small.len + 1);
+    try std.testing.expect(sm.entries.capacity() < keys.len / 2);
+    try std.testing.expect(sm.pool.items.len <= small.len + 1);
+    // The held key came through the move.
+    try std.testing.expect(!try acquire(&sm, 0, 2, .exclusive));
+    try std.testing.expect(!sm.entries.get(0).?.rw.tryLock(@src()));
+    release(&sm, 0, 2);
+}
+
 test "SemaphoreMap: re-entrant acquire by the holder is a no-op" {
-    var sm = try SemaphoreMap.init(gpa);
+    var sm = SemaphoreMap.init(gpa);
     defer sm.deinit();
 
     try std.testing.expect(try acquire(&sm, 10, 7, .exclusive));
@@ -87,7 +165,7 @@ test "SemaphoreMap: re-entrant acquire by the holder is a no-op" {
 }
 
 test "SemaphoreMap: acquireMany takes a set, skips held keys, releaseMany" {
-    var sm = try SemaphoreMap.init(gpa);
+    var sm = SemaphoreMap.init(gpa);
     defer sm.deinit();
 
     // Key 3 is already held by the owner: not taken twice, not listed.
@@ -123,7 +201,7 @@ test "SemaphoreMap: acquireMany takes a set, skips held keys, releaseMany" {
 }
 
 test "SemaphoreMap: acquireMany parks on a contended key and resumes" {
-    var sm = try SemaphoreMap.init(gpa);
+    var sm = SemaphoreMap.init(gpa);
     defer sm.deinit();
 
     // Owner 100 holds key 2 of the set; the batch takes 1, waits for 2,
@@ -151,7 +229,7 @@ test "SemaphoreMap: acquireMany parks on a contended key and resumes" {
 }
 
 test "SemaphoreMap: FIFO hand-off under exclusive contention" {
-    var sm = try SemaphoreMap.init(gpa);
+    var sm = SemaphoreMap.init(gpa);
     defer sm.deinit();
 
     try std.testing.expect(try acquire(&sm, 10, 100, .exclusive));
@@ -190,7 +268,7 @@ test "SemaphoreMap: FIFO hand-off under exclusive contention" {
 }
 
 test "SemaphoreMap: shared holders coexist; writer preference holds" {
-    var sm = try SemaphoreMap.init(gpa);
+    var sm = SemaphoreMap.init(gpa);
     defer sm.deinit();
 
     // Three shared owners hold concurrently — none blocks.
@@ -237,7 +315,7 @@ test "SemaphoreMap: shared holders coexist; writer preference holds" {
 }
 
 test "SemaphoreMap: two-party deadlock refused at the closing edge" {
-    var sm = try SemaphoreMap.init(gpa);
+    var sm = SemaphoreMap.init(gpa);
     defer sm.deinit();
 
     // Owners are tokens, not fibers: the test holds A as owner 1 and B
@@ -269,7 +347,7 @@ test "SemaphoreMap: two-party deadlock refused at the closing edge" {
 }
 
 test "SemaphoreMap: deadlock through a shared holder is detected" {
-    var sm = try SemaphoreMap.init(gpa);
+    var sm = SemaphoreMap.init(gpa);
     defer sm.deinit();
 
     try std.testing.expect(try acquire(&sm, 0xA, 1, .shared));
@@ -299,7 +377,7 @@ test "SemaphoreMap: deadlock through a shared holder is detected" {
 }
 
 test "SemaphoreMap: three-party cycle is detected" {
-    var sm = try SemaphoreMap.init(gpa);
+    var sm = SemaphoreMap.init(gpa);
     defer sm.deinit();
 
     try std.testing.expect(try acquire(&sm, 0xA, 1, .exclusive));
@@ -345,7 +423,7 @@ test "BIG: SemaphoreMap: 64 owners cycling shared holds free drained entries" {
     // ordering — so this is a stress exercise of the path, not the
     // tripwire; the rw's underflow assert in a ReleaseSafe server is.
     // Opt-in (`--bigtest`): a few seconds in Debug.
-    var sm = try SemaphoreMap.init(gpa);
+    var sm = SemaphoreMap.init(gpa);
     defer sm.deinit();
 
     const owners = 64;

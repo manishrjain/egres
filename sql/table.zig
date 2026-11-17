@@ -367,8 +367,19 @@ pub fn loadTableSchema(
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     const a = arena.allocator();
+    // The catalog walks run on their own arena, freed on return: their
+    // cursors' merge state and the rows they decode were 40 KB of every
+    // cached schema on the Table's, which frees nothing before the
+    // Table goes. The Table copies out what it keeps.
+    var walk_arena = std.heap.ArenaAllocator.init(alloc);
+    defer walk_arena.deinit();
 
-    const all = try loadColumnRows(a, forest, catalogs, table_key);
+    const all = try loadColumnRows(
+        walk_arena.allocator(),
+        forest,
+        catalogs,
+        table_key,
+    );
     // compile() derives the layout from the full history; reconstruct()
     // derives current_version across all columns.
     const logical = _catalog.reconstruct(all);
@@ -384,7 +395,7 @@ pub fn loadTableSchema(
         try cols.append(a, .{
             .column_id = lc.column_id,
             .pos = pos,
-            .name = lc.name,
+            .name = try a.dupe(u8, lc.name),
             .ty = lc.ty,
             .pkey_position = lc.pkey_position,
             .type_mod = lc.type_mod,
@@ -397,7 +408,12 @@ pub fn loadTableSchema(
     // an index naming a column the table doesn't have is corrupt
     // catalog state. The pointers target the arena-owned `columns`
     // slice, so they survive the Table being moved into the cache.
-    const defs = try loadIndexes(a, forest, catalogs, table_key);
+    const defs = try loadIndexes(
+        walk_arena.allocator(),
+        forest,
+        catalogs,
+        table_key,
+    );
     const indexes = try a.alloc(Index, defs.len);
     for (defs, indexes) |def, *idx| {
         const col = for (columns) |*c| {

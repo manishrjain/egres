@@ -77,7 +77,7 @@ const Fixture = struct {
             .live = f_live,
             .store = store,
             .oracle = oracle,
-            .db = try sql.database.Database.init(
+            .db = sql.database.Database.init(
                 testing.allocator,
                 ns,
                 oracle,

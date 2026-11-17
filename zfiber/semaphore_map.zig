@@ -36,7 +36,7 @@ const Spinlock = @import("spinlock.zig").Spinlock;
 
 pub const SemaphoreMap = struct {
     allocator: std.mem.Allocator,
-    /// A parking mutex over the entry table and the wait-for graph.
+    /// Guards the entry table, the wait-for graph and the pool.
     /// A spinlock, not a fiber mutex: every hold is a hash probe, a
     /// list edit, the deadlock DFS or a walk over one statement's keys,
     /// microseconds, and no hold parks (`waitForLock` lets go before
@@ -55,7 +55,7 @@ pub const SemaphoreMap = struct {
     /// map churns at the write rate, and HashMap's tombstone deletes
     /// leave it with no free slot to end a miss on; a `getOrPut` then
     /// probes the whole table, 6 us each with every other connection
-    /// spinning on `sl` meanwhile (a third of the server's CPU at
+    /// spinning on `mu` meanwhile (a third of the server's CPU at
     /// 100k rows/s). ArrayHashMap removes by shifting, no tombstones.
     entries: std.AutoArrayHashMapUnmanaged(u64, *Entry) = .empty,
     /// The wait-for graph's edge source: which entry each BLOCKED owner
@@ -64,13 +64,19 @@ pub const SemaphoreMap = struct {
     /// map type.
     waiting: std.AutoArrayHashMapUnmanaged(u64, Waiting) = .empty,
     /// Drained entries kept for reuse with their list capacity intact,
-    /// so steady-state acquire/release does no allocator work. Bounded:
-    /// beyond `max_pooled` (or after a spike balloons an entry's lists)
-    /// entries are freed instead of held forever.
+    /// so acquire/release under load does no allocator work. Bounded by
+    /// `max_pooled`, and an entry whose lists a spike ballooned is
+    /// freed instead; `sweep` cuts it to what the map has been using.
     pool: std.ArrayList(*Entry) = .empty,
     /// wouldDeadlock's walker, reused across runs. Only touched under
     /// `mu`, which serializes detection.
     dfs: Dfs,
+    /// The most keys held at once since the last `sweep`, and in the
+    /// window before that: what the map has been using, which a sweep
+    /// sizes it for. Between statements a map holds nothing, so the
+    /// count at a sweep says nothing about its use.
+    peak: usize = 0,
+    last_peak: usize = 0,
 
     const max_pooled = 128;
     /// A pooled entry keeps its holders/waiters capacity; anything that
@@ -152,12 +158,9 @@ pub const SemaphoreMap = struct {
         }
     };
 
-    pub fn init(allocator: std.mem.Allocator) !SemaphoreMap {
-        var pool: std.ArrayList(*Entry) = .empty;
-        try pool.ensureTotalCapacityPrecise(allocator, max_pooled);
+    pub fn init(allocator: std.mem.Allocator) SemaphoreMap {
         return .{
             .allocator = allocator,
-            .pool = pool,
             .dfs = .{ .allocator = allocator },
         };
     }
@@ -378,6 +381,7 @@ pub const SemaphoreMap = struct {
     fn entryFor(self: *SemaphoreMap, key: u64) !*Entry {
         const gop = try self.entries.getOrPut(self.allocator, key);
         if (gop.found_existing) return gop.value_ptr.*;
+        self.peak = @max(self.peak, self.entries.count());
 
         if (self.pool.pop()) |e| {
             gop.value_ptr.* = e;
@@ -416,14 +420,82 @@ pub const SemaphoreMap = struct {
         if (self.pool.items.len >= max_pooled or
             e.holders.capacity > max_kept_capacity or
             e.waiters.capacity > max_kept_capacity)
-            return self.destroyEntry(e);
-        e.rw = .{};
-        // As above: keep the buffers without the safe-build memset.
-        e.holders.items.len = 0;
-        e.waiters.items.len = 0;
-        // Capacity for max_pooled is reserved at init; the length guard
-        // above makes this infallible.
-        self.pool.appendAssumeCapacity(e);
+        {
+            self.destroyEntry(e);
+        } else {
+            e.rw = .{};
+            // As above: keep the buffers without the safe-build memset.
+            e.holders.items.len = 0;
+            e.waiters.items.len = 0;
+            // Grown on demand, not reserved at init: a reserve costs
+            // every database the same, whether it ever locks a row.
+            self.pool.append(self.allocator, e) catch self.destroyEntry(e);
+        }
+    }
+
+    /// One tick of the owner's sweeper, on a fixed period: size the map
+    /// for what it used over the last two periods, when that is under
+    /// a quarter of what it has. A burst's memory so lives two to
+    /// three periods, long enough for the next statement to reuse it,
+    /// a database that went on to run small statements comes down to
+    /// their size, not to nothing and back, and one that went quiet
+    /// holds nothing: a map is one database's, and keeping even a
+    /// small statement's entries cost each idle database kilobytes.
+    /// Nothing points into the tables across a release of `mu`, so
+    /// moving them under it is sound; the entries themselves stay
+    /// where parked fibers hold pointers to them.
+    pub fn sweep(self: *SemaphoreMap) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        const want = @max(self.last_peak, self.peak);
+        self.last_peak = self.peak;
+        // The keys still held open the next window.
+        self.peak = self.entries.count();
+
+        if (want * 4 < self.entries.capacity()) {
+            std.debug.assert(self.entries.count() <= want);
+            shrinkTable(*Entry, &self.entries, self.allocator, want);
+        }
+        // Blocked owners only, so sized to its own use.
+        const blocked = self.waiting.count();
+        if (blocked * 4 < self.waiting.capacity())
+            shrinkTable(Waiting, &self.waiting, self.allocator, blocked);
+
+        while (self.pool.items.len > want)
+            self.destroyEntry(self.pool.pop().?);
+        if (self.pool.capacity > want)
+            self.pool.shrinkAndFree(self.allocator, self.pool.items.len);
+    }
+
+    /// Move `table` to one of exactly `want` entries: an ArrayHashMap
+    /// keeps its arrays at their peak through removes, and its index
+    /// through `shrinkAndFree`. On OOM the table stays as it is.
+    fn shrinkTable(
+        comptime V: type,
+        table: *std.AutoArrayHashMapUnmanaged(u64, V),
+        allocator: std.mem.Allocator,
+        want: usize,
+    ) void {
+        var fresh: std.AutoArrayHashMapUnmanaged(u64, V) = .empty;
+        // Nothing to size for: the table was empty to get here.
+        if (want == 0) {
+            table.deinit(allocator);
+            table.* = fresh;
+            return;
+        }
+        // The arrays first, at `want` exactly: `ensureTotalCapacity`
+        // would grow them with a list's slack, and only adds the index
+        // once they are large enough.
+        fresh.entries.setCapacity(allocator, want) catch return;
+        fresh.ensureTotalCapacity(allocator, want) catch {
+            fresh.deinit(allocator);
+            return;
+        };
+        for (table.keys(), table.values()) |k, v|
+            fresh.putAssumeCapacityNoClobber(k, v);
+        table.deinit(allocator);
+        table.* = fresh;
     }
 
     /// Pull `owner_id`'s published wait edge: its slot in the entry's

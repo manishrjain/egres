@@ -97,11 +97,13 @@ pub const Server = struct {
         return self;
     }
 
-    /// The listener and the oracle rotation, in the engine's loop
-    /// group, so they end with its loops. After `eng.start`.
+    /// The listener, the oracle rotation and the lock sweep, in the
+    /// engine's loop group, so they end with its loops. After
+    /// `eng.start`.
     pub fn start(self: *Server) !void {
         try self.engine.spawnListener(runListener, .{self});
         try self.engine.spawnListener(runOracleRotation, .{self});
+        try self.engine.spawnListener(runLockSweep, .{self});
     }
 
     /// After `eng.stop`: the apply loop calls the hook until then.
@@ -136,12 +138,7 @@ pub const Server = struct {
                 _ = self.databases.remove(ns);
                 return err;
             };
-            const alloc = self.engine.allocator;
-            d.* = Database.init(alloc, ns, &self.oracle) catch |err| {
-                self.engine.allocator.destroy(d);
-                _ = self.databases.remove(ns);
-                return err;
-            };
+            d.* = Database.init(self.engine.allocator, ns, &self.oracle);
             gop.value_ptr.* = d;
         }
         return gop.value_ptr.*;
@@ -159,6 +156,45 @@ pub const Server = struct {
             const shutdown = &self.engine.node.shutdown;
             if (shutdown.waitForStart(.shutdown, period_ms)) return;
             self.oracle.rotate(period_ms - 1000);
+        }
+    }
+
+    /// Sweep every database's row-lock map (SemaphoreMap.sweep) on a
+    /// fixed cadence, so one that locked many rows and went quiet gives
+    /// the memory back within two to three periods. One fiber for all
+    /// databases: a tick is a lock take and a few compares per
+    /// database, a few milliseconds for 100,000 of them, where a timer
+    /// per database would be 100,000 parked fibers. Runs until
+    /// shutdown; `waitForStart` doubles as the sleep.
+    fn runLockSweep(self: *Server) void {
+        const period_ms: u64 = 30 * 1000;
+
+        while (!self.engine.node.isShuttingDown()) {
+            const shutdown = &self.engine.node.shutdown;
+            if (shutdown.waitForStart(.shutdown, period_ms)) return;
+            self.sweepLocks();
+        }
+    }
+
+    /// The databases are gathered under `databases_mu` and swept
+    /// without it: a Database is never deleted (see `database`), and a
+    /// walk over all of them must not keep new ones from being made,
+    /// nor run on one worker without a yield.
+    fn sweepLocks(self: *Server) void {
+        const alloc = self.engine.allocator;
+        var dbs: std.ArrayList(*Database) = .empty;
+        defer dbs.deinit(alloc);
+        {
+            self.databases_mu.lock(@src());
+            defer self.databases_mu.unlock();
+            dbs.ensureTotalCapacity(alloc, self.databases.count()) catch
+                return;
+            var it = self.databases.valueIterator();
+            while (it.next()) |db| dbs.appendAssumeCapacity(db.*);
+        }
+        for (dbs.items) |db| {
+            fiber.ctx().meter() catch return;
+            db.row_locks.sweep();
         }
     }
 
