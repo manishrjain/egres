@@ -17,6 +17,12 @@ test "calibrate: runCalibration profiles a directory and cleans up" {
     const p = try calibrate.runCalibration(alloc, root);
     try testing.expect(p.read_bps > 0);
     try testing.expect(p.write_bps > 0);
+    try testing.expect(p.read_iops > 0);
+    // Carried into the limiter's config as sampled.
+    try testing.expectEqual(
+        p.read_iops,
+        calibrate.bwConfigFrom(p).read_ops_per_sec,
+    );
 
     const scratch = try std.fmt.allocPrint(alloc, "{s}/calibrate", .{root});
     defer alloc.free(scratch);

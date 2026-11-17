@@ -122,7 +122,7 @@ pub const FileHandle = struct {
         errdefer allocator.free(buf);
 
         const file = self.file.?;
-        self.bw.grant(aligned_size, .read);
+        self.bw.grant(aligned_size, 1, .read);
         var total_read: usize = 0;
         while (total_read < aligned_size) {
             const rest = buf[total_read..];
@@ -188,7 +188,7 @@ pub const FileHandle = struct {
             std.debug.assert(offset % page_size == 0);
         }
 
-        self.bw.grant(data.len, .write);
+        self.bw.grant(data.len, 1, .write);
         var written: usize = 0;
         while (written < data.len) {
             const n = try fs.submit(.write, .{
@@ -301,11 +301,12 @@ pub const VFS = struct {
         _ = self;
         const alloc = arena.allocator();
 
-        // Bandwidth: acquire total bytes for this chunk before submitting.
+        // Bandwidth: acquire the chunk's bytes and operations before
+        // submitting; each request is one operation on the device.
         {
             var total: usize = 0;
             for (requests) |r| total += r.len;
-            bw.grant(total, .read);
+            bw.grant(total, requests.len, .read);
         }
 
         // One BatchOp + page-aligned buffer per request, heap-allocated from

@@ -21,6 +21,9 @@ const log = std.log.scoped(.calibrate);
 pub const Profile = struct {
     read_bps: u64,
     write_bps: u64,
+    /// Random one-page reads per second; 0 when the probe did not
+    /// sample them.
+    read_iops: u64 = 0,
 };
 
 /// Under the data dir; removed when calibration ends.
@@ -30,6 +33,9 @@ const scratch_dir = "calibrate";
 /// and the limiter regulates the sum of many fibers' I/O.
 const depth = 8;
 const request_size: u64 = 1 << 20;
+/// The iops sample's request: one page, the point read's size, so the
+/// count is operations the device completes and not bytes it moves.
+const iops_request_size: u64 = _vfs.page_size;
 /// Rounds of one write sample then one read sample, 250 ms each; the
 /// best of each direction is the device's capacity. One sample can
 /// land in a drive's housekeeping stall (seconds on a DRAM-less SSD)
@@ -49,18 +55,22 @@ pub const Cfg = struct {
     auto_calibrate: bool = true,
     bandwidth_bytes: u64 = 1 << 30,
     write_cost: u8 = 2,
+    iops: u64 = 0,
 
     pub const docs = .{
         .self = "Disk bandwidth for the I/O limiter: one budget in device " ++
             "time, refilled at the read bandwidth, where a write costs " ++
-            "write_cost reads of the same size.",
+            "write_cost reads of the same size and an operation costs " ++
+            "at least the bandwidth over the iops.",
         .auto_calibrate = "Probe the data directory at startup and take " ++
-            "both numbers from the device. A failed probe falls back to " ++
-            "bandwidth_bytes and write_cost.",
+            "the numbers from the device. A failed probe falls back to " ++
+            "bandwidth_bytes, write_cost and iops.",
         .bandwidth_bytes = "Read bandwidth per second the budget refills " ++
             "at, when not calibrated.",
         .write_cost = "How many reads of the same size a write costs, " ++
             "when not calibrated. 1 to 32.",
+        .iops = "Random 4 KiB reads per second the device serves, when " ++
+            "not calibrated. 0 charges an operation its pages alone.",
     };
 };
 
@@ -132,6 +142,7 @@ fn pinnedConfig(io_cfg: Cfg) _bandwidth.Config {
     return .{
         .bytes_per_sec = io_cfg.bandwidth_bytes,
         .write_cost = io_cfg.write_cost,
+        .read_ops_per_sec = io_cfg.iops,
     };
 }
 
@@ -145,17 +156,20 @@ fn deviceConfig(
     if (!io_cfg.auto_calibrate) return pinned;
     const p = runCalibration(allocator, dir) catch |err| {
         log.warn("disk calibration of {s} failed: {s}; using --io " ++
-            "bandwidth_bytes={d}MiB write_cost={d}", .{
+            "bandwidth_bytes={d}MiB write_cost={d} iops={d}", .{
             dir,                          @errorName(err),
             io_cfg.bandwidth_bytes >> 20, io_cfg.write_cost,
+            io_cfg.iops,
         });
         return pinned;
     };
     const cfg = bwConfigFrom(p);
-    log.info("disk calibrated: {s}: read {d} MiB/s, write {d} MiB/s; " ++
-        "setting bandwidth_bytes={d}MiB write_cost={d}", .{
-        dir,                     p.read_bps >> 20, p.write_bps >> 20,
-        cfg.bytes_per_sec >> 20, cfg.write_cost,
+    log.info("disk calibrated: {s}: read {d} MiB/s, write {d} MiB/s, " ++
+        "{d} iops; setting bandwidth_bytes={d}MiB write_cost={d} " ++
+        "iops={d}", .{
+        dir,                  p.read_bps >> 20,        p.write_bps >> 20,
+        p.read_iops,          cfg.bytes_per_sec >> 20, cfg.write_cost,
+        cfg.read_ops_per_sec,
     });
     return cfg;
 }
@@ -181,9 +195,18 @@ pub fn runCalibration(a: std.mem.Allocator, data_dir: String) !Profile {
 
     var read_bps: u64 = 0;
     var write_bps: u64 = 0;
+    var read_iops: u64 = 0;
     for (0..rounds) |_| {
-        write_bps = @max(write_bps, try throughput(a, path, .write));
-        read_bps = @max(read_bps, try throughput(a, path, .read));
+        write_bps = @max(
+            write_bps,
+            try throughput(a, path, .write, request_size),
+        );
+        read_bps = @max(
+            read_bps,
+            try throughput(a, path, .read, request_size),
+        );
+        const small = try throughput(a, path, .read, iops_request_size);
+        read_iops = @max(read_iops, small / iops_request_size);
     }
     if (read_bps == 0 or write_bps == 0) return error.CalibrationFailed;
     if (write_bps * stall_ratio < read_bps) {
@@ -192,19 +215,29 @@ pub fn runCalibration(a: std.mem.Allocator, data_dir: String) !Profile {
             data_dir, write_bps >> 20, read_bps >> 20,
         });
     }
-    return .{ .read_bps = read_bps, .write_bps = write_bps };
+    return .{
+        .read_bps = read_bps,
+        .write_bps = write_bps,
+        .read_iops = read_iops,
+    };
 }
 
 /// The limiter that fits `p`: one budget in device time, refilled at
 /// the read bandwidth, where a write page costs as many read pages as
 /// the device takes longer to write it than to read it, to the nearest
-/// whole page. Reads and writes share the device, so the budget is
-/// shared; the ratio is the exchange rate.
+/// whole page, and an operation at least the pages the device moves
+/// in the time one takes (`Limiter.pages_per_op`). Reads and writes share
+/// the device, so the budget is shared; the ratios are the exchange
+/// rates.
 pub fn bwConfigFrom(p: Profile) _bandwidth.Config {
     const write_bps = @max(p.write_bps, 1);
     const ratio = (p.read_bps + write_bps / 2) / write_bps;
     const cost = std.math.clamp(ratio, 1, 255);
-    return .{ .bytes_per_sec = p.read_bps, .write_cost = @intCast(cost) };
+    return .{
+        .bytes_per_sec = p.read_bps,
+        .write_cost = @intCast(cost),
+        .read_ops_per_sec = p.read_iops,
+    };
 }
 
 /// The probe file: `probe_max` bytes, written O_DIRECT and synced, so
@@ -222,11 +255,16 @@ fn fillProbeFile(a: std.mem.Allocator, path: String) !void {
 }
 
 /// Bytes per second over 250ms with `depth` fibers, one per
-/// worker, each issuing `request_size` O_DIRECT requests at random
+/// worker, each issuing `size`-byte O_DIRECT requests at random
 /// offsets of the probe file, back to back. One sample of `rounds`.
 /// The file is opened once here: reads and writes are positional,
 /// so every worker shares the descriptor.
-fn throughput(a: std.mem.Allocator, path: String, kind: _vfs.IOKind) !u64 {
+fn throughput(
+    a: std.mem.Allocator,
+    path: String,
+    kind: _vfs.IOKind,
+    size: u64,
+) !u64 {
     const file = try _vfs.openDirect(path, .{
         .mode = .direct,
         .flags = .{ .writable = kind == .write },
@@ -239,7 +277,7 @@ fn throughput(a: std.mem.Allocator, path: String, kind: _vfs.IOKind) !u64 {
     const t0 = utils.timestampNow(.monotonic, .nanos);
     for (0..depth) |i| {
         try group.spawn(.{ .worker_id = @intCast(i) }, worker, .{
-            a, file, kind, &stop,
+            a, file, kind, size, &stop,
         });
     }
     fiber.sleepMs(250);
@@ -259,20 +297,21 @@ fn throughput(a: std.mem.Allocator, path: String, kind: _vfs.IOKind) !u64 {
     return bps;
 }
 
-/// One fiber's share of `throughput`: requests until `stop`, the
-/// bytes moved returned.
+/// One fiber's share of `throughput`: `size`-byte requests until
+/// `stop`, the bytes moved returned.
 fn worker(
     a: std.mem.Allocator,
     file: fiber.File,
     kind: _vfs.IOKind,
+    size_in: u64,
     stop: *std.atomic.Value(bool),
 ) anyerror!u64 {
-    const size: usize = @intCast(request_size);
+    const size: usize = @intCast(size_in);
     const buf = try a.alignedAlloc(u8, _vfs.page_alignment, size);
     defer a.free(buf);
     @memset(buf, 0xA5);
 
-    const pages = (_lookahead.probe_max - request_size) / _vfs.page_size;
+    const pages = (_lookahead.probe_max - size_in) / _vfs.page_size;
 
     var bytes: u64 = 0;
     while (!stop.load(.acquire)) {

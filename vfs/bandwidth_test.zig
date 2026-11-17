@@ -34,21 +34,54 @@ test "limiter: only a metered device charges the fiber's tenant" {
     });
     // Unmetered: the device counts its pages, the tenant pays nothing.
     try expect(!limiter.metered);
-    limiter.grant(5000, .read);
+    limiter.grant(5000, 1, .read);
     try expectEqual(2, limiter.total_read_pages.load(.monotonic));
     try expectEqual(0, t.totals.io_pages.load(.monotonic));
 
     // Metered: a read costs its pages, a write its pages times the
     // write cost, and the device counts pages either way.
     limiter.metered = true;
-    limiter.grant(5000, .read);
-    limiter.grant(4 * page_size, .write);
-    limiter.grant(0, .read);
+    limiter.grant(5000, 1, .read);
+    limiter.grant(4 * page_size, 1, .write);
+    limiter.grant(0, 1, .read);
     try expectEqual(4, limiter.total_read_pages.load(.monotonic));
     try expectEqual(4, limiter.total_write_pages.load(.monotonic));
     try expectEqual(2 + 4 * 8, t.totals.io_pages.load(.monotonic));
     try expectEqual(1_000_000, limiter.status().pages_per_sec);
     try expect(limiter.status().metered);
+}
+
+test "limiter: an operation costs at least the device's op pages" {
+    var t = tenantAt(12, 1_000_000);
+    const ctx = fiber.ctx();
+    ctx.tenant = &t;
+    defer ctx.tenant = &fiber.meter.shared;
+
+    // 1000 pages a second over 100 operations a second: one operation
+    // is worth 10 pages of device time.
+    var limiter = Limiter.init(.{
+        .bytes_per_sec = 1000 * page_size,
+        .read_ops_per_sec = 100,
+    });
+    limiter.metered = true;
+    try expectEqual(10, limiter.pages_per_op);
+
+    // A point read's one page costs the operation; a large read its
+    // pages; a batch of small reads its operations.
+    limiter.grant(page_size, 1, .read);
+    try expectEqual(10, t.totals.io_pages.load(.monotonic));
+    limiter.grant(100 * page_size, 1, .read);
+    try expectEqual(110, t.totals.io_pages.load(.monotonic));
+    limiter.grant(20 * page_size, 20, .read);
+    try expectEqual(310, t.totals.io_pages.load(.monotonic));
+    try expectEqual(22, t.totals.io_ops.load(.monotonic));
+    // The device counts what moved, and in how many requests.
+    try expectEqual(121, limiter.total_read_pages.load(.monotonic));
+    try expectEqual(22, limiter.status().total_read_ops);
+
+    // Without an iops figure an operation is its pages alone.
+    const plain = Limiter.init(.{ .bytes_per_sec = 1000 * page_size });
+    try expectEqual(1, plain.pages_per_op);
 }
 
 test "limiter: the shared tenant never waits" {
@@ -57,8 +90,8 @@ test "limiter: the shared tenant never waits" {
     var limiter = Limiter.init(.{ .bytes_per_sec = page_size });
     limiter.metered = true;
     const start = utils.coarseMs();
-    limiter.grant(1024 * page_size, .read);
-    limiter.grant(1024 * page_size, .write);
+    limiter.grant(1024 * page_size, 1, .read);
+    limiter.grant(1024 * page_size, 1, .write);
     try expect(utils.coarseMs() - start < 100);
 }
 
@@ -73,9 +106,9 @@ test "limiter: a tenant pays fg's debt first, then bg's" {
 
     // fg: 300 pages at once, 200 owed, 200 ms before the next.
     var start = utils.coarseMs();
-    limiter.grant(300 * page_size, .read);
+    limiter.grant(300 * page_size, 1, .read);
     try expect(utils.coarseMs() - start < 50);
-    limiter.grant(page_size, .read);
+    limiter.grant(page_size, 1, .read);
     const fg_waited = utils.coarseMs() - start;
     try expect(fg_waited >= 150 and fg_waited <= 1500);
 
@@ -84,9 +117,9 @@ test "limiter: a tenant pays fg's debt first, then bg's" {
     ctx.class = .bg;
     defer ctx.class = .fg;
     start = utils.coarseMs();
-    limiter.grant(101 * page_size, .read);
+    limiter.grant(101 * page_size, 1, .read);
     try expect(utils.coarseMs() - start < 50);
-    limiter.grant(page_size, .read);
+    limiter.grant(page_size, 1, .read);
     const bg_waited = utils.coarseMs() - start;
     try expect(bg_waited >= 50 and bg_waited <= 1500);
     try expectEqual(300 + 1 + 101 + 1, t.totals.io_pages.load(.monotonic));

@@ -16,64 +16,98 @@ const _vfs = @import("vfs.zig");
 pub const Config = struct {
     bytes_per_sec: u64, // bytes per second
     write_cost: u8 = 4, // write multiplier - each write costs k * read cost.
+    /// Random one-page reads per second the device serves; 0 when
+    /// unknown, and an operation then costs its pages alone.
+    read_ops_per_sec: u64 = 0,
 };
 
 pub const Limiter = struct {
-    /// Cumulative pages ever granted across the process lifetime,
-    /// split by IOKind. Incremented at each grant; never
-    /// decremented. Useful as a sanity check against the rate limit
-    /// and against the expected on-disk footprint.
+    /// Cumulative pages and operations ever granted across the
+    /// process lifetime, split by IOKind. Incremented at each grant;
+    /// never decremented. Useful as a sanity check against the rate
+    /// limit and against the expected on-disk footprint.
     total_read_pages: std.atomic.Value(i64) = .init(0),
     total_write_pages: std.atomic.Value(i64) = .init(0),
+    total_read_ops: std.atomic.Value(i64) = .init(0),
+    total_write_ops: std.atomic.Value(i64) = .init(0),
     /// In the meter's i64; the config's bytes are the u64 edge.
     pages_per_sec: i64,
+    /// The least one operation costs, in pages: what the device moves
+    /// in the time one operation takes it, the bandwidth over the
+    /// iops. A point read's one page is then charged the device time
+    /// it takes, which is what a tenant doing small random reads
+    /// uses up; a large read is charged its pages as before.
+    pages_per_op: i64,
     /// Set at startup on the tenants' device; startup only, so a
     /// plain field.
     metered: bool = false,
     conf: Config,
 
     /// Snapshot of the live limiter state, all counted in pages
-    /// (multiply by `vfs.page_size` for bytes).
+    /// (multiply by `vfs.page_size` for bytes) and operations.
     pub const Status = struct {
         pages_per_sec: i64,
+        pages_per_op: i64,
         metered: bool,
         total_read_pages: i64,
         total_write_pages: i64,
+        total_read_ops: i64,
+        total_write_ops: i64,
     };
 
     pub fn status(self: *const Limiter) Status {
         return .{
             .pages_per_sec = self.pages_per_sec,
+            .pages_per_op = self.pages_per_op,
             .metered = self.metered,
             .total_read_pages = self.total_read_pages.load(.monotonic),
             .total_write_pages = self.total_write_pages.load(.monotonic),
+            .total_read_ops = self.total_read_ops.load(.monotonic),
+            .total_write_ops = self.total_write_ops.load(.monotonic),
         };
     }
 
     pub fn init(config: Config) Limiter {
+        const pages_per_sec = config.bytes_per_sec / _vfs.page_size;
+        const pages_per_op: u64 = if (config.read_ops_per_sec == 0)
+            1
+        else
+            @max(pages_per_sec / config.read_ops_per_sec, 1);
         return .{
-            .pages_per_sec = @intCast(config.bytes_per_sec / _vfs.page_size),
+            .pages_per_sec = @intCast(pages_per_sec),
+            .pages_per_op = @intCast(pages_per_op),
             .conf = config,
         };
     }
 
-    /// Pays for the whole request before the I/O starts, at the
-    /// calling fiber's class and tenant, waiting as the meter says. A
-    /// write costs `write_cost` pages per page.
-    pub fn grant(self: *Limiter, bytes: usize, kind: _vfs.IOKind) void {
-        if (bytes == 0) return;
+    /// Pays for the whole request, `ops` operations moving `bytes` in
+    /// all, before the I/O starts, at the calling fiber's class and
+    /// tenant, waiting as the meter says. The cost is the pages or the
+    /// operations' `pages_per_op`, whichever is more; a write costs
+    /// `write_cost` of either per page.
+    pub fn grant(
+        self: *Limiter,
+        bytes: usize,
+        ops: usize,
+        kind: _vfs.IOKind,
+    ) void {
+        if (bytes == 0 or ops == 0) return;
         const wm: i64 = if (kind == .write) self.conf.write_cost else 1;
         const pages: i64 = @intCast(
             std.math.divCeil(usize, bytes, _vfs.page_size) catch unreachable,
         );
+        const nops: i64 = @intCast(ops);
+        const cost = @max(pages, nops * self.pages_per_op);
         if (self.metered) {
             const ctx = fiber.ctx();
-            ctx.tenant.acquire(.io, ctx.class, pages * wm);
+            ctx.tenant.acquire(.io, ctx.class, cost * wm);
+            ctx.tenant.countOps(nops);
         }
-        const counter = switch (kind) {
-            .read => &self.total_read_pages,
-            .write => &self.total_write_pages,
+        const counters = switch (kind) {
+            .read => .{ &self.total_read_pages, &self.total_read_ops },
+            .write => .{ &self.total_write_pages, &self.total_write_ops },
         };
-        _ = counter.fetchAdd(pages, .monotonic);
+        _ = counters[0].fetchAdd(pages, .monotonic);
+        _ = counters[1].fetchAdd(nops, .monotonic);
     }
 };

@@ -257,6 +257,10 @@ pub const Tenant = struct {
     pub const Totals = struct {
         cpu_ticks: std.atomic.Value(i64) = .init(0),
         io_pages: std.atomic.Value(i64) = .init(0),
+        /// Operations behind `io_pages`: the pages say how much was
+        /// moved, the count says in how many requests, which is what
+        /// a device short of iops runs out of.
+        io_ops: std.atomic.Value(i64) = .init(0),
         mem_peak: std.atomic.Value(i64) = .init(0),
         parked_ms: std.atomic.Value(u64) = .init(0),
         statements: std.atomic.Value(u64) = .init(0),
@@ -403,6 +407,12 @@ pub const Tenant = struct {
         _ = statsFor(kind, class).grants.fetchAdd(1, .monotonic);
         self.pay(kind, class);
         self.charge(kind, class, cost, _clock.ms());
+    }
+
+    /// Operations granted on the metered device, beside the pages
+    /// `acquire` charged for them.
+    pub fn countOps(self: *Tenant, ops: i64) void {
+        _ = self.totals.io_ops.fetchAdd(ops, .monotonic);
     }
 
     /// A cost that is not refused: taken whole and counted in the

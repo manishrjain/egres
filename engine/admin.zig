@@ -1262,9 +1262,14 @@ pub const AdminServer = struct {
         const s = bw.status();
         try w.print("vfs bandwidth {s} (pages):\n", .{name});
         try w.print("  rate:          {d} pages/s\n", .{s.pages_per_sec});
+        try w.print("  pages_per_op:  {d}\n", .{s.pages_per_op});
         try w.print("  metered:       {}\n", .{s.metered});
-        try w.print("  total_read:    {d}\n", .{s.total_read_pages});
-        try w.print("  total_write:   {d}\n", .{s.total_write_pages});
+        try w.print("  total_read:    {d} in {d} ops\n", .{
+            s.total_read_pages, s.total_read_ops,
+        });
+        try w.print("  total_write:   {d} in {d} ops\n", .{
+            s.total_write_pages, s.total_write_ops,
+        });
     }
 
     /// The meter's io wait counters in Prometheus text, beside the zdb
@@ -1320,7 +1325,7 @@ pub const AdminServer = struct {
         try w.print(" cpu rate={d}m fg={d}ms bg={d}ms" ++
             " io rate={d}/s fg={d} bg={d}" ++
             " mem held={d} share={d} peak={d}" ++
-            " | cpu_ticks={d} io_pages={d} parked={d}ms" ++
+            " | cpu_ticks={d} io_pages={d} io_ops={d} parked={d}ms" ++
             " stmts={d} failed={d}\n", .{
             t.cpuRateMilli(),
             t.cpuBalanceMs(.fg),
@@ -1333,6 +1338,7 @@ pub const AdminServer = struct {
             t.totals.mem_peak.load(.monotonic),
             t.totals.cpu_ticks.load(.monotonic),
             t.totals.io_pages.load(.monotonic),
+            t.totals.io_ops.load(.monotonic),
             t.totals.parked_ms.load(.monotonic),
             t.totals.statements.load(.monotonic),
             t.totals.failed.load(.monotonic),
