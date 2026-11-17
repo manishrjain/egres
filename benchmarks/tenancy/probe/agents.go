@@ -16,8 +16,9 @@
 // -run/vm<i>. The taps fctap<i> must exist (netns_setup.sh) and this
 // must run where they are (in_netns.sh). Here the probe is also the
 // platform's control plane (vm.go): it puts idle VMs to sleep when the
-// awake ones hold more than -budget-mib, least recently used first,
-// and a session for a sleeping tenant wakes it.
+// test's cgroup holds more than -budget-mib outside the file cache,
+// least recently used first, and a session for a sleeping tenant
+// wakes it.
 //
 // The run grows by arrivals, open loop at -arrive a second, to each
 // count in -steps; there it pauses arrivals for -window, sessions still
@@ -55,7 +56,7 @@ const (
 
 var kindNames = [numKinds]string{"point", "range", "update", "insert", "count"}
 
-const header = "tenants,awake,pss_mib,disk_mib,arrive_p50_ms,arrive_p99_ms," +
+const header = "tenants,awake,held_mib,disk_mib,arrive_p50_ms,arrive_p99_ms," +
 	"wake_p50_ms,wake_p99_ms,woke_pct,sleeps_per_s,wakes_per_s," +
 	"point_p50_ms,point_p99_ms,range_p50_ms,range_p99_ms," +
 	"update_p50_ms,update_p99_ms,insert_p50_ms,insert_p99_ms," +
@@ -452,12 +453,20 @@ func (a *agentRun) window(d time.Duration) windowRow {
 		a.p.measure(true)
 	}
 	end := start.Add(d)
-	var pssSum, pssN int64
+	// Shared: the cgroup's figure, as the VM side's; the server's PSS
+	// when there is no cgroup limit.
+	var heldSum, heldN int64
 	for time.Now().Before(end) {
 		time.Sleep(min(250*time.Millisecond, time.Until(end)))
-		if a.p == nil && a.pid > 0 {
-			pssSum += pssKB(a.pid)
-			pssN++
+		if a.p == nil {
+			kb := heldKB()
+			if kb < 0 && a.pid > 0 {
+				kb = pssKB(a.pid)
+			}
+			if kb >= 0 {
+				heldSum += kb
+				heldN++
+			}
 		}
 	}
 
@@ -469,10 +478,10 @@ func (a *agentRun) window(d time.Duration) windowRow {
 		open = append(open, s)
 	}
 	a.mu.Unlock()
-	var awakeAvg, pssMiB float64
+	var awakeAvg, heldMiB float64
 	var wakes, sleeps int
 	if a.p != nil {
-		awakeAvg, pssMiB, wakes, sleeps = a.p.measure(false)
+		awakeAvg, heldMiB, wakes, sleeps = a.p.measure(false)
 	}
 	// A statement due in the window may not have finished yet; the row
 	// waits for it, up to what the statement's own timeouts allow.
@@ -496,17 +505,17 @@ func (a *agentRun) window(d time.Duration) windowRow {
 		if n := a.ok + a.errs; n > 0 {
 			woke = 100 * float64(a.woke) / float64(n)
 		}
-		cells = append(cells, f0(awakeAvg), f0(pssMiB),
+		cells = append(cells, f0(awakeAvg), f0(heldMiB),
 			f0(diskUsedMiB(a.p.run)),
 			pctCell(arrive, 0.5), pctCell(arrive, 0.99),
 			pctCell(wake, 0.5), pctCell(wake, 0.99), f2(woke),
 			f2(float64(sleeps)/secs), f2(float64(wakes)/secs))
 	} else {
-		pss := ""
-		if pssN > 0 {
-			pss = f0(float64(pssSum) / float64(pssN) / 1024)
+		held := ""
+		if heldN > 0 {
+			held = f0(float64(heldSum) / float64(heldN) / 1024)
 		}
-		cells = append(cells, "", pss, "",
+		cells = append(cells, "", held, "",
 			pctCell(arrive, 0.5), pctCell(arrive, 0.99), "", "", "", "", "")
 	}
 	for k := range numKinds {
@@ -556,7 +565,8 @@ func agents(args []string) {
 	fs := flag.NewFlagSet("agents", flag.ExitOnError)
 	backend := fs.String("backend", "", "shared or vm")
 	addr := fs.String("addr", "", "shared: the server, ip:port")
-	pid := fs.Int("pid", 0, "shared: the server's pid, for pss_mib")
+	pid := fs.Int("pid", 0,
+		"shared: the server's pid, for held_mib when there is no cgroup limit")
 	runDir := fs.String("run", "", "vm: directory for the VMs' vm<i>/")
 	fc := fs.String("fc", "", "vm: the firecracker binary")
 	kernel := fs.String("kernel", "", "vm: the guest kernel")
@@ -566,7 +576,8 @@ func agents(args []string) {
 	memMiB := fs.Int("mem-mib", 128, "vm: guest memory, MiB")
 	wakeBy := fs.String("wake", "restore", "vm: wake by restore or boot")
 	budgetMiB := fs.Int64("budget-mib", 0,
-		"vm: PSS the awake VMs may hold, MiB; 0 = no budget, nothing sleeps")
+		"vm: what the cgroup may hold outside the file cache, MiB (the awake "+
+			"VMs' PSS without a cgroup limit); 0 = no budget, nothing sleeps")
 	floorGiB := fs.Float64("floor-gib", 16,
 		"stop arrivals when the host's MemAvailable is under this")
 	diskFloorGiB := fs.Float64("disk-floor-gib", 5,

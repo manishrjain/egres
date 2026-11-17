@@ -30,7 +30,7 @@ disk_gib() { df -BG --output=avail "$RUN" | awk 'NR == 2 {print int($1)}'; }
 # Snapshots and data disks can fill the drive before memory runs out.
 have_room() {
     [ "$(avail_gib)" -ge "$FLOOR_GIB" ] &&
-        [ "$(tenants_pss_kb)" -lt $((MEM_GIB << 20)) ] &&
+        [ "$(mem_held_kb)" -lt "$(budget_kb)" ] &&
         [ "$(disk_gib)" -ge "$DISK_FLOOR_GIB" ]
 }
 

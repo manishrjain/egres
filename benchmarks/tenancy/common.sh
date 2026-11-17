@@ -5,12 +5,13 @@
 # What every test shares: the settings, the seed data, psql against a
 # probe-style target, and the platform behind BACKEND. A test sources
 # this and then speaks only the backend interface (backends/README):
+#   in_cgroup "$@"       first: the test under its memory limit (re-exec)
 #   platform_init "$@"   before anything else (the VM side may re-exec)
 #   platform_up          the platform, empty
 #   platform_down        everything stopped and removed
 #   tenant_create i rows the tenant, its table and its rows, through SQL
 #   tenant_addr i        ip:port[/database], the probe's target form
-#   tenants_pss_kb       host memory the tenants hold (PSS)
+#   tenants_pss_kb       host memory the tenants' processes hold (PSS)
 #   tenants_disk_kb      disk the tenants' data holds
 # and, where a backend has them: platform_restart, platform_pid,
 # tenants_fds, platform_dump name.
@@ -19,8 +20,16 @@ source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 RUN=$WORK/run
 # Memory each side gets, whatever the host has: the Egres server's
 # cap, the micro-VMs' budget, and what the footprint's fit is per. The
-# same figure on every machine keeps the results comparable.
+# same figure on every machine keeps the results comparable. It is
+# enforced: in_cgroup puts the test in a cgroup allowed this much, so
+# the page cache the tenants' files take on the host (a micro-VM's disk
+# image and snapshot, a server's WAL) comes out of the same memory as
+# their processes. PSS alone would miss it.
 MEM_GIB=${MEM_GIB:-64}
+# The share of MEM_GIB the tenants' processes may hold; the rest is for
+# the kernel's own and the file cache. A test stops adding tenants
+# there, and the micro-VM control plane puts VMs to sleep there.
+BUDGET_PCT=${BUDGET_PCT:-90}
 # What the host must keep free; a test stops adding tenants under it.
 FLOOR_GIB=${FLOOR_GIB:-16}
 # Tenants made at once by create_range. Past 16 the server sets the
@@ -31,14 +40,51 @@ mkdir -p "$RUN" "$RES"
 avail_gib() { awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo; }
 avail_kb() { awk '/MemAvailable/ {print $2}' /proc/meminfo; }
 total_kb() { awk '/MemTotal/ {print $2}' /proc/meminfo; }
+
+# Re-runs the test in a transient cgroup allowed MEM_GIB and no swap
+# (systemd-run; the user's slice has the memory controller on both
+# machines so far). Everything the test starts, the server, the VMs,
+# the probe, is charged to it. CGROUP=0 runs without one. Docker's
+# containers (pgsolo) are the daemon's, outside it.
+in_cgroup() {
+    [ "${CGROUP:-1}" = 1 ] || return 0
+    if [ -n "${IN_CGROUP:-}" ]; then
+        echo "cgroup $(cgroup_dir):" \
+            "memory.max $(cat "$(cgroup_dir)/memory.max")" >&2
+        return 0
+    fi
+    export IN_CGROUP=1
+    exec systemd-run --user --scope --quiet \
+        -p MemoryMax=$((MEM_GIB << 30)) -p MemorySwapMax=0 "$0" "$@"
+}
+cgroup_dir() { echo "/sys/fs/cgroup$(sed -n 's#^0::##p' /proc/self/cgroup)"; }
+cgroup_limited() { [ "$(cat "$(cgroup_dir)/memory.max" 2>/dev/null)" != max ]; }
+# All the cgroup is charged, file cache included; "" without a limit.
+cgroup_kb() {
+    cgroup_limited || return 0
+    echo $(($(cat "$(cgroup_dir)/memory.current") >> 10))
+}
+# What the tenants' processes hold, with the kernel's own: all but the
+# file cache, which is the kernel's to write back and drop. PSS where
+# there is no cgroup limit.
+mem_held_kb() {
+    if cgroup_limited; then
+        awk -v cur="$(cat "$(cgroup_dir)/memory.current")" \
+            '$1 == "file" {print int((cur - $2) / 1024)}' \
+            "$(cgroup_dir)/memory.stat"
+    else
+        tenants_pss_kb
+    fi
+}
+budget_kb() { echo $(((MEM_GIB << 20) * BUDGET_PCT / 100)); }
 # Room for another tenant: the host above its floor, and the tenants
-# under their memory. A backend with another limit (the VMs' disk)
+# under their budget. A backend with another limit (the VMs' disk)
 # adds it.
 have_room() {
     [ "$(avail_gib)" -ge "$FLOOR_GIB" ] &&
-        [ "$(tenants_pss_kb)" -lt $((MEM_GIB << 20)) ]
+        [ "$(mem_held_kb)" -lt "$(budget_kb)" ]
 }
-mib() { awk -v kb="$1" 'BEGIN {printf "%.1f", kb / 1024}'; }
+mib() { [ -z "$1" ] || awk -v kb="$1" 'BEGIN {printf "%.1f", kb / 1024}'; }
 
 # "ip:port" or "ip:port/database" to a psql connection string. With no
 # database, "postgres", as the probe does.
@@ -80,12 +126,15 @@ seed() {
 }
 
 # Creates tenants [from, to) with `rows` rows each, CREATE_PAR at a
-# time. Returns 1 at the host's memory floor or when one failed.
+# time. Returns 1 at the host's memory floor or when one failed; MADE
+# is then the count that exists, since the tenants made before the
+# stop stay and a row must not be credited to fewer.
 create_range() {
     local from=$1 to=$2 rows=$3 i j p pids failed=0
+    MADE=$to
     seed_file "$rows" >/dev/null
     for ((i = from; i < to; i += CREATE_PAR)); do
-        have_room || { echo "host is out of room" >&2; return 1; }
+        have_room || { echo "out of room at $i" >&2; MADE=$i; return 1; }
         pids=()
         for ((j = i; j < i + CREATE_PAR && j < to; j++)); do
             tenant_create "$j" "$rows" &
@@ -93,7 +142,7 @@ create_range() {
         done
         for p in "${pids[@]}"; do wait "$p" || failed=$((failed + 1)); done
         [ "$failed" = 0 ] ||
-            { echo "$failed tenants failed to create" >&2; return 1; }
+            { echo "$failed tenants failed to create" >&2; MADE=$i; return 1; }
     done
 }
 

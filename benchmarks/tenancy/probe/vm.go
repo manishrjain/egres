@@ -71,12 +71,12 @@ type platform struct {
 	budget                         int64 // KiB; 0 = no budget, nothing sleeps
 
 	// What the measurement window reads; counted while measuring.
-	measuring        bool
-	wakes, sleeps    int
-	awakeSum, pssSum int64
-	samples          int64
-	snapFails        int
-	lastSnapErr      error
+	measuring         bool
+	wakes, sleeps     int
+	awakeSum, heldSum int64
+	samples           int64
+	snapFails         int
+	lastSnapErr       error
 }
 
 func vmIP(i int) string {
@@ -194,6 +194,44 @@ func pssKB(pid int) int64 {
 		}
 	}
 	return 0
+}
+
+// heldKB is what the probe's cgroup holds outside the file cache: the
+// tenants' processes and the probe with the kernel's own, the figure
+// the harness budgets on (common.sh mem_held_kb). -1 when the cgroup
+// has no memory limit: the test is not under in_cgroup, and a caller
+// falls back to PSS.
+func heldKB() int64 {
+	raw, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return -1
+	}
+	dir := ""
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(line, "0::") {
+			dir = "/sys/fs/cgroup" + strings.TrimPrefix(line, "0::")
+		}
+	}
+	limit, err := os.ReadFile(dir + "/memory.max")
+	if err != nil || strings.TrimSpace(string(limit)) == "max" {
+		return -1
+	}
+	cur, err := os.ReadFile(dir + "/memory.current")
+	if err != nil {
+		return -1
+	}
+	current, _ := strconv.ParseInt(strings.TrimSpace(string(cur)), 10, 64)
+	stat, err := os.ReadFile(dir + "/memory.stat")
+	if err != nil {
+		return -1
+	}
+	for _, line := range strings.Split(string(stat), "\n") {
+		if f := strings.Fields(line); len(f) == 2 && f[0] == "file" {
+			file, _ := strconv.ParseInt(f[1], 10, 64)
+			return (current - file) / 1024
+		}
+	}
+	return -1
 }
 
 // memAvailableGiB is the host's MemAvailable.
@@ -471,9 +509,13 @@ func (p *platform) sleep(v *vm) {
 	p.mu.Unlock()
 }
 
-// control keeps the awake VMs within the budget: four times a second
-// it adds up what they hold and, when that is over, puts idle ones to
-// sleep, least recently used first, until it is a little under.
+// control keeps the VMs within the budget: four times a second it reads
+// what the cgroup holds outside the file cache (without a cgroup
+// limit, the awake VMs' PSS) and, when that is over, puts idle VMs to
+// sleep, least recently used first, until it is a little under. A VM
+// on its way to sleep still holds its memory until its snapshot is
+// written and it is killed; that is taken off the reading, or every
+// tick until then would put more to sleep.
 func (p *platform) control() {
 	type held struct {
 		v   *vm
@@ -483,23 +525,38 @@ func (p *platform) control() {
 	for {
 		time.Sleep(250 * time.Millisecond)
 		p.mu.Lock()
-		var up []held
+		var up, going []held
 		for _, v := range p.vms {
-			if v != nil && v.state == awake {
-				up = append(up, held{v: v, pid: v.cmd.Process.Pid})
+			if v == nil || v.cmd == nil || v.cmd.Process == nil {
+				continue
+			}
+			h := held{v: v, pid: v.cmd.Process.Pid}
+			switch v.state {
+			case awake:
+				up = append(up, h)
+			case sleeping:
+				going = append(going, h)
 			}
 		}
 		p.mu.Unlock()
-		var sum int64
+		var pss int64
 		for i := range up {
 			up[i].kb = pssKB(up[i].pid)
-			sum += up[i].kb
+			pss += up[i].kb
+		}
+		sum := heldKB()
+		if sum < 0 {
+			sum = pss
+		} else {
+			for _, h := range going {
+				sum -= pssKB(h.pid)
+			}
 		}
 		p.mu.Lock()
 		if p.measuring {
 			p.samples++
 			p.awakeSum += int64(len(up))
-			p.pssSum += sum
+			p.heldSum += sum
 		}
 		if p.budget > 0 && sum > p.budget {
 			sort.Slice(up, func(a, b int) bool {
@@ -526,18 +583,18 @@ func (p *platform) control() {
 
 // measure starts (on) or ends a measurement window, and at its end
 // returns what the window saw.
-func (p *platform) measure(on bool) (awakeAvg, pssMiB float64, wakes, sleeps int) {
+func (p *platform) measure(on bool) (awake, held float64, wakes, sleeps int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if on {
 		p.measuring = true
 		p.wakes, p.sleeps = 0, 0
-		p.awakeSum, p.pssSum, p.samples = 0, 0, 0
+		p.awakeSum, p.heldSum, p.samples = 0, 0, 0
 		return
 	}
 	p.measuring = false
 	n := float64(max(p.samples, 1))
-	return float64(p.awakeSum) / n, float64(p.pssSum) / n / 1024,
+	return float64(p.awakeSum) / n, float64(p.heldSum) / n / 1024,
 		p.wakes, p.sleeps
 }
 

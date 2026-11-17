@@ -11,9 +11,11 @@ drive-idle            drive_idle
 noisy-vm              noisy      BACKEND=vm
 noisy-egres           noisy      BACKEND=egres
 
-# 2. What a tenant costs, and how many fit. The micro-VM side stops at
-# the memory floor; pgsolo splits its figure into Postgres and the VM.
-footprint-vm          footprint  BACKEND=vm      1 10 100 400 1100
+# 2. What a tenant costs, and how many fit. A micro-VM settles at about
+# 170 MiB (tanland), so 300 is what MEM_GIB's budget holds; more would
+# be killed by the cgroup as they settle. pgsolo splits its figure into
+# Postgres and the VM.
+footprint-vm          footprint  BACKEND=vm      1 10 100 300
 footprint-pgsolo      footprint  BACKEND=pgsolo  RESTART=0 1 10 100
 footprint-egres       footprint  BACKEND=egres   1000 10000 50000 100000
 

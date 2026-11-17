@@ -12,15 +12,19 @@
 # restarted on the same data and timed to a first row, and ten tenants
 # nothing has read since are touched. Ends early at the memory floor.
 #
-# The per-tenant cost is the slope between counts; footprint_fit.txt
-# estimates from it how many tenants fit in MEM_GIB. The counts stop
-# when the tenants hold that much.
-#   BACKEND=egres ./footprint.sh [counts...]   default: 1 10 100 400 1100
+# Three memory columns: pss_mib is the tenants' processes; held_mib is
+# the cgroup's all but file cache (the processes with the kernel's
+# own), what the budget is on; cgroup_mib is everything charged, cache
+# included. The per-tenant cost is the slope of held_mib between
+# counts; footprint_fit.txt estimates from it how many tenants fit in
+# MEM_GIB's budget. The counts stop when the tenants hold that much.
+#   BACKEND=egres ./footprint.sh [counts...]   default: 1 10 100 300
 #   ROWS=1000 RATE=200 DUR=15s SETTLE=600 SAMPLE=60 RESTART=1 CREATE_PAR=16
 source "$(dirname "$0")/common.sh"
+in_cgroup "$@"
 platform_init "$@"
 counts=("$@")
-[ ${#counts[@]} -gt 0 ] || counts=(1 10 100 400 1100)
+[ ${#counts[@]} -gt 0 ] || counts=(1 10 100 300)
 ROWS=${ROWS:-1000}
 RATE=${RATE:-200}
 DUR=${DUR:-15s}
@@ -34,8 +38,8 @@ fds() { [ "$(type -t tenants_fds)" = function ] && tenants_fds || true; }
 row() {
     local n=$1 state=$2
     shift 2
-    echo "$n,$state,$(mib "$(tenants_pss_kb)")," \
-        "$(mib $((base_kb - $(avail_kb)))),$(mib "$(tenants_disk_kb)")," \
+    echo "$n,$state,$(mib "$(tenants_pss_kb)"),$(mib "$(mem_held_kb)")," \
+        "$(mib "$(cgroup_kb)"),$(mib "$(tenants_disk_kb)")," \
         "$(fds),$*" | tr -d ' ' | tee -a "$out"
 }
 probe_first() { "$ROOT/probe/probe" first -addr "$(tenant_addr "$1")" -t0 "$2" \
@@ -43,22 +47,27 @@ probe_first() { "$ROOT/probe/probe" first -addr "$(tenant_addr "$1")" -t0 "$2" \
 
 platform_down
 trap platform_down EXIT
-base_kb=$(avail_kb)
 platform_up
-echo "tenants,state,pss_mib,host_avail_drop_mib,disk_mib,open_files," \
+echo "tenants,state,pss_mib,held_mib,cgroup_mib,disk_mib,open_files," \
     "p50_ms,p90_ms,p99_ms,ok,errors,first_row_ms" | tr -d ' ' | tee "$out"
 sleep 5
 # The platform with no tenants: its fixed cost.
 row 0 loaded ",,,,,"
 have=0
 for n in "${counts[@]}"; do
-    if ! create_range "$have" "$n" "$ROWS"; then
-        echo "stopped below $n" >&2
-        break
+    if create_range "$have" "$n" "$ROWS"; then
+        have=$n
+    else
+        # Out of room on the way: the tenants that were made are
+        # measured as the last count, and the run goes on from there.
+        [ "$MADE" -gt "$have" ] || break
+        have=$MADE
+        stopped=1
     fi
-    have=$n
     sleep 5
-    row "$n" loaded "$(point_reads "$(targets_file "$n" all)" "$RATE" "$DUR"),"
+    row "$have" loaded \
+        "$(point_reads "$(targets_file "$have" all)" "$RATE" "$DUR"),"
+    [ -z "${stopped:-}" ] || break
 done
 
 # Settle: memory every SAMPLE seconds, nothing else running.
@@ -83,26 +92,26 @@ if [ "$RESTART" != 0 ] && [ "$(type -t platform_restart)" = function ]; then
     row "$have" touched ",,,,,$med"
 fi
 
-# The estimate. The cost per tenant is the slope between the last two
-# counts: the first tenants also pay for the platform's pools and
-# arenas, which the fixed cost (the intercept) absorbs. The settled
-# figure scales that slope by what the last count gave back.
-awk -F, -v mem_gib="$MEM_GIB" '
-    $2 == "loaded" && $1 > 0 {pn = n; ploaded = loaded; n = $1; loaded = $3}
-    $2 ~ /^settled/ {settled = $3}
+# The estimate, on held_mib. The cost per tenant is the slope between
+# the last two counts: the first tenants also pay for the platform's
+# pools and arenas, which the fixed cost (the intercept) absorbs. The
+# settled figure scales that slope by what the last count gave back.
+awk -F, -v mem_gib="$MEM_GIB" -v budget_mib="$(($(budget_kb) / 1024))" '
+    $2 == "loaded" && $1 > 0 {pn = n; ploaded = loaded; n = $1; loaded = $4}
+    $2 ~ /^settled/ {settled = $4}
     END {
         if (n == 0 || n == pn) exit
         slope = (loaded - ploaded) * 1024 / (n - pn)
         fixed = loaded - slope * n / 1024
         if (settled > 0)
             slope_settled = slope * (settled - fixed) / (loaded - fixed)
-        room = mem_gib * 1024 - fixed
+        room = budget_mib - fixed
         printf "fixed cost: %.0f MiB (intercept)\n", fixed
         printf "per tenant: %.0f KiB just loaded", slope
         if (settled > 0) printf ", %.0f KiB settled", slope_settled
         printf "\n"
         if (slope_settled > 0)
             printf "fit: about %d tenants in %d GiB " \
-                "(%.0f MiB past the fixed cost)\n",
+                "(%.0f MiB budget for tenants past the fixed cost)\n",
                 room * 1024 / slope_settled, mem_gib, room
     }' "$out" | tee "$RES/footprint_fit.txt" >&2

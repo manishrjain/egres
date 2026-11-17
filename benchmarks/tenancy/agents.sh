@@ -12,13 +12,14 @@
 # has the model and the columns).
 #
 # On the micro-VM side the probe is also the platform's control plane:
-# when the awake VMs hold more than BUDGET_MIB, idle ones are put to
-# sleep (paused, snapshotted to disk, killed), least recently used
-# first, and a session for a sleeping tenant first wakes it, by
-# restoring the snapshot (WAKE=restore) or booting afresh (WAKE=boot);
-# the wait is in that statement's latency. The budget is MEM_GIB, the
-# memory the Egres server is capped at. On Egres nothing is put to
-# sleep or woken: what stays in memory is the server's own choice.
+# when the test's cgroup holds more than BUDGET_MIB outside the file
+# cache, idle VMs are put to sleep (paused, snapshotted to disk,
+# killed), least recently used first, and a session for a sleeping
+# tenant first wakes it, by restoring the snapshot (WAKE=restore) or
+# booting afresh (WAKE=boot); the wait is in that statement's latency.
+# The budget is BUDGET_PCT of MEM_GIB, the memory both sides run in
+# and the Egres server is capped at. On Egres nothing is put to sleep
+# or woken: what stays in memory is the server's own choice.
 #
 # The run stops growing at the memory or disk floor, or when a count
 # no longer fits: the reads' p99 over STOP_P99_MS, arrivals' p99 over
@@ -30,9 +31,10 @@
 #   STEPS=1000,2000,5000,10000,20000,50000,100000 ARRIVE=30 WINDOW=2m
 #   ACTIVE=0.10 SESSION=2m RATE=1 ROWS=1000
 #   MIX=point=60,range=15,update=15,insert=8,count=2
-#   MEM_GIB=64 WAKE=restore
+#   MEM_GIB=64 BUDGET_PCT=90 WAKE=restore
 #   STOP_P99_MS=50 STOP_ARRIVE_MS=5000 STOP_ERRORS_PCT=1   (0 turns one off)
 source "$(dirname "$0")/common.sh"
+in_cgroup "$@"
 platform_init "$@"
 STEPS=${STEPS:-1000,2000,5000,10000,20000,50000,100000}
 ARRIVE=${ARRIVE:-30}
@@ -46,7 +48,7 @@ WAKE=${WAKE:-restore}
 STOP_P99_MS=${STOP_P99_MS:-50}
 STOP_ARRIVE_MS=${STOP_ARRIVE_MS:-5000}
 STOP_ERRORS_PCT=${STOP_ERRORS_PCT:-1}
-BUDGET_MIB=$((MEM_GIB * 1024))
+BUDGET_MIB=$(($(budget_kb) / 1024))
 out=$RES/agents.csv
 
 platform_down

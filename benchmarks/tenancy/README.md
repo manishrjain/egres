@@ -27,11 +27,11 @@ Each test is one script that runs against a platform, `BACKEND=vm`,
    the memory is sampled for ten minutes as the tenants go quiet,
    then the platform is restarted on the same data and timed to a
    first row. `footprint_fit.txt` estimates from the slope how many
-   tenants the host's memory holds.
+   tenants fit in the memory each side gets.
 3. **`agents`: the workload.** Tenants arrive over time and load their
    data; a tenth of them are in a session at any moment, sending a
    mix of reads and writes; the rest are idle. On the micro-VM side
-   the probe is also the control plane: when memory runs out, idle
+   the probe is also the control plane: when the memory runs out, idle
    VMs are put to sleep (snapshotted to disk) and woken, by restoring
    the snapshot or booting afresh, when a session starts for them. At
    each tenant count: the latency of every statement kind, the time
@@ -48,8 +48,16 @@ Each script's header says what it does and lists its settings.
 - **Bare metal**, x86_64. Firecracker needs KVM, and nested
   virtualisation would tax only the micro-VM side. `machine.txt`
   records `virtualisation: none`.
-- **About 128 GB of memory.** The tanland rehearsal had 121 GB. The
-  micro-VM side stops at the memory floor (`FLOOR_GIB`, 16).
+- **About 128 GB of memory.** The tanland rehearsal had 121 GB. Each
+  side gets `MEM_GIB` (64) of it, enforced: every test runs in a
+  transient cgroup allowed that much and no swap (`systemd-run
+  --user --scope`; the user's slice must have the memory controller,
+  as Ubuntu's does), so the host page cache the tenants' files take
+  comes out of the same memory as their processes. The tenants'
+  processes are kept to `BUDGET_PCT` (90) of it; the rest is the
+  kernel's and the cache's. The host must also keep `FLOOR_GIB` (16)
+  free. `pgsolo`'s containers are docker's, outside the cgroup; its
+  counts are small.
 - **A datacenter NVMe drive, 1 TB free under WORK.** A sleeping
   micro-VM holds a 128 MiB snapshot; a consumer drive's write stalls
   set the micro-VM wake times and the Egres write results, as
@@ -122,9 +130,12 @@ suite. Each run's directory holds:
 `suite.txt` holds the settings the tanland rehearsal published.
 Edit it, or point `SUITE` at another file, to change a run.
 
-The micro-VM tests run inside the taps' namespace (`in_netns.sh`,
-done by `run.sh`). Egres listens 50 above its own ports (SQL 3260,
-admin 5260), so a development server on the machine is left alone.
+Every test re-runs itself in its memory cgroup first (`in_cgroup` in
+`common.sh`; `CGROUP=0` skips it, and the memory columns fall back to
+PSS). The micro-VM tests run inside the taps' namespace
+(`in_netns.sh`, done by `run.sh`). Egres listens 50 above its own
+ports (SQL 3260, admin 5260), so a development server on the machine
+is left alone.
 One test at a time, on an otherwise idle machine: every test measures
 the whole host.
 
