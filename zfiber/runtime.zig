@@ -1568,6 +1568,7 @@ fn spawn_(
         f.ctx.class = parent.ctx.class;
         f.ctx.cache = parent.ctx.cache;
         f.ctx.tenant = parent.ctx.tenant;
+        f.ctx.io_waits = parent.ctx.io_waits;
         if (!detached) {
             f.ctx.parent = parent.ctx.parent orelse
                 if (parent.ctx.arena != null) &parent.ctx else null;

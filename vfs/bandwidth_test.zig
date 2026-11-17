@@ -95,6 +95,32 @@ test "limiter: the shared tenant never waits" {
     try expect(utils.coarseMs() - start < 100);
 }
 
+test "limiter: a fiber whose io does not wait is charged and runs on" {
+    // 1000 pages/s, a burst of 100.
+    var t = tenantAt(13, 1000);
+    const ctx = fiber.ctx();
+    ctx.tenant = &t;
+    defer ctx.tenant = &fiber.meter.shared;
+    var limiter = Limiter.init(.{ .bytes_per_sec = 1000 * page_size });
+    limiter.metered = true;
+
+    // A flush's worth at once, taken whole and not waited for.
+    ctx.io_waits = false;
+    defer ctx.io_waits = true;
+    var start = utils.coarseMs();
+    limiter.grant(400 * page_size, 1, .read);
+    limiter.grant(400 * page_size, 1, .read);
+    try expect(utils.coarseMs() - start < 50);
+    try expectEqual(800, t.totals.io_pages.load(.monotonic));
+
+    // The tenant's next paying grant owes the debt: 700 pages, 700 ms.
+    ctx.io_waits = true;
+    start = utils.coarseMs();
+    limiter.grant(page_size, 1, .read);
+    const waited = utils.coarseMs() - start;
+    try expect(waited >= 500 and waited <= 2000);
+}
+
 test "limiter: a tenant pays fg's debt first, then bg's" {
     // 1000 pages/s, a burst of 100.
     var t = tenantAt(12, 1000);

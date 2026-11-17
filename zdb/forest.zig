@@ -865,6 +865,17 @@ pub const Forest = struct {
     /// done being pushed to, and nothing touches it until the fiber
     /// is joined. A failure is logged here and set in `err_out`.
     fn flushTable(em: *Emitter, err_out: *utils.SafeError) void {
+        // The tables are the tree's database's work, charged to its
+        // tenant, by the put fibers the flush spawns too, but never
+        // waited for: the forest's flush is every tree's, so the
+        // tenant's statements wait instead. The fiber ends with the
+        // flush, so nothing to restore.
+        const ctx = fiber.ctx();
+        ctx.tenant = fiber.meter.tenants.get(
+            em.tree.namespace,
+            utils.coarseMs(),
+        ) catch &fiber.meter.shared;
+        ctx.io_waits = false;
         em.flush() catch |err| {
             log.err("flush tree={d} table failed: {s}", .{
                 em.tree.tree_id, @errorName(err),

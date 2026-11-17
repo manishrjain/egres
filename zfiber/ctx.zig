@@ -108,6 +108,11 @@ pub const Ctx = struct {
     /// spawn copies it, and until then it is the system's, which is
     /// never short.
     tenant: *Tenant = &_meter.shared,
+    /// Whether an io grant waits for the tenant's bucket. A flush is
+    /// charged and runs on (`Forest.flushTable`): stalled, it would
+    /// stall every tree's writes, so the tenant's statements wait for
+    /// what it spent instead.
+    io_waits: bool = true,
     /// Live bytes in the statement's arenas, on the root: a helper's
     /// allocations count here too. Checked against the cap at a yield.
     mem_held: std.atomic.Value(i64) = .init(0),
