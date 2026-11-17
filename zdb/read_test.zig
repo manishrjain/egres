@@ -512,6 +512,74 @@ test "multiget: prefetch reads the blocks the seeks land in, in one batch" {
     try std.testing.expectEqualStrings("r000", first.key.primary);
 }
 
+test "flush: a written table's blocks are admitted while there is room" {
+    const alloc = std.testing.allocator;
+    // Both outlive the fixture: a table purges into the cache it was
+    // opened with as the forest closes.
+    var cache = try zdb.cache.ShardedCache(u128).init(alloc, 64 << 20, 2);
+    defer cache.deinit();
+    var tight = try zdb.cache.ShardedCache(u128).init(alloc, 2, 2);
+    defer tight.deinit();
+    var fx: Fixture = undefined;
+    try fx.setup(alloc);
+    defer fx.teardown();
+    fx.store.setBlockCache(&cache);
+
+    const wide = try alloc.alloc(u8, 1024);
+    defer alloc.free(wide);
+    @memset(wide, 'w');
+    var name: [4]u8 = undefined;
+    for (0..300) |i| {
+        _ = try std.fmt.bufPrint(&name, "r{d:0>3}", .{i});
+        try fx.put(&name, 10, wide);
+    }
+    try fx.flush();
+
+    const tree = fx.f.getTree(ns, fx.tree_id) orelse
+        return error.TestExpectedTree;
+    defer tree.release();
+    const tbl = blk: {
+        const held = tree.mu.hold(.shared, @src());
+        defer held.release();
+        const ents = tree.levels[0].entries(held);
+        try std.testing.expectEqual(@as(usize, 1), ents.len);
+        ents[0].table.incrRef();
+        break :blk ents[0].table;
+    };
+    defer tbl.decrRef();
+    const nblocks = tbl.blockCount();
+    try std.testing.expect(nblocks >= 3);
+
+    // Every block went in with the write: the first read is a hit.
+    try std.testing.expectEqual(nblocks, cache.count());
+    const misses = cache.misses.load(.monotonic);
+    {
+        const val = try tbl.readBlock(0);
+        defer val.decrRef();
+    }
+    try std.testing.expectEqual(misses, cache.misses.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), cache.hits.load(.monotonic));
+
+    // The table opened after the admission learns of a block as it
+    // hits it: its purge finds the one it read, the rest stay for the
+    // cache to cycle out.
+    try std.testing.expectEqual(@as(usize, 1), tbl.purgeCachedBlocks(&cache));
+    try std.testing.expectEqual(nblocks - 1, cache.count());
+
+    // A cache with room for the table but not for its reserve admits
+    // nothing of it: the same rows again make a table of the same
+    // size, and five percent over that is under the tenth kept back.
+    const size: usize = tbl.index.uncompressed_size;
+    tight.setCapacity(size + size / 20);
+    fx.store.setBlockCache(&tight);
+    for (0..300) |i| {
+        _ = try std.fmt.bufPrint(&name, "s{d:0>3}", .{i});
+        try fx.put(&name, 11, wide);
+    }
+    try fx.flush();
+    try std.testing.expectEqual(@as(usize, 0), tight.count());
+}
+
 test "readBlock: a bypass context neither fills nor marks the cache" {
     const alloc = std.testing.allocator;
     var fx: Fixture = undefined;

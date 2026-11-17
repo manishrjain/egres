@@ -113,9 +113,11 @@ pub const Table = struct {
     /// it closes.
     block_cache: ?*BlockCache,
     /// One bit per block: set when this table put the block into the
-    /// block cache, so `purgeCachedBlocks` can drop exactly this
-    /// file's entries without walking the cache. A set bit for a block
-    /// the cache has since evicted on its own only costs a no-op remove.
+    /// block cache, or found it there (the emitter admits a table's
+    /// blocks before any Table for it exists), so `purgeCachedBlocks`
+    /// can drop exactly this file's entries without walking the cache.
+    /// A set bit for a block the cache has since evicted on its own
+    /// only costs a no-op remove.
     /// Atomic words, since readers on different workers insert
     /// concurrently.
     cached: []std.atomic.Value(u64),
@@ -146,6 +148,48 @@ pub const Table = struct {
         t.file_id = file_id;
         t.block_cache = store.blockCache();
         return t;
+    }
+
+    /// Put every block of this table into `cache`, for a table just
+    /// written: what a statement wrote or a compaction rewrote is then
+    /// a hit before anything reads it, where a cache filled on misses
+    /// alone left a quiet tenant's rows cold for as long as the tenant
+    /// stayed quiet. The table is memory-backed over the written
+    /// bytes, so the reads are copies, and `file_id` is the id the
+    /// blocks will be read under. Only while the cache has room for
+    /// the whole table with its reserve left over: a write never
+    /// evicts what reads are using. The Table opened for the file
+    /// later learns of these blocks as its reads hit them; one it never
+    /// reads stays until the cache cycles past it. Returns how many
+    /// blocks went in.
+    pub fn admit(self: *const Table, cache: *BlockCache) !usize {
+        std.debug.assert(self.file_id != 0 and self.obj.isResident());
+        // Past the reserve an unhit entry is dropped for every block
+        // admitted (`Cache.evictSmall`); the tenth also covers reads
+        // inserting meanwhile and shards filling unevenly, since the
+        // budget is a shard's and this sum is over all of them.
+        const used = cache.totalCost();
+        const cap = cache.capacity();
+        if (used + self.index.uncompressed_size + cap / 10 > cap) return 0;
+
+        var n: usize = 0;
+        for (self.index.blocks, 0..) |bi, idx| {
+            if (bi.len < 4) return error.CorruptTable;
+            const raw = try self.obj.readAligned(
+                self.allocator,
+                @intCast(bi.offset),
+                bi.len,
+            );
+            defer raw.free();
+
+            const val = try self.decodeBlock(raw.data);
+            defer val.decrRef(); // the cache holds its own ref
+
+            cache.put(self.cacheKey(idx), val) catch break;
+            self.setCachedBit(idx);
+            n += 1;
+        }
+        return n;
     }
 
     /// A Table over an already-open object (a memory-backed handle in
@@ -424,9 +468,13 @@ pub const Table = struct {
         return (@as(u128, self.file_id) << 64) | @as(u128, block_idx);
     }
 
-    /// Record that block `idx` was put into the block cache.
+    /// Record that block `idx` is in the block cache. A hit on a block
+    /// already recorded, the common case, is a load and no store.
     fn setCachedBit(self: *const Table, idx: usize) void {
-        _ = self.cached[idx / 64].fetchOr(@as(u64, 1) << @intCast(idx % 64), .monotonic);
+        const word = &self.cached[idx / 64];
+        const bit = @as(u64, 1) << @intCast(idx % 64);
+        if (word.load(.monotonic) & bit != 0) return;
+        _ = word.fetchOr(bit, .monotonic);
     }
 
     /// Drop every block this table put into `cache`. Run when the last
@@ -498,7 +546,10 @@ pub const Table = struct {
         const cache_key = self.cacheKey(block_idx);
         if (cache != null and cache_key != 0) {
             const hit: _cache.Hit = if (bypass) .once else .reuse;
-            if (cache.?.get(cache_key, hit)) |val| return val; // incrRef'd.
+            if (cache.?.get(cache_key, hit)) |val| {
+                self.setCachedBit(block_idx);
+                return val; // incrRef'd.
+            }
         }
 
         const bi = self.index.blocks[block_idx];
@@ -565,6 +616,7 @@ pub const Table = struct {
             if (idx >= blocks.len) return error.CorruptTable;
             if (cache.get(self.cacheKey(idx), .reuse)) |val| {
                 val.decrRef();
+                self.setCachedBit(idx);
                 continue;
             }
             const bi = blocks[idx];

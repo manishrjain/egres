@@ -541,9 +541,45 @@ fn putFile(
     defer _ = e.inflight.tryReceive() catch {};
     const name = _table.table.sstName(tb.allocator, file_id) catch return null;
     defer tb.allocator.free(name);
-    e.tree.ground.cache.store.put(name, tb.bytes) catch |err| {
+    const store = e.tree.ground.cache.store;
+    store.put(name, tb.bytes) catch |err| {
         log.err("put {s}: {s}", .{ name, @errorName(err) });
         return null;
     };
+    if (store.blockCache()) |cache| admit(e, &tb, file_id, cache);
     return .{ .file_id = file_id, .extent = tb.extent() };
+}
+
+/// The written table's blocks into the block cache (`Table.admit`),
+/// through a memory-backed Table over the bytes just put: the index
+/// and the decode are the reader's own, so what goes in is what a
+/// read would have produced. Best effort: the file is durable either
+/// way, and a table that does not fit is left to the reads.
+fn admit(
+    e: *Emitter,
+    tb: *const _table.builder.TableBuffer,
+    file_id: u64,
+    cache: *vfs.BlockCache,
+) void {
+    // No `buf_allocator`: the handle borrows `tb.bytes`, so its close
+    // frees nothing and `tb.deinit` stays the owner.
+    const handle: vfs.FileHandle = .{
+        .file_size = tb.bytes.len,
+        .owned_buf = tb.bytes,
+        .vfs = vfs.g(),
+        .bw = vfs.g().bw,
+    };
+    const t = _table.table.Table.openObject(
+        e.tree.ground.allocator,
+        .{ .file = handle },
+        tb.extent(),
+    ) catch |err| {
+        log.debug("admit {d}: open: {s}", .{ file_id, @errorName(err) });
+        return;
+    };
+    defer t.decrRef();
+    t.file_id = file_id;
+    _ = t.admit(cache) catch |err| {
+        log.debug("admit {d}: {s}", .{ file_id, @errorName(err) });
+    };
 }
