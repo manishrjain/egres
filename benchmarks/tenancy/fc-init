@@ -1,0 +1,19 @@
+#!/bin/sh
+# Copyright 2026 Manish R Jain
+# SPDX-License-Identifier: Apache-2.0
+
+# PID 1 in the guest: mount what Postgres needs and become Postgres.
+# No init system, so boot time and idle memory are the kernel's and
+# Postgres's own. The kernel has already set the address (ip= on its
+# command line).
+export PATH=/usr/lib/postgresql/18/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /tmp
+mkdir -p /dev/shm
+mount -t tmpfs tmpfs /dev/shm
+mkdir -p /run/postgresql
+chown postgres:postgres /run/postgresql
+mount -t ext4 -o noatime /dev/vdb /data
+exec gosu postgres postgres -D /data/pg

@@ -26,6 +26,8 @@ patches/
 __pycache__/
 benchmarks/monitor/.env
 benchmarks/run/local.toml
+benchmarks/tenancy/local.sh
+benchmarks/tenancy/probe/probe
 
 # A server started with no flags keeps its data here.
 egres-data/
