@@ -29,8 +29,8 @@ tenant_addr() { echo "$ADDR/tenant_$1"; }
 
 # Launches the server and returns at once; a caller timing the start
 # takes its clock before calling. Arguments are extra server flags.
-# No memory flags: Egres sizes itself to the host, as a micro-VM host
-# is given the whole machine.
+# The server is given MEM_GIB, the memory the micro-VM side gets too;
+# left alone it would size itself to the host.
 egres_launch() {
     mkdir -p "$LOG_DIR"
     local n=1
@@ -51,6 +51,7 @@ egres_launch() {
     fi
     "$bin" --listen="offset=$OFFSET" --raft="id=1" \
         --store="dir-path=$EDATA/store" --wal="dir=$EDATA/wal" \
+        --memory="total-bytes=$((MEM_GIB << 30))" \
         "${io[@]}" "$@" >"$ELOG" 2>&1 &
     echo $! >"$RUN/egres.pid"
 }

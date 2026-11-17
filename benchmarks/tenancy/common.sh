@@ -17,6 +17,11 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 RUN=$WORK/run
+# Memory each side gets, whatever the host has: the Egres server's
+# cap, the micro-VMs' budget, and what the footprint's fit is per. The
+# same figure on every machine keeps the results comparable.
+MEM_GIB=${MEM_GIB:-64}
+# What the host must keep free; a test stops adding tenants under it.
 FLOOR_GIB=${FLOOR_GIB:-16}
 # Tenants made at once by create_range. Past 16 the server sets the
 # pace (about 75 tenants/s on Egres); 1 reproduces the serial runs.
@@ -26,7 +31,13 @@ mkdir -p "$RUN" "$RES"
 avail_gib() { awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo; }
 avail_kb() { awk '/MemAvailable/ {print $2}' /proc/meminfo; }
 total_kb() { awk '/MemTotal/ {print $2}' /proc/meminfo; }
-have_room() { [ "$(avail_gib)" -ge "$FLOOR_GIB" ]; }
+# Room for another tenant: the host above its floor, and the tenants
+# under their memory. A backend with another limit (the VMs' disk)
+# adds it.
+have_room() {
+    [ "$(avail_gib)" -ge "$FLOOR_GIB" ] &&
+        [ "$(tenants_pss_kb)" -lt $((MEM_GIB << 20)) ]
+}
 mib() { awk -v kb="$1" 'BEGIN {printf "%.1f", kb / 1024}'; }
 
 # "ip:port" or "ip:port/database" to a psql connection string. With no

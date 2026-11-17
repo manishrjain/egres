@@ -13,7 +13,8 @@
 # nothing has read since are touched. Ends early at the memory floor.
 #
 # The per-tenant cost is the slope between counts; footprint_fit.txt
-# estimates from it how many tenants this host's memory holds.
+# estimates from it how many tenants fit in MEM_GIB. The counts stop
+# when the tenants hold that much.
 #   BACKEND=egres ./footprint.sh [counts...]   default: 1 10 100 400 1100
 #   ROWS=1000 RATE=200 DUR=15s SETTLE=600 SAMPLE=60 RESTART=1 CREATE_PAR=16
 source "$(dirname "$0")/common.sh"
@@ -86,7 +87,7 @@ fi
 # counts: the first tenants also pay for the platform's pools and
 # arenas, which the fixed cost (the intercept) absorbs. The settled
 # figure scales that slope by what the last count gave back.
-awk -F, -v total_kb="$(total_kb)" -v floor_gib="$FLOOR_GIB" '
+awk -F, -v mem_gib="$MEM_GIB" '
     $2 == "loaded" && $1 > 0 {pn = n; ploaded = loaded; n = $1; loaded = $3}
     $2 ~ /^settled/ {settled = $3}
     END {
@@ -95,12 +96,13 @@ awk -F, -v total_kb="$(total_kb)" -v floor_gib="$FLOOR_GIB" '
         fixed = loaded - slope * n / 1024
         if (settled > 0)
             slope_settled = slope * (settled - fixed) / (loaded - fixed)
-        room = total_kb / 1024 - floor_gib * 1024 - fixed
+        room = mem_gib * 1024 - fixed
         printf "fixed cost: %.0f MiB (intercept)\n", fixed
         printf "per tenant: %.0f KiB just loaded", slope
         if (settled > 0) printf ", %.0f KiB settled", slope_settled
         printf "\n"
         if (slope_settled > 0)
-            printf "fit: about %d tenants in %.0f MiB above the floor\n",
-                room * 1024 / slope_settled, room
+            printf "fit: about %d tenants in %d GiB " \
+                "(%.0f MiB past the fixed cost)\n",
+                room * 1024 / slope_settled, mem_gib, room
     }' "$out" | tee "$RES/footprint_fit.txt" >&2
