@@ -57,7 +57,8 @@ const (
 
 var kindNames = [numKinds]string{"point", "range", "update", "insert", "count"}
 
-const header = "tenants,awake,held_mib,disk_mib,arrive_p50_ms,arrive_p99_ms," +
+const header = "tenants,awake,held_mib,disk_mib,read_mib_s,write_mib_s," +
+	"arrive_p50_ms,arrive_p99_ms," +
 	"first_p50_ms,first_p99_ms," +
 	"wake_p50_ms,wake_p99_ms,woke_pct,sleeps_per_s,wakes_per_s," +
 	"point_p50_ms,point_p99_ms,range_p50_ms,range_p99_ms," +
@@ -321,6 +322,7 @@ type agentRun struct {
 	addr    string    // shared
 	p       *platform // vm; nil for shared
 	pid     int       // shared: the server's, for its PSS
+	disk    string    // the drive WORK is on, for its traffic; "" = none
 	clk     *clock
 	rows    int
 	mix     mix
@@ -607,6 +609,7 @@ func (a *agentRun) window(d time.Duration) windowRow {
 	if a.p != nil {
 		a.p.measure(true)
 	}
+	read0, written0 := diskIO(a.disk)
 	end := start.Add(d)
 	// Shared: the cgroup's figure, as the VM side's; the server's PSS
 	// when there is no cgroup limit.
@@ -628,6 +631,7 @@ func (a *agentRun) window(d time.Duration) windowRow {
 	a.mu.Lock()
 	a.winEnd = time.Now()
 	stop := a.winEnd
+	read1, written1 := diskIO(a.disk)
 	var open []*sessionRun
 	for s := range a.running {
 		open = append(open, s)
@@ -655,6 +659,14 @@ func (a *agentRun) window(d time.Duration) windowRow {
 	arrive := sorted(a.arriveLat)
 	first := sorted(a.firstLat)
 	wake := sorted(a.wakeLat)
+	// The drive's traffic over the window, MiB a second; "" without
+	// a drive to read.
+	ioRate := func(before, after int64) string {
+		if a.disk == "" {
+			return ""
+		}
+		return f2(float64(after-before) / 1024 / secs)
+	}
 	cells := []string{strconv.Itoa(a.count)}
 	if a.p != nil {
 		woke := 0.0
@@ -663,6 +675,7 @@ func (a *agentRun) window(d time.Duration) windowRow {
 		}
 		cells = append(cells, f0(awakeAvg), f0(heldMiB),
 			f0(diskUsedMiB(a.p.run)),
+			ioRate(read0, read1), ioRate(written0, written1),
 			pctCell(arrive, 0.5), pctCell(arrive, 0.99),
 			pctCell(first, 0.5), pctCell(first, 0.99),
 			pctCell(wake, 0.5), pctCell(wake, 0.99), f2(woke),
@@ -673,6 +686,7 @@ func (a *agentRun) window(d time.Duration) windowRow {
 			held = f0(float64(heldSum) / float64(heldN) / 1024)
 		}
 		cells = append(cells, "", held, "",
+			ioRate(read0, read1), ioRate(written0, written1),
 			pctCell(arrive, 0.5), pctCell(arrive, 0.99),
 			pctCell(first, 0.5), pctCell(first, 0.99), "", "", "", "", "")
 	}
@@ -738,6 +752,8 @@ func agents(args []string) {
 	budgetMiB := fs.Int64("budget-mib", 0,
 		"vm: what the cgroup may hold, MiB, all but the clean unmapped file "+
 			"cache (the awake VMs' PSS without a cgroup limit); 0 = no budget")
+	disk := fs.String("disk", "",
+		"the drive WORK is on (nvme0n1), for read_mib_s and write_mib_s")
 	floorGiB := fs.Float64("floor-gib", 16,
 		"stop arrivals when the host's MemAvailable is under this")
 	diskFloorGiB := fs.Float64("disk-floor-gib", 5,
@@ -791,8 +807,9 @@ func agents(args []string) {
 		fail("-rows, -rate and -arrive must be positive, -active in 0..1")
 	}
 
-	a := &agentRun{addr: *addr, pid: *pid, clk: newClock(), rows: *rows,
-		mix: m, rate: *rate, sessLen: *sessLen, active: *active,
+	a := &agentRun{addr: *addr, pid: *pid, disk: *disk, clk: newClock(),
+		rows: *rows,
+		mix:  m, rate: *rate, sessLen: *sessLen, active: *active,
 		begin: time.Now(), rng: rand.New(rand.NewSource(*seed)),
 		running: map[*sessionRun]bool{}}
 	if *backend == "vm" {

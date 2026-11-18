@@ -399,3 +399,16 @@ func TestVMConfig(t *testing.T) {
 		t.Errorf("vmAddr(0) = %s", vmAddr(0))
 	}
 }
+
+// /proc/diskstats: the named device's sectors, read and written, as KiB.
+func TestParseDiskstats(t *testing.T) {
+	text := " 259       0 nvme0n1 10 0 2048 5 20 0 4096 7 0 1 1\n" +
+		" 259       1 nvme0n1p1 1 0 8 0 2 0 16 0 0 0 0\n"
+	r, w := parseDiskstats(text, "nvme0n1")
+	if r != 1024 || w != 2048 {
+		t.Errorf("nvme0n1: %d %d KiB, want 1024 2048", r, w)
+	}
+	if r, w = parseDiskstats(text, "sda"); r != 0 || w != 0 {
+		t.Errorf("sda: %d %d, want 0 0", r, w)
+	}
+}

@@ -254,6 +254,34 @@ func tagCheck(want string) checker {
 	}
 }
 
+// diskIO is the KiB read and written on the drive since boot, from
+// /proc/diskstats; 0, 0 without one or when it cannot be read.
+func diskIO(disk string) (read, written int64) {
+	if disk == "" {
+		return 0, 0
+	}
+	raw, err := os.ReadFile("/proc/diskstats")
+	if err != nil {
+		return 0, 0
+	}
+	return parseDiskstats(string(raw), disk)
+}
+
+// parseDiskstats: a line per device, the name in field 3, sectors
+// (512 B) read in field 6 and written in field 10.
+func parseDiskstats(text, disk string) (read, written int64) {
+	for _, line := range strings.Split(text, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 10 || f[2] != disk {
+			continue
+		}
+		r, _ := strconv.ParseInt(f[5], 10, 64)
+		w, _ := strconv.ParseInt(f[9], 10, 64)
+		return r / 2, w / 2
+	}
+	return 0, 0
+}
+
 // insertRows is one INSERT of the rows from..to, both included. The
 // rows are spelled out because Egres has no INSERT ... SELECT.
 func insertRows(from, to int) string {

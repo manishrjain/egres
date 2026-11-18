@@ -47,6 +47,22 @@ PLATFORM_CPUS=${PLATFORM_CPUS:-}
 PROBE_CPUS=${PROBE_CPUS:-}
 [ -z "$PROBE_CPUS" ] || taskset -pc "$PROBE_CPUS" $$ >/dev/null
 on_platform() { [ -z "$PLATFORM_CPUS" ] || echo taskset -c "$PLATFORM_CPUS"; }
+
+# The drive WORK is on (a partition's parent), and the KiB read and
+# written on it since boot, from /proc/diskstats. Every side's files,
+# images, snapshots, store, WAL, the container's volume, are under
+# WORK, so what a step cost in disk traffic is the difference.
+work_disk() {
+    local mnt=$WORK src d
+    [ -e "$mnt" ] || mnt=$(dirname "$WORK")
+    src=$(findmnt -no SOURCE --target "$mnt" 2>/dev/null)
+    d=$(lsblk -no PKNAME "$src" 2>/dev/null | head -1)
+    echo "${d:-$(basename "$src")}"
+}
+disk_io_kb() {
+    awk -v d="$(work_disk)" '$3 == d {printf "%d %d\n", $6 / 2, $10 / 2}' \
+        /proc/diskstats
+}
 mkdir -p "$RUN" "$RES"
 
 avail_gib() { awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo; }

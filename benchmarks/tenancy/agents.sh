@@ -80,6 +80,7 @@ egres)
 *) echo "agents runs on vm or egres, not $BACKEND" >&2; exit 2 ;;
 esac
 "$ROOT/probe/probe" agents "${side[@]}" -floor-gib "$FLOOR_GIB" \
+    -disk "$(work_disk)" \
     -steps "$STEPS" -arrive "$ARRIVE" -window "$WINDOW" -active "$ACTIVE" \
     -session "$SESSION" -rate "$RATE" -rows "$ROWS" -mix "$MIX" \
     -stop-p99-ms "$STOP_P99_MS" -stop-arrive-ms "$STOP_ARRIVE_MS" \
