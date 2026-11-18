@@ -95,9 +95,6 @@ platform_up() {
     egres_launch "$@" && egres_wait && egres_warm
 }
 platform_down() { egres_stop; }
-# Stops and launches again on the same data; returns as soon as the
-# process is started, so the caller can time the start to a first row.
-platform_restart() { egres_stop; egres_launch "$@"; }
 platform_pid() { cat "$RUN/egres.pid"; }
 
 tenant_create() {

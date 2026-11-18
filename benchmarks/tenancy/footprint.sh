@@ -8,9 +8,9 @@
 # reads at random tenants and records the latency, and the memory and
 # disk the tenants hold. After the last count it settles for SETTLE
 # seconds, sampling the memory every SAMPLE seconds: what a tenant
-# costs once it has gone quiet. Then, where the platform can, it is
-# restarted on the same data and timed to a first row, and ten tenants
-# nothing has read since are touched. Ends early at the memory floor.
+# costs once it has gone quiet. Ends early at the memory floor. (A
+# tenant's first row after idleness is the agents test's first_*
+# columns.)
 #
 # Three memory columns: pss_mib is the tenants' processes; held_mib is
 # what the cgroup holds that the kernel cannot simply drop (all but
@@ -19,7 +19,7 @@
 # between counts; footprint_fit.txt estimates from it how many fit in
 # MEM_GIB's budget. The counts stop when the tenants hold that much.
 #   BACKEND=egres ./footprint.sh [counts...]   default: 1 10 100 300
-#   ROWS=1000 RATE=200 DUR=15s SETTLE=600 SAMPLE=60 RESTART=1 CREATE_PAR=16
+#   ROWS=1000 RATE=200 DUR=15s SETTLE=600 SAMPLE=60 CREATE_PAR=16
 source "$(dirname "$0")/common.sh"
 in_cgroup "$@"
 platform_init "$@"
@@ -30,7 +30,6 @@ RATE=${RATE:-200}
 DUR=${DUR:-15s}
 SETTLE=${SETTLE:-600}
 SAMPLE=${SAMPLE:-60}
-RESTART=${RESTART:-1}
 out=$RES/footprint.csv
 
 fds() { [ "$(type -t tenants_fds)" = function ] && tenants_fds || true; }
@@ -42,17 +41,15 @@ row() {
         "$(mib "$(cgroup_kb)"),$(mib "$(tenants_disk_kb)")," \
         "$(fds),$*" | tr -d ' ' | tee -a "$out"
 }
-probe_first() { "$ROOT/probe/probe" first -addr "$(tenant_addr "$1")" -t0 "$2" \
-    -timeout 1800s; }
 
 platform_down
 trap platform_down EXIT
 platform_up
 echo "tenants,state,pss_mib,held_mib,cgroup_mib,disk_mib,open_files," \
-    "p50_ms,p90_ms,p99_ms,ok,errors,first_row_ms" | tr -d ' ' | tee "$out"
+    "p50_ms,p90_ms,p99_ms,ok,errors" | tr -d ' ' | tee "$out"
 sleep 5
 # The platform with no tenants: its fixed cost.
-row 0 loaded ",,,,,"
+row 0 loaded ",,,,"
 have=0
 for n in "${counts[@]}"; do
     if create_range "$have" "$n" "$ROWS"; then
@@ -66,31 +63,15 @@ for n in "${counts[@]}"; do
     fi
     sleep 5
     row "$have" loaded \
-        "$(point_reads "$(targets_file "$have" all)" "$RATE" "$DUR"),"
+        "$(point_reads "$(targets_file "$have" all)" "$RATE" "$DUR")"
     [ -z "${stopped:-}" ] || break
 done
 
 # Settle: memory every SAMPLE seconds, nothing else running.
 for ((t = SAMPLE; t <= SETTLE; t += SAMPLE)); do
     sleep "$SAMPLE"
-    row "$have" "settled_${t}s" ",,,,,"
+    row "$have" "settled_${t}s" ",,,,"
 done
-
-if [ "$RESTART" != 0 ] && [ "$(type -t platform_restart)" = function ]; then
-    t0=$(date +%s%N)
-    platform_restart
-    ms=$(probe_first 0 "$t0")
-    sleep 10
-    row "$have" restarted ",,,,,$ms"
-    # Ten tenants nothing has read since the start, spread over the
-    # range; the median is the cost of a first touch.
-    touched=()
-    for i in 1 2 3 4 5 6 7 8 9 10; do
-        touched+=("$(probe_first $((have * i / 11)) 0)")
-    done
-    med=$(printf '%s\n' "${touched[@]}" | sort -n | sed -n 6p)
-    row "$have" touched ",,,,,$med"
-fi
 
 # The estimate, on held_mib. The cost per tenant is the slope between
 # the last two counts: the first tenants also pay for the platform's

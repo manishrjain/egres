@@ -208,11 +208,11 @@ func TestRecordWindow(t *testing.T) {
 	a := &agentRun{running: map[*sessionRun]bool{}}
 	now := time.Now()
 	a.winStart = now
-	a.record(0, kPoint, now.Add(-time.Second), 1, nil, false, 0) // before
-	a.record(0, kPoint, now, 2, nil, true, 50*time.Millisecond)
-	a.record(0, kCount, now, 3, errors.New("x"), false, 0)
+	a.record(0, kPoint, now.Add(-time.Second), 1, nil, true, false, 0) // before
+	a.record(0, kPoint, now, 2, nil, true, true, 50*time.Millisecond)
+	a.record(0, kCount, now, 3, errors.New("x"), false, false, 0)
 	a.winEnd = now.Add(time.Second)
-	a.record(0, kPoint, now.Add(time.Second), 4, nil, false, 0) // after
+	a.record(0, kPoint, now.Add(time.Second), 4, nil, false, false, 0) // after
 	if a.ok != 1 || a.errs != 1 || a.woke != 1 || len(a.lat[kPoint]) != 1 ||
 		a.lat[kPoint][0] != 2 || a.wakeLat[0] != 50 {
 		t.Fatalf("ok %d errs %d woke %d lat %v wake %v", a.ok, a.errs, a.woke,

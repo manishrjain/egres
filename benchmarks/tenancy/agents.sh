@@ -8,8 +8,10 @@
 # reads and writes at RATE statements a second for SESSION; the rest
 # are idle. At each count in STEPS the arrivals pause and a WINDOW is
 # measured: the latency of every statement kind, the time an arrival
-# took to its first row, and the memory and disk held (probe/agents.go
-# has the model and the columns).
+# took to its first row, a session's first statement on its own (the
+# time to a result from a tenant that was idle; on the micro-VM side
+# that includes waking it), and the memory and disk held
+# (probe/agents.go has the model and the columns).
 #
 # On the micro-VM side the probe is also the platform's control plane:
 # when the test's cgroup holds more than BUDGET_MIB (all but the clean,

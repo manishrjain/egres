@@ -13,8 +13,8 @@
 #   tenant_addr i        ip:port[/database], the probe's target form
 #   tenants_pss_kb       host memory the tenants' processes hold (PSS)
 #   tenants_disk_kb      disk the tenants' data holds
-# and, where a backend has them: platform_restart, platform_pid,
-# tenants_fds, platform_dump name.
+# and, where a backend has them: platform_pid, tenants_fds,
+# platform_dump name.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 RUN=$WORK/run

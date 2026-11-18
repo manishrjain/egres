@@ -23,9 +23,10 @@
 // The run grows by arrivals, open loop at -arrive a second, to each
 // count in -steps; there it pauses arrivals for -window, sessions still
 // running, and prints one CSV row (see header). Every latency is from
-// when its statement was due, so a wake is in the latency of the
-// session's first statement and a stalled server cannot hide its tail
-// by slowing the sender.
+// when its statement was due, so a stalled server cannot hide its tail
+// by slowing the sender. A session's first statement is also reported
+// on its own (first_*): the time to a result from a tenant that was
+// idle, which on the micro-VM side includes waking it.
 package main
 
 import (
@@ -57,6 +58,7 @@ const (
 var kindNames = [numKinds]string{"point", "range", "update", "insert", "count"}
 
 const header = "tenants,awake,held_mib,disk_mib,arrive_p50_ms,arrive_p99_ms," +
+	"first_p50_ms,first_p99_ms," +
 	"wake_p50_ms,wake_p99_ms,woke_pct,sleeps_per_s,wakes_per_s," +
 	"point_p50_ms,point_p99_ms,range_p50_ms,range_p99_ms," +
 	"update_p50_ms,update_p99_ms,insert_p50_ms,insert_p99_ms," +
@@ -195,6 +197,7 @@ type agentRun struct {
 	// the window ends.
 	winStart, winEnd time.Time
 	lat              [numKinds][]float64
+	firstLat         []float64 // each session's first statement
 	wakeLat          []float64
 	woke, ok, errs   int
 	lastErr          error
@@ -218,7 +221,7 @@ func (a *agentRun) traceLine(due time.Time, id int, kind string, lms float64,
 }
 
 func (a *agentRun) record(id, kind int, due time.Time, lms float64, err error,
-	woke bool, wake time.Duration) {
+	first, woke bool, wake time.Duration) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.traceLine(due, id, kindNames[kind], lms, woke, err)
@@ -232,6 +235,9 @@ func (a *agentRun) record(id, kind int, due time.Time, lms float64, err error,
 	} else {
 		a.ok++
 		a.lat[kind] = append(a.lat[kind], lms)
+		if first {
+			a.firstLat = append(a.firstLat, lms)
+		}
 	}
 	if woke {
 		a.woke++
@@ -321,7 +327,8 @@ func (a *agentRun) session(s *sessionRun, start time.Time, seed int64) {
 				err = errors.New(kindNames[kind] + ": no row")
 			}
 		}
-		a.record(t.id, kind, due, msSince(due), err, woke && k == 0, took)
+		a.record(t.id, kind, due, msSince(due), err, k == 0, woke && k == 0,
+			took)
 		s.mark.Store(due.Add(gap).UnixNano())
 	}
 }
@@ -447,7 +454,7 @@ func (a *agentRun) window(d time.Duration) windowRow {
 	a.mu.Lock()
 	a.winStart, a.winEnd = time.Now(), time.Time{}
 	a.lat = [numKinds][]float64{}
-	a.wakeLat = nil
+	a.firstLat, a.wakeLat = nil, nil
 	a.woke, a.ok, a.errs, a.lastErr = 0, 0, 0, nil
 	start := a.winStart
 	a.mu.Unlock()
@@ -500,6 +507,7 @@ func (a *agentRun) window(d time.Duration) windowRow {
 	f0 := func(x float64) string { return fmt.Sprintf("%.0f", x) }
 	f2 := func(x float64) string { return fmt.Sprintf("%.2f", x) }
 	arrive := sorted(a.arriveLat)
+	first := sorted(a.firstLat)
 	wake := sorted(a.wakeLat)
 	cells := []string{strconv.Itoa(a.count)}
 	if a.p != nil {
@@ -510,6 +518,7 @@ func (a *agentRun) window(d time.Duration) windowRow {
 		cells = append(cells, f0(awakeAvg), f0(heldMiB),
 			f0(diskUsedMiB(a.p.run)),
 			pctCell(arrive, 0.5), pctCell(arrive, 0.99),
+			pctCell(first, 0.5), pctCell(first, 0.99),
 			pctCell(wake, 0.5), pctCell(wake, 0.99), f2(woke),
 			f2(float64(sleeps)/secs), f2(float64(wakes)/secs))
 	} else {
@@ -518,7 +527,8 @@ func (a *agentRun) window(d time.Duration) windowRow {
 			held = f0(float64(heldSum) / float64(heldN) / 1024)
 		}
 		cells = append(cells, "", held, "",
-			pctCell(arrive, 0.5), pctCell(arrive, 0.99), "", "", "", "", "")
+			pctCell(arrive, 0.5), pctCell(arrive, 0.99),
+			pctCell(first, 0.5), pctCell(first, 0.99), "", "", "", "", "")
 	}
 	for k := range numKinds {
 		l := sorted(a.lat[k])

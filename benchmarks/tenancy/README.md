@@ -24,10 +24,9 @@ Each test is one script that runs against a platform, `BACKEND=vm`,
 2. **`footprint`: what a tenant costs, and how many fit.** Tenants are
    brought up to each count in turn; after each, point reads at
    random tenants, and the memory and disk held. After the last count
-   the memory is sampled for ten minutes as the tenants go quiet,
-   then the platform is restarted on the same data and timed to a
-   first row. `footprint_fit.txt` estimates from the slope how many
-   tenants fit in the memory each side gets.
+   the memory is sampled for ten minutes as the tenants go quiet.
+   `footprint_fit.txt` estimates from the slope how many tenants fit
+   in the memory each side gets.
 3. **`agents`: the workload.** Tenants arrive over time and load their
    data; a tenth of them are in a session at any moment, sending a
    mix of reads and writes; the rest are idle. On the micro-VM side
@@ -35,8 +34,9 @@ Each test is one script that runs against a platform, `BACKEND=vm`,
    VMs are put to sleep (snapshotted to disk) and woken, by restoring
    the snapshot or booting afresh, when a session starts for them. At
    each tenant count: the latency of every statement kind, the time
-   an arrival took to its first row, wakes and sleeps, memory and
-   disk.
+   an arrival took to its first row, the time to a result from a
+   tenant that was idle (a session's first statement, a wake included
+   on the micro-VM side), wakes and sleeps, memory and disk.
 
 `drive_idle` runs first: whether the drive slows down when idle,
 which would show in every latency.
