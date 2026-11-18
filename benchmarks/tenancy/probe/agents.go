@@ -435,7 +435,7 @@ func (a *agentRun) grow(to int, perSec, floorGiB, diskFloorGiB float64) (
 	}
 	wg.Wait()
 	if err := failure(); err != nil {
-		return "an arrival failed: " + err.Error()
+		return "the platform did not take an arrival: " + err.Error()
 	}
 	return why
 }
