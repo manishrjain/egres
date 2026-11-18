@@ -17,6 +17,7 @@ pub const RaftError = @import("node.zig").RaftError;
 pub const Entry = @import("node.zig").Entry;
 pub const CommitStatus = @import("node.zig").CommitStatus;
 pub const ProposalWaiter = @import("node.zig").ProposalWaiter;
+pub const ApplyWaiters = @import("node.zig").ApplyWaiters;
 pub const Watermark = @import("node.zig").Watermark;
 pub const diskwal = @import("diskwal.zig");
 pub const log_file = @import("log_file.zig");

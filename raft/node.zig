@@ -164,6 +164,71 @@ pub const ProposalWaiter = struct {
     }
 };
 
+/// Proposals waiting for apply, in index order: the main loop pushes
+/// each one as its entry is logged, the apply fiber pops them as the
+/// entries apply. Unbounded on purpose. The apply fiber drains it only
+/// past the commit index, and the main loop advances that after it
+/// has pushed, so a bound it waited on wedged the node: 1,024 writes
+/// logged behind a slow apply, and nothing committed again.
+pub const ApplyWaiters = struct {
+    mu: fiber.Mutex(.untracked) = .{},
+    list: std.ArrayList(*ProposalWaiter) = .empty,
+    /// Popped up to here. The popped prefix is dropped once it is most
+    /// of the list, so a pop moves nothing as a rule.
+    head: usize = 0,
+    closed: bool = false,
+
+    pub fn deinit(self: *ApplyWaiters, alloc: std.mem.Allocator) void {
+        self.list.deinit(alloc);
+    }
+
+    /// `error.Closed` once closed: the proposer hears at once.
+    pub fn push(
+        self: *ApplyWaiters,
+        alloc: std.mem.Allocator,
+        w: *ProposalWaiter,
+    ) error{ Closed, OutOfMemory }!void {
+        self.mu.lock(@src());
+        defer self.mu.unlock();
+        if (self.closed) return error.Closed;
+        try self.list.append(alloc, w);
+    }
+
+    /// The oldest waiter queued, or null.
+    pub fn pop(self: *ApplyWaiters) ?*ProposalWaiter {
+        self.mu.lock(@src());
+        defer self.mu.unlock();
+        if (self.head == self.list.items.len) return null;
+        const w = self.list.items[self.head];
+        self.head += 1;
+        if (self.head * 2 >= self.list.items.len) {
+            const rest = self.list.items[self.head..];
+            std.mem.copyForwards(
+                *ProposalWaiter,
+                self.list.items[0..rest.len],
+                rest,
+            );
+            self.list.items.len = rest.len;
+            self.head = 0;
+        }
+        return w;
+    }
+
+    /// No push lands from now on; what is queued is still popped, by
+    /// the drain that fails it at shutdown.
+    pub fn close(self: *ApplyWaiters) void {
+        self.mu.lock(@src());
+        defer self.mu.unlock();
+        self.closed = true;
+    }
+
+    pub fn len(self: *ApplyWaiters) usize {
+        self.mu.lock(@src());
+        defer self.mu.unlock();
+        return self.list.items.len - self.head;
+    }
+};
+
 /// A worker's id is a u8.
 const max_workers = std.math.maxInt(u8) + 1;
 
@@ -289,12 +354,10 @@ pub const Node = struct {
     /// finishes them on the main loop, which is also the only appender,
     /// so no lock.
     commit_waiters: std.ArrayList(*ProposalWaiter) = .empty,
-    /// Proposals waiting for apply, in index order; `fireApplied`
-    /// drains them on the apply fiber. `applied_held` is the one
-    /// taken out but not yet due.
-    apply_waiters: fiber.Channel(*ProposalWaiter) = undefined,
-    // applied_held is cached when we receive a waiter but haven't reached its
-    // index yet.
+    /// Proposals waiting for apply; `processApplyWaiters` drains them
+    /// on the apply fiber. `applied_held` is the one popped but not
+    /// yet due.
+    apply_waiters: ApplyWaiters = .{},
     applied_held: ?*ProposalWaiter = null,
 
     event_notify: fiber.Notify = .{},
@@ -398,7 +461,6 @@ pub const Node = struct {
             .applied_ts = Watermark.init(allocator),
         };
         node.proposal_ch = try fiber.Channel(ProposalRequest).initAlloc(allocator, proposal_queue_capacity);
-        node.apply_waiters = try fiber.Channel(*ProposalWaiter).initAlloc(allocator, 1024);
         node.log.on_written = .{ .ctx = node, .call = onWritten };
         node.log.onFailed(.{ .ctx = node, .call = onLogFailed });
         node.inbound_ch = try fiber.Channel(InboundMsg).initAlloc(allocator, 1024);
@@ -500,8 +562,7 @@ pub const Node = struct {
         self.abortPending();
         self.proposal_ch.deinit();
         self.commit_waiters.deinit(self.allocator);
-        self.apply_waiters.close(.immediate);
-        self.apply_waiters.deinit();
+        self.apply_waiters.deinit(self.allocator);
         // Fires startShutdown() (idempotent) then joins the signal-watcher
         // fiber (if install() was used) before freeing — nothing stays
         // parked.
@@ -976,16 +1037,16 @@ pub const Node = struct {
         self.event_notify.notify();
         // Stop the apply queue before the apply loop: from here a
         // waiter that misses the queue is failed inline with .shutdown
-        // (`send` fails on a closed channel), and the ones already
-        // queued stay drainable (graceful, not immediate) for
-        // `applyLoop` to fail on its way out. The order matters: the
-        // apply loop drains once, as it exits, so nothing may be
-        // queued after that drain. Before this, the queued waiters
-        // lived until deinit's failAllPendingCallbacks, which runs
-        // after Engine.wait has joined the loop group; a clock tick
-        // in flight at SIGTERM sat in that group waiting for its
-        // apply, so the join waited on deinit and deinit on the join.
-        self.apply_waiters.close(.graceful);
+        // (`push` fails once closed), and the ones already queued are
+        // still popped, by `applyLoop` failing them on its way out.
+        // The order matters: the apply loop drains once, as it exits,
+        // so nothing may be queued after that drain. Before this, the
+        // queued waiters lived until deinit's failAllPendingCallbacks,
+        // which runs after Engine.wait has joined the loop group; a
+        // clock tick in flight at SIGTERM sat in that group waiting
+        // for its apply, so the join waited on deinit and deinit on
+        // the join.
+        self.apply_waiters.close();
         // Wake applyLoop + any pending proposeAndWaitForApply / waitForApplied
         // callers with error.Closed.
         self.commit_index.close();
@@ -1798,8 +1859,9 @@ pub const Node = struct {
         _metrics.g().observePhase("log_append", t_persist);
 
         // The log holds the entries through its last index, also when
-        // the append failed part way. send() blocks on a full channel
-        // (the apply is behind) and fails only at shutdown.
+        // the append failed part way. Queueing a waiter fails only at
+        // shutdown; it never waits on the apply, whose progress is
+        // this loop's commit.
         const last = self.log.lastIndex();
         for (requests) |*req| {
             const w = req.waiter orelse continue;
@@ -1811,7 +1873,7 @@ pub const Node = struct {
             req.waiter = null;
             const queued = switch (w.wait_for) {
                 .commit => self.commit_waiters.append(self.allocator, w),
-                .apply => self.apply_waiters.send(w),
+                .apply => self.apply_waiters.push(self.allocator, w),
             };
             queued catch w.finish(.shutdown);
         }
@@ -2086,7 +2148,7 @@ pub const Node = struct {
     fn processApplyWaiters(self: *Node, ai: u64) void {
         while (true) {
             const w = self.applied_held orelse
-                (self.apply_waiters.tryReceive() catch return);
+                self.apply_waiters.pop() orelse return;
             if (w.entry.index > ai) {
                 self.applied_held = w;
                 return;
@@ -2727,10 +2789,7 @@ pub const Node = struct {
             self.applied_held = null;
             w.finish(status);
         }
-        while (true) {
-            const head = self.apply_waiters.tryReceive() catch break;
-            head.finish(status);
-        }
+        while (self.apply_waiters.pop()) |w| w.finish(status);
     }
 
     /// A proposal that never reached the log: no index, this term.
