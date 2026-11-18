@@ -184,6 +184,19 @@ do_check() {
         "Egres tenants"
     ok "memory: $(awk '/MemTotal/ {printf "%.0f GiB", $2 / 1048576}' \
         /proc/meminfo)"
+    # The tests' memory cap needs the memory controller in the user's
+    # slice (Ubuntu's systemd delegates it) and a working scope.
+    local ctl
+    ctl=$(cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id \
+        -u).service/cgroup.controllers" 2>/dev/null || true)
+    if echo " $ctl " | grep -q " memory " &&
+        systemd-run --user --scope --quiet -p MemoryMax=1G true 2>/dev/null
+    then
+        ok "memory cgroup: user slice delegates $ctl"
+    else
+        lack "memory cgroup: the user slice lacks the memory controller" \
+            "(Delegate=memory in user@.service), or CGROUP=0 to run without"
+    fi
 
     echo "tools"
     local t
