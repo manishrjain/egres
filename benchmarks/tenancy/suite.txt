@@ -7,11 +7,13 @@
 
 drive-idle            drive_idle
 
-# 1. Isolation: a heavy tenant beside quiet ones. pgsolo, a Postgres
-# per tenant in a container with the VM's CPU and memory limits, says
-# what the VM boundary itself adds.
+# 1. Isolation: a heavy tenant beside quiet ones. pgshared, every
+# tenant a database in one stock Postgres, is Egres's shape without
+# its metering; pgsolo, a Postgres per tenant in a container with the
+# VM's CPU and memory limits, says what the VM boundary itself adds.
 noisy-vm              noisy      BACKEND=vm
 noisy-egres           noisy      BACKEND=egres
+noisy-pgshared        noisy      BACKEND=pgshared
 noisy-pgsolo          noisy      BACKEND=pgsolo
 
 # 2. What a tenant costs, and how many fit. A micro-VM holds about
@@ -20,6 +22,7 @@ noisy-pgsolo          noisy      BACKEND=pgsolo
 # Postgres and the VM.
 footprint-vm          footprint  BACKEND=vm      1 10 100 300 600
 footprint-pgsolo      footprint  BACKEND=pgsolo  1 10 100
+footprint-pgshared    footprint  BACKEND=pgshared 100 1000 10000
 footprint-egres       footprint  BACKEND=egres   1000 10000 50000 100000
 
 # 3. Agents arriving and working, the micro-VMs put to sleep and woken

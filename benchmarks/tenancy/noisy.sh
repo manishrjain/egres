@@ -14,7 +14,9 @@
 # host CPU for the quiet ones: past one heavy tenant per host thread
 # they compete. On Egres nothing bounds a heavy tenant but the server's
 # meter, which gives each active tenant an equal share; its per-tenant
-# lines are saved after each step. A pgsolo tenant has the micro-VM's
+# lines are saved after each step. On pgshared, one stock Postgres
+# with a database per tenant, nothing bounds a heavy tenant at all:
+# Egres's shape without its meter. A pgsolo tenant has the micro-VM's
 # limits (one CPU, its memory) with no VM: what the VM boundary itself
 # adds to isolation, or costs.
 #   BACKEND=vm ./noisy.sh
