@@ -57,6 +57,9 @@ egres_launch() {
     # it (abort_conf), aborts; the arenas are off either way, so say
     # so and start. A pinned Egres is therefore measured without
     # per-CPU arenas, an unpinned one with them unless told otherwise.
+    # EGRES_RAFT_WORKERS reaches the server through the environment (a
+    # benchmark build reads it); named here so command.txt records it.
+    : "${EGRES_RAFT_WORKERS:-}"
     local conf=${EGRES_MALLOC_CONF:-} env=()
     [ -n "$conf" ] || [ -z "$PLATFORM_CPUS" ] || conf=percpu_arena:disabled
     [ -z "$conf" ] || env=(env "MALLOC_CONF=$conf")

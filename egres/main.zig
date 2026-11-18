@@ -218,9 +218,17 @@ pub fn main(init: std.process.Init) !void {
     // num_workers/raft_workers omitted → auto: workers = CPU core count,
     // raft_workers = 2 at 8 or more (see fiber.runtime.raftWorkerCount). The
     // coarse clock reads time via `context.g().io`, already initialized above.
-    try fiber_rt.init(allocator, .{});
+    // EGRES_RAFT_WORKERS overrides the raft lane's size for the tenancy
+    // benchmark's A/B of lanes against priority alone (0: no lane).
+    var rt_opts: fiber.InitOptions = .{};
+    if (std.c.getenv("EGRES_RAFT_WORKERS")) |s| {
+        rt_opts.raft_workers = std.fmt.parseInt(usize, std.mem.span(s), 10) catch null;
+    }
+    try fiber_rt.init(allocator, rt_opts);
     defer fiber_rt.deinit();
-    log.info("runtime initialized: {d} workers", .{fiber_rt.workers.len});
+    log.info("runtime initialized: {d} workers, {d} in the raft lane", .{
+        fiber_rt.workers.len, fiber_rt.laneWorkers(.raft),
+    });
 
     // Without allocator background threads (mimalloc has none; jemalloc
     // has them on Linux only, see jemalloc/root.zig), freed memory
