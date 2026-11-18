@@ -27,9 +27,13 @@ platform_down() {
 platform_up() {
     platform_down
     mkdir -p "$DIR"
+    # Postgres puts parallel workers' and CREATE DATABASE's dynamic
+    # shared memory on /dev/shm, which docker caps at 64 MB unless
+    # told otherwise; with 16 creators that cap stopped the 1,000 to
+    # 10,000 step ("could not resize shared memory segment").
     # shellcheck disable=SC2086  # PG_CONF is a list of -c settings
     docker run -d --name "$NAME" --network host --memory="${MEM_GIB}g" \
-        -e POSTGRES_HOST_AUTH_METHOD=trust \
+        --shm-size=8g -e POSTGRES_HOST_AUTH_METHOD=trust \
         -v "$DIR:/var/lib/postgresql" "$PG_IMAGE" \
         -c port="$PG_PORT" -c listen_addresses=127.0.0.1 \
         -c max_connections="$PG_MAX_CONN" $PG_CONF >/dev/null
