@@ -62,10 +62,12 @@ for ((i = 0; i < QUIET; i++)); do tenant_addr "$i"; done >"$RUN/quiet.txt"
 for ((i = QUIET; i < total; i++)); do tenant_addr "$i"; done >"$RUN/heavy.txt"
 
 # read_mib and write_mib: the drive's traffic over the step, the
-# heavy tenants' warm-up included.
+# heavy tenants' warm-up included. pss_mib and held_mib: the memory
+# the side has at the end of the step, as footprint measures it (the
+# tenants' processes; all the cgroup holds but clean unmapped cache).
 echo "kind,heavy,conns,p50_ms,p90_ms,p99_ms,ok,errors," \
-    "heavy_done,heavy_failed,heavy_mean_ms,read_mib,write_mib" |
-    tr -d ' ' | tee "$out"
+    "heavy_done,heavy_failed,heavy_mean_ms,read_mib,write_mib," \
+    "pss_mib,held_mib" | tr -d ' ' | tee "$out"
 for kind in $KINDS; do
     sql=$(heavy_sql "$kind")
     for h in $HEAVY; do
@@ -76,7 +78,8 @@ for kind in $KINDS; do
             -rows "$ROWS")
         read -r r1 w1 <<<"$(disk_io_kb)"
         rd=$(((r1 - r0) / 1024)) wr=$(((w1 - w0) / 1024))
-        echo "$kind,$h,$CONNS,$lat,$rd,$wr" | tee -a "$out"
+        echo "$kind,$h,$CONNS,$lat,$rd,$wr,$(mib "$(tenants_pss_kb)")," \
+            "$(mib "$(mem_held_kb)")" | tr -d ' ' | tee -a "$out"
         [ "$(type -t platform_dump)" = function ] &&
             platform_dump "noisy_${kind}_$h"
         sleep 5
