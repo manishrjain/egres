@@ -31,6 +31,12 @@ field threads_per_core "$(cpu 'Thread(s) per core')"
 field governor \
     "$(read1 /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
 field boost "$(read1 /sys/devices/system/cpu/cpufreq/boost)"
+# The deepest idle state a core may enter: its exit latency is in
+# every quiet tenant's read when the machine is otherwise idle.
+field deepest_idle "$(for d in /sys/devices/system/cpu/cpu0/cpuidle/state*; do
+    [ "$(read1 "$d/disable")" = 1 ] && continue
+    echo "$(read1 "$d/name") $(read1 "$d/latency")us"
+done 2>/dev/null | tail -1)"
 field memory "$(awk '/MemTotal/ {printf "%.1f GiB", $2 / 1048576}' \
     /proc/meminfo)"
 field swap "$(awk '/SwapTotal/ {printf "%.1f GiB", $2 / 1048576}' \

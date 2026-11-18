@@ -15,9 +15,9 @@ noisy-egres           noisy      BACKEND=egres
 noisy-pgshared        noisy      BACKEND=pgshared
 
 # 2. What a tenant costs, and how many fit. A micro-VM holds about
-# 85 MiB settled (tanland), so 600 is near what MEM_GIB's budget
-# holds; the count stops early if not.
-footprint-vm          footprint  BACKEND=vm      1 10 100 300 600
+# 96 MiB settled (tanland), so 600 fills a 64 GiB budget and 1,000 a
+# 100 GiB one; the count stops early where it does not fit.
+footprint-vm          footprint  BACKEND=vm      1 10 100 300 600 1000
 footprint-pgshared    footprint  BACKEND=pgshared 100 1000 10000
 footprint-egres       footprint  BACKEND=egres   1000 10000 50000 100000
 
