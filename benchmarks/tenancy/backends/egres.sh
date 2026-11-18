@@ -148,7 +148,11 @@ PY
 }
 # The meter's per-tenant lines and the memory report, beside the
 # results, so a tenant the meter held back shows as parked time.
+# The meter, the memory, and the workers (per-worker CPU, lifetime,
+# so a step's share is the difference from the dump before): how busy
+# the raft lane is beside the SQL workers at each heavy count.
 platform_dump() {
     egres_admin tenants >"$RES/$1.tenants" 2>&1 || true
     egres_admin mem >"$RES/$1.mem" 2>&1 || true
+    egres_admin workers >"$RES/$1.workers" 2>&1 || true
 }
