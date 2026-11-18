@@ -362,7 +362,7 @@ test "branch: a restart keeps the rows a namespace branch copied" {
 }
 
 // The change lock keeps such an entry out of the log
-// (`Engine.proposeHeld`). One that got there all the same wedged the
+// (`Engine.proposeChange`). One that got there all the same wedged the
 // apply loop or the snapshot, each failing on a tree that was gone.
 test "apply: a flush behind a drop is skipped whole, in the draft too" {
     var fx: ApplyFixture = undefined;

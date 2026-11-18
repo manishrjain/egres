@@ -1024,9 +1024,9 @@ pub const Forest = struct {
 
     /// Puts first in a built flush the tables of trees that are still
     /// there, in their order, and returns how many: the rest are of
-    /// trees dropped while it was built. The proposer calls this under
-    /// the engine's change lock and proposes only the first ones, so
-    /// each tree is there at the apply. No entry names the rest.
+    /// trees dropped while it was built. The engine's executor calls
+    /// this and proposes only the first ones, so each tree is there at
+    /// the apply. No entry names the rest.
     pub fn keepListed(
         self: *Forest,
         changes: []_manifest.SSTableChange,

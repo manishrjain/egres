@@ -79,7 +79,7 @@ pub const Metrics = struct {
     /// are not observed, so the count is the number of braked batches.
     write_backpressure_ms: BackpressureHist,
     /// How long each merge's build took (merge and write, not the
-    /// propose and apply), per level pair (`Engine.proposeCompaction`).
+    /// propose and apply), per level pair (`Engine.runCompaction`).
     /// Moves and splits are not merges and are not observed.
     compaction_ms: CompactionHist,
 

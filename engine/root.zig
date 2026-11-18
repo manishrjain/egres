@@ -19,8 +19,9 @@
 //!   * LSM housekeeping is replicated too: the flush/compaction/snapshot/split
 //!     loops propose manifest changes so every node installs the same SSTs, and
 //!     snapshots prune the raft WAL. Manifest changes, DDL's among them, go
-//!     one at a time: each is applied before the next is checked against the
-//!     trees (`Engine.change_mu`), so none is applied to a tree that is gone.
+//!     one at a time through one queue (`Engine.mqueue`): each is applied
+//!     before the next is checked against the trees, so none is applied to
+//!     a tree that is gone, and a user's change goes ahead of the loops'.
 //!
 //! `Engine.open` opens one node's parts (raft WAL, raft node, forest) and
 //! wires them (state machine ↔ node, file-id allocator ↔ node+WAL, raft
@@ -39,6 +40,7 @@ const _engine = @import("engine.zig");
 /// The admin protocol + its front-end server (wire format + the listener).
 pub const admin = @import("admin.zig");
 pub const governor = @import("governor.zig");
+pub const manifest_queue = @import("manifest_queue.zig");
 
 /// The replicated storage engine (forest + raft node + apply + loops).
 pub const Engine = _engine.Engine;

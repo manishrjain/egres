@@ -700,7 +700,7 @@ pub fn applySplit(
 /// bottommost level, locally, without going through Raft. **Test-only**
 /// — production must propose splits through the manifest pipeline so
 /// all nodes apply the same split deterministically; see
-/// `proposeSplit` in the engine. Takes the locks it needs itself, like
+/// `runSplit` in the engine. Takes the locks it needs itself, like
 /// applySplit on the apply path.
 pub fn splitTreeForTests(self: *Forest, namespace_id: u64, tree_id: u64) !void {
     var arena = std.heap.ArenaAllocator.init(self.allocator);

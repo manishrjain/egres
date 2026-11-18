@@ -371,7 +371,7 @@ pub fn updateCompactCandidate_(self: *Tree, held: Lock.Exclusive) !void {
     // at least min_lmax_tables_for_split tables to pick a boundary key. A
     // tree can be oversized in total while its data is still stacked in the
     // upper levels (Lmax near-empty) — triggering then spins forever:
-    // the split verdict stays, buildSplit returns null, proposeSplit skips.
+    // the split verdict stays, buildSplit returns null, runSplit skips.
     // When infeasible, fall through to compaction, which drains data into
     // Lmax until a split becomes possible.
     const lmax_idx = self.ground.live.cur().max_levels - 1;
