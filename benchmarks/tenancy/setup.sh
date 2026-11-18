@@ -51,8 +51,12 @@ fetch() {
 
 do_packages() {
     sudo apt-get update
+    # libpam-systemd registers a login with logind, which is what gives
+    # the user a systemd manager and so the memory cgroup; a minimal
+    # cloud image ships without it.
     sudo apt-get install -y docker.io postgresql-client curl make \
-        python3 golang-go e2fsprogs iproute2 util-linux
+        python3 golang-go e2fsprogs iproute2 util-linux libpam-systemd \
+        dbus-user-session
     sudo usermod -aG docker "$USER"
     echo "log in again for the docker group; Zig $(zig_wanted) is not" \
         "packaged: https://ziglang.org/download/"
