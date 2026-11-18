@@ -1,7 +1,7 @@
 # The whole benchmark, in the order `./run.sh suite` runs it. One step
 # per line: a label, the test (a script here, without .sh), then
 # VAR=value settings and the test's arguments. BACKEND picks the
-# platform (vm, egres, pgsolo). Each script's header says what the
+# platform (vm, egres, pgshared). Each script's header says what the
 # settings mean. Edit to change a run; the copy used is saved with its
 # results.
 
@@ -9,19 +9,15 @@ drive-idle            drive_idle
 
 # 1. Isolation: a heavy tenant beside quiet ones. pgshared, every
 # tenant a database in one stock Postgres, is Egres's shape without
-# its metering; pgsolo, a Postgres per tenant in a container with the
-# VM's CPU and memory limits, says what the VM boundary itself adds.
+# its metering.
 noisy-vm              noisy      BACKEND=vm
 noisy-egres           noisy      BACKEND=egres
 noisy-pgshared        noisy      BACKEND=pgshared
-noisy-pgsolo          noisy      BACKEND=pgsolo
 
 # 2. What a tenant costs, and how many fit. A micro-VM holds about
 # 85 MiB settled (tanland), so 600 is near what MEM_GIB's budget
-# holds; the count stops early if not. pgsolo splits its figure into
-# Postgres and the VM.
+# holds; the count stops early if not.
 footprint-vm          footprint  BACKEND=vm      1 10 100 300 600
-footprint-pgsolo      footprint  BACKEND=pgsolo  1 10 100
 footprint-pgshared    footprint  BACKEND=pgshared 100 1000 10000
 footprint-egres       footprint  BACKEND=egres   1000 10000 50000 100000
 

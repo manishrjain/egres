@@ -48,7 +48,7 @@ total_kb() { awk '/MemTotal/ {print $2}' /proc/meminfo; }
 # process in it, one tenant's VM or the server; OOMPolicy=continue
 # keeps systemd from then stopping the whole test, whose rows should
 # show the loss. CGROUP=0 runs without one. Docker's containers
-# (pgshared, pgsolo) are the daemon's, outside it.
+# (pgshared) is the daemon's, outside it.
 in_cgroup() {
     [ "${CGROUP:-1}" = 1 ] || return 0
     if [ -n "${IN_CGROUP:-}" ]; then
@@ -166,7 +166,7 @@ targets_file() {
 # Prints p50_ms,p90_ms,p99_ms,ok,errors.
 point_reads() { "$ROOT/probe/probe" load -addrs "$1" -rate "$2" -dur "$3"; }
 
-BACKEND=${BACKEND:?vm, egres, pgshared or pgsolo}
+BACKEND=${BACKEND:?vm, egres or pgshared}
 [ -f "$ROOT/backends/$BACKEND.sh" ] ||
     { echo "no backend $BACKEND" >&2; exit 2; }
 source "$ROOT/backends/$BACKEND.sh"

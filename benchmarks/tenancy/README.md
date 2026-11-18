@@ -3,11 +3,9 @@
 Many small tenants on one machine, two ways. On one side each tenant
 is a Firecracker micro-VM running stock Postgres 18 (1 vCPU,
 128 MiB). On the other, each tenant is a database on one Egres
-server. Two controls run beside them: `pgshared`, every tenant a
-database in one stock Postgres, Egres's shape without its metering;
-and `pgsolo`, a Postgres per tenant in a container with the VM's
-limits and no VM, which splits the micro-VM's cost into Postgres's
-part and the VM's. The same scripts rerun the whole
+server. One control runs beside them: `pgshared`, every tenant a
+database in one stock Postgres, Egres's shape without its metering.
+The same scripts rerun the whole
 comparison on another machine and record what they ran on.
 
 Every tenant on every side gets its data the same way, through SQL:
@@ -17,7 +15,7 @@ its database (a VM, on the micro-VM side), table `t`, and rows
 ## The tests
 
 Each test is one script that runs against a platform, `BACKEND=vm`,
-`egres`, `pgshared` or `pgsolo`:
+`egres` or `pgshared`:
 
 1. **`noisy`: isolation.** 50 quiet tenants send an occasional point
    read while 0 to 64 heavy tenants each run one statement flat out,
@@ -58,9 +56,8 @@ Each script's header says what it does and lists its settings.
   comes out of the same memory as their processes. The tenants'
   processes are kept to `BUDGET_PCT` (90) of it; the rest is the
   kernel's and the cache's. The host must also keep `FLOOR_GIB` (16)
-  free. The controls' containers are docker's, outside the cgroup:
-  `pgshared`'s is given `MEM_GIB` by docker, page cache included;
-  `pgsolo`'s counts are small.
+  free. `pgshared`'s container is docker's, outside the cgroup, and
+  is given `MEM_GIB` by docker, page cache included.
 - **Both sides fsync.** The micro-VMs' data drive runs with
   Firecracker's Writeback cache, so a commit Postgres fsyncs reaches
   the device, as Egres's do. (Firecracker's default, Unsafe, stops a
@@ -153,8 +150,7 @@ the whole host.
 - `local.sh`: this machine's settings (ignored by git).
 - `common.sh`: what the tests share, and the backend interface its
   header lists; it sources `backends/$BACKEND.sh`.
-- `backends/`: `vm.sh`, `egres.sh`, `pgshared.sh`, `pgsolo.sh`, one platform
-  each.
+- `backends/`: `vm.sh`, `egres.sh`, `pgshared.sh`, one platform each.
 - `footprint.sh`, `noisy.sh`, `agents.sh`, `drive_idle.sh`: the tests.
 - `setup.sh`, `run.sh`, `machine.sh`, `suite.txt`: making a machine
   ready, and running on it.

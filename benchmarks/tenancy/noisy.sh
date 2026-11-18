@@ -16,9 +16,7 @@
 # meter, which gives each active tenant an equal share; its per-tenant
 # lines are saved after each step. On pgshared, one stock Postgres
 # with a database per tenant, nothing bounds a heavy tenant at all:
-# Egres's shape without its meter. A pgsolo tenant has the micro-VM's
-# limits (one CPU, its memory) with no VM: what the VM boundary itself
-# adds to isolation, or costs.
+# Egres's shape without its meter.
 #   BACKEND=vm ./noisy.sh
 #   KINDS="cpu write" HEAVY="0 1 2 4 8 16 32 64" QUIET=50 CONNS=4
 #   RATE=50 DUR=60s HOLD=1 QHOLD=2 ROWS=100000
