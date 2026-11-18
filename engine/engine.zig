@@ -443,27 +443,6 @@ pub const StorageImpl = struct {
     }
 };
 
-/// Snapshot of work the compaction/flush loops are currently building.
-/// Lives only between the moment we start writing SSTs / building changes
-/// and the moment the resulting manifest entry is appended via
-/// `proposeAndWaitForApply`. Surfaced through `zdb` so an operator
-/// can tell whether a "compactions wanted" entry is genuinely starved or
-/// just waiting on an in-flight build to finish.
-pub const InFlight = struct {
-    pub const Kind = enum { flush, compaction, split, new_memtable };
-    /// A flush or a new memtable works on no one tree.
-    pub const no_tree: TreeKey = .{ .namespace = 0, .tree_id = 0 };
-    kind: Kind,
-    tree: TreeKey = no_tree,
-    src_level: u8 = 0,
-    src_tables: u32 = 0,
-    /// Compaction id (`cid`) for `kind == .compaction`; 0 otherwise. Lets
-    /// the watchdog log line cross-reference the compaction's own line
-    /// (`compact cid=N done ...`, and its phases at debug).
-    cid: u64 = 0,
-    started_at_ms: i64,
-};
-
 /// How far a propose blocks: `commit` = replicated to a quorum (durable +
 /// ordered); `apply` = also applied to this node's state (locally readable).
 pub const Wait = enum { commit, apply };
@@ -491,8 +470,6 @@ pub const Engine = struct {
     raft_rt: raft.RaftRuntime,
     snapshot_cfg: *flags.Live(SnapshotCfg),
     runtime_cfg: *flags.Live(fiber.Runtime.Cfg),
-    in_flight_mu: fiber.Mutex(.tracked) = .{},
-    in_flight: std.ArrayList(InFlight) = .empty,
     /// Monotonic per-call ID for runCompaction so we can grep its
     /// per-phase log lines (start/build_done/distribute_done/done) out
     /// of a noisy log without picking up unrelated compactions. Wraps
@@ -591,10 +568,6 @@ pub const Engine = struct {
     /// After `stop`, when `start` ran. The forest, the node and the raft
     /// log close here too, in that order.
     pub fn deinit(self: *Engine) void {
-        self.in_flight_mu.lock(@src());
-        self.in_flight.deinit(self.allocator);
-        self.in_flight_mu.unlock();
-        self.in_flight_mu.deinit();
         self.mqueue.deinit();
         self.bg.deinit();
         self.raft_rt.deinit();
@@ -934,35 +907,6 @@ pub const Engine = struct {
         };
     }
 
-    /// Add an in-flight record. Returns the slice index for `removeInFlight`.
-    /// Caller is responsible for pairing exactly one `remove` per `add`,
-    /// typically via `defer`.
-    fn addInFlight(self: *Engine, entry: InFlight) void {
-        self.in_flight_mu.lock(@src());
-        defer self.in_flight_mu.unlock();
-        self.in_flight.append(self.allocator, entry) catch {};
-    }
-
-    fn removeInFlight(
-        self: *Engine,
-        kind: InFlight.Kind,
-        tree: TreeKey,
-        src_level: u8,
-    ) void {
-        self.in_flight_mu.lock(@src());
-        defer self.in_flight_mu.unlock();
-        // Match on (kind, tree, src_level): a tree runs at most one job
-        // per level (`Tree.reserveJob`).
-        for (self.in_flight.items, 0..) |it, i| {
-            if (it.kind == kind and std.meta.eql(it.tree, tree) and
-                it.src_level == src_level)
-            {
-                _ = self.in_flight.orderedRemove(i);
-                return;
-            }
-        }
-    }
-
     pub fn runCompactionLoop(self: *Engine) void {
         // Block until we're leader and have proposed + applied a no-op
         // entry. That commits the prior-term WAL tail (Raft's prior-term
@@ -1018,28 +962,15 @@ pub const Engine = struct {
         log.info("compaction loops exiting (shutdown)", .{});
     }
 
-    /// Diagnostic loop: every 15s, scan the in_flight table and warn
-    /// about any entry older than the configured threshold. Catches
-    /// stuck compactions, flushes, splits, and newMemtable proposals
-    /// generically — wherever the wedge is, the entry stops aging out.
+    /// Every 15 s, warns about a manifest change built or waiting for
+    /// over 30 s: a stuck compaction, flush, split or new memtable,
+    /// wherever the wedge is.
     fn runInFlightWatchdog(self: *Engine) void {
         const poll: u64 = 15000;
         const stuck_threshold_ms: i64 = 30_000;
         while (!self.node.isShuttingDown()) {
             if (self.node.shutdown.waitForStart(.shutdown, poll)) return;
-            const now_ms = utils.coarseMs();
-            self.in_flight_mu.lock(@src());
-            defer self.in_flight_mu.unlock();
-
-            for (self.in_flight.items) |it| {
-                const age_ms = now_ms - it.started_at_ms;
-                if (age_ms < stuck_threshold_ms) continue;
-                log.warn("in-flight stuck: kind={s} cid={d} tree={d}:{d} " ++
-                    "src_level={d} age_ms={d}", .{
-                    @tagName(it.kind), it.cid,       it.tree.namespace,
-                    it.tree.tree_id,   it.src_level, age_ms,
-                });
-            }
+            self.mqueue.warnStuck(stuck_threshold_ms);
         }
     }
 
@@ -1647,11 +1578,6 @@ pub const Engine = struct {
     }
 
     fn proposeNewMemtable(self: *Engine) !void {
-        self.addInFlight(.{
-            .kind = .new_memtable,
-            .started_at_ms = utils.coarseMs(),
-        });
-        defer self.removeInFlight(.new_memtable, InFlight.no_tree, 0);
         // memtable_id stays 0 in the proposal: the id is assigned at apply
         // as the entry's own log index, identically on every node.
         try self.submit(.fg, .{
@@ -1660,15 +1586,15 @@ pub const Engine = struct {
     }
 
     fn runFlush(self: *Engine) !void {
-        // Track the flush BUILD as in-flight (writing SSTs is the slow
-        // part). buildFlush iterates the oldest immutable memtable; we
-        // don't know the target tree(s) until changes return, so the
-        // record names no tree.
-        self.addInFlight(.{
-            .kind = .flush,
-            .started_at_ms = utils.coarseMs(),
-        });
-        defer self.removeInFlight(.flush, InFlight.no_tree, 0);
+        // Listed as building from here: writing the tables is the slow
+        // part. The trees are not known until the build returns, so
+        // the request names none.
+        var req: _manifest_queue.Request = .{
+            .class = .fg,
+            .kind = .{ .flush = .{} },
+        };
+        self.mqueue.begin(&req);
+        defer self.mqueue.end(&req);
 
         // The build routes every key by the trees as they are when it
         // starts, and a split applied before the entry would narrow a
@@ -1684,13 +1610,8 @@ pub const Engine = struct {
 
         try self.announceNewFiles(changes.items);
 
-        var req: _manifest_queue.Request = .{
-            .class = .fg,
-            .kind = .{ .flush = .{
-                .changes = changes.items,
-                .memtable_id = result.newest_memtable_id,
-            } },
-        };
+        req.kind.flush.changes = changes.items;
+        req.kind.flush.memtable_id = result.newest_memtable_id;
         const proposed = self.mqueue.submit(&req);
         // Whatever became of the proposal, no entry names these.
         try self.forest.removeUnlisted(changes.items[req.kind.flush.kept..]);
@@ -1701,21 +1622,24 @@ pub const Engine = struct {
         // Per-call ID so we can grep all phase-lines for one compaction
         // out of a noisy multi-loop log: every line below carries
         // `cid=<id>`. The `cid_` prefix is unique enough to tail+grep.
-        // Assigned BEFORE addInFlight so the watchdog warning carries it.
+        // Assigned before `begin` so a watchdog warning carries it.
         const cid = self.next_compaction_id.fetchAdd(1, .monotonic);
 
-        // Track the compaction so `zdb` can show whether a
-        // "compactions wanted" entry is genuinely starved or just waiting
-        // on a build/sync that hasn't proposed yet.
+        // Listed as building so `zdb` can show whether a "compactions
+        // wanted" entry is starved or waiting on a build that has not
+        // proposed yet; the tables go in once built.
         const tree = job.tree;
-        self.addInFlight(.{
-            .kind = .compaction,
+        var req: _manifest_queue.Request = .{
+            .class = .bg,
             .tree = job.key,
-            .src_level = job.cand.level,
-            .cid = cid,
-            .started_at_ms = utils.coarseMs(),
-        });
-        defer self.removeInFlight(.compaction, job.key, job.cand.level);
+            .kind = .{ .compaction = .{
+                .move = job.cand.job == .move_down,
+                .cid = cid,
+                .src_level = job.cand.level,
+            } },
+        };
+        self.mqueue.begin(&req);
+        defer self.mqueue.end(&req);
 
         const src = job.cand.level;
         const t0 = utils.coarseMs();
@@ -1760,10 +1684,8 @@ pub const Engine = struct {
             cid, t2 - t1,
         });
 
-        const proposed = self.submit(.bg, .{ .compaction = .{
-            .changes = changes.items,
-            .move = job.cand.job == .move_down,
-        } });
+        req.kind.compaction.changes = changes.items;
+        const proposed = self.mqueue.submit(&req);
         proposed catch |err| switch (err) {
             // The tree was dropped during the build, and no entry names
             // the tables written for it. Any other failure may have left
@@ -1792,15 +1714,14 @@ pub const Engine = struct {
     }
 
     fn runSplit(self: *Engine, key: TreeKey) !void {
-        self.addInFlight(.{
-            .kind = .split,
-            .tree = key,
-            .started_at_ms = utils.coarseMs(),
-        });
-        defer self.removeInFlight(.split, key, 0);
         // Built and proposed by the executor (`executeSplit`), after
         // any flush that was building when the split was asked for.
-        try self.submit(.bg, .{ .split = key });
+        var req: _manifest_queue.Request = .{
+            .class = .bg,
+            .tree = key,
+            .kind = .{ .split = key },
+        };
+        return self.mqueue.submit(&req);
     }
 
     /// Announce new SST files, BEFORE their manifest change is proposed:
@@ -1885,45 +1806,6 @@ pub const Engine = struct {
         // can be told apart from a braked one.
         metrics.g().write_backpressure_ms.observe(delay_ms);
         fiber.sleepMs(delay_ms);
-    }
-
-    /// Append a section listing in-flight flush/compaction/split builds —
-    /// work that's started writing SSTs or computing manifest changes but
-    /// hasn't yet appended the resulting Raft entry. A `compactions wanted`
-    /// row in the forest stats with no matching in-flight row means the
-    /// compaction loop is starved (not picking up the candidate); a row
-    /// that's been "in flight" for many seconds means a build is slow.
-    pub fn writeInFlight(self: *Engine, w: *std.Io.Writer) !void {
-        const q = self.mqueue.status();
-        try w.print("\n  changes queued: fg={d} bg={d} oldest_ms={d}{s}\n", .{
-            q.waiting[0],     q.waiting[1],
-            q.oldest_wait_ms, if (q.flush_building) " (flush building)" else "",
-        });
-        self.in_flight_mu.lock(@src());
-        defer self.in_flight_mu.unlock();
-        if (self.in_flight.items.len == 0) {
-            try w.print("\n  in-flight: (none)\n", .{});
-            return;
-        }
-        const now = utils.coarseMs();
-        try w.print("\n  in-flight:\n", .{});
-        for (self.in_flight.items) |it| {
-            const age_ms = now - it.started_at_ms;
-            const ns = it.tree.namespace;
-            const id = it.tree.tree_id;
-            switch (it.kind) {
-                .compaction => try w.print(
-                    "    compaction tree={d}:{d} L{d} age_ms={d}\n",
-                    .{ ns, id, it.src_level, age_ms },
-                ),
-                .flush => try w.print("    flush age_ms={d}\n", .{age_ms}),
-                .split => try w.print(
-                    "    split tree={d}:{d} age_ms={d}\n",
-                    .{ ns, id, age_ms },
-                ),
-                .new_memtable => try w.print("    new_memtable age_ms={d}\n", .{age_ms}),
-            }
-        }
     }
 
     /// Ensure this node is a leader that has APPLIED every entry committed

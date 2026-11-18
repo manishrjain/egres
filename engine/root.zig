@@ -46,7 +46,6 @@ pub const manifest_queue = @import("manifest_queue.zig");
 pub const Engine = _engine.Engine;
 pub const StorageImpl = _engine.StorageImpl;
 pub const SnapshotCfg = _engine.SnapshotCfg;
-pub const InFlight = _engine.InFlight;
 pub const ApplyObserver = _engine.ApplyObserver;
 
 /// The admin protocol front-end: a line-protocol listener over an Engine.

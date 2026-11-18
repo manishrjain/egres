@@ -148,6 +148,46 @@ test "manifest queue: takeMoves takes every waiting move and nothing else" {
     for (g.wait()) |r| try r;
 }
 
+test "manifest queue: a begun request is building until submitted or ended" {
+    var q = ManifestQueue.init(testing.allocator);
+    defer q.deinit();
+    var comp: Request = .{ .class = .bg, .tree = .{
+        .namespace = 3,
+        .tree_id = 4,
+    }, .kind = .{
+        .compaction = .{ .move = false, .cid = 9, .src_level = 1 },
+    } };
+    var flush: Request = .{ .class = .fg, .kind = .{ .flush = .{} } };
+
+    // Two builds under way; one is given up.
+    q.begin(&comp);
+    q.begin(&flush);
+    try testing.expectEqual(2, q.status().building);
+    q.end(&flush);
+    try testing.expectEqual(1, q.status().building);
+
+    // The dump names the build with its tree and id.
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try q.write(&w);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        w.buffered(),
+        "building compaction tree=3:4 L1 cid=9",
+    ) != null);
+
+    // Submitted, it is waiting and no longer building; ending it
+    // then is nothing.
+    var g = fiber.Group(anyerror!void).init(testing.allocator);
+    defer g.deinit();
+    try queue(&g, &q, &comp);
+    try testing.expectEqual(0, q.status().building);
+    q.end(&comp);
+    try testing.expectEqual(1, q.status().waiting[1]);
+    ManifestQueue.complete(q.take().?, {});
+    for (g.wait()) |r| try r;
+}
+
 test "manifest queue: closing fails every waiter and every later submit" {
     var q = ManifestQueue.init(testing.allocator);
     defer q.deinit();

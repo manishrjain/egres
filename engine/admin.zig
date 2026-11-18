@@ -1700,7 +1700,7 @@ pub const AdminServer = struct {
             },
             .forest => {
                 try self.engine.forest.writeStats(&body.writer, .{ .scope = .forest });
-                try self.engine.writeInFlight(&body.writer);
+                try self.engine.mqueue.write(&body.writer);
             },
             .tree => try self.engine.forest.writeStats(&body.writer, .{ .scope = .{ .tree = .{ .namespace = req.ns_id, .tree_id = req.tree_id } } }),
             .namespace => try self.engine.forest.writeStats(&body.writer, .{ .scope = .{ .namespace = req.ns_id } }),
