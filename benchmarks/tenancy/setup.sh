@@ -200,9 +200,16 @@ do_check() {
 
     echo "tools"
     local t
-    for t in docker psql curl make python3 go mkfs.ext4 nsenter ip sudo sg; do
+    for t in docker psql curl make python3 go mkfs.ext4 nsenter ip sudo; do
         have "$t" && ok "$t" || lack "$t: ./setup.sh packages"
     done
+    # sg is only the bridge for a login older than the kvm group; a
+    # session that can open /dev/kvm never runs it (Ubuntu 26.04 has
+    # no sg).
+    if ! { [ -r /dev/kvm ] && [ -w /dev/kvm ]; }; then
+        have sg && ok "sg, for the kvm group" ||
+            lack "sg, or log in again for the kvm group"
+    fi
     have zig && ok "zig $(zig version)" ||
         lack "zig $(zig_wanted), for ./setup.sh egres"
     if have docker; then
