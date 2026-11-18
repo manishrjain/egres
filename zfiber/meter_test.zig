@@ -453,3 +453,26 @@ test "payForMem: waits only while the pool is full" {
     // The shared tenant never waits.
     try meter.shared.payForMem();
 }
+
+test "holdMem: the shared tenant's bytes do not fill the pool" {
+    // The total is the binary's, and the other meter tests hold a pool
+    // or two on it meanwhile, so the amounts here dwarf anything they
+    // can: a petabyte on the shared tenant must leave the total under
+    // half of it, the same on a tenant must take it past.
+    const much: i64 = 1 << 50;
+    const shared_before = meter.shared.mem_held.load(.monotonic);
+    meter.shared.holdMem(much);
+    defer meter.shared.releaseMem(much);
+    try expectEqual(
+        shared_before + much,
+        meter.shared.mem_held.load(.monotonic),
+    );
+    try expect(meter.mem_held_total.load(.monotonic) < much / 2);
+
+    meter.capacity = box;
+    var t = Tenant.init(43, meter.default_limit, 0);
+    t.holdMem(much);
+    defer t.releaseMem(much);
+    try expect(meter.mem_held_total.load(.monotonic) >= much);
+    try expect(meter.memPressure());
+}

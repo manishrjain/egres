@@ -313,16 +313,17 @@ pub const Tenant = struct {
     }
 
     /// `n` bytes taken from, or given back to, an allocator counted
-    /// on the tenant: its own held and peak, and the process total.
+    /// on the tenant: its own held and peak, and the pool's total
+    /// unless it is the shared tenant (`mem_held_total`).
     pub fn holdMem(self: *Tenant, n: i64) void {
         const held = self.mem_held.fetchAdd(n, .monotonic) + n;
         _ = self.totals.mem_peak.fetchMax(held, .monotonic);
-        _ = mem_held_total.fetchAdd(n, .monotonic);
+        if (self != &shared) _ = mem_held_total.fetchAdd(n, .monotonic);
     }
 
     pub fn releaseMem(self: *Tenant, n: i64) void {
         _ = self.mem_held.fetchSub(n, .monotonic);
-        _ = mem_held_total.fetchSub(n, .monotonic);
+        if (self != &shared) _ = mem_held_total.fetchSub(n, .monotonic);
     }
 
     /// The runtime's allocator, counted on the tenant alone: for work
@@ -470,7 +471,7 @@ pub var capacity: Tenant.Limit = .{
     .mem_bytes = 0,
 };
 
-/// A tenant past its soft limit waits: every tenant's held bytes
+/// A tenant past its soft limit waits: the tenants' held bytes
 /// together fill the pool, read live. No pool until the governor's
 /// first tick sizes it.
 pub fn memPressure() bool {
@@ -478,8 +479,11 @@ pub fn memPressure() bool {
     return pool > 0 and mem_held_total.load(.monotonic) >= pool;
 }
 
-/// Live bytes every tenant holds, the shared one included: against
-/// the pool, `memPressure`.
+/// Live bytes the tenants hold, against the pool (`memPressure`). The
+/// shared tenant's are left out: its memory is the server's own work,
+/// a flush's tables or the WAL, which the governor sizes the cache
+/// around already. Counted here it filled the pool with no statement
+/// behind it, and statements were refused for a flush.
 pub var mem_held_total: std.atomic.Value(i64) = .init(0);
 
 /// A statement's live bytes past which its next yield refuses it,
