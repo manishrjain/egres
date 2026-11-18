@@ -142,8 +142,12 @@ do_calibrate() (
         fi
         mib=$(echo "$line" | sed -n 's/.*bandwidth_bytes=\([0-9]*\)MiB.*/\1/p')
         cost=$(echo "$line" | sed -n 's/.*write_cost=\([0-9]*\).*/\1/p')
-        printf '%s;%s\n' "auto-calibrate=false;bandwidth-bytes=$((mib << 20))" \
-            "write-cost=$cost" >"$RUN/egres_io.flags"
+        # iops: random one-page reads a second, from 58b2ed31 on; an
+        # older server prints none, and the flag is left out.
+        iops=$(echo "$line" | sed -n 's/.*iops=\([0-9]*\).*/\1/p')
+        printf 'auto-calibrate=false;bandwidth-bytes=%s;write-cost=%s%s\n' \
+            "$((mib << 20))" "$cost" "${iops:+;iops=$iops}" \
+            >"$RUN/egres_io.flags"
         echo "kept: $(cat "$RUN/egres_io.flags")"
         exit 0
     done
