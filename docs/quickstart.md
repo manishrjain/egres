@@ -12,7 +12,7 @@ Egres speaks the PostgreSQL wire protocol. Anything that connects to Postgres â€
 ## Install
 
 ```sh
-$ curl -fsSL https://egresql.io/install.sh | sh
+$ curl -fsSL https://egresql.com/install.sh | sh
 ```
 
 The script downloads the latest release for your platform, verifies its checksum, and installs a single `egres` binary into `~/.local/bin`, or `/usr/local/bin` when run as root. Builds exist for Linux x86_64 and macOS on Apple silicon.

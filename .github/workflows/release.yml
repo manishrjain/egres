@@ -161,7 +161,7 @@ jobs:
         run: |
           tag=${GITHUB_REF_NAME}
           cat > notes.md <<EOF
-          Install: \`curl -fsSL https://egresql.io/install.sh | sh\`
+          Install: \`curl -fsSL https://egresql.com/install.sh | sh\`
           (pin with \`EGRES_VERSION=$tag\`).
 
           macOS: the binary is not signed. The installer runs it without

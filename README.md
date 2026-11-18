@@ -5,16 +5,16 @@ Written in Zig, Egres is not a Postgres rewrite: it is a ground-up,
 first-principles redesign.
 
 This README is barebones on purpose. The full documentation is at
-[egresql.io][docs]. Also read the [announcement][ann] post. If you like the
+[egresql.com][docs]. Also read the [announcement][ann] post. If you like the
 project, give it a star.
 
 [ann]: https://manishrjain.com/egres/
-[docs]: https://egresql.io/docs
+[docs]: https://egresql.com/docs
 
 ## Install
 
 ```sh
-curl -fsSL https://egresql.io/install.sh | sh
+curl -fsSL https://egresql.com/install.sh | sh
 ```
 
 The installer puts the latest release's `egres` on your path. Release

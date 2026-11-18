@@ -1,6 +1,6 @@
 # Egres documentation
 
-The pages in this directory are the documentation site at egresql.io. The site
+The pages in this directory are the documentation site at egresql.com. The site
 itself (theme, landing page, build) lives in manishrjain/docs-egres , which
 pulls this directory in at build time; nothing here needs to know about it.
 

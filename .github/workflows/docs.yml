@@ -1,5 +1,5 @@
 # The documentation site (manishrjain/docs-egres) builds from docs/ in this
-# repository and serves scripts/install.sh as egresql.io/install.sh. Tell
+# repository and serves scripts/install.sh as egresql.com/install.sh. Tell
 # it to rebuild whenever either changes on main.
 #
 # DOCS_DISPATCH_TOKEN is a fine-grained token with write access to the

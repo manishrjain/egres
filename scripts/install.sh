@@ -4,7 +4,7 @@
 
 # Install the Egres binary from a GitHub release.
 #
-#   curl -fsSL https://egresql.io/install.sh | sh
+#   curl -fsSL https://egresql.com/install.sh | sh
 #
 # The script is served from this file, so it must stay POSIX sh: it runs
 # under dash on Debian and under busybox in Alpine. Everything is inside
