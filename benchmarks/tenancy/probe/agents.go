@@ -139,22 +139,26 @@ func arrivalDue(begin time.Time, k int, perSec float64) time.Time {
 	return begin.Add(time.Duration(float64(k) * float64(time.Second) / perSec))
 }
 
-// statement is the SQL for one statement of kind: r is a random id in
-// 1..rows, n the tenant's next unused id, text 32 random characters.
-// wantRow says a reply without a row is wrong.
-func statement(kind, r, n int, text string) (sql string, wantRow bool) {
+// statement is the SQL for one statement of kind, and the check its
+// reply is held to: r is a random id in 1..rows, n the tenant's next
+// unused id, text 32 random characters. An update writes the row's
+// md5 and then the text, so a later read can still tell the row is
+// its own (valueOK); an insert writes what the seed would have.
+func statement(kind, r, n, rows int, text string) (sql string, check checker) {
 	switch kind {
 	case kPoint:
-		return fmt.Sprintf("SELECT v FROM t WHERE id = %d", r), true
+		return fmt.Sprintf("SELECT v FROM t WHERE id = %d", r), pointCheck(r)
 	case kRange:
 		return fmt.Sprintf("SELECT id, v FROM t WHERE id BETWEEN %d AND %d",
-			r, r+9), true
+			r, r+9), rangeCheck(r, r+9, rows)
 	case kUpdate:
-		return fmt.Sprintf("UPDATE t SET v = '%s' WHERE id = %d", text, r), false
+		return fmt.Sprintf("UPDATE t SET v = '%s:%s' WHERE id = %d",
+			md5Text(r), text, r), tagCheck("UPDATE 1")
 	case kInsert:
-		return fmt.Sprintf("INSERT INTO t VALUES (%d, '%s')", n, text), false
+		return fmt.Sprintf("INSERT INTO t VALUES (%d, '%s')", n, md5Text(n)),
+			tagCheck("INSERT 0 1")
 	default:
-		return "SELECT count(*) FROM t", true
+		return "SELECT count(*) FROM t", countCheck(rows, n-1)
 	}
 }
 
@@ -310,21 +314,23 @@ func (a *agentRun) session(s *sessionRun, start time.Time, seed int64) {
 			// before the reply was lost.
 			t.nextID++
 		}
-		sql, wantRow := statement(kind, 1+rng.Intn(a.rows), n, randText(rng))
+		sql, check := statement(kind, 1+rng.Intn(a.rows), n, a.rows, randText(rng))
 		err := held
 		if err == nil && conn == nil {
 			conn, err = openRetry(a.target(t.id), time.Now().Add(convTimeout))
 		}
 		if err == nil {
-			var got bool
-			got, err = conn.query(sql)
+			var res *result
+			res, err = conn.query(sql)
 			var pe *pgError
 			if err != nil && !errors.As(err, &pe) {
 				conn.close()
 				conn = nil
 			}
-			if err == nil && wantRow && !got {
-				err = errors.New(kindNames[kind] + ": no row")
+			if err == nil {
+				if err = check(res); err != nil {
+					err = fmt.Errorf("%s: %w", kindNames[kind], err)
+				}
 			}
 		}
 		a.record(t.id, kind, due, msSince(due), err, k == 0, woke && k == 0,
@@ -345,7 +351,7 @@ func (a *agentRun) arrive(i int, due time.Time) error {
 		defer a.p.release(v)
 	} else {
 		err := run(a.addr+"/egres", fmt.Sprintf("CREATE DATABASE tenant_%d", i),
-			2*time.Second, false)
+			2*time.Second, nil)
 		if err != nil {
 			return fmt.Errorf("tenant_%d: %w", i, err)
 		}
@@ -359,11 +365,10 @@ func (a *agentRun) arrive(i int, due time.Time) error {
 		if err := loadRows(s, a.rows); err != nil {
 			return err
 		}
-		got, err := s.query(query)
-		if err == nil && !got {
-			err = errors.New("no row after the load")
+		if err := s.check(query, pointCheck(1)); err != nil {
+			return fmt.Errorf("after the load: %w", err)
 		}
-		return err
+		return nil
 	}()
 	if err != nil {
 		return fmt.Errorf("tenant %d: %w", i, err)

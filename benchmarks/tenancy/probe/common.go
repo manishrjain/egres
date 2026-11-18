@@ -166,6 +166,101 @@ func md5Text(g int) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// The checks a reply is held to. Every row a tenant holds has v
+// beginning with md5(id): the seed writes exactly that, an insert the
+// same, and an update keeps it as a prefix before its new text. So a
+// read that returns the wrong row, a torn or stale-from-another-table
+// value, or junk, fails here, and the failure counts as an error in
+// the test's row like a refusal would.
+
+// valueOK says whether v is the value of row id, or an update of it.
+func valueOK(id int, v string) bool {
+	return strings.HasPrefix(v, md5Text(id))
+}
+
+func short(v string) string {
+	if len(v) > 48 {
+		return v[:48] + "..."
+	}
+	return v
+}
+
+// pointCheck: one row, v of row id.
+func pointCheck(id int) checker {
+	return func(r *result) error {
+		if len(r.rows) != 1 || len(r.rows[0]) < 1 {
+			return fmt.Errorf("point id %d: %d rows, want 1", id, len(r.rows))
+		}
+		if v := r.rows[0][0]; !valueOK(id, v) {
+			return fmt.Errorf("point id %d: got %q, want md5 %s", id, short(v),
+				md5Text(id))
+		}
+		return nil
+	}
+}
+
+// rangeCheck: rows (id, v) for from..to, every id once, each v its
+// row's. The ids up to seeded were loaded and must all be there; ids
+// past it come from this tenant's inserts, which may have failed, so
+// they may be missing but not wrong.
+func rangeCheck(from, to, seeded int) checker {
+	return func(r *result) error {
+		seen := map[int]bool{}
+		for _, row := range r.rows {
+			if len(row) < 2 {
+				return fmt.Errorf("range %d..%d: a row of %d columns", from, to,
+					len(row))
+			}
+			id, err := strconv.Atoi(row[0])
+			if err != nil || id < from || id > to {
+				return fmt.Errorf("range %d..%d: id %q outside it", from, to, row[0])
+			}
+			if seen[id] {
+				return fmt.Errorf("range %d..%d: id %d twice", from, to, id)
+			}
+			seen[id] = true
+			if !valueOK(id, row[1]) {
+				return fmt.Errorf("range %d..%d: id %d got %q, want md5 %s", from,
+					to, id, short(row[1]), md5Text(id))
+			}
+		}
+		for id := from; id <= min(to, seeded); id++ {
+			if !seen[id] {
+				return fmt.Errorf("range %d..%d: id %d missing (%d rows)", from, to,
+					id, len(r.rows))
+			}
+		}
+		return nil
+	}
+}
+
+// countCheck: one row, one number between lo and hi (the rows loaded
+// and the inserts since, some of which may have failed).
+func countCheck(lo, hi int) checker {
+	return func(r *result) error {
+		if len(r.rows) != 1 || len(r.rows[0]) < 1 {
+			return fmt.Errorf("count: %d rows, want 1", len(r.rows))
+		}
+		n, err := strconv.Atoi(r.rows[0][0])
+		if err != nil || n < lo || n > hi {
+			return fmt.Errorf("count: got %q, want %d..%d", short(r.rows[0][0]),
+				lo, hi)
+		}
+		return nil
+	}
+}
+
+// tagCheck: the command tag, "UPDATE 1" or "INSERT 0 1": the write
+// touched the one row it named.
+func tagCheck(want string) checker {
+	return func(r *result) error {
+		if r.tag != want {
+			return fmt.Errorf("tag %q, want %q", r.tag, want)
+		}
+		return nil
+	}
+}
+
 // insertRows is one INSERT of the rows from..to, both included. The
 // rows are spelled out because Egres has no INSERT ... SELECT.
 func insertRows(from, to int) string {

@@ -75,6 +75,14 @@ func noisy(args []string) {
 		heavy = readTargets(*heavyFile, *heavyN)
 	}
 
+	// The heavy statement's reply is checked where it can be: a count
+	// over the table must be the rows it holds. The heavy UPDATE is
+	// over a random range of rows the heavy tenants own; no check.
+	var heavyCheck checker
+	if strings.HasPrefix(*sql, "SELECT count(*)") {
+		heavyCheck = countCheck(*rows, *rows)
+	}
+
 	// The quiet tenants' pools. Each connection has answered a query
 	// before it is used, as one in a pool has.
 	pools := map[string]chan *session{}
@@ -86,7 +94,7 @@ func noisy(args []string) {
 		for c := 0; c < *quietHold; c++ {
 			s, err := open(target, 2*time.Second)
 			if err == nil {
-				err = s.exec(query)
+				err = s.check(query, pointCheck(1))
 			}
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "quiet pool:", target, err)
@@ -111,13 +119,13 @@ func noisy(args []string) {
 					t0 := time.Now()
 					var err error
 					if !*hold {
-						err = run(target, fill(*sql, *rows), 2*time.Second, false)
+						err = run(target, fill(*sql, *rows), 2*time.Second, heavyCheck)
 					} else {
 						if s == nil {
 							s, err = open(target, 2*time.Second)
 						}
 						if err == nil {
-							if err = s.exec(fill(*sql, *rows)); err != nil {
+							if err = s.check(fill(*sql, *rows), heavyCheck); err != nil {
 								s.c.Close()
 								s = nil
 							}
@@ -158,7 +166,8 @@ func noisy(args []string) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			q := fmt.Sprintf("SELECT v FROM t WHERE id = %d", 1+rand.Intn(*rows))
+			id := 1 + rand.Intn(*rows)
+			q := fmt.Sprintf("SELECT v FROM t WHERE id = %d", id)
 			began := time.Since(due)
 			var ph phases
 			var err error
@@ -167,12 +176,8 @@ func noisy(args []string) {
 				// pooled client waits the same way.
 				s := <-pool
 				t0 := time.Now()
-				var got bool
-				got, err = s.query(q)
+				err = s.check(q, pointCheck(id))
 				ph.query = time.Since(t0)
-				if err == nil && !got {
-					err = fmt.Errorf("no row")
-				}
 				if err != nil {
 					s.c.Close()
 					s, _ = open(target, 2*time.Second)
@@ -181,7 +186,7 @@ func noisy(args []string) {
 					pool <- s
 				}
 			} else {
-				ph, err = runTimed(target, q, 2*time.Second, true)
+				ph, err = runTimed(target, q, 2*time.Second, pointCheck(id))
 			}
 			lms := msSince(due)
 			mu.Lock()

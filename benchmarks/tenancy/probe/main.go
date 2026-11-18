@@ -29,7 +29,7 @@ func sqlOnce(args []string) {
 	addr := fs.String("addr", "", "ip:port or ip:port/database")
 	q := fs.String("q", "", "the statement")
 	fs.Parse(args)
-	if err := run(*addr, *q, 2*time.Second, false); err != nil {
+	if err := run(*addr, *q, 2*time.Second, nil); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -45,10 +45,12 @@ func first(args []string) {
 		"the statement; given, it need not return a row (a blank Postgres"+
 			" can be waited for with \"SELECT 1\")")
 	fs.Parse(args)
-	wantRow := true
+	// The default statement is the point read of row 1, held to its
+	// value; a statement given is only waited for.
+	check := pointCheck(1)
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "q" {
-			wantRow = false
+			check = nil
 		}
 	})
 
@@ -63,7 +65,7 @@ func first(args []string) {
 	for time.Since(start) < *timeout {
 		// A short dial and a fresh attempt: a SYN the guest missed
 		// would otherwise be resent only after a full second.
-		if last = run(*addr, *q, 5*time.Millisecond, wantRow); last == nil {
+		if last = run(*addr, *q, 5*time.Millisecond, check); last == nil {
 			fmt.Printf("%.1f\n", msSince(start))
 			return
 		}
@@ -102,7 +104,7 @@ func load(args []string) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ph, err := runTimed(addr, query, 2*time.Second, true)
+			ph, err := runTimed(addr, query, 2*time.Second, pointCheck(1))
 			lms := msSince(due)
 			mu.Lock()
 			defer mu.Unlock()

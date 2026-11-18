@@ -150,25 +150,68 @@ func TestArrivalDue(t *testing.T) {
 
 func TestStatement(t *testing.T) {
 	text := strings.Repeat("a", 32)
+	m7, m1001 := md5Text(7), md5Text(1001)
+	rows := func(cells ...[]string) *result { return &result{rows: cells} }
+	tag := func(s string) *result { return &result{tag: s} }
 	for _, c := range []struct {
-		kind    int
-		want    string
-		wantRow bool
+		kind      int
+		want      string
+		good, bad *result
 	}{
-		{kPoint, "SELECT v FROM t WHERE id = 7", true},
-		{kRange, "SELECT id, v FROM t WHERE id BETWEEN 7 AND 16", true},
-		{kUpdate, "UPDATE t SET v = '" + text + "' WHERE id = 7", false},
-		{kInsert, "INSERT INTO t VALUES (1001, '" + text + "')", false},
-		{kCount, "SELECT count(*) FROM t", true},
+		{kPoint, "SELECT v FROM t WHERE id = 7",
+			rows([]string{m7}), rows([]string{md5Text(8)})},
+		{kRange, "SELECT id, v FROM t WHERE id BETWEEN 7 AND 16",
+			rows([]string{"7", m7}, []string{"8", md5Text(8)},
+				[]string{"9", md5Text(9)}, []string{"10", md5Text(10)}),
+			rows([]string{"7", m7}, []string{"8", md5Text(8)},
+				[]string{"9", md5Text(9)})},
+		{kUpdate, "UPDATE t SET v = '" + m7 + ":" + text + "' WHERE id = 7",
+			tag("UPDATE 1"), tag("UPDATE 0")},
+		{kInsert, "INSERT INTO t VALUES (1001, '" + m1001 + "')",
+			tag("INSERT 0 1"), tag("INSERT 0 0")},
+		{kCount, "SELECT count(*) FROM t",
+			rows([]string{"1000"}), rows([]string{"1001"})},
 	} {
-		sql, row := statement(c.kind, 7, 1001, text)
-		if sql != c.want || row != c.wantRow {
-			t.Errorf("%s: %q %v, want %q %v", kindNames[c.kind], sql, row,
-				c.want, c.wantRow)
+		// 10 rows loaded, inserts up to 1000 so far: a range past 10
+		// may be short, a count is 10..1000.
+		sql, check := statement(c.kind, 7, 1001, 10, text)
+		if sql != c.want {
+			t.Errorf("%s: %q, want %q", kindNames[c.kind], sql, c.want)
 		}
+		if err := check(c.good); err != nil {
+			t.Errorf("%s: good reply rejected: %v", kindNames[c.kind], err)
+		}
+		if err := check(c.bad); err == nil {
+			t.Errorf("%s: bad reply accepted", kindNames[c.kind])
+		}
+	}
+	// An updated row still passes a point read: its md5 leads.
+	if err := pointCheck(7)(rows([]string{m7 + ":" + text})); err != nil {
+		t.Errorf("updated row: %v", err)
+	}
+	// A range over seeded rows must have every one of them.
+	if err := rangeCheck(7, 16, 1000)(rows([]string{"7", m7})); err == nil {
+		t.Error("short range over seeded rows accepted")
 	}
 	if s := randText(rand.New(rand.NewSource(1))); len(s) != 32 {
 		t.Errorf("randText gave %q", s)
+	}
+}
+
+// A DataRow's columns come out as the server sent them, NULL as "".
+func TestDataRow(t *testing.T) {
+	body := []byte{0, 3}
+	for _, col := range []string{"7", "", "abc"} {
+		if col == "" {
+			body = append(body, 0xff, 0xff, 0xff, 0xff)
+			continue
+		}
+		body = append(body, 0, 0, 0, byte(len(col)))
+		body = append(body, col...)
+	}
+	got := dataRow(body)
+	if len(got) != 3 || got[0] != "7" || got[1] != "" || got[2] != "abc" {
+		t.Fatalf("dataRow: %q", got)
 	}
 }
 
@@ -252,17 +295,19 @@ func TestUntilReadyAfterError(t *testing.T) {
 	b.Write(msg('E', "SERROR\x00C42P04\x00Mdatabase exists\x00\x00"))
 	b.Write(msg('Z', "I"))
 	b.Write(msg('T', "whatever"))
-	b.Write(msg('D', "row"))
+	b.Write(msg('D', "\x00\x01\x00\x00\x00\x03row"))
 	b.Write(msg('C', "SELECT 1\x00"))
 	b.Write(msg('Z', "I"))
 	r := bufio.NewReader(&b)
-	row, err := untilReady(r)
+	res, err := untilReady(r)
 	var pe *pgError
-	if row || !errors.As(err, &pe) || pe.code != "42P04" {
-		t.Fatalf("first reply: row %v, err %v", row, err)
+	if res != nil || !errors.As(err, &pe) || pe.code != "42P04" {
+		t.Fatalf("first reply: %v, err %v", res, err)
 	}
-	if row, err = untilReady(r); !row || err != nil {
-		t.Fatalf("second reply: row %v, err %v", row, err)
+	res, err = untilReady(r)
+	if err != nil || len(res.rows) != 1 || res.rows[0][0] != "row" ||
+		res.tag != "SELECT 1" {
+		t.Fatalf("second reply: %+v, err %v", res, err)
 	}
 	// At startup the server closes after its error: the error, not EOF.
 	b.Reset()

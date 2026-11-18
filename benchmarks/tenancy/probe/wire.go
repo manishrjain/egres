@@ -9,7 +9,6 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"io"
 	"net"
 	"strings"
@@ -66,37 +65,76 @@ func serverError(body []byte) error {
 	return &pgError{sev, code, msg}
 }
 
-// untilReady reads messages up to ReadyForQuery and reports whether a
-// DataRow was among them. An error from the server is returned only
-// once its ReadyForQuery has been read too, so that a connection kept
-// for the next statement is not left one reply behind.
-func untilReady(r *bufio.Reader) (bool, error) {
+// result is what a statement's reply carried: its rows, each column
+// as the text the server sent (empty for NULL), and the command tag,
+// "SELECT 1" or "UPDATE 1". A checker reads it and says what was
+// wrong, so that a reply is held to the data the tenant was loaded
+// with, not only to having arrived.
+type result struct {
+	rows [][]string
+	tag  string
+}
+
+type checker func(*result) error
+
+// dataRow parses a DataRow body: a column count, then each column's
+// length (-1 for NULL) and bytes.
+func dataRow(body []byte) []string {
+	if len(body) < 2 {
+		return nil
+	}
+	n := int(binary.BigEndian.Uint16(body))
+	body = body[2:]
+	cols := make([]string, 0, n)
+	for i := 0; i < n && len(body) >= 4; i++ {
+		l := int(int32(binary.BigEndian.Uint32(body)))
+		body = body[4:]
+		if l < 0 || l > len(body) {
+			cols = append(cols, "")
+			continue
+		}
+		cols = append(cols, string(body[:l]))
+		body = body[l:]
+	}
+	return cols
+}
+
+// untilReady reads messages up to ReadyForQuery and returns what they
+// carried. An error from the server is returned only once its
+// ReadyForQuery has been read too, so that a connection kept for the
+// next statement is not left one reply behind.
+func untilReady(r *bufio.Reader) (*result, error) {
 	var hdr [5]byte
-	row := false
+	res := &result{}
 	var failed error
 	for {
 		if _, err := io.ReadFull(r, hdr[:]); err != nil {
 			// During startup the server closes after its error.
 			if failed != nil {
-				return false, failed
+				return nil, failed
 			}
-			return false, err
+			return nil, err
 		}
 		n := int(binary.BigEndian.Uint32(hdr[1:])) - 4
 		body := make([]byte, n)
 		if _, err := io.ReadFull(r, body); err != nil {
 			if failed != nil {
-				return false, failed
+				return nil, failed
 			}
-			return false, err
+			return nil, err
 		}
 		switch hdr[0] {
 		case 'E':
 			failed = serverError(body)
 		case 'D':
-			row = true
+			res.rows = append(res.rows, dataRow(body))
+		case 'C':
+			res.tag = strings.TrimRight(string(body), "\x00")
 		case 'Z':
-			return row && failed == nil, failed
+			if failed != nil {
+				return nil, failed
+			}
+			return res, nil
 		}
 	}
 }
@@ -110,10 +148,10 @@ func splitTarget(target string) (addr, db string) {
 	return addr, db
 }
 
-// run connects, sends one statement and reads its reply; with wantRow
-// a reply without a row is an error.
-func run(target, sql string, dial time.Duration, wantRow bool) error {
-	_, err := runTimed(target, sql, dial, wantRow)
+// run connects, sends one statement and reads its reply; a reply the
+// checker (nil: none) rejects is an error.
+func run(target, sql string, dial time.Duration, check checker) error {
+	_, err := runTimed(target, sql, dial, check)
 	return err
 }
 
@@ -121,7 +159,8 @@ func run(target, sql string, dial time.Duration, wantRow bool) error {
 // wait for the server to answer the startup message, and the query.
 type phases struct{ connect, startup, query time.Duration }
 
-func runTimed(target, sql string, dial time.Duration, wantRow bool) (phases, error) {
+func runTimed(target, sql string, dial time.Duration, check checker) (
+	phases, error) {
 	var ph phases
 	addr, db := splitTarget(target)
 	t0 := time.Now()
@@ -145,13 +184,13 @@ func runTimed(target, sql string, dial time.Duration, wantRow bool) (phases, err
 	if _, err := c.Write(simpleQuery(sql)); err != nil {
 		return ph, err
 	}
-	row, err := untilReady(r)
+	res, err := untilReady(r)
 	if err != nil {
 		return ph, err
 	}
 	ph.query = time.Since(t2)
-	if wantRow && !row {
-		return ph, errors.New("no row")
+	if check != nil {
+		return ph, check(res)
 	}
 	return ph, nil
 }
@@ -175,7 +214,7 @@ func retry(deadline time.Time, fn func(dial time.Duration) error) error {
 // waitSQL returns once the server answers sql, or fails at the deadline.
 func waitSQL(target, sql string, deadline time.Time) error {
 	return retry(deadline, func(dial time.Duration) error {
-		return run(target, sql, dial, false)
+		return run(target, sql, dial, nil)
 	})
 }
 
@@ -222,11 +261,20 @@ func (s *session) exec(sql string) error {
 	return err
 }
 
-// query is exec that also says whether a row came back.
-func (s *session) query(sql string) (bool, error) {
+// query is exec that also returns what the reply carried.
+func (s *session) query(sql string) (*result, error) {
 	s.c.SetDeadline(time.Now().Add(convTimeout))
 	if _, err := s.c.Write(simpleQuery(sql)); err != nil {
-		return false, err
+		return nil, err
 	}
 	return untilReady(s.r)
+}
+
+// check is query with the reply held to a checker (nil: none).
+func (s *session) check(sql string, check checker) error {
+	res, err := s.query(sql)
+	if err != nil || check == nil {
+		return err
+	}
+	return check(res)
 }
