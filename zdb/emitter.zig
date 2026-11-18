@@ -487,7 +487,13 @@ pub const Emitter = struct {
     pub fn flush(e: *Emitter) !void {
         var tb = try e.bld.finish();
         errdefer tb.deinit();
-        defer e.bld.reset();
+        // An L0 emitter writes exactly one table and lives on until every
+        // tree's is written: its 8 MiB chunk would be held that long for every
+        // tree in the flush, thousands of them at once.
+        defer {
+            e.bld.reset();
+            if (e.dest == 0) e.bld.shrink();
+        }
         if (tb.bytes.len == 0) {
             tb.deinit();
             return;

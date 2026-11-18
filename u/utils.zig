@@ -78,6 +78,15 @@ pub const ChunkBuffer = struct {
         self.len = 0;
     }
 
+    /// Empty the buffer and free its chunks: for a buffer kept around
+    /// but not about to be filled again, whose chunks are what it
+    /// weighs. The next append allocates afresh.
+    pub fn release(self: *ChunkBuffer) void {
+        for (self.chunks.items) |chunk| self.allocator.free(chunk);
+        self.chunks.clearRetainingCapacity();
+        self.len = 0;
+    }
+
     /// The unwritten tail of the chunk `len` falls in, never empty:
     /// a fresh chunk is added once the last one is full.
     fn tail(self: *ChunkBuffer) ![]u8 {

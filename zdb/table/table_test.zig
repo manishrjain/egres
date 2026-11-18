@@ -1904,3 +1904,24 @@ test "table: a failed read keeps its error, not CorruptTable" {
     const val = try tbl.readBlock(0);
     val.decrRef();
 }
+
+test "builder: shrink frees the table buffer, and the next table builds" {
+    const alloc = std.testing.allocator;
+    var b = Builder.init(alloc, .{ .block_bytes = 4 * 1024 });
+    defer b.deinit();
+
+    try b.add(.{ .primary = "k1" }, 0, "v1");
+    var first = try b.finish();
+    defer first.deinit();
+    try std.testing.expect(b.table_buf.chunks.items.len > 0);
+
+    // A reset keeps the chunk for the next table; a shrink gives it
+    // back, and a table is still built after it.
+    b.reset();
+    b.shrink();
+    try std.testing.expectEqual(@as(usize, 0), b.table_buf.chunks.items.len);
+    try b.add(.{ .primary = "k2" }, 0, "v2");
+    var second = try b.finish();
+    defer second.deinit();
+    try std.testing.expect(second.bytes.len > 0);
+}

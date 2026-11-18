@@ -64,6 +64,23 @@ test "ChunkBuffer reset keeps chunks and refills from the start" {
     try testing.expectEqualStrings("hello, chunks", &got);
 }
 
+test "ChunkBuffer release frees the chunks and refills from nothing" {
+    const alloc = testing.allocator;
+    var cb = ChunkBuffer.init(alloc, 8);
+    defer cb.deinit();
+
+    try cb.appendSlice("0123456789abcdef0123");
+    cb.release();
+    try testing.expectEqual(@as(usize, 0), cb.len);
+    try testing.expectEqual(@as(usize, 0), cb.chunks.items.len);
+
+    try cb.appendSlice("hello, chunks");
+    try testing.expectEqual(@as(usize, 2), cb.chunks.items.len);
+    var got: [13]u8 = undefined;
+    cb.copyTo(&got);
+    try testing.expectEqualStrings("hello, chunks", &got);
+}
+
 test "logEvery: each call site has its own interval" {
     const due = utils.logDue;
     // A site's first call logs, whatever the clock reads.

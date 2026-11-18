@@ -305,9 +305,11 @@ pub const Builder = struct {
     /// on-disk footprint — fine as a signal.
     stale_data_size: u32,
 
-    /// table_buf grows by this much at a time: a few blocks' worth of
-    /// wasted tail per table, and a small table stays one allocation.
-    const table_chunk_bytes: usize = 8 << 20;
+    /// table_buf grows by this much at a time: 64 blocks, so a small
+    /// table stays one allocation, and little enough that a builder
+    /// idle between tables, or walking a tenant's few rows, weighs
+    /// little.
+    const table_chunk_bytes: usize = 1 << 20;
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) Builder {
         return .{
@@ -375,6 +377,13 @@ pub const Builder = struct {
         self.uncompressed_size = 0;
         self.compressed_size = 0;
         self.stale_data_size = 0;
+    }
+
+    /// Frees the table buffer's chunks after a `reset`: for a builder
+    /// that will write no more tables but is not yet freed, since its
+    /// first chunk is `table_chunk_bytes` whatever the table weighed.
+    pub fn shrink(self: *Builder) void {
+        self.table_buf.release();
     }
 
     /// The key of the last entry written.
