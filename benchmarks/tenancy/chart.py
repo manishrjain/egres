@@ -105,6 +105,7 @@ class Panel:
             self.ymax *= 1.08
         self.title, self.ylabel, self.xlabel = title, ylabel, xlabel
         self.out = []
+        self.labels = []
 
     def sx(self, x):
         if self.xlog:
@@ -140,19 +141,22 @@ class Panel:
                  f'font-size="14" font-weight="600" {FONT}>{self.title}</text>')
         for y in self.yticks():
             py = self.sy(y)
-            o.append(f'<line x1="{self.x0}" x2="{self.x0 + self.w}" y1="{py:.1f}" '
-                     f'y2="{py:.1f}" stroke="{GRID}" stroke-width="1"/>')
+            o.append(f'<line x1="{self.x0}" x2="{self.x0 + self.w}" '
+                     f'y1="{py:.1f}" y2="{py:.1f}" stroke="{GRID}" '
+                     f'stroke-width="1"/>')
             o.append(f'<text x="{self.x0 - 8}" y="{py + 4:.1f}" fill="{INK2}" '
                      f'font-size="11" text-anchor="end" {FONT}>{fmt(y)}</text>')
         for x in xticks:
             px = self.sx(x)
-            o.append(f'<text x="{px:.1f}" y="{self.y0 + self.h + 16}" fill="{INK2}" '
-                     f'font-size="11" text-anchor="middle" {FONT}>{xfmt(x)}</text>')
+            o.append(f'<text x="{px:.1f}" y="{self.y0 + self.h + 16}" '
+                     f'fill="{INK2}" font-size="11" text-anchor="middle" '
+                     f'{FONT}>{xfmt(x)}</text>')
         o.append(f'<line x1="{self.x0}" x2="{self.x0 + self.w}" '
                  f'y1="{self.y0 + self.h}" y2="{self.y0 + self.h}" '
                  f'stroke="{INK2}" stroke-width="1"/>')
         o.append(f'<text x="{self.x0 - 8}" y="{self.y0 - 14}" fill="{INK2}" '
-                 f'font-size="11" text-anchor="end" {FONT}>{self.ylabel}</text>')
+                 f'font-size="11" text-anchor="end" {FONT}>{self.ylabel}'
+                 f'</text>')
         o.append(f'<text x="{self.x0 + self.w}" y="{self.y0 + self.h + 32}" '
                  f'fill="{INK2}" font-size="11" text-anchor="end" {FONT}>'
                  f'{self.xlabel}</text>')
@@ -180,13 +184,23 @@ class Panel:
         o.append(f'<path d="{path}" fill="none" stroke="{colour}" '
                  f'stroke-width="2" stroke-linejoin="round"/>')
         for x, y, tip in pts:
-            o.append(f'<circle cx="{self.sx(x):.1f}" cy="{self.sy(y):.1f}" r="4" '
-                     f'fill="{colour}" stroke="{SURFACE}" stroke-width="2">'
-                     f'<title>{tip}</title></circle>')
+            o.append(f'<circle cx="{self.sx(x):.1f}" cy="{self.sy(y):.1f}" '
+                     f'r="4" fill="{colour}" stroke="{SURFACE}" '
+                     f'stroke-width="2"><title>{tip}</title></circle>')
         x, y, _ = pts[-1]
         note = f'{label} {fmt(y)}' if end_note is None else end_note
-        o.append(f'<text x="{self.sx(x) + 8:.1f}" y="{self.sy(y) + 4:.1f}" '
-                 f'fill="{INK}" font-size="11" {FONT}>{note}</text>')
+        self.labels.append([self.sx(x) + 8, self.sy(y) + 4, note])
+
+    def end_labels(self):
+        """The lines' names at their ends, 14px apart at least: a
+        label that would sit on another is moved down."""
+        self.labels.sort(key=lambda l: l[1])
+        for i in range(1, len(self.labels)):
+            if self.labels[i][1] - self.labels[i - 1][1] < 14:
+                self.labels[i][1] = self.labels[i - 1][1] + 14
+        for x, y, note in self.labels:
+            self.out.append(f'<text x="{x:.1f}" y="{y:.1f}" fill="{INK}" '
+                            f'font-size="11" {FONT}>{note}</text>')
 
 
 def nice(v):
@@ -198,8 +212,10 @@ def nice(v):
 
 
 def fmt(v):
+    if v >= 1e6:
+        return f"{v / 1e6:.3g}M"
     if v >= 1000:
-        return f"{v / 1000:g}k" if v < 1e6 else f"{v / 1e6:g}M"
+        return f"{v / 1000:.3g}k" if v < 10000 else f"{v / 1000:.0f}k"
     if v >= 100:
         return f"{v:.0f}"
     if v >= 1:
@@ -219,10 +235,11 @@ def svg(width, height, panels, title, subtitle, legend_sides):
     for key, label, colour in legend_sides:
         o.append(f'<rect x="{x}" y="64" width="12" height="12" rx="2" '
                  f'fill="{colour}"/>')
-        o.append(f'<text x="{x + 18}" y="74" fill="{INK}" font-size="12" {FONT}>'
-                 f'{label}</text>')
+        o.append(f'<text x="{x + 18}" y="74" fill="{INK}" font-size="12" '
+                 f'{FONT}>{label}</text>')
         x += 18 + 7 * len(label) + 24
     for p in panels:
+        p.end_labels()
         o.extend(p.out)
     o.append("</svg>")
     return "\n".join(o)
@@ -241,7 +258,7 @@ def chart_noisy(runs, out):
     heavies = sorted({int(r["heavy"]) for s in sides
                       for r in runs[("noisy", s[0])]["rows"]})
     xpos = {h: i for i, h in enumerate(heavies)}
-    W, PW, PH = 960, 760, 220
+    W, PW, PH = 1060, 760, 220
     panels = []
     specs = [("write", "p99_ms", "Quiet tenants' p99 beside heavy writers",
               "ms", True),
@@ -277,7 +294,7 @@ def chart_footprint(runs, out):
     sides = sides_in(runs, "footprint")
     if not sides:
         return
-    W, PW, PH = 960, 760, 240
+    W, PW, PH = 1060, 760, 240
     rows = {s[0]: [r for r in runs[("footprint", s[0])]["rows"]
                    if r["state"] == "loaded" and int(r["tenants"]) > 0]
             for s in sides}
@@ -308,7 +325,8 @@ def chart_footprint(runs, out):
                  f'{label}, {r["tenants"]} tenants: {mem(key, r):.2f} GiB')
                 for r in rows[key]], colour, label)
     panels.append(p)
-    ys = [num(r["p99_ms"]) for v in rows.values() for r in v if num(r["p99_ms"])]
+    ys = [num(r["p99_ms"]) for v in rows.values() for r in v
+          if num(r["p99_ms"])]
     p = Panel(90, 110 + PH + 70, PW, PH, xs, ys, True, True,
               "Point read p99 at each count, a fresh connection each", "ms",
               "tenants")
@@ -331,7 +349,7 @@ def chart_agents(runs, out):
     sides = sides_in(runs, "agents")
     if not sides:
         return
-    W, PW, PH = 960, 760, 200
+    W, PW, PH = 1060, 760, 200
     rows = {s[0]: [r for r in runs[("agents", s[0])]["rows"]
                    if int(r["tenants"]) > 0] for s in sides}
     xs = [int(r["tenants"]) for v in rows.values() for r in v]
@@ -351,7 +369,8 @@ def chart_agents(runs, out):
     panels = []
     for i, (col, title, ylabel, stop, stop_label) in enumerate(specs):
         div = 1024 if ylabel == "GiB" else 1
-        ys = [num(r[col]) / div for v in rows.values() for r in v if num(r[col])]
+        ys = [num(r.get(col)) / div for v in rows.values() for r in v
+              if num(r.get(col))]
         if not ys:
             continue
         if stop:
@@ -367,9 +386,9 @@ def chart_agents(runs, out):
             p.rule(budget, f"the {fmt(budget)} GiB budget")
         for key, label, colour in sides:
             pts = [(int(r["tenants"]), num(r[col]) / div,
-                    f'{label}, {r["tenants"]} tenants: {fmt(num(r[col]) / div)}'
-                    f' {ylabel}')
-                   for r in rows[key] if num(r[col])]
+                    f'{label}, {r["tenants"]} tenants: '
+                    f'{fmt(num(r[col]) / div)} {ylabel}')
+                   for r in rows[key] if num(r.get(col))]
             p.line(pts, colour, label)
         panels.append(p)
     active = st.get("ACTIVE", "0.10")
