@@ -284,7 +284,7 @@ func TestVMConfig(t *testing.T) {
 	for _, want := range []string{
 		`"guest_mac": "06:00:0a:c8:02:2c"`, `"host_dev_name": "fctap300"`,
 		"ip=10.200.2.44::10.200.0.1:255.255.0.0::eth0:off", "init=/fc-init",
-		`"cache_type": "Unsafe"`, `"path_on_host": "/r/vm300/data.ext4"`,
+		`"cache_type": "Writeback"`, `"path_on_host": "/r/vm300/data.ext4"`,
 		`"mem_size_mib": 128`, `"boot-source"`, `"machine-config"`,
 	} {
 		if !strings.Contains(s, want) {

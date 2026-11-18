@@ -126,16 +126,17 @@ type fcNet struct {
 	Tap string `json:"host_dev_name"`
 }
 
-// config is lib.sh's vm_config. Unsafe is Firecracker's own cache
-// choice: a guest flush is ignored, but what the guest wrote is in the
-// host's page cache, so a killed VM loses nothing Postgres committed.
+// config is backends/vm.sh's vm_config. Writeback passes the guest's
+// flushes to the host's drive, so a commit Postgres fsyncs is on the
+// device, as Egres's are: both sides pay for durability. (Firecracker's
+// default, Unsafe, stops a flush at the host's page cache.)
 func (p *platform) config(i int, dir string) ([]byte, error) {
 	var c fcConfig
 	c.Boot.Kernel = p.kernel
 	c.Boot.Args = bootArgs(i)
 	c.Drives = []fcDrive{
 		{ID: "rootfs", Path: p.rootfs, Root: true, ReadOnly: true},
-		{ID: "data", Path: filepath.Join(dir, "data.ext4"), Cache: "Unsafe"},
+		{ID: "data", Path: filepath.Join(dir, "data.ext4"), Cache: "Writeback"},
 	}
 	c.Machine.VCPUs = 1
 	c.Machine.MemMiB = p.memMiB

@@ -10,9 +10,11 @@
 GW=10.200.0.1
 MEM_MIB=${MEM_MIB:-128}
 CONSOLE=${CONSOLE:-0}
-# The data disk's cache: Unsafe lets the guest's flushes stop at the
-# host's page cache, as a platform would run it.
-DRIVE_CACHE=${DRIVE_CACHE:-Unsafe}
+# The data disk's cache. Writeback passes the guest's flushes to the
+# host's drive, so a commit Postgres fsyncs is on the device, as Egres's
+# are: both sides pay for durability. (Firecracker's default, Unsafe,
+# stops a flush at the host's page cache.)
+DRIVE_CACHE=${DRIVE_CACHE:-Writeback}
 DISK_FLOOR_GIB=${DISK_FLOOR_GIB:-5}
 
 # Tenant i is 10.200.x.y with x.y from i+256, so .0.x stays free for

@@ -58,6 +58,11 @@ Each script's header says what it does and lists its settings.
   kernel's and the cache's. The host must also keep `FLOOR_GIB` (16)
   free. `pgsolo`'s containers are docker's, outside the cgroup; its
   counts are small.
+- **Both sides fsync.** The micro-VMs' data drive runs with
+  Firecracker's Writeback cache, so a commit Postgres fsyncs reaches
+  the device, as Egres's do. (Firecracker's default, Unsafe, stops a
+  guest flush at the host's page cache; `DRIVE_CACHE=Unsafe` runs it
+  that way.)
 - **A datacenter NVMe drive, 1 TB free under WORK.** A sleeping
   micro-VM holds a 128 MiB snapshot; a consumer drive's write stalls
   set the micro-VM wake times and the Egres write results, as
