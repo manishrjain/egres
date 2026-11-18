@@ -342,7 +342,9 @@ def chart_agents(runs, out):
               "ms", num(st.get("STOP_ARRIVE_MS")), "the stop, {} ms"),
              ("first_p99_ms", "A session's first statement from an idle "
               "tenant, p99 (a wake included)", "ms", None, None),
-             ("held_mib", "Memory held", "GiB", None, None)]
+             ("held_mib", "Memory held", "GiB", None, None),
+             ("write_mib_s", "Disk written during the window", "MiB/s",
+              None, None)]
     budget = None
     if "MEM_GIB" in st:
         budget = int(st["MEM_GIB"]) * int(st.get("BUDGET_PCT", 90)) / 100
