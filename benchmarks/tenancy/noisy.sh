@@ -14,7 +14,9 @@
 # host CPU for the quiet ones: past one heavy tenant per host thread
 # they compete. On Egres nothing bounds a heavy tenant but the server's
 # meter, which gives each active tenant an equal share; its per-tenant
-# lines are saved after each step.
+# lines are saved after each step. A pgsolo tenant has the micro-VM's
+# limits (one CPU, its memory) with no VM: what the VM boundary itself
+# adds to isolation, or costs.
 #   BACKEND=vm ./noisy.sh
 #   KINDS="cpu write" HEAVY="0 1 2 4 8 16 32 64" QUIET=50 CONNS=4
 #   RATE=50 DUR=60s HOLD=1 QHOLD=2 ROWS=100000

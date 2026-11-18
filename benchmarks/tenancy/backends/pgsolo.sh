@@ -3,10 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Control: one stock Postgres 18 per tenant with no VM around it, each
-# in its own container on the host's kernel, from the micro-VM's data
-# image (shared_buffers 16MB, 20 connections). What an idle tenant
-# holds here is Postgres's share of the micro-VM figure; the rest is
-# the guest kernel and the VM. Sourced by common.sh; see the interface
+# in its own container on the host's kernel with the micro-VM's limits
+# (one CPU, MEM_MIB), from the micro-VM's data image (shared_buffers
+# 16MB, 20 connections). What an idle tenant holds here is Postgres's
+# share of the micro-VM figure; the rest is the guest kernel and the
+# VM. Under noisy, what the VM boundary itself adds to isolation.
+# Sourced by common.sh; see the interface
 # there. Needs docker (image PG_IMAGE) and sudo, to copy the image's
 # data directory and read the containers' memory.
 DIR=${DIR:-$WORK/pg-solo}
@@ -31,7 +33,10 @@ tenant_create() {
     local i=$1
     sudo mkdir -p "$DIR/t$i"
     sudo cp -a "$DIR/mnt/pg" "$DIR/t$i/pg"
+    # The micro-VM's shape, one CPU and its memory, so that what
+    # differs from the micro-VM side is the VM itself.
     docker run -d --name "$(name "$i")" --network host \
+        --cpus=1 --memory="${MEM_MIB:-128}m" \
         -e PGDATA=/data/pg -v "$DIR/t$i:/data" "$PG_IMAGE" \
         postgres -p $((7000 + i)) -c listen_addresses=127.0.0.1 >/dev/null
     "$ROOT/probe/probe" first -addr "$(tenant_addr "$i")" -q "SELECT 1" \

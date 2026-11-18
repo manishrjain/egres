@@ -7,9 +7,12 @@
 
 drive-idle            drive_idle
 
-# 1. Isolation: a heavy tenant beside quiet ones.
+# 1. Isolation: a heavy tenant beside quiet ones. pgsolo, a Postgres
+# per tenant in a container with the VM's CPU and memory limits, says
+# what the VM boundary itself adds.
 noisy-vm              noisy      BACKEND=vm
 noisy-egres           noisy      BACKEND=egres
+noisy-pgsolo          noisy      BACKEND=pgsolo
 
 # 2. What a tenant costs, and how many fit. A micro-VM holds about
 # 85 MiB settled (tanland), so 600 is near what MEM_GIB's budget
