@@ -72,7 +72,7 @@ vm)
     side=(-backend vm -run "$RUN" -fc "$A/firecracker" -kernel "$A/vmlinux"
         -rootfs "$A/rootfs.ext4" -blank "$A/data.ext4" -mem-mib "$MEM_MIB"
         -wake "$WAKE" -budget-mib "$BUDGET_MIB"
-        -disk-floor-gib "$DISK_FLOOR_GIB")
+        -disk-floor-gib "$DISK_FLOOR_GIB" -cpus "$PLATFORM_CPUS")
     ;;
 egres)
     side=(-backend shared -addr "$ADDR" -pid "$(platform_pid)")

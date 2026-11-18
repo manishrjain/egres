@@ -92,7 +92,8 @@ vm_prepare() {
 vm_launch() {
     local i=$1 d=$RUN/vm$1
     rm -f "$d/api.sock"
-    "$A/firecracker" --api-sock "$d/api.sock" \
+    # shellcheck disable=SC2046  # on_platform is a command prefix
+    $(on_platform) "$A/firecracker" --api-sock "$d/api.sock" \
         --config-file "$d/config.json" >"$d/console.log" 2>&1 &
     echo $! >"$d/pid"
 }

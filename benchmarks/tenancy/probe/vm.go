@@ -66,6 +66,7 @@ type platform struct {
 	vms []*vm // by tenant; nil before its arrival
 
 	fc, kernel, rootfs, blank, run string
+	cpus                           string // the VMs' CPU list; "" = any
 	memMiB                         int
 	boot                           bool
 	budget                         int64 // KiB; 0 = no budget, nothing sleeps
@@ -310,6 +311,13 @@ func (p *platform) launch(v *vm, restore bool) error {
 		return err
 	}
 	cmd := exec.Command(p.fc, args...)
+	if p.cpus != "" {
+		// The VM is the platform's: on its CPUs, not the probe's,
+		// which this process is pinned to. taskset execs into it, so
+		// the pid is the VM's.
+		cmd = exec.Command("taskset", append([]string{"-c", p.cpus, p.fc},
+			args...)...)
+	}
 	cmd.Stdout, cmd.Stderr = logf, logf
 	err = cmd.Start()
 	logf.Close()

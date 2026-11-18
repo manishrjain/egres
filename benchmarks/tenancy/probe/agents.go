@@ -732,6 +732,8 @@ func agents(args []string) {
 	blank := fs.String("blank", "",
 		"vm: the blank data image, initdb done and no table")
 	memMiB := fs.Int("mem-mib", 128, "vm: guest memory, MiB")
+	cpus := fs.String("cpus", "",
+		"vm: the CPU list the VMs run on (taskset -c); empty = any")
 	wakeBy := fs.String("wake", "restore", "vm: wake by restore or boot")
 	budgetMiB := fs.Int64("budget-mib", 0,
 		"vm: what the cgroup may hold, MiB, all but the clean unmapped file "+
@@ -798,7 +800,7 @@ func agents(args []string) {
 			fail(err.Error())
 		}
 		a.p = &platform{fc: *fc, kernel: *kernel, rootfs: *rootfs,
-			blank: *blank, run: *runDir, memMiB: *memMiB,
+			blank: *blank, run: *runDir, memMiB: *memMiB, cpus: *cpus,
 			boot: *wakeBy == "boot", budget: *budgetMiB * 1024}
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)

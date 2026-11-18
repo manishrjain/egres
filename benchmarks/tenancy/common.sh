@@ -35,6 +35,18 @@ FLOOR_GIB=${FLOOR_GIB:-16}
 # Tenants made at once by create_range. Past 16 the server sets the
 # pace (about 75 tenants/s on Egres); 1 reproduces the serial runs.
 CREATE_PAR=${CREATE_PAR:-16}
+# The platform's CPUs and the load generator's, when the two are kept
+# apart (on a 16-core box, PLATFORM_CPUS=0-13,16-29 PROBE_CPUS=
+# 14,15,30,31: siblings N and N+16 share a core): the probe, psql and
+# the seeders must neither steal from what they measure nor be starved
+# by it. Empty, nothing is pinned. The test puts itself on PROBE_CPUS,
+# so everything it starts inherits them; a backend starts its platform
+# under on_platform. A server reading its CPU count from its affinity
+# mask (Egres does) then sees the platform's share.
+PLATFORM_CPUS=${PLATFORM_CPUS:-}
+PROBE_CPUS=${PROBE_CPUS:-}
+[ -z "$PROBE_CPUS" ] || taskset -pc "$PROBE_CPUS" $$ >/dev/null
+on_platform() { [ -z "$PLATFORM_CPUS" ] || echo taskset -c "$PLATFORM_CPUS"; }
 mkdir -p "$RUN" "$RES"
 
 avail_gib() { awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo; }

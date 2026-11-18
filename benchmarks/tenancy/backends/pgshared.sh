@@ -33,6 +33,7 @@ platform_up() {
     # 10,000 step ("could not resize shared memory segment").
     # shellcheck disable=SC2086  # PG_CONF is a list of -c settings
     docker run -d --name "$NAME" --network host --memory="${MEM_GIB}g" \
+        ${PLATFORM_CPUS:+--cpuset-cpus="$PLATFORM_CPUS"} \
         --shm-size=8g -e POSTGRES_HOST_AUTH_METHOD=trust \
         -v "$DIR:/var/lib/postgresql" "$PG_IMAGE" \
         -c port="$PG_PORT" -c listen_addresses=127.0.0.1 \
