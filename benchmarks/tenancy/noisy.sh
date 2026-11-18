@@ -18,13 +18,16 @@
 # with a database per tenant, nothing bounds a heavy tenant at all:
 # Egres's shape without its meter.
 #   BACKEND=vm ./noisy.sh
-#   KINDS="cpu write" HEAVY="0 1 2 4 8 16 32 64" QUIET=50 CONNS=4
+#   KINDS=cpu,write HEAVY=0,1,2,4,8,16,32,64 QUIET=50 CONNS=4
 #   RATE=50 DUR=60s HOLD=1 QHOLD=2 ROWS=100000
 source "$(dirname "$0")/common.sh"
 in_cgroup "$@"
 platform_init "$@"
+# Lists take commas or spaces: suite.txt has no quoting.
 KINDS=${KINDS:-cpu write}
 HEAVY=${HEAVY:-0 1 2 4 8 16 32 64}
+KINDS=${KINDS//,/ }
+HEAVY=${HEAVY//,/ }
 QUIET=${QUIET:-50}
 CONNS=${CONNS:-4}
 RATE=${RATE:-50}

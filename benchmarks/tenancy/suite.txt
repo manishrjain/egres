@@ -9,10 +9,12 @@ drive-idle            drive_idle
 
 # 1. Isolation: a heavy tenant beside quiet ones. pgshared, every
 # tenant a database in one stock Postgres, is Egres's shape without
-# its metering.
-noisy-vm              noisy      BACKEND=vm
-noisy-egres           noisy      BACKEND=egres
-noisy-pgshared        noisy      BACKEND=pgshared
+# its metering. To 512 heavy (2,048 writing connections on the box's
+# 28 threads): on a datacenter drive none of the sides had broken at
+# 64, so the count goes on until the quiet tenants' tail gives.
+noisy-vm        noisy  BACKEND=vm       HEAVY=0,1,2,4,8,16,32,64,128,256,512
+noisy-egres     noisy  BACKEND=egres    HEAVY=0,1,2,4,8,16,32,64,128,256,512
+noisy-pgshared  noisy  BACKEND=pgshared HEAVY=0,1,2,4,8,16,32,64,128,256,512
 
 # 2. What a tenant costs, and how many fit. A micro-VM holds about
 # 96 MiB settled (tanland), so 600 fills a 64 GiB budget and 1,000 a
