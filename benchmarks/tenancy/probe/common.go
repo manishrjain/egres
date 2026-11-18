@@ -166,16 +166,35 @@ func md5Text(g int) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// The checks a reply is held to. Every row a tenant holds has v
-// beginning with md5(id): the seed writes exactly that, an insert the
-// same, and an update keeps it as a prefix before its new text. So a
-// read that returns the wrong row, a torn or stale-from-another-table
-// value, or junk, fails here, and the failure counts as an error in
-// the test's row like a refusal would.
+// The checks a reply is held to. Row id holds value(id, k): md5(id)
+// as the seed or an insert wrote it, md5(id):k after its k-th update.
+// So a read that returns the wrong row, junk, a value from another
+// table, or (where the reader knows the row's version, agents.go) a
+// version older than the last write it confirmed, fails here, and the
+// failure counts as an error in the test's row like a refusal would.
 
-// valueOK says whether v is the value of row id, or an update of it.
-func valueOK(id int, v string) bool {
-	return strings.HasPrefix(v, md5Text(id))
+func value(id, k int) string {
+	if k == 0 {
+		return md5Text(id)
+	}
+	return md5Text(id) + ":" + strconv.Itoa(k)
+}
+
+// parseValue is the version v carries as a value of row id, or -1
+// when v is not one.
+func parseValue(id int, v string) int {
+	m := md5Text(id)
+	if v == m {
+		return 0
+	}
+	if !strings.HasPrefix(v, m+":") {
+		return -1
+	}
+	k, err := strconv.Atoi(v[len(m)+1:])
+	if err != nil || k < 1 {
+		return -1
+	}
+	return k
 }
 
 func short(v string) string {
@@ -185,66 +204,40 @@ func short(v string) string {
 	return v
 }
 
-// pointCheck: one row, v of row id.
+// oneValue: the reply is one row of one column, and returns it.
+func oneValue(r *result, what string) (string, error) {
+	if len(r.rows) != 1 || len(r.rows[0]) < 1 {
+		return "", fmt.Errorf("%s: %d rows, want 1", what, len(r.rows))
+	}
+	return r.rows[0][0], nil
+}
+
+// pointCheck: one row, the value of row id as it was loaded. For a
+// row that may have been updated, tenant.pointCheck.
 func pointCheck(id int) checker {
 	return func(r *result) error {
-		if len(r.rows) != 1 || len(r.rows[0]) < 1 {
-			return fmt.Errorf("point id %d: %d rows, want 1", id, len(r.rows))
+		v, err := oneValue(r, fmt.Sprintf("point id %d", id))
+		if err != nil {
+			return err
 		}
-		if v := r.rows[0][0]; !valueOK(id, v) {
-			return fmt.Errorf("point id %d: got %q, want md5 %s", id, short(v),
-				md5Text(id))
-		}
-		return nil
-	}
-}
-
-// rangeCheck: rows (id, v) for from..to, every id once, each v its
-// row's. The ids up to seeded were loaded and must all be there; ids
-// past it come from this tenant's inserts, which may have failed, so
-// they may be missing but not wrong.
-func rangeCheck(from, to, seeded int) checker {
-	return func(r *result) error {
-		seen := map[int]bool{}
-		for _, row := range r.rows {
-			if len(row) < 2 {
-				return fmt.Errorf("range %d..%d: a row of %d columns", from, to,
-					len(row))
-			}
-			id, err := strconv.Atoi(row[0])
-			if err != nil || id < from || id > to {
-				return fmt.Errorf("range %d..%d: id %q outside it", from, to, row[0])
-			}
-			if seen[id] {
-				return fmt.Errorf("range %d..%d: id %d twice", from, to, id)
-			}
-			seen[id] = true
-			if !valueOK(id, row[1]) {
-				return fmt.Errorf("range %d..%d: id %d got %q, want md5 %s", from,
-					to, id, short(row[1]), md5Text(id))
-			}
-		}
-		for id := from; id <= min(to, seeded); id++ {
-			if !seen[id] {
-				return fmt.Errorf("range %d..%d: id %d missing (%d rows)", from, to,
-					id, len(r.rows))
-			}
+		if v != value(id, 0) {
+			return fmt.Errorf("point id %d: got %q, want %s", id, short(v),
+				value(id, 0))
 		}
 		return nil
 	}
 }
 
-// countCheck: one row, one number between lo and hi (the rows loaded
-// and the inserts since, some of which may have failed).
+// countCheck: one row, one number between lo and hi.
 func countCheck(lo, hi int) checker {
 	return func(r *result) error {
-		if len(r.rows) != 1 || len(r.rows[0]) < 1 {
-			return fmt.Errorf("count: %d rows, want 1", len(r.rows))
+		v, err := oneValue(r, "count")
+		if err != nil {
+			return err
 		}
-		n, err := strconv.Atoi(r.rows[0][0])
+		n, err := strconv.Atoi(v)
 		if err != nil || n < lo || n > hi {
-			return fmt.Errorf("count: got %q, want %d..%d", short(r.rows[0][0]),
-				lo, hi)
+			return fmt.Errorf("count: got %q, want %d..%d", short(v), lo, hi)
 		}
 		return nil
 	}

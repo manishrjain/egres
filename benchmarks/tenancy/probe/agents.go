@@ -139,34 +139,175 @@ func arrivalDue(begin time.Time, k int, perSec float64) time.Time {
 	return begin.Add(time.Duration(float64(k) * float64(time.Second) / perSec))
 }
 
-// statement is the SQL for one statement of kind, and the check its
-// reply is held to: r is a random id in 1..rows, n the tenant's next
-// unused id, text 32 random characters. An update writes the row's
-// md5 and then the text, so a later read can still tell the row is
-// its own (valueOK); an insert writes what the seed would have.
-func statement(kind, r, n, rows int, text string) (sql string, check checker) {
-	switch kind {
-	case kPoint:
-		return fmt.Sprintf("SELECT v FROM t WHERE id = %d", r), pointCheck(r)
-	case kRange:
-		return fmt.Sprintf("SELECT id, v FROM t WHERE id BETWEEN %d AND %d",
-			r, r+9), rangeCheck(r, r+9, rows)
-	case kUpdate:
-		return fmt.Sprintf("UPDATE t SET v = '%s:%s' WHERE id = %d",
-			md5Text(r), text, r), tagCheck("UPDATE 1")
-	case kInsert:
-		return fmt.Sprintf("INSERT INTO t VALUES (%d, '%s')", n, md5Text(n)),
-			tagCheck("INSERT 0 1")
-	default:
-		return "SELECT count(*) FROM t", countCheck(rows, n-1)
+// tenant is what the probe knows of a tenant's table, so that a read
+// can be held to it: which rows exist and the version each updated
+// row is at. Only the tenant's one session at a time touches it.
+type tenant struct {
+	id int
+	// Rows 1..rows were loaded; the id the next insert uses.
+	rows, nextID int
+	// ver[id] is the version of row id's last attempted update (0:
+	// never updated, the row holds md5(id)); nil until the first.
+	ver []uint16
+	// Rows whose last update(s) may not have committed, the reply
+	// lost with the connection: the version known to be there. The
+	// row is then at any version from that to ver[id], and a read
+	// settles it.
+	doubt map[int]int
+	// Inserts a server error refused (the row is not there) and
+	// inserts whose reply was lost (it may be).
+	absent, unsure map[int]bool
+}
+
+func (t *tenant) version(id int) int {
+	if id < len(t.ver) {
+		return int(t.ver[id])
+	}
+	return 0
+}
+
+func (t *tenant) setVersion(id, k int) {
+	if t.ver == nil {
+		t.ver = make([]uint16, t.rows+1)
+	}
+	for id >= len(t.ver) {
+		t.ver = append(t.ver, 0)
+	}
+	t.ver[id] = uint16(k)
+}
+
+// accept holds v to what row id may be at: a version from the one
+// known to be there to the last one written. Seeing the last one
+// settles the row; seeing an older one does not, since a write whose
+// reply was lost may still be running on the abandoned connection.
+func (t *tenant) accept(id int, v string) error {
+	k := parseValue(id, v)
+	hi := t.version(id)
+	lo, doubted := t.doubt[id]
+	if !doubted {
+		lo = hi
+	}
+	if k < lo || k > hi {
+		want := value(id, hi)
+		if doubted {
+			want = value(id, lo) + ".." + strconv.Itoa(hi)
+		}
+		return fmt.Errorf("id %d: got %q, want %s", id, short(v), want)
+	}
+	if doubted && k == hi {
+		delete(t.doubt, id)
+	}
+	return nil
+}
+
+// exists says whether row id is certainly there.
+func (t *tenant) exists(id int) bool {
+	return id <= t.rows || (id < t.nextID && !t.absent[id] && !t.unsure[id])
+}
+
+func (t *tenant) pointCheck(id int) checker {
+	return func(r *result) error {
+		v, err := oneValue(r, fmt.Sprintf("point id %d", id))
+		if err != nil {
+			return err
+		}
+		return t.accept(id, v)
 	}
 }
 
-type tenant struct {
-	id int
-	// The id the next insert uses. Only the tenant's one session
-	// touches it.
-	nextID int
+// rangeCheck: rows (id, v) for from..to, every id once, each v its
+// row's, and every row that exists among them.
+func (t *tenant) rangeCheck(from, to int) checker {
+	return func(r *result) error {
+		seen := map[int]bool{}
+		for _, row := range r.rows {
+			if len(row) < 2 {
+				return fmt.Errorf("range %d..%d: a row of %d columns", from, to,
+					len(row))
+			}
+			id, err := strconv.Atoi(row[0])
+			if err != nil || id < from || id > to {
+				return fmt.Errorf("range %d..%d: id %q outside it", from, to, row[0])
+			}
+			if seen[id] {
+				return fmt.Errorf("range %d..%d: id %d twice", from, to, id)
+			}
+			seen[id] = true
+			if err := t.accept(id, row[1]); err != nil {
+				return fmt.Errorf("range %d..%d: %w", from, to, err)
+			}
+			delete(t.unsure, id)
+		}
+		for id := from; id <= to; id++ {
+			if t.exists(id) && !seen[id] {
+				return fmt.Errorf("range %d..%d: id %d missing (%d rows)", from, to,
+					id, len(r.rows))
+			}
+		}
+		return nil
+	}
+}
+
+// countCheck: the rows that certainly exist, up to those that may.
+func (t *tenant) countCheck() checker {
+	hi := t.nextID - 1 - len(t.absent)
+	return countCheck(hi-len(t.unsure), hi)
+}
+
+// statement is the SQL for one statement of kind, the check its reply
+// is held to, and done, to be told how the statement ended: ok, a
+// server error (nothing committed), or lost (the reply did not come
+// back, so a write may or may not have committed). r is a random id
+// in 1..rows. An update writes the row's next version, an insert the
+// next id with the value the seed would have given it.
+func (t *tenant) statement(kind, r int) (sql string, check checker,
+	done func(err error, lost bool)) {
+	switch kind {
+	case kPoint:
+		return fmt.Sprintf("SELECT v FROM t WHERE id = %d", r), t.pointCheck(r),
+			nil
+	case kRange:
+		return fmt.Sprintf("SELECT id, v FROM t WHERE id BETWEEN %d AND %d",
+			r, r+9), t.rangeCheck(r, r+9), nil
+	case kUpdate:
+		k := t.version(r) + 1
+		return fmt.Sprintf("UPDATE t SET v = '%s' WHERE id = %d", value(r, k), r),
+			tagCheck("UPDATE 1"), func(err error, lost bool) {
+				switch {
+				case err == nil:
+					t.setVersion(r, k)
+				case lost:
+					if _, in := t.doubt[r]; !in {
+						if t.doubt == nil {
+							t.doubt = map[int]int{}
+						}
+						t.doubt[r] = t.version(r)
+					}
+					t.setVersion(r, k)
+				}
+			}
+	case kInsert:
+		n := t.nextID
+		t.nextID++
+		return fmt.Sprintf("INSERT INTO t VALUES (%d, '%s')", n, value(n, 0)),
+			tagCheck("INSERT 0 1"), func(err error, lost bool) {
+				switch {
+				case err == nil:
+				case lost:
+					if t.unsure == nil {
+						t.unsure = map[int]bool{}
+					}
+					t.unsure[n] = true
+				default:
+					if t.absent == nil {
+						t.absent = map[int]bool{}
+					}
+					t.absent[n] = true
+				}
+			}
+	default:
+		return "SELECT count(*) FROM t", t.countCheck(), nil
+	}
 }
 
 type sessionRun struct {
@@ -308,13 +449,7 @@ func (a *agentRun) session(s *sessionRun, start time.Time, seed int64) {
 		due := start.Add(time.Duration(k) * gap)
 		a.clk.wait(due)
 		kind := a.mix.pick(rng.Intn(100))
-		n := t.nextID
-		if kind == kInsert {
-			// Used up even if the insert fails: it may have committed
-			// before the reply was lost.
-			t.nextID++
-		}
-		sql, check := statement(kind, 1+rng.Intn(a.rows), n, a.rows, randText(rng))
+		sql, check, done := t.statement(kind, 1+rng.Intn(a.rows))
 		err := held
 		if err == nil && conn == nil {
 			conn, err = openRetry(a.target(t.id), time.Now().Add(convTimeout))
@@ -323,7 +458,8 @@ func (a *agentRun) session(s *sessionRun, start time.Time, seed int64) {
 			var res *result
 			res, err = conn.query(sql)
 			var pe *pgError
-			if err != nil && !errors.As(err, &pe) {
+			lost := err != nil && !errors.As(err, &pe)
+			if lost {
 				conn.close()
 				conn = nil
 			}
@@ -332,6 +468,11 @@ func (a *agentRun) session(s *sessionRun, start time.Time, seed int64) {
 					err = fmt.Errorf("%s: %w", kindNames[kind], err)
 				}
 			}
+			if done != nil {
+				done(err, lost)
+			}
+		} else if done != nil {
+			done(err, false)
 		}
 		a.record(t.id, kind, due, msSince(due), err, k == 0, woke && k == 0,
 			took)
@@ -381,7 +522,7 @@ func (a *agentRun) arrive(i int, due time.Time) error {
 	for len(a.tenants) <= i {
 		a.tenants = append(a.tenants, nil)
 	}
-	a.tenants[i] = &tenant{id: i, nextID: a.rows + 1}
+	a.tenants[i] = &tenant{id: i, rows: a.rows, nextID: a.rows + 1}
 	a.count++
 	a.idle = append(a.idle, i)
 	return nil

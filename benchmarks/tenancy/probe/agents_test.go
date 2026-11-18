@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"math/rand"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -148,11 +149,14 @@ func TestArrivalDue(t *testing.T) {
 	}
 }
 
+func rows(cells ...[]string) *result { return &result{rows: cells} }
+func tagged(s string) *result        { return &result{tag: s} }
+func cell(id, k int) []string {
+	return []string{strconv.Itoa(id), value(id, k)}
+}
+
 func TestStatement(t *testing.T) {
-	text := strings.Repeat("a", 32)
-	m7, m1001 := md5Text(7), md5Text(1001)
-	rows := func(cells ...[]string) *result { return &result{rows: cells} }
-	tag := func(s string) *result { return &result{tag: s} }
+	m7, m11 := md5Text(7), md5Text(11)
 	for _, c := range []struct {
 		kind      int
 		want      string
@@ -161,20 +165,19 @@ func TestStatement(t *testing.T) {
 		{kPoint, "SELECT v FROM t WHERE id = 7",
 			rows([]string{m7}), rows([]string{md5Text(8)})},
 		{kRange, "SELECT id, v FROM t WHERE id BETWEEN 7 AND 16",
-			rows([]string{"7", m7}, []string{"8", md5Text(8)},
-				[]string{"9", md5Text(9)}, []string{"10", md5Text(10)}),
-			rows([]string{"7", m7}, []string{"8", md5Text(8)},
-				[]string{"9", md5Text(9)})},
-		{kUpdate, "UPDATE t SET v = '" + m7 + ":" + text + "' WHERE id = 7",
-			tag("UPDATE 1"), tag("UPDATE 0")},
-		{kInsert, "INSERT INTO t VALUES (1001, '" + m1001 + "')",
-			tag("INSERT 0 1"), tag("INSERT 0 0")},
+			rows(cell(7, 0), cell(8, 0), cell(9, 0), cell(10, 0)),
+			rows(cell(7, 0), cell(8, 0), cell(9, 0))},
+		{kUpdate, "UPDATE t SET v = '" + m7 + ":1' WHERE id = 7",
+			tagged("UPDATE 1"), tagged("UPDATE 0")},
+		{kInsert, "INSERT INTO t VALUES (11, '" + m11 + "')",
+			tagged("INSERT 0 1"), tagged("INSERT 0 0")},
 		{kCount, "SELECT count(*) FROM t",
-			rows([]string{"1000"}), rows([]string{"1001"})},
+			rows([]string{"10"}), rows([]string{"11"})},
 	} {
-		// 10 rows loaded, inserts up to 1000 so far: a range past 10
-		// may be short, a count is 10..1000.
-		sql, check := statement(c.kind, 7, 1001, 10, text)
+		// 10 rows loaded and nothing inserted: a range past 10 is
+		// short, a count is exactly 10.
+		tn := &tenant{rows: 10, nextID: 11}
+		sql, check, _ := tn.statement(c.kind, 7)
 		if sql != c.want {
 			t.Errorf("%s: %q, want %q", kindNames[c.kind], sql, c.want)
 		}
@@ -185,16 +188,72 @@ func TestStatement(t *testing.T) {
 			t.Errorf("%s: bad reply accepted", kindNames[c.kind])
 		}
 	}
-	// An updated row still passes a point read: its md5 leads.
-	if err := pointCheck(7)(rows([]string{m7 + ":" + text})); err != nil {
-		t.Errorf("updated row: %v", err)
-	}
-	// A range over seeded rows must have every one of them.
-	if err := rangeCheck(7, 16, 1000)(rows([]string{"7", m7})); err == nil {
-		t.Error("short range over seeded rows accepted")
-	}
 	if s := randText(rand.New(rand.NewSource(1))); len(s) != 32 {
 		t.Errorf("randText gave %q", s)
+	}
+}
+
+// A read is held to the row's version: the one last confirmed, or
+// any from the one known to be there when a write's reply was lost.
+func TestStaleRead(t *testing.T) {
+	tn := &tenant{rows: 10, nextID: 11}
+	_, check, done := tn.statement(kUpdate, 7)
+	done(check(tagged("UPDATE 1")), false)
+	_, check, _ = tn.statement(kPoint, 7)
+	if err := check(rows([]string{value(7, 0)})); err == nil {
+		t.Error("stale read accepted after a confirmed update")
+	}
+	if err := check(rows([]string{value(7, 1)})); err != nil {
+		t.Errorf("current value rejected: %v", err)
+	}
+	if err := check(rows([]string{value(7, 2)})); err == nil {
+		t.Error("a version never written accepted")
+	}
+	// A lost update: version 1 or 2 may be there. A read of 2 settles
+	// it, and 1 is stale from then on.
+	_, _, done = tn.statement(kUpdate, 7)
+	done(errors.New("EOF"), true)
+	_, check, _ = tn.statement(kRange, 7)
+	seen1 := rows(cell(7, 1), cell(8, 0), cell(9, 0), cell(10, 0))
+	if err := check(seen1); err != nil {
+		t.Errorf("version known to be there rejected: %v", err)
+	}
+	seen2 := rows(cell(7, 2), cell(8, 0), cell(9, 0), cell(10, 0))
+	if err := check(seen2); err != nil {
+		t.Errorf("lost write's version rejected: %v", err)
+	}
+	_, check, _ = tn.statement(kPoint, 7)
+	if err := check(rows([]string{value(7, 1)})); err == nil {
+		t.Error("stale read accepted after the lost write was seen")
+	}
+	// A refused update leaves the row where it was.
+	_, _, done = tn.statement(kUpdate, 8)
+	done(&pgError{"ERROR", "53200", "out of memory"}, false)
+	_, check, _ = tn.statement(kPoint, 8)
+	if err := check(rows([]string{value(8, 0)})); err != nil {
+		t.Errorf("row after a refused update: %v", err)
+	}
+	// Inserts: a refused one is not there, a lost one may be; a
+	// count and a range allow for both.
+	_, _, done = tn.statement(kInsert, 0) // 11: refused
+	done(&pgError{"ERROR", "53200", "out of memory"}, false)
+	_, _, done = tn.statement(kInsert, 0) // 12: lost
+	done(errors.New("EOF"), true)
+	_, _, done = tn.statement(kInsert, 0) // 13: confirmed
+	done(nil, false)
+	_, check, _ = tn.statement(kCount, 0)
+	for n, ok := range map[string]bool{"11": true, "12": true, "10": false,
+		"13": false} {
+		if err := check(rows([]string{n})); (err == nil) != ok {
+			t.Errorf("count %s: ok %v, err %v", n, ok, err)
+		}
+	}
+	_, check, _ = tn.statement(kRange, 10)
+	if err := check(rows(cell(10, 0), cell(13, 0))); err != nil {
+		t.Errorf("range without the refused and lost inserts: %v", err)
+	}
+	if err := check(rows(cell(10, 0))); err == nil {
+		t.Error("range without the confirmed insert accepted")
 	}
 }
 
