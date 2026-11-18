@@ -265,20 +265,23 @@ def chart_noisy(runs, out):
              ("cpu", "p99_ms", "Quiet tenants' p99 beside heavy scanners",
               "ms", True),
              ("write", "heavy_done", "The heavy writers' own statements in "
-              "the minute", "statements", True)]
+              "the minute", "statements", True),
+             ("write", "write_mib", "Disk written over the writers' step",
+              "MiB", True)]
     for i, (kind, col, title, ylabel, ylog) in enumerate(specs):
-        ys = [num(r[col]) for s in sides for r in runs[("noisy", s[0])]["rows"]
-              if r["kind"] == kind and num(r[col])]
+        ys = [num(r.get(col)) for s in sides
+              for r in runs[("noisy", s[0])]["rows"]
+              if r["kind"] == kind and num(r.get(col))]
         if not ys:
             continue
         p = Panel(90, 110 + i * (PH + 70), PW, PH, list(xpos.values()), ys,
                   False, ylog, title, ylabel, "heavy tenants beside 50 quiet")
         p.frame(list(xpos.values()), lambda x: str(heavies[int(x)]))
         for key, label, colour in sides:
-            pts = [(xpos[int(r["heavy"])], num(r[col]),
-                    f'{label}, {r["heavy"]} heavy: {r[col]} {ylabel}')
+            pts = [(xpos[int(r["heavy"])], num(r.get(col)),
+                    f'{label}, {r["heavy"]} heavy: {r.get(col)} {ylabel}')
                    for r in runs[("noisy", key)]["rows"]
-                   if r["kind"] == kind and num(r[col])]
+                   if r["kind"] == kind and num(r.get(col))]
             p.line(pts, colour, label)
         panels.append(p)
     sub = ("50 quiet tenants each send a point read a second; the heavy ones"
