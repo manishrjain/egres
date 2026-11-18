@@ -49,16 +49,19 @@ egres_launch() {
     if [ "${PROBE:-0}" != 1 ] && [ -f "$RUN/egres_io.flags" ]; then
         io=(--io="$(cat "$RUN/egres_io.flags")")
     fi
-    # Pinned to PLATFORM_CPUS, the server's jemalloc sees fewer CPUs in
-    # its affinity mask than the machine has, turns its per-CPU arenas
-    # off and, as Egres builds it (abort_conf), aborts. MALLOC_CONF is
-    # Egres's documented override: the arenas are off either way, so
-    # say so and start. A pinned Egres is therefore measured without
-    # per-CPU arenas; an unpinned one with them.
-    local conf=()
-    [ -z "$PLATFORM_CPUS" ] || conf=(env MALLOC_CONF=percpu_arena:disabled)
+    # EGRES_MALLOC_CONF is handed to the server's jemalloc as
+    # MALLOC_CONF, Egres's documented override, to measure an
+    # allocator setting. Pinned to PLATFORM_CPUS the server needs one:
+    # its jemalloc sees fewer CPUs in its affinity mask than the
+    # machine has, turns its per-CPU arenas off and, as Egres builds
+    # it (abort_conf), aborts; the arenas are off either way, so say
+    # so and start. A pinned Egres is therefore measured without
+    # per-CPU arenas, an unpinned one with them unless told otherwise.
+    local conf=${EGRES_MALLOC_CONF:-} env=()
+    [ -n "$conf" ] || [ -z "$PLATFORM_CPUS" ] || conf=percpu_arena:disabled
+    [ -z "$conf" ] || env=(env "MALLOC_CONF=$conf")
     # shellcheck disable=SC2046  # on_platform is a command prefix
-    "${conf[@]}" $(on_platform) "$bin" --listen="offset=$OFFSET" --raft="id=1" \
+    "${env[@]}" $(on_platform) "$bin" --listen="offset=$OFFSET" --raft="id=1" \
         --store="dir-path=$EDATA/store" --wal="dir=$EDATA/wal" \
         --memory="total-bytes=$((MEM_GIB << 30))" \
         "${io[@]}" "$@" >"$ELOG" 2>&1 &
