@@ -20,7 +20,16 @@ pub const Config = struct {
     /// Random one-page reads per second the device serves; 0 when
     /// unknown, and an operation then costs its pages alone.
     read_ops_per_sec: u64 = 0,
+    /// Direct writes on the device at once, each a `write_chunk` at
+    /// most: the queue a read waits behind. At least 1.
+    write_depth: u16 = 8,
 };
+
+/// A direct write reaches the device in pieces this big, one
+/// `write_depth` slot each, so a read queues behind a piece and not
+/// behind a whole table. Enough in flight to keep a drive at its
+/// sequential rate, few enough that the wait is milliseconds.
+pub const write_chunk: usize = 1 << 20;
 
 pub const Limiter = struct {
     /// Cumulative pages and operations ever granted across the
@@ -43,6 +52,8 @@ pub const Limiter = struct {
     /// plain field.
     metered: bool = false,
     conf: Config,
+    /// Direct write pieces on the device now, `write_depth` at once.
+    writes: fiber.Inflight,
 
     /// Snapshot of the live limiter state, all counted in pages
     /// (multiply by `vfs.page_size` for bytes) and operations.
@@ -54,9 +65,11 @@ pub const Limiter = struct {
         total_write_pages: i64,
         total_read_ops: i64,
         total_write_ops: i64,
+        write_depth: u16,
+        writes_in_flight: u32,
     };
 
-    pub fn status(self: *const Limiter) Status {
+    pub fn status(self: *Limiter) Status {
         return .{
             .pages_per_sec = self.pages_per_sec,
             .pages_per_op = self.pages_per_op,
@@ -65,6 +78,8 @@ pub const Limiter = struct {
             .total_write_pages = self.total_write_pages.load(.monotonic),
             .total_read_ops = self.total_read_ops.load(.monotonic),
             .total_write_ops = self.total_write_ops.load(.monotonic),
+            .write_depth = self.conf.write_depth,
+            .writes_in_flight = self.writes.inFlight(),
         };
     }
 
@@ -78,6 +93,7 @@ pub const Limiter = struct {
             .pages_per_sec = @intCast(pages_per_sec),
             .pages_per_op = @intCast(pages_per_op),
             .conf = config,
+            .writes = .{ .limit = config.write_depth },
         };
     }
 

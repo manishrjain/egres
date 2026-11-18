@@ -103,6 +103,7 @@ pub const Condition = _sync.Condition;
 pub const RWMutex = _sync.RWMutex;
 pub const Notify = _sync.Notify;
 pub const Event = _sync.Event;
+pub const Inflight = _sync.Inflight;
 
 // Mutex-protected containers for state shared between fibers.
 pub const SafeHashMap = @import("safe_hash_map.zig").SafeHashMap;

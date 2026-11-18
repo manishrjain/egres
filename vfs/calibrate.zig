@@ -56,6 +56,7 @@ pub const Cfg = struct {
     bandwidth_bytes: u64 = 1 << 30,
     write_cost: u8 = 2,
     iops: u64 = 0,
+    write_depth: u16 = 8,
 
     pub const docs = .{
         .self = "Disk bandwidth for the I/O limiter: one budget in device " ++
@@ -71,6 +72,8 @@ pub const Cfg = struct {
             "when not calibrated. 1 to 32.",
         .iops = "Random 4 KiB reads per second the device serves, when " ++
             "not calibrated. 0 charges an operation its pages alone.",
+        .write_depth = "Direct writes in flight on a device at once, in " ++
+            "1 MiB pieces: the most a read queues behind. At least 1.",
     };
 };
 
@@ -97,6 +100,10 @@ pub fn devices() []const Device {
 pub fn initGlobal(io_cfg: Cfg) !void {
     if (io_cfg.write_cost < 1 or io_cfg.write_cost > 32) {
         log.err("--io write_cost must be between [1, 32]", .{});
+        return error.InvalidFlag;
+    }
+    if (io_cfg.write_depth < 1) {
+        log.err("--io write_depth must be at least 1", .{});
         return error.InvalidFlag;
     }
     _vfs.VFS.initGlobal(pinnedConfig(io_cfg));
@@ -143,6 +150,7 @@ fn pinnedConfig(io_cfg: Cfg) _bandwidth.Config {
         .bytes_per_sec = io_cfg.bandwidth_bytes,
         .write_cost = io_cfg.write_cost,
         .read_ops_per_sec = io_cfg.iops,
+        .write_depth = io_cfg.write_depth,
     };
 }
 
@@ -163,7 +171,9 @@ fn deviceConfig(
         });
         return pinned;
     };
-    const cfg = bwConfigFrom(p);
+    // The probe sizes the budget; the depth is the flag's either way.
+    var cfg = bwConfigFrom(p);
+    cfg.write_depth = io_cfg.write_depth;
     log.info("disk calibrated: {s}: read {d} MiB/s, write {d} MiB/s, " ++
         "{d} iops; setting bandwidth_bytes={d}MiB write_cost={d} " ++
         "iops={d}", .{

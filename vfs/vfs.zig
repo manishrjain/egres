@@ -188,12 +188,26 @@ pub const FileHandle = struct {
             std.debug.assert(offset % page_size == 0);
         }
 
-        self.bw.grant(data.len, 1, .write);
+        if (data.len == 0) return;
+        // A direct write is a table or a snapshot, megabytes at once:
+        // it goes in `write_chunk` pieces, one `write_depth` slot
+        // each, so the device queue holds a bounded run of them and a
+        // read waits behind a piece. Each piece is granted on its own,
+        // before its slot: the meter then paces the pieces instead of
+        // releasing the table in a burst, and a fiber parked on the
+        // meter holds no slot. A buffered write, the WAL's, goes whole
+        // and takes no slot.
+        const piece_len = if (self.direct) bandwidth.write_chunk else data.len;
         var written: usize = 0;
         while (written < data.len) {
+            const rest = data[written..];
+            const piece = rest[0..@min(rest.len, piece_len)];
+            self.bw.grant(piece.len, 1, .write);
+            if (self.direct) self.bw.writes.enter();
+            defer if (self.direct) self.bw.writes.leave();
             const n = try fs.submit(.write, .{
                 .file = file,
-                .data = data[written..],
+                .data = piece,
                 .offset = offset + written,
             });
             if (n == 0) return error.WriteFailed;

@@ -1257,12 +1257,15 @@ pub const AdminServer = struct {
     fn writeLimiter(
         w: *std.Io.Writer,
         name: String,
-        bw: *const vfs.bandwidth.Limiter,
+        bw: *vfs.bandwidth.Limiter,
     ) !void {
         const s = bw.status();
         try w.print("vfs bandwidth {s} (pages):\n", .{name});
         try w.print("  rate:          {d} pages/s\n", .{s.pages_per_sec});
         try w.print("  pages_per_op:  {d}\n", .{s.pages_per_op});
+        try w.print("  write_depth:   {d} ({d} in flight)\n", .{
+            s.write_depth, s.writes_in_flight,
+        });
         try w.print("  metered:       {}\n", .{s.metered});
         try w.print("  total_read:    {d} in {d} ops\n", .{
             s.total_read_pages, s.total_read_ops,

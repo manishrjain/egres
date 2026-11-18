@@ -121,6 +121,28 @@ test "limiter: a fiber whose io does not wait is charged and runs on" {
     try expect(waited >= 500 and waited <= 2000);
 }
 
+test "limiter: direct writes share write_depth slots" {
+    var limiter = Limiter.init(.{
+        .bytes_per_sec = page_size,
+        .write_depth = 3,
+    });
+    var group = fiber.Group(bool).init(testing.allocator);
+    defer group.deinit();
+    for (0..12) |_| try group.spawn(.{}, holdSlot, .{&limiter});
+    for (group.wait()) |within| try expect(within);
+    try expectEqual(0, limiter.status().writes_in_flight);
+}
+
+/// One write piece's worth of a slot: whether the writes in flight
+/// while it was held stayed within the depth.
+fn holdSlot(limiter: *Limiter) bool {
+    limiter.writes.enter();
+    defer limiter.writes.leave();
+    const in_flight = limiter.status().writes_in_flight;
+    fiber.sleepMs(5);
+    return in_flight >= 1 and in_flight <= 3;
+}
+
 test "limiter: a tenant pays fg's debt first, then bg's" {
     // 1000 pages/s, a burst of 100.
     var t = tenantAt(12, 1000);

@@ -642,6 +642,40 @@ pub const Event = struct {
     }
 };
 
+/// Pieces of work in flight, `limit` at once: `enter` parks while that
+/// many are out, `leave` lets the next one in. For a queue the holder
+/// does not own, a device's or a peer's, that should hold a bounded
+/// run of ours. Mutex + Condition as `Event`, which is the one-job
+/// case with transitions that assert instead of waiting.
+pub const Inflight = struct {
+    mu: Mutex(.untracked) = .{},
+    cond: Condition = .{},
+    /// At least 1, or `enter` never returns.
+    limit: u32,
+    count: u32 = 0,
+
+    pub fn enter(self: *Inflight) void {
+        self.mu.lock(@src());
+        defer self.mu.unlock();
+        while (self.count >= self.limit) self.cond.wait(&self.mu);
+        self.count += 1;
+    }
+
+    pub fn leave(self: *Inflight) void {
+        self.mu.lock(@src());
+        std.debug.assert(self.count > 0);
+        self.count -= 1;
+        self.mu.unlock();
+        self.cond.signal();
+    }
+
+    pub fn inFlight(self: *Inflight) u32 {
+        self.mu.lock(@src());
+        defer self.mu.unlock();
+        return self.count;
+    }
+};
+
 pub const Notify = struct {
     sl: Spinlock = .{},
     waiter: ?*Fiber = null,

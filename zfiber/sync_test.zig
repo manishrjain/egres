@@ -478,3 +478,32 @@ test "Event: waitForDone returns at once when idle, and wakes every waiter on se
     try std.testing.expect(!ev.isRunning());
     ev.waitForDone();
 }
+
+test "Inflight: enter parks at the limit until a leave" {
+    var inflight: fiber.Inflight = .{ .limit = 2 };
+    inflight.enter();
+    inflight.enter();
+    try std.testing.expectEqual(@as(u32, 2), inflight.inFlight());
+
+    var entered: std.atomic.Value(u32) = .init(0);
+    const Third = struct {
+        fn run(f: *fiber.Inflight, n: *std.atomic.Value(u32)) void {
+            f.enter();
+            _ = n.fetchAdd(1, .release);
+        }
+    };
+    var g: fiber.Group(void) = .init(std.testing.allocator);
+    defer g.deinit();
+    try g.spawn(.{}, Third.run, .{ &inflight, &entered });
+    fiber.yield();
+    fiber.yield();
+    try std.testing.expectEqual(@as(u32, 0), entered.load(.acquire));
+
+    inflight.leave();
+    g.wait();
+    try std.testing.expectEqual(@as(u32, 1), entered.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 2), inflight.inFlight());
+    inflight.leave();
+    inflight.leave();
+    try std.testing.expectEqual(@as(u32, 0), inflight.inFlight());
+}

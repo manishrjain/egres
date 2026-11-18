@@ -147,10 +147,16 @@ test "O_DIRECT page-aligned write round-trips intact (content verified)" {
     const expected_checksum = std.hash.XxHash32.hash(0, data[0 .. len - 4]);
     std.mem.writeInt(u32, data[len - 4 ..][0..4], expected_checksum, .little);
 
-    const v = vfs.g().*;
+    // A limiter of this test's own, so the write's operations can be
+    // counted: 16 pieces of a MiB and one of a page, each on a slot
+    // that is back before the write returns.
+    var limiter = bandwidth.Limiter.init(.{ .bytes_per_sec = 1 << 40 });
+    var v = VFS.new(&limiter);
     const wh = try v.createFile(path, .{ .mode = .direct });
     try wh.write(data, 0);
     wh.close();
+    try testing.expectEqual(17, limiter.status().total_write_ops);
+    try testing.expectEqual(0, limiter.status().writes_in_flight);
 
     // Read the file back through a plain (non-O_DIRECT) read so we
     // observe what's actually on disk, not whatever caches we skipped.
