@@ -135,9 +135,15 @@ func noisy(args []string) {
 						return
 					}
 					if err != nil {
+						// A short pause, longer once the server is gone,
+						// so 256 loops do not spin on it.
 						failed.Add(1)
 						heavyErr.Store(err.Error())
-						time.Sleep(10 * time.Millisecond)
+						if s == nil {
+							time.Sleep(200 * time.Millisecond)
+						} else {
+							time.Sleep(10 * time.Millisecond)
+						}
 						continue
 					}
 					done.Add(1)
@@ -174,17 +180,23 @@ func noisy(args []string) {
 			if pool := pools[target]; pool != nil {
 				// The wait for a free connection is the query's: a
 				// pooled client waits the same way.
+				// A slot holds a connection, or nil after one failed:
+				// the next query opens again. The slot always goes
+				// back, so a server that dies cannot wedge the pool.
 				s := <-pool
 				t0 := time.Now()
-				err = s.check(q, pointCheck(id))
+				if s == nil {
+					s, err = open(target, 2*time.Second)
+				}
+				if err == nil {
+					err = s.check(q, pointCheck(id))
+				}
 				ph.query = time.Since(t0)
-				if err != nil {
+				if err != nil && s != nil {
 					s.c.Close()
-					s, _ = open(target, 2*time.Second)
+					s = nil
 				}
-				if s != nil {
-					pool <- s
-				}
+				pool <- s
 			} else {
 				ph, err = runTimed(target, q, 2*time.Second, pointCheck(id))
 			}

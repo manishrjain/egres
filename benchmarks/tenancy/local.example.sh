@@ -11,7 +11,7 @@ WORK=/data/tenancy
 
 # The Egres server. `./setup.sh egres` builds this checkout into
 # $WORK/egres-bin; set it to measure another build.
-#EGRES_BIN=/path/to/egres
+#EGRES_BIN=${EGRES_BIN:-/path/to/egres}   # an exported value wins
 
 # Below this much available memory no test adds another tenant.
 #FLOOR_GIB=16
