@@ -223,10 +223,20 @@ pub const Shutdown = struct {
     /// POSIX-only; Windows console-ctrl handling is a TODO.
     pub fn install(self: *Shutdown) !void {
         if (builtin.os.tag == .windows) return;
+        process_shutdown.store(self, .seq_cst);
+        try self.installSignals();
+    }
+
+    /// `install` without making this the process's Shutdown: the
+    /// handlers and the watcher, whose stages are then this instance's
+    /// alone. For a test of the signal path: one that published itself
+    /// failed every `maybeYield` in the tests running beside it for
+    /// as long as it was stopping.
+    pub fn installSignals(self: *Shutdown) !void {
+        if (builtin.os.tag == .windows) return;
         // A signal an earlier instance took (tests) must not fire on this
         // one.
         g_signal.store(0, .release);
-        process_shutdown.store(self, .seq_cst);
         self.watcher = try _rt.spawn(.{}, watchSignal, .{self});
 
         var sa = std.posix.Sigaction{

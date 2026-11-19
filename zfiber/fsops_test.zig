@@ -44,7 +44,8 @@ test "fsops: many fibers offload concurrently; every result is correct" {
 test "fsops: a raft-lane fiber's job goes ahead of the queued bulk jobs" {
     // Twice the pool's threads of slow jobs, then one from a raft-lane
     // fiber: it runs as soon as a thread is free, before the bulk jobs
-    // still queued, so it finishes ahead of at least the last of them.
+    // still queued, so at least the last of them finishes after it. A
+    // FIFO would run it last of all nine.
     const bulk = 8;
     const Body = struct {
         var order: std.atomic.Value(u32) = .init(0);
@@ -71,7 +72,7 @@ test "fsops: a raft-lane fiber's job goes ahead of the queued bulk jobs" {
     var h = try fiber.spawn(.{ .lane = .raft }, Body.run, .{&urgent});
     h.join();
     g.wait();
-    try std.testing.expect(urgent < bulk - 1);
+    try std.testing.expect(urgent < bulk);
 }
 
 test "fsops: an offloaded error union propagates back to the fiber" {

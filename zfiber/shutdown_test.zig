@@ -173,7 +173,9 @@ test "Shutdown: install — first SIGTERM drains, second starts" {
     // deinit start()s (idempotent) then joins the watcher fiber.
     defer sd.deinit();
 
-    try sd.install();
+    // Not `install`: the tests beside this one would see its stopping
+    // stage from their `maybeYield`.
+    try sd.installSignals();
     try std.testing.expect(!sd.isDraining());
     try posix.raise(posix.SIG.TERM);
     // The handler counts the signal, the watcher fires startDrain.
