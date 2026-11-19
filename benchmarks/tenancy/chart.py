@@ -359,7 +359,9 @@ def chart_agents(runs, out):
     st = runs[("agents", sides[0][0])]["settings"]
     specs = [("point_p95_ms", "Active tenants' point read p95", "ms",
               num(st.get("STOP_P95_MS")), "the stop, {} ms"),
-             ("onboard_p95_ms", "An onboarding's time to its first row, p95",
+             # Runs before 2026-11-19 wrote the column as arrive_p95_ms.
+             ("onboard_p95_ms|arrive_p95_ms",
+              "An onboarding's time to its first row, p95",
               "ms", num(st.get("STOP_ONBOARD_MS")), "the stop, {} ms"),
              ("first_p95_ms", "A session's first statement from an idle "
               "tenant, p95 (a wake included)", "ms", None, None),
@@ -370,7 +372,10 @@ def chart_agents(runs, out):
     if "MEM_GIB" in st:
         budget = int(st["MEM_GIB"]) * int(st.get("BUDGET_PCT", 90)) / 100
     panels = []
-    for i, (col, title, ylabel, stop, stop_label) in enumerate(specs):
+    for i, (cols, title, ylabel, stop, stop_label) in enumerate(specs):
+        col = next((c for c in cols.split("|")
+                    if any(c in r for v in rows.values() for r in v)),
+                   cols.split("|")[0])
         div = 1024 if ylabel == "GiB" else 1
         ys = [num(r.get(col)) / div for v in rows.values() for r in v
               if num(r.get(col))]
