@@ -496,8 +496,21 @@ func (a *agentRun) onboard(i int, due time.Time) error {
 		}
 		defer a.p.release(v)
 	} else {
-		err := run(a.addr+"/egres", fmt.Sprintf("CREATE DATABASE tenant_%d", i),
-			2*time.Second, nil)
+		// A server may refuse the create for a moment (a full proposal
+		// queue behind a big flush); a client retries once, and a
+		// database that exists by then was made by the first try.
+		create := fmt.Sprintf("CREATE DATABASE tenant_%d", i)
+		err := run(a.addr+"/egres", create, 2*time.Second, nil)
+		var pe *pgError
+		if err != nil && errors.As(err, &pe) {
+			fmt.Fprintf(os.Stderr, "agents: tenant_%d refused once (%v); "+
+				"retrying\n", i, err)
+			time.Sleep(time.Second)
+			err = run(a.addr+"/egres", create, 2*time.Second, nil)
+			if err != nil && errors.As(err, &pe) && pe.code == "42P04" {
+				err = nil
+			}
+		}
 		if err != nil {
 			return fmt.Errorf("tenant_%d: %w", i, err)
 		}
