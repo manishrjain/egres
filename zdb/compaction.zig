@@ -556,18 +556,22 @@ fn pickL0Merge(self: *Tree, held: Lock.Shared) ?CompactCandidate {
 /// `updateCompactCandidate_` stores the winner and `buildCompaction`
 /// runs it.
 ///
-/// It moves ONE table down as it is when any can, else rewrites a run
-/// of tables (`mergeDownRun`), scored by the level's bytes against its
-/// target. Below L0 the moved table is picked at random among those
-/// that can: always taking the smallest-key table starves higher key
-/// ranges and biases write amplification to the keyspace's left edge.
+/// A level over its target moves ONE table down as it is when any
+/// can, else rewrites a run of tables (`mergeDownRun`); a level at or
+/// under its target wants nothing. The size decides whether there is
+/// work, the move is only the cheapest way to do it: offered on the
+/// mere chance of one, it sent every tenant's single flushed table to
+/// the level above the bottom in two manifest entries, five million
+/// of them in a run of 195,000 tenants. Below L0 the moved table is
+/// picked at random among those that can: always taking the
+/// smallest-key table starves higher key ranges and biases write
+/// amplification to the keyspace's left edge.
 ///
-/// L0 differs in two ways. Only its oldest table may move. Its
-/// rewrite scores the larger of the bytes ratio (L0's target is L1's:
-/// a push of that size costs about two bytes written per byte
-/// drained) and its table count against HALF the backpressure start
-/// count: full-size tables at the target are still too few to score
-/// by count.
+/// L0 differs in two ways. Only its oldest table may move. Its score
+/// is the larger of the bytes ratio (L0's target is L1's: a push of
+/// that size costs about two bytes written per byte drained) and its
+/// table count against HALF the backpressure start count: full-size
+/// tables at the target are still too few to score by count.
 fn pickJob(self: *Tree, held: Lock.Shared, src: usize) ?CompactCandidate {
     const entries = self.levels[src].entries(held);
     if (entries.len == 0) return null;
@@ -575,6 +579,15 @@ fn pickJob(self: *Tree, held: Lock.Shared, src: usize) ?CompactCandidate {
     const opts = self.ground.live.cur();
     const dest = src + 1;
     if (dest >= opts.max_levels) return null;
+
+    const size: u64 = @intCast(self.levels[src].getTotalSize(held));
+    const target: u64 = @intCast(levelTarget(opts, src));
+    var score = ratio(size, target);
+    if (src == 0) {
+        const start_count = opts.l0_backpressure_start_count;
+        score = @max(score, ratio(entries.len * 2, start_count));
+    }
+    if (score <= 1.0) return null;
 
     // For move, L0 can only consider the oldest table. Otherwise, we'd
     // have issues with newer values in lower levels.
@@ -596,13 +609,6 @@ fn pickJob(self: *Tree, held: Lock.Shared, src: usize) ?CompactCandidate {
         };
     }
 
-    const size: u64 = @intCast(self.levels[src].getTotalSize(held));
-    const target: u64 = @intCast(levelTarget(opts, src));
-    var score = ratio(size, target);
-    if (src == 0) {
-        const start_count = opts.l0_backpressure_start_count;
-        score = @max(score, ratio(entries.len * 2, start_count));
-    }
     return .{
         .level = @intCast(src),
         .score = rewriteScore(score),
@@ -1083,8 +1089,6 @@ fn reportJob(
     );
     if (stats.rollups > 0) {
         try _metrics.g().rollups.incrBy(.{
-            .namespace_id = self.namespace,
-            .tree_id = self.tree_id,
             .level = @intCast(dest),
         }, stats.rollups);
     }

@@ -1090,11 +1090,11 @@ pub const Forest = struct {
         changes: []const _manifest.SSTableChange,
         memtable_id: u64,
     ) !void {
-        // Load all new L0 tables concurrently via the cache. The announce
-        // prefetch may have pre-opened these (follower path) → cache hit.
-        // On the leader they will typically be misses. This is the step
-        // that can fail (I/O), so it runs before any state changes: a
-        // retry of the entry then starts from a clean manifest and clean
+        // Load all new L0 tables through the cache: hits, as a rule,
+        // since the announce opened them on every node before the
+        // proposal (`Engine.announceNewFiles`). This is the step that
+        // can fail (I/O), so it runs before any state changes: a retry
+        // of the entry then starts from a clean manifest and clean
         // levels.
         var needed: std.ArrayList(_tree.TableNeed) = .empty;
         defer needed.deinit(self.allocator);
@@ -1115,8 +1115,16 @@ pub const Forest = struct {
             try self.ground.manifest.commit(index, changes, &.{});
         }
 
-        // Install each loaded table into its tree's level. We zip changes and
-        // needed in the same order they were built, so indices align.
+        // Install each loaded table into its tree's level, and the
+        // tree's compaction verdict under the same hold: a flush lists
+        // one table per tree, so every tree here has a new L0 table.
+        // `changes` and `needed` were built in the same order, so they
+        // zip. A flush over 40,000 tenants' trees is 40,000 of these on
+        // the apply fiber, as one step until the meter: the WAL
+        // writer's completion on that worker waited 1.3 s for it. The
+        // tables are listed in the manifest already, so an install seen
+        // half way is what any reader sees meanwhile.
+        var bytes: u64 = 0;
         for (changes, needed.items) |c, n| {
             std.debug.assert(c.sst_id == n.id);
             const tree = self.getTree(
@@ -1130,20 +1138,13 @@ pub const Forest = struct {
                 // A flush output is a new file, so the applying entry's
                 // index is exactly what the manifest just stored for it.
                 try tree.levels[c.level].addEntry(held, n.id, index, n.table.?);
+                try tree.updateCompactCandidate_(held);
             }
-
-            // Metrics: one per-tree flush output + bytes written to L0.
-            try _metrics.g().flushes.incr(.{
-                .namespace_id = c.namespace_id,
-                .tree_id = c.tree_id,
-            });
-            try _metrics.g().bytes_written.incrBy(.{
-                .source = "flush",
-                .namespace_id = c.namespace_id,
-                .tree_id = c.tree_id,
-                .level = @intCast(c.level),
-            }, n.table.?.fileSize());
+            bytes += n.table.?.fileSize();
+            try fiber.ctx().meter();
         }
+        _metrics.g().flushes.incrBy(@intCast(changes.len));
+        try _metrics.g().bytes_written.incrBy(.{ .source = "flush" }, bytes);
 
         // Remove the flushed memtable from local immutables IF it's there.
         // During recovery replay, the memtable's `newMemtable` proposal may
@@ -1151,23 +1152,6 @@ pub const Forest = struct {
         // either is empty or contains a *later* memtable. The SST install
         // above handles the data side; nothing local to remove.
         self.memtables.popOldestIfMatches(memtable_id);
-
-        // Update compaction candidates for affected trees.
-        var seen_trees = std.AutoHashMap(TreeKey, void).init(self.allocator);
-        defer seen_trees.deinit();
-        for (changes) |c| {
-            const tk = TreeKey{
-                .namespace = c.namespace_id,
-                .tree_id = c.tree_id,
-            };
-            if (!seen_trees.contains(tk)) {
-                try seen_trees.put(tk, {});
-                if (self.getTree(tk.namespace, tk.tree_id)) |tree| {
-                    defer tree.release();
-                    try tree.updateCompactCandidate();
-                }
-            }
-        }
     }
 
     /// Compact finds the tree with the highest compaction score and runs one

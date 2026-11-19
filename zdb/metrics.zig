@@ -14,27 +14,21 @@ const String = utils.String;
 // every metric means code paths not wired to a real Metrics instance are still
 // safe to call — the ops become no-ops.
 
-/// Labels for `flushes`: which tree (in which namespace) this flush targeted.
-pub const FlushLabels = struct {
-    namespace_id: u64,
-    tree_id: u64,
-};
+// No metric carries a tree or a namespace: a tenant is a namespace,
+// and 200,000 of them made a series per tree, a label lookup under
+// the counter's lock on every table a flush installed and a scrape
+// of 400,000 lines. What a tenant used is the meter's, not a metric.
 
-/// Labels for `compactions`: which tree, at which destination level.
+/// Labels for `compactions` and `rollups`: the destination level.
 pub const CompactionLabels = struct {
-    namespace_id: u64,
-    tree_id: u64,
     level: u8,
 };
 
-/// Labels for `bytes_written`: write source (user|flush|compact) plus the
-/// coordinate fields that are known at emit time. User writes don't know the
-/// destination tree/level yet, so those default to 0 (sentinel "not applicable").
+/// Labels for `bytes_written`: write source (user|flush|compact) and
+/// the destination level, 0 for user writes, which land in a memtable.
 /// Write amp = sum(bytes_written) / sum(bytes_written{source="user"}).
 pub const BytesWrittenLabels = struct {
     source: String,
-    namespace_id: u64 = 0,
-    tree_id: u64 = 0,
     level: u8 = 0,
 };
 
@@ -65,14 +59,14 @@ pub const CompactionHist =
 /// Top-level handle. Construct once in main, pass to Forest/Tree/server.
 /// Adding a new metric is a one-line field here plus a call-site update.
 pub const Metrics = struct {
-    /// Per-tree flush outputs — incr once per SST produced by a memtable flush.
-    flushes: m.CounterVec(u64, FlushLabels),
-    /// Per-tree-per-level compactions — incr once per completed compaction run.
+    /// Tables a memtable flush produced, one per tree it touched.
+    flushes: m.Counter(u64),
+    /// Completed compaction runs, per destination level.
     compactions: m.CounterVec(u64, CompactionLabels),
     /// Roaring delta chains folded into a synthetic state during
     /// compaction (leader-only; incremented at build time).
     rollups: m.CounterVec(u64, CompactionLabels),
-    /// Bytes written, sliced by source + tree coordinates.
+    /// Bytes written, by source and destination level.
     bytes_written: m.CounterVec(u64, BytesWrittenLabels),
     /// How long each write batch slept in the L0 brake
     /// (`Engine.applyWriteBackpressure`); batches that did not sleep
@@ -86,13 +80,8 @@ pub const Metrics = struct {
     pub fn init(allocator: std.mem.Allocator) !Metrics {
         const io = utils.context.g().io;
         return .{
-            .flushes = try m.CounterVec(u64, FlushLabels).init(
-                allocator,
-                io,
-                "zdb_flushes_total",
-                .{},
-                .{},
-            ),
+            // A comptime counter: no allocator, nothing to deinit.
+            .flushes = m.Counter(u64).init("zdb_flushes_total", .{}, .{}),
             .compactions = try m.CounterVec(u64, CompactionLabels).init(
                 allocator,
                 io,
@@ -131,7 +120,6 @@ pub const Metrics = struct {
     }
 
     pub fn deinit(self: *Metrics) void {
-        self.flushes.deinit();
         self.compactions.deinit();
         self.rollups.deinit();
         self.bytes_written.deinit();

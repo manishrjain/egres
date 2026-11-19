@@ -867,10 +867,11 @@ pub const Tree = struct {
         if (changes.len == 0) return;
 
         // Batch-load all CREATE tables via the cache in a single concurrent
-        // pass. writeFile may have pre-opened them (follower path) → hit;
-        // otherwise loadTables opens them. This is the step that can fail
-        // (I/O), so it runs before any state changes: a retry of the
-        // entry then starts from a clean manifest and clean levels.
+        // pass: hits, as a rule, since the announce opened them on every
+        // node before the proposal (`Engine.announceNewFiles`). This is
+        // the step that can fail (I/O), so it runs before any state
+        // changes: a retry of the entry then starts from a clean
+        // manifest and clean levels.
         var needed: std.ArrayList(TableNeed) = .empty;
         defer needed.deinit(self.ground.allocator);
         for (changes) |c| {
@@ -931,17 +932,10 @@ pub const Tree = struct {
         }
 
         // Metrics: one compaction run, plus bytes written to the dest level.
-        const ns_id = self.namespace;
         if (dest_level) |lvl| {
-            try _metrics.g().compactions.incr(.{
-                .namespace_id = ns_id,
-                .tree_id = self.tree_id,
-                .level = lvl,
-            });
+            try _metrics.g().compactions.incr(.{ .level = lvl });
             try _metrics.g().bytes_written.incrBy(.{
                 .source = "compact",
-                .namespace_id = ns_id,
-                .tree_id = self.tree_id,
                 .level = lvl,
             }, bytes_out);
         }

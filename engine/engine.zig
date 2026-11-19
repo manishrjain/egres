@@ -257,7 +257,6 @@ pub const StorageImpl = struct {
         for (items) |it| total_bytes += it.newest().value.len;
         try metrics.g().bytes_written.incrBy(.{
             .source = "user",
-            .namespace_id = ns,
         }, total_bytes);
     }
 
@@ -1737,6 +1736,8 @@ pub const Engine = struct {
     ) !void {
         var files: std.ArrayList(raft.buffers.FileRefStruct) = .empty;
         defer files.deinit(self.allocator);
+        var needed: std.ArrayList(zdb.tree.TableNeed) = .empty;
+        defer needed.deinit(self.allocator);
         for (changes) |c| {
             if (c.op != .create) continue;
             try files.append(self.allocator, .{
@@ -1744,9 +1745,27 @@ pub const Engine = struct {
                 .size = c.size,
                 .index_offset = c.index_offset,
             });
+            try needed.append(self.allocator, .{
+                .id = c.sst_id,
+                .level = c.level,
+                .extent = .{ .size = c.size, .index_offset = c.index_offset },
+            });
         }
         if (files.items.len == 0) return;
-        try self.node.announceAndWaitForFileQuorum(files.items);
+        // This node applies the entry too, and a flush over 40,000
+        // tenants' trees opened its 40,000 tables on the apply fiber,
+        // 0.6 s every data entry behind it waited. Here they open on
+        // a fiber of their own while the followers open theirs, and
+        // the proposal waits for the slower side, not for both in
+        // turn. A table of a change that never applies is evicted with
+        // its file (`Forest.removeUnlisted`, the orphan scan).
+        var opens = try fiber.spawn(.{}, Forest.prefetch, .{
+            self.forest, needed.items,
+        });
+        // Joined whatever the announce did: `needed` is this frame's.
+        const announced = self.node.announceAndWaitForFileQuorum(files.items);
+        try opens.join();
+        try announced;
     }
 
     /// Write backpressure: sleep proportional to how many L0 tables the
