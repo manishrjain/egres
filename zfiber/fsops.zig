@@ -18,6 +18,12 @@
 //!   - The pool is the natural seam for a cross-platform op implementation
 //!     later (it can call blocking std-library I/O without blocking a fiber).
 //!
+//! A queue per lane, the raft lane's taken first. A flush over 20,000
+//! tenants is 40,000 jobs here, a create and an fsync per table, and
+//! the wal's rename and directory sync at a rotation queued behind
+//! every one of them: seconds, under the wal lock. A raft-lane fiber's
+//! job now waits for one job to finish, never for the queue.
+//!
 //! This module is intentionally I/O-agnostic: it only knows how to run an
 //! arbitrary function off-fiber and wake the caller. Callers (e.g. `fs.zig`)
 //! supply the actual syscall.
@@ -27,6 +33,7 @@ const _fb = @import("fiber.zig");
 const _rt = @import("runtime.zig");
 
 const Fiber = _fb.Fiber;
+const Lane = _fb.Lane;
 
 /// A unit of work on the pool. Embedded in the caller's `run` frame (which
 /// lives on the parked fiber's stack).
@@ -60,14 +67,49 @@ pub fn io() std.Io {
     return io_backend.io();
 }
 
+/// An intrusive FIFO of jobs, under the pool's mutex.
+const Queue = struct {
+    head: ?*Job = null,
+    tail: ?*Job = null,
+
+    fn push(self: *Queue, job: *Job) void {
+        job.next = null;
+        if (self.tail) |t| {
+            t.next = job;
+        } else {
+            self.head = job;
+        }
+        self.tail = job;
+    }
+
+    fn pop(self: *Queue) ?*Job {
+        const job = self.head orelse return null;
+        self.head = job.next;
+        if (self.head == null) self.tail = null;
+        return job;
+    }
+};
+
 const Pool = struct {
     threads: []std.Thread = &.{},
     allocator: std.mem.Allocator = undefined,
     mu: Mutex = .init,
     cond: Condition = .init,
-    head: ?*Job = null,
-    tail: ?*Job = null,
+    /// A queue per lane: the raft lane's jobs, the wal's and the
+    /// transport's, ahead of the default lane's, a flush's or a
+    /// compaction's syncs by the thousand.
+    queues: [Lane.count]Queue = .{ .{}, .{} },
     stopping: bool = false,
+
+    fn push(self: *Pool, job: *Job, lane: Lane) void {
+        self.queues[@intFromEnum(lane)].push(job);
+    }
+
+    /// The raft lane's first, then the default lane's.
+    fn pop(self: *Pool) ?*Job {
+        if (self.queues[@intFromEnum(Lane.raft)].pop()) |j| return j;
+        return self.queues[@intFromEnum(Lane.default)].pop();
+    }
 };
 
 var pool: Pool = .{};
@@ -89,8 +131,7 @@ pub fn start(allocator: std.mem.Allocator, num_threads: usize) !void {
     pool.allocator = allocator;
     pool.mu = .init;
     pool.cond = .init;
-    pool.head = null;
-    pool.tail = null;
+    pool.queues = .{ .{}, .{} };
     pool.stopping = false;
     pool.threads = try allocator.alloc(std.Thread, n);
     errdefer allocator.free(pool.threads);
@@ -125,31 +166,25 @@ pub fn stop() void {
     pool.threads = &.{};
 }
 
-fn enqueue(job: *Job) void {
+fn enqueue(job: *Job, lane: Lane) void {
     pool.mu.lockUncancelable(io());
     defer pool.mu.unlock(io());
-    job.next = null;
-    if (pool.tail) |t| {
-        t.next = job;
-    } else {
-        pool.head = job;
-    }
-    pool.tail = job;
+    pool.push(job, lane);
     pool.cond.signal(io());
 }
 
 fn workerLoop() void {
     while (true) {
         pool.mu.lockUncancelable(io());
-        while (pool.head == null and !pool.stopping) pool.cond.waitUncancelable(io(), &pool.mu);
-        if (pool.head == null) {
-            // Woken with no work → stopping.
-            pool.mu.unlock(io());
-            return;
-        }
-        const job = pool.head.?;
-        pool.head = job.next;
-        if (pool.head == null) pool.tail = null;
+        const job = while (true) {
+            if (pool.pop()) |j| break j;
+            // Woken with no work: stopping.
+            if (pool.stopping) {
+                pool.mu.unlock(io());
+                return;
+            }
+            pool.cond.waitUncancelable(io(), &pool.mu);
+        };
         pool.mu.unlock(io());
 
         job.run_fn(job);
@@ -182,12 +217,13 @@ pub fn run(comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) Retu
         }
     };
 
+    const self = _rt.currentFiber();
     var frame: Frame = .{
-        .job = .{ .run_fn = Frame.trampoline, .fiber = _rt.currentFiber() },
+        .job = .{ .run_fn = Frame.trampoline, .fiber = self },
         .args = args,
         .result = undefined,
     };
-    enqueue(&frame.job);
+    enqueue(&frame.job, self.lane);
 
     _rt.park();
     // Invariant: this fiber parks and resumes ONLY when the pool ran its job and
