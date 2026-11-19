@@ -341,6 +341,10 @@ pub const wal = struct {
 
         // Open all files except the last as rotated (read slots from header).
         // The last (highest fid) is the current file (indexed from its records).
+        // A file prepared ahead and never rotated in is that last one,
+        // filled and empty; the file that was current sits below it with
+        // the empty header it was created with, and `openRotated` indexes
+        // it from its records.
         var opened = std.ArrayList(LogFile).empty;
         errdefer {
             for (opened.items) |*lf| lf.deinit();
@@ -675,6 +679,17 @@ pub const wal = struct {
     /// next file comes first: when there is none, the current one is
     /// left as it was and the next append asks again.
     fn rotate(self: *wal) !void {
+        // Under the wal lock: for as long as this takes, no append is
+        // buffered and the writer takes nothing, so a slow one is a
+        // stall of every commit. Named so a log shows it.
+        const t0 = utils.coarseMs();
+        defer {
+            const took = utils.coarseMs() - t0;
+            if (took >= 20) log.warn(
+                "rotation to log file {d} held the wal lock {d} ms",
+                .{ self.current.fid, took },
+            );
+        }
         var nf = try self.next.swapIn();
         errdefer nf.deinit();
 

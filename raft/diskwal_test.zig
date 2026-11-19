@@ -32,6 +32,13 @@ fn awaitReady(next: *const raft.diskwal.NextLog) void {
     while (!next.isReady()) fiber.sleepMs(1);
 }
 
+/// Until no prepare is running: an append starts one, and the file it
+/// makes is a log file on disk once its fill is done, so a count of
+/// them is settled only after.
+fn settleNext(next: *const raft.diskwal.NextLog) void {
+    while (next.creating != null and !next.isReady()) fiber.sleepMs(1);
+}
+
 /// Raw bytes of a WAL file at `off`, through vfs: a test that corrupts
 /// or inspects one reaches the same disk the WAL wrote, simulated or
 /// real.
@@ -456,19 +463,22 @@ test "diskwal: no entry goes into a file whose name is not durable" {
     {
         var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
         defer ds.deinit();
-        ds.wal_store.next.prepare();
-        awaitReady(&ds.wal_store.next);
         for (1..4) |i| {
             fillLargePayload(payload, @intCast(i));
             try appendEntry(alloc, &ds, @intCast(i), 1, payload);
         }
         try ds.sync();
 
-        // The fourth record rotates: the prepared file is renamed in
-        // and the directory's sync fails. A power cut would bring the
-        // file back under its tmp name, so the record is refused.
+        // The directory's sync fails: the file prepared now is never
+        // ready under a durable name, and the fourth record, which
+        // rotates, gets no file whose name is. A power cut would bring
+        // either back under its tmp name or not at all, so the record
+        // is refused.
         try disk.setFaults(wal_dir, .{ .sync = 1000 });
         defer disk.setFaults(wal_dir, .{}) catch {};
+        ds.wal_store.next.discard();
+        ds.wal_store.next.prepare();
+        awaitReady(&ds.wal_store.next);
         fillLargePayload(payload, 4);
         try std.testing.expectError(
             error.Unavailable,
@@ -1952,27 +1962,32 @@ test "diskwal prepared log file: renamed in at rotation, a spare at open" {
     {
         var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
         defer ds.deinit();
-        // Prepare log file 2 as the sync fiber would, and let it finish.
+        // Prepare log file 2 as the sync fiber would, and let it
+        // finish: filled, and a log file by name already.
         ds.wal_store.next.prepare();
         awaitReady(&ds.wal_store.next);
-        try std.testing.expect(try dirHas(wal_dir, "00002.wal.tmp"));
-        try std.testing.expect(!try dirHas(wal_dir, "00002.wal"));
+        try std.testing.expect(try dirHas(wal_dir, "00002.wal"));
+        try std.testing.expect(!try dirHas(wal_dir, "00002.wal.tmp"));
 
-        // Four 300 KiB records cross 1 MiB: the fourth rotates.
+        // Four 300 KiB records cross 1 MiB: the fourth rotates, and
+        // its append prepares file 3.
         for (1..5) |i| {
             fillLargePayload(payload, @intCast(i));
             try appendEntry(alloc, &ds, @intCast(i), 1, payload);
         }
         try ds.sync();
-        try std.testing.expect(try dirHas(wal_dir, "00002.wal"));
-        try std.testing.expect(!try dirHas(wal_dir, "00002.wal.tmp"));
-        try std.testing.expectEqual(@as(usize, 2), try countWalFiles(wal_dir));
+        settleNext(&ds.wal_store.next);
+        try std.testing.expect(try dirHas(wal_dir, "00003.wal"));
+        try std.testing.expect(!try dirHas(wal_dir, "00003.wal.tmp"));
+        try std.testing.expectEqual(@as(usize, 3), try countWalFiles(wal_dir));
     }
-    // A prepared log file left behind by a crash is a spare at the
-    // next open; one whose fill was cut short is removed. The log
-    // files around them are untouched.
+    // A prepared log file left behind by a crash is the current one
+    // at the next open, and the file before it, whose header was
+    // never written, is indexed from its records. A spare left behind
+    // is a spare again; one whose fill was cut short is removed. The
+    // log files around them are untouched.
     {
-        var stray = try raft.diskwal.LogFile.createNamed(vfs.g(), alloc, wal_dir, "00003.wal.tmp", 3, opts);
+        var stray = try raft.diskwal.LogFile.createNamed(vfs.g(), alloc, wal_dir, "00004.wal.tmp", 4, opts);
         stray.deinit();
         const short = try std.fmt.allocPrint(
             alloc,
@@ -1985,8 +2000,9 @@ test "diskwal prepared log file: renamed in at rotation, a spare at open" {
     {
         var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
         defer ds.deinit();
-        try std.testing.expect(try dirHas(wal_dir, "00003.wal.tmp"));
+        try std.testing.expect(try dirHas(wal_dir, "00004.wal.tmp"));
         try std.testing.expect(!try dirHas(wal_dir, "00007.wal.tmp"));
+        try std.testing.expectEqual(@as(u64, 3), ds.wal_store.current.fid);
         try std.testing.expectEqual(@as(u64, 4), ds.lastIndex());
         for (1..5) |i| try std.testing.expectEqual(@as(?u64, 1), try ds.term(@intCast(i)));
         fillLargePayload(payload, 5);
@@ -2155,15 +2171,18 @@ test "diskwal: an unfilled log file rotates once the prepared one is ready" {
     defer ds.deinit();
 
     // Mark the current file as one handed out unfilled, with the
-    // next one prepared and ready: the next append rotates.
+    // next one prepared and ready: the next append rotates. The
+    // prepared file is a log file on disk from the moment it is ready.
     try appendRange(alloc, &ds, 1, 3, 1);
-    try std.testing.expectEqual(@as(usize, 1), try countWalFiles(wal_dir));
+    settleNext(&ds.wal_store.next);
+    try std.testing.expectEqual(@as(usize, 2), try countWalFiles(wal_dir));
     ds.wal_store.current.filled = false;
     ds.wal_store.next.prepare();
     awaitReady(&ds.wal_store.next);
     try appendRange(alloc, &ds, 4, 4, 1);
     try ds.sync();
-    try std.testing.expectEqual(@as(usize, 2), try countWalFiles(wal_dir));
+    settleNext(&ds.wal_store.next);
+    try std.testing.expectEqual(@as(usize, 3), try countWalFiles(wal_dir));
     try std.testing.expect(ds.wal_store.current.filled);
     try checkRange(&ds, 1, 5);
 }
@@ -2233,12 +2252,13 @@ test "diskwal: a trimmed log file is reused, its old records unread" {
         }
         try appendPreparedSnapshot(alloc, &ds, payload, 12, 8);
         try ds.sync();
-        try std.testing.expectEqual(@as(usize, 4), try countWalFiles(wal_dir));
+        settleNext(&ds.wal_store.next);
+        try std.testing.expectEqual(@as(usize, 5), try countWalFiles(wal_dir));
 
         // A cut at 8 drops files 1 and 2. Three rotations since the
         // start, so the pool keeps both, as spares.
         try ds.compactUntil(8);
-        try std.testing.expectEqual(@as(usize, 2), try countWalFiles(wal_dir));
+        try std.testing.expectEqual(@as(usize, 3), try countWalFiles(wal_dir));
         try std.testing.expectEqual(@as(usize, 2), spares.items.len);
         try std.testing.expect(try dirHas(wal_dir, "00001.wal.tmp"));
         try std.testing.expect(try dirHas(wal_dir, "00002.wal.tmp"));
@@ -2305,12 +2325,14 @@ test "diskwal: a pooled log file nobody took goes at the next trim" {
     try ds.compactUntil(8);
     try std.testing.expectEqual(@as(usize, 2), spares.items.len);
 
-    // No rotation since that trim: the next one keeps none.
+    // No rotation since that trim: the next one keeps none. Files 3
+    // and 4 stay, with the one prepared after record 12.
     try ds.compactUntil(8);
     try std.testing.expectEqual(@as(usize, 0), spares.items.len);
     try std.testing.expect(!try dirHas(wal_dir, "00001.wal.tmp"));
     try std.testing.expect(!try dirHas(wal_dir, "00002.wal.tmp"));
-    try std.testing.expectEqual(@as(usize, 2), try countWalFiles(wal_dir));
+    settleNext(&ds.wal_store.next);
+    try std.testing.expectEqual(@as(usize, 3), try countWalFiles(wal_dir));
 }
 
 test "diskwal: the pool keeps at most max_spare_log_files" {
@@ -2361,25 +2383,29 @@ test "diskwal: spare log files are taken up again after a restart" {
         try appendPreparedSnapshot(alloc, &ds, payload, 12, 8);
         try ds.compactUntil(8);
     }
-    // Left on disk: the two pooled files and the one that was prepared.
+    // Left on disk: the two pooled files, and the one that was
+    // prepared as log file 5, empty.
     try std.testing.expect(try dirHas(wal_dir, "00001.wal.tmp"));
     try std.testing.expect(try dirHas(wal_dir, "00002.wal.tmp"));
-    try std.testing.expect(try dirHas(wal_dir, "00005.wal.tmp"));
+    try std.testing.expect(try dirHas(wal_dir, "00005.wal"));
 
     var ds = try raft.DiskWAL.openPath(wal_dir, alloc, reuse_opts);
     defer ds.deinit();
     try std.testing.expectEqual(@as(u64, 8), ds.snapshot().index);
     const next = &ds.wal_store.next;
-    try std.testing.expectEqual(@as(usize, 3), next.spares.items.len);
-    // No new file takes a fid a spare holds.
+    try std.testing.expectEqual(@as(usize, 2), next.spares.items.len);
+    // The prepared file is the current one; no new file takes a fid a
+    // spare holds.
+    try std.testing.expectEqual(@as(u64, 5), ds.wal_store.current.fid);
     try std.testing.expectEqual(@as(u64, 6), next.next_fid);
 
-    // 13 rotates into one of the spares; the prepare after it takes
-    // another.
+    // 13 goes into file 5; the prepare before it takes one of the
+    // spares, as file 6.
     try appendPrepared(alloc, &ds, payload, 13);
     try ds.sync();
-    awaitReady(next);
-    try std.testing.expectEqual(@as(usize, 3), try countWalFiles(wal_dir));
+    settleNext(next);
+    try std.testing.expect(try dirHas(wal_dir, "00006.wal"));
+    try std.testing.expectEqual(@as(usize, 4), try countWalFiles(wal_dir));
     try std.testing.expectEqual(@as(usize, 1), next.spares.items.len);
     try std.testing.expectEqual(@as(u64, 13), ds.lastIndex());
 }
