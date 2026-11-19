@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -405,4 +406,53 @@ func readTargets(path string, limit int) []string {
 		t = t[:limit]
 	}
 	return t
+}
+
+// cgroupDir is the probe's own cgroup, where the harness's in_cgroup
+// put the whole test: the platform's processes and the probe.
+func cgroupDir() string {
+	raw, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(line, "0::") {
+			return "/sys/fs/cgroup" + strings.TrimPrefix(line, "0::")
+		}
+	}
+	return ""
+}
+
+// platformCPU is the CPU seconds the platform has used so far: the
+// test's cgroup (cpu.stat usage_usec: every process in it, user and
+// kernel time, the VMs' guest time included) less the probe's own.
+// Both sides are read from the same source this way; a window's
+// figure is the difference of two readings. -1 without a cgroup.
+func platformCPU() float64 {
+	dir := cgroupDir()
+	if dir == "" {
+		return -1
+	}
+	raw, err := os.ReadFile(dir + "/cpu.stat")
+	if err != nil {
+		return -1
+	}
+	usage := -1.0
+	for _, line := range strings.Split(string(raw), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 2 && f[0] == "usage_usec" {
+			us, _ := strconv.ParseFloat(f[1], 64)
+			usage = us / 1e6
+		}
+	}
+	if usage < 0 {
+		return -1
+	}
+	var ru syscall.Rusage
+	if syscall.Getrusage(syscall.RUSAGE_SELF, &ru) != nil {
+		return -1
+	}
+	self := float64(ru.Utime.Sec) + float64(ru.Utime.Usec)/1e6 +
+		float64(ru.Stime.Sec) + float64(ru.Stime.Usec)/1e6
+	return usage - self
 }

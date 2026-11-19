@@ -90,6 +90,13 @@ in_cgroup() {
 }
 cgroup_dir() { echo "/sys/fs/cgroup$(sed -n 's#^0::##p' /proc/self/cgroup)"; }
 cgroup_limited() { [ "$(cat "$(cgroup_dir)/memory.max" 2>/dev/null)" != max ]; }
+# The cgroup's CPU seconds so far, every process in it, user and
+# kernel time (cpu.stat usage_usec); "" without a limit, when the
+# cgroup is whatever shell started the test.
+cgroup_cpu_s() {
+    cgroup_limited || return 0
+    awk '$1 == "usage_usec" {printf "%.1f", $2 / 1e6}' "$(cgroup_dir)/cpu.stat"
+}
 # All the cgroup is charged, file cache included; "" without a limit.
 cgroup_kb() {
     cgroup_limited || return 0

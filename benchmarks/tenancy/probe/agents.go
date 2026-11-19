@@ -57,7 +57,7 @@ const (
 
 var kindNames = [numKinds]string{"point", "range", "update", "insert", "count"}
 
-const header = "tenants,awake,held_mib,cache_mib,disk_mib,read_mib_s,write_mib_s," +
+const header = "tenants,awake,held_mib,cache_mib,disk_mib,read_mib_s,write_mib_s,cpu_s," +
 	"onboard_p50_ms,onboard_p95_ms,onboard_p99_ms," +
 	"first_p50_ms,first_p95_ms,first_p99_ms," +
 	"wake_p50_ms,wake_p95_ms,wake_p99_ms,woke_pct,sleeps_per_s,wakes_per_s," +
@@ -628,6 +628,7 @@ func (a *agentRun) window(d time.Duration) windowRow {
 		a.p.measure(true)
 	}
 	read0, written0 := diskIO(a.disk)
+	cpu0 := platformCPU()
 	end := start.Add(d)
 	// Shared: the cgroup's figure, as the VM side's; the server's PSS
 	// when there is no cgroup limit.
@@ -650,6 +651,7 @@ func (a *agentRun) window(d time.Duration) windowRow {
 	a.winEnd = time.Now()
 	stop := a.winEnd
 	read1, written1 := diskIO(a.disk)
+	cpu1 := platformCPU()
 	var open []*sessionRun
 	for s := range a.running {
 		open = append(open, s)
@@ -685,6 +687,12 @@ func (a *agentRun) window(d time.Duration) windowRow {
 		}
 		return f2(float64(after-before) / 1024 / secs)
 	}
+	// The platform's CPU seconds over the window, both sides from the
+	// test's cgroup; "" without one.
+	cpu := ""
+	if cpu0 >= 0 && cpu1 >= 0 {
+		cpu = fmt.Sprintf("%.1f", cpu1-cpu0)
+	}
 	cells := []string{strconv.Itoa(a.count)}
 	if a.p != nil {
 		woke := 0.0
@@ -693,7 +701,7 @@ func (a *agentRun) window(d time.Duration) windowRow {
 		}
 		cells = append(cells, f0(awakeAvg), f0(heldMiB), "",
 			f0(diskUsedMiB(a.p.run)),
-			ioRate(read0, read1), ioRate(written0, written1),
+			ioRate(read0, read1), ioRate(written0, written1), cpu,
 			pctCell(onboard, 0.5), pctCell(onboard, 0.95), pctCell(onboard, 0.99),
 			pctCell(first, 0.5), pctCell(first, 0.95), pctCell(first, 0.99),
 			pctCell(wake, 0.5), pctCell(wake, 0.95), pctCell(wake, 0.99),
@@ -705,7 +713,7 @@ func (a *agentRun) window(d time.Duration) windowRow {
 			held = f0(float64(heldSum) / float64(heldN) / 1024)
 		}
 		cells = append(cells, "", held, cacheMiB(a.admin), "",
-			ioRate(read0, read1), ioRate(written0, written1),
+			ioRate(read0, read1), ioRate(written0, written1), cpu,
 			pctCell(onboard, 0.5), pctCell(onboard, 0.95), pctCell(onboard, 0.99),
 			pctCell(first, 0.5), pctCell(first, 0.95), pctCell(first, 0.99),
 			"", "", "", "", "", "")

@@ -37,13 +37,20 @@ cache() {
     [ "$(type -t tenants_cache_kb)" = function ] && mib "$(tenants_cache_kb)" ||
         true
 }
-# One row: the state, then memory, disk and whatever the caller adds.
+# One row: the state, then memory, disk and whatever the caller adds,
+# then the platform's CPU seconds since the previous row (the test's
+# cgroup; in a settle row that is the idle tenants' housekeeping).
+last_cpu=
 row() {
-    local n=$1 state=$2
+    local n=$1 state=$2 now cpu=
     shift 2
+    now=$(cgroup_cpu_s)
+    [ -z "$now" ] || [ -z "$last_cpu" ] ||
+        cpu=$(awk -v a="$last_cpu" -v b="$now" 'BEGIN {printf "%.1f", b - a}')
+    last_cpu=$now
     echo "$n,$state,$(mib "$(tenants_pss_kb)"),$(mib "$(mem_held_kb)")," \
         "$(mib "$(cgroup_kb)"),$(cache),$(mib "$(tenants_disk_kb)")," \
-        "$(fds),$*" | tr -d ' ' | tee -a "$out"
+        "$(fds),$*,$cpu" | tr -d ' ' | tee -a "$out"
 }
 
 platform_down
@@ -52,7 +59,7 @@ platform_up
 # cache_mib: a server's block cache (Egres's memory report), the
 # server's choice rather than the tenants' cost; the fit takes it off.
 echo "tenants,state,pss_mib,held_mib,cgroup_mib,cache_mib,disk_mib," \
-    "open_files,p50_ms,p95_ms,p99_ms,ok,errors" | tr -d ' ' | tee "$out"
+    "open_files,p50_ms,p95_ms,p99_ms,ok,errors,cpu_s" | tr -d ' ' | tee "$out"
 sleep 5
 # The platform with no tenants: its fixed cost.
 row 0 loaded ",,,,"
