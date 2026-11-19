@@ -19,7 +19,8 @@ Each test is one script that runs against a platform, `BACKEND=vm`,
 
 1. **`noisy`: isolation.** 50 quiet tenants send an occasional point
    read while 0 to 64 heavy tenants each run one statement flat out,
-   a count over 100,000 rows or an update of 1,000 of them. Reported:
+   a sort of 10,000 rows by an unindexed column or an update of 1,000
+   of them. Reported:
    the quiet tenants' latency at each heavy count.
 2. **`footprint`: what a tenant costs, and how many fit.** Tenants are
    brought up to each count in turn; after each, point reads at

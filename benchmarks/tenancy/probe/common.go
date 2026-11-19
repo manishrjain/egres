@@ -228,6 +228,25 @@ func pointCheck(id int) checker {
 	}
 }
 
+// valueShapeCheck: one row whose value has the shape every v in a
+// tenant's table has, 32 hex characters first; for a reply whose
+// exact row the probe cannot know cheaply, such as a sort's maximum.
+func valueShapeCheck(r *result) error {
+	v, err := oneValue(r, "sort")
+	if err != nil {
+		return err
+	}
+	if len(v) < 32 {
+		return fmt.Errorf("sort: got %q, want a 32-hex value", short(v))
+	}
+	for _, c := range v[:32] {
+		if !strings.ContainsRune("0123456789abcdef", c) {
+			return fmt.Errorf("sort: got %q, want a 32-hex value", short(v))
+		}
+	}
+	return nil
+}
+
 // countCheck: one row, one number between lo and hi.
 func countCheck(lo, hi int) checker {
 	return func(r *result) error {

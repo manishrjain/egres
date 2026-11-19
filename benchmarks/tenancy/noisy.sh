@@ -7,7 +7,8 @@
 # out on CONNS connections. What is reported is the quiet tenants'
 # latency at each heavy count; the row with 0 heavy tenants is what the
 # others are compared with (probe/noisy.go). Every tenant holds ROWS
-# rows. Two kinds of heavy statement: cpu, a count over the table;
+# rows. Two kinds of heavy statement: cpu, a sort of 10,000 rows by
+# the unindexed column;
 # write, an UPDATE of a random 1,000-row range.
 #
 # A micro-VM tenant can use no more than its vCPU, but nothing reserves
@@ -46,7 +47,12 @@ out=$RES/noisy.csv
 
 heavy_sql() {
     case $1 in
-    cpu) echo "SELECT count(*) FROM t" ;;
+    # A sort of 10,000 rows by the unindexed column: every engine has
+    # to read and decode the rows and spend the comparisons, in memory;
+    # a count(*) Postgres answers from the index and the visibility map
+    # without touching a row (3 ms against Egres's 14 at 100K rows).
+    cpu) echo "SELECT v FROM t WHERE id BETWEEN {R} AND {E}" \
+        "ORDER BY v DESC LIMIT 1" ;;
     write) echo "UPDATE t SET v = '{s}' WHERE id BETWEEN {r} AND {e}" ;;
     *) echo "unknown kind: $1" >&2; exit 1 ;;
     esac

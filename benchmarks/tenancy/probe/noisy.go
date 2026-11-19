@@ -39,6 +39,12 @@ func fill(sql string, rows int) string {
 		sql = strings.ReplaceAll(sql, "{r}", fmt.Sprint(r))
 		sql = strings.ReplaceAll(sql, "{e}", fmt.Sprint(r+999))
 	}
+	// {R}..{E}: a 10,000-row range, the CPU-heavy statement's sort.
+	if strings.Contains(sql, "{R}") {
+		r := 1 + rand.Intn(max(1, rows-10000))
+		sql = strings.ReplaceAll(sql, "{R}", fmt.Sprint(r))
+		sql = strings.ReplaceAll(sql, "{E}", fmt.Sprint(r+9999))
+	}
 	if strings.Contains(sql, "{s}") {
 		sql = strings.ReplaceAll(sql, "{s}", randText(nil))
 	}
@@ -76,11 +82,15 @@ func noisy(args []string) {
 	}
 
 	// The heavy statement's reply is checked where it can be: a count
-	// over the table must be the rows it holds. The heavy UPDATE is
-	// over a random range of rows the heavy tenants own; no check.
+	// over the table must be the rows it holds; a sort's one row must
+	// be a value of the table (32 hex characters, or an update's text
+	// behind them). The heavy UPDATE is over a random range of rows
+	// the heavy tenants own; no check.
 	var heavyCheck checker
 	if strings.HasPrefix(*sql, "SELECT count(*)") {
 		heavyCheck = countCheck(*rows, *rows)
+	} else if strings.HasPrefix(*sql, "SELECT v") {
+		heavyCheck = valueShapeCheck
 	}
 
 	// The quiet tenants' pools. Each connection has answered a query
