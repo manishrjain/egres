@@ -3,7 +3,7 @@
 
 // The micro-VM platform's control plane, for agents -backend vm: one
 // Firecracker VM per tenant, made from a blank data image when the
-// tenant arrives, put to sleep when memory is over budget and woken
+// tenant onboards, put to sleep when memory is over budget and woken
 // when a session starts for it.
 //
 // Sleep pauses the guest, writes a full snapshot (memory and device
@@ -38,7 +38,7 @@ const (
 	waking
 	awake
 	sleeping
-	broken // its arrival failed; nothing uses it
+	broken // its onboarding failed; nothing uses it
 )
 
 // How long a launched VM has to answer SQL.
@@ -50,7 +50,7 @@ type vm struct {
 	state int
 	// Closed when the wake or the sleep under way is over.
 	done chan struct{}
-	// Sessions (and the arrival) using it; never put to sleep while > 0.
+	// Sessions (and the onboarding) using it; never put to sleep while > 0.
 	holds int
 	last  time.Time
 	cmd   *exec.Cmd
@@ -63,14 +63,14 @@ type vm struct {
 
 type platform struct {
 	mu  sync.Mutex
-	vms []*vm // by tenant; nil before its arrival
+	vms []*vm // by tenant; nil before its onboarding
 
 	fc, kernel, rootfs, blank, run string
 	cpus                           string // the VMs' CPU list; "" = any
 	memMiB                         int
 	boot                           bool
 	budget                         int64 // KiB; 0 = no budget, nothing sleeps
-	// Over budget at the last reading: an arrival waits for room.
+	// Over budget at the last reading: an onboarding waits for room.
 	over bool
 
 	// What the measurement window reads; counted while measuring.
@@ -375,7 +375,7 @@ func (p *platform) kill(v *vm) {
 
 // create makes tenant i's VM from the blank image, boots it and waits
 // for Postgres to answer. On success the VM is held, as acquire would
-// hold it, until release: the arrival still has to load its table.
+// hold it, until release: the onboarding still has to load its table.
 func (p *platform) create(i int) (*vm, error) {
 	v := &vm{id: i, dir: filepath.Join(p.run, fmt.Sprintf("vm%d", i)),
 		state: waking, done: make(chan struct{})}
@@ -388,8 +388,8 @@ func (p *platform) create(i int) (*vm, error) {
 
 	err := func() error {
 		// Admission: a new VM waits for the budget to have room, as a
-		// platform would hold an arrival rather than run out of memory.
-		// The wait is in the arrival's latency; a platform that cannot
+		// platform would hold an onboarding rather than run out of memory.
+		// The wait is in the onboarding's latency; a platform that cannot
 		// make room in the time a wake is allowed has refused it.
 		deadline := time.Now().Add(wakeTimeout)
 		for {
@@ -400,7 +400,7 @@ func (p *platform) create(i int) (*vm, error) {
 				break
 			}
 			if time.Now().After(deadline) {
-				return fmt.Errorf("no room for an arrival within %s",
+				return fmt.Errorf("no room for an onboarding within %s",
 					wakeTimeout)
 			}
 			time.Sleep(50 * time.Millisecond)
@@ -556,7 +556,7 @@ const maxSleeping = 16
 // control keeps the VMs within the budget: four times a second it reads
 // what the cgroup holds (heldKB; without a cgroup limit, the awake
 // VMs' PSS) and, when that is over, puts idle VMs to sleep, least
-// recently used first, until it is a little under, and holds arrivals
+// recently used first, until it is a little under, and holds onboardings
 // (create) until it is. A VM on its way to sleep still holds its
 // memory until its snapshot is written and it is killed; that is
 // taken off the reading, or every tick until then would put more to

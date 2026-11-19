@@ -28,14 +28,14 @@ Each test is one script that runs against a platform, `BACKEND=vm`,
    the memory is sampled for ten minutes as the tenants go quiet.
    `footprint_fit.txt` estimates from the slope how many tenants fit
    in the memory each side gets.
-3. **`agents`: the workload.** Tenants arrive over time and load their
+3. **`agents`: the workload.** Tenants onboard over time and load their
    data; a tenth of them are in a session at any moment, sending a
    mix of reads and writes; the rest are idle. On the micro-VM side
    the probe is also the control plane: when the memory runs out, idle
    VMs are put to sleep (snapshotted to disk) and woken, by restoring
    the snapshot or booting afresh, when a session starts for them. At
    each tenant count: the latency of every statement kind, the time
-   an arrival took to its first row, the time to a result from a
+   an onboarding took to its first row, the time to a result from a
    tenant that was idle (a session's first statement, a wake included
    on the micro-VM side), wakes and sleeps, memory and disk.
 

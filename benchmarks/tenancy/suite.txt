@@ -23,11 +23,11 @@ footprint-vm          footprint  BACKEND=vm      1 10 100 300 600 1000
 footprint-pgshared    footprint  BACKEND=pgshared 100 1000 10000
 footprint-egres       footprint  BACKEND=egres   1000 10000 50000 100000
 
-# 3. Agents arriving and working, the micro-VMs put to sleep and woken
+# 3. Agents onboarding and working, the micro-VMs put to sleep and woken
 # as memory runs out, restored from a snapshot: how a micro-VM
 # platform wakes a tenant. (WAKE=boot, a fresh boot instead, is a
 # check, not a step: both ran out of memory at the same count.) At
-# 30 arrivals a second both sides ran out of onboarding speed before
+# 30 onboardings a second both sides ran out of onboarding speed before
 # memory or latency gave out (tanland); 10 lets those show.
-agents-vm             agents     BACKEND=vm      WAKE=restore ARRIVE=10
-agents-egres          agents     BACKEND=egres   ARRIVE=10
+agents-vm             agents     BACKEND=vm      WAKE=restore ONBOARD=10
+agents-egres          agents     BACKEND=egres   ONBOARD=10

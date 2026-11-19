@@ -132,7 +132,7 @@ func TestParseSteps(t *testing.T) {
 	}
 }
 
-func TestArrivalDue(t *testing.T) {
+func TestOnboardingDue(t *testing.T) {
 	begin := time.Unix(1000, 0)
 	for _, c := range []struct {
 		k    int
@@ -142,8 +142,8 @@ func TestArrivalDue(t *testing.T) {
 		{0, 30, 0}, {30, 30, time.Second}, {45, 30, 1500 * time.Millisecond},
 		{3, 0.5, 6 * time.Second},
 	} {
-		if got := arrivalDue(begin, c.k, c.rate).Sub(begin); got != c.want {
-			t.Errorf("arrival %d at %v/s: due at %v, want %v", c.k, c.rate,
+		if got := onboardingDue(begin, c.k, c.rate).Sub(begin); got != c.want {
+			t.Errorf("onboarding %d at %v/s: due at %v, want %v", c.k, c.rate,
 				got, c.want)
 		}
 	}
@@ -291,12 +291,12 @@ func TestRowShape(t *testing.T) {
 
 // The stop rule reads a window's figures, and a bound of 0 is off.
 func TestStopRule(t *testing.T) {
-	r := stopRule{readP95: 50, arriveP95: 5000, errPct: 1}
-	ok := windowRow{readP95: 49, arriveP95: 4999, errPct: 0.9}
+	r := stopRule{readP95: 50, onboardP95: 5000, errPct: 1}
+	ok := windowRow{readP95: 49, onboardP95: 4999, errPct: 0.9}
 	if why := r.breached(ok); why != "" {
 		t.Errorf("fit: %s", why)
 	}
-	for _, w := range []windowRow{{readP95: 51}, {arriveP95: 5001}, {errPct: 1.1}} {
+	for _, w := range []windowRow{{readP95: 51}, {onboardP95: 5001}, {errPct: 1.1}} {
 		if r.breached(w) == "" {
 			t.Errorf("%+v passed", w)
 		}

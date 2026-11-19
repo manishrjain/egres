@@ -1,7 +1,7 @@
 // Copyright 2026 Manish R Jain
 // SPDX-License-Identifier: Apache-2.0
 
-// agents is the agentic workload, on both platforms. Tenants arrive
+// agents is the agentic workload, on both platforms. Tenants onboard
 // over time, each creating its database and loading its table through
 // SQL, as an agent setting up its own store would. A share of the
 // tenants (-active) are in a session at any moment, each sending a mix
@@ -11,17 +11,17 @@
 // server (Egres), created on its "egres" database. The server must
 // start with none of them.
 //
-// -backend vm: every tenant is a Firecracker VM, made at its arrival
+// -backend vm: every tenant is a Firecracker VM, made at its onboarding
 // from a blank data image (Postgres initialised, no table) under
 // -run/vm<i>. The taps fctap<i> must exist (netns_setup.sh) and this
 // must run where they are (in_netns.sh). Here the probe is also the
 // platform's control plane (vm.go): it puts idle VMs to sleep when the
 // test's cgroup holds more than -budget-mib (all but the clean,
-// unmapped file cache), least recently used first, holds arrivals
+// unmapped file cache), least recently used first, holds onboardings
 // until it is under, and a session for a sleeping tenant wakes it.
 //
-// The run grows by arrivals, open loop at -arrive a second, to each
-// count in -steps; there it pauses arrivals for -window, sessions still
+// The run grows by onboardings, open loop at -onboard a second, to each
+// count in -steps; there it pauses onboardings for -window, sessions still
 // running, and prints one CSV row (see header). Every latency is from
 // when its statement was due, so a stalled server cannot hide its tail
 // by slowing the sender. A session's first statement is also reported
@@ -58,7 +58,7 @@ const (
 var kindNames = [numKinds]string{"point", "range", "update", "insert", "count"}
 
 const header = "tenants,awake,held_mib,disk_mib,read_mib_s,write_mib_s," +
-	"arrive_p50_ms,arrive_p95_ms,arrive_p99_ms," +
+	"onboard_p50_ms,onboard_p95_ms,onboard_p99_ms," +
 	"first_p50_ms,first_p95_ms,first_p99_ms," +
 	"wake_p50_ms,wake_p95_ms,wake_p99_ms,woke_pct,sleeps_per_s,wakes_per_s," +
 	"point_p50_ms,point_p95_ms,point_p99_ms," +
@@ -67,9 +67,9 @@ const header = "tenants,awake,held_mib,disk_mib,read_mib_s,write_mib_s," +
 	"insert_p50_ms,insert_p95_ms,insert_p99_ms," +
 	"count_p50_ms,count_p95_ms,count_p99_ms,ok,errors"
 
-// Arrivals under way at once. Past this an arrival waits its turn, and
+// Onboardings under way at once. Past this an onboarding waits its turn, and
 // the wait is in its latency.
-const maxArriving = 32
+const maxOnboarding = 32
 
 // mix is each kind's share of the statements, in percent.
 type mix [numKinds]int
@@ -137,8 +137,8 @@ func parseSteps(s string) ([]int, error) {
 	return steps, nil
 }
 
-// arrivalDue is when the k-th arrival of a growth begun at begin is due.
-func arrivalDue(begin time.Time, k int, perSec float64) time.Time {
+// onboardingDue is when the k-th onboarding of a growth begun at begin is due.
+func onboardingDue(begin time.Time, k int, perSec float64) time.Time {
 	return begin.Add(time.Duration(float64(k) * float64(time.Second) / perSec))
 }
 
@@ -332,11 +332,11 @@ type agentRun struct {
 	sessLen time.Duration
 	active  float64
 	begin   time.Time
-	next    int // the next tenant to arrive; the main goroutine's
+	next    int // the next tenant to onboard; the main goroutine's
 
 	mu      sync.Mutex // guards what follows
 	rng     *rand.Rand
-	tenants []*tenant // by id; nil until it has arrived
+	tenants []*tenant // by id; nil until it has onboarded
 	count   int
 	idle    []int // tenants with no session
 	running map[*sessionRun]bool
@@ -351,7 +351,7 @@ type agentRun struct {
 	woke, ok, errs   int
 	lastErr          error
 	// Since the last row.
-	arriveLat []float64
+	onboardLat []float64
 }
 
 func (a *agentRun) target(id int) string {
@@ -484,10 +484,10 @@ func (a *agentRun) session(s *sessionRun, start time.Time, seed int64) {
 	}
 }
 
-// arrive brings tenant i in: its database (or VM), its table, its
+// onboard brings tenant i in: its database (or VM), its table, its
 // rows, and then the first row of a point read, which is where its
 // latency ends.
-func (a *agentRun) arrive(i int, due time.Time) error {
+func (a *agentRun) onboard(i int, due time.Time) error {
 	if a.p != nil {
 		v, err := a.p.create(i)
 		if err != nil {
@@ -521,8 +521,8 @@ func (a *agentRun) arrive(i int, due time.Time) error {
 	lms := msSince(due)
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.traceLine(due, i, "arrive", lms, false, nil)
-	a.arriveLat = append(a.arriveLat, lms)
+	a.traceLine(due, i, "onboard", lms, false, nil)
+	a.onboardLat = append(a.onboardLat, lms)
 	for len(a.tenants) <= i {
 		a.tenants = append(a.tenants, nil)
 	}
@@ -534,12 +534,12 @@ func (a *agentRun) arrive(i int, due time.Time) error {
 
 // grow adds tenants, open loop at perSec, until `to` have been sent
 // for, and waits for them. It stops short at the host's floors or
-// after an arrival fails, and says why. A failed arrival is a stop,
+// after an onboarding fails, and says why. A failed onboarding is a stop,
 // not a fault: the platform did not take a tenant in the time
 // allowed, and the count it had is measured.
 func (a *agentRun) grow(to int, perSec, floorGiB, diskFloorGiB float64) (
 	why string) {
-	sem := make(chan struct{}, maxArriving)
+	sem := make(chan struct{}, maxOnboarding)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var firstErr error
@@ -550,7 +550,7 @@ func (a *agentRun) grow(to int, perSec, floorGiB, diskFloorGiB float64) (
 	}
 	begin := time.Now()
 	for k := 0; a.next < to; k++ {
-		due := arrivalDue(begin, k, perSec)
+		due := onboardingDue(begin, k, perSec)
 		waitUntil(due)
 		if failure() != nil {
 			break
@@ -574,7 +574,7 @@ func (a *agentRun) grow(to int, perSec, floorGiB, diskFloorGiB float64) (
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			if err := a.arrive(i, due); err != nil {
+			if err := a.onboard(i, due); err != nil {
 				mu.Lock()
 				if firstErr == nil {
 					firstErr = err
@@ -585,7 +585,7 @@ func (a *agentRun) grow(to int, perSec, floorGiB, diskFloorGiB float64) (
 	}
 	wg.Wait()
 	if err := failure(); err != nil {
-		return "the platform did not take an arrival: " + err.Error()
+		return "the platform did not take an onboarding: " + err.Error()
 	}
 	return why
 }
@@ -593,15 +593,15 @@ func (a *agentRun) grow(to int, perSec, floorGiB, diskFloorGiB float64) (
 // A window's row, with the figures the stop rule reads.
 type windowRow struct {
 	csv string
-	// p95 of the reads (point and range), the arrivals' p95, and the
+	// p95 of the reads (point and range), the onboardings' p95, and the
 	// share of statements that failed, all in the window; 0 where there
 	// were no samples. p95 is the figure reported and stopped on; p99
 	// is in the row for a sanity check, since at a few thousand samples
 	// it is the worst few dozen queries.
-	readP95, arriveP95, errPct float64
+	readP95, onboardP95, errPct float64
 }
 
-// window measures for d with arrivals paused and returns the CSV row.
+// window measures for d with onboardings paused and returns the CSV row.
 func (a *agentRun) window(d time.Duration) windowRow {
 	a.mu.Lock()
 	a.winStart, a.winEnd = time.Now(), time.Time{}
@@ -660,7 +660,7 @@ func (a *agentRun) window(d time.Duration) windowRow {
 	secs := max(stop.Sub(start).Seconds(), 1e-3) // -window 0: no NaN
 	f0 := func(x float64) string { return fmt.Sprintf("%.0f", x) }
 	f2 := func(x float64) string { return fmt.Sprintf("%.2f", x) }
-	arrive := sorted(a.arriveLat)
+	onboard := sorted(a.onboardLat)
 	first := sorted(a.firstLat)
 	wake := sorted(a.wakeLat)
 	// The drive's traffic over the window, MiB a second; "" without
@@ -680,7 +680,7 @@ func (a *agentRun) window(d time.Duration) windowRow {
 		cells = append(cells, f0(awakeAvg), f0(heldMiB),
 			f0(diskUsedMiB(a.p.run)),
 			ioRate(read0, read1), ioRate(written0, written1),
-			pctCell(arrive, 0.5), pctCell(arrive, 0.95), pctCell(arrive, 0.99),
+			pctCell(onboard, 0.5), pctCell(onboard, 0.95), pctCell(onboard, 0.99),
 			pctCell(first, 0.5), pctCell(first, 0.95), pctCell(first, 0.99),
 			pctCell(wake, 0.5), pctCell(wake, 0.95), pctCell(wake, 0.99),
 			f2(woke),
@@ -692,7 +692,7 @@ func (a *agentRun) window(d time.Duration) windowRow {
 		}
 		cells = append(cells, "", held, "",
 			ioRate(read0, read1), ioRate(written0, written1),
-			pctCell(arrive, 0.5), pctCell(arrive, 0.95), pctCell(arrive, 0.99),
+			pctCell(onboard, 0.5), pctCell(onboard, 0.95), pctCell(onboard, 0.99),
 			pctCell(first, 0.5), pctCell(first, 0.95), pctCell(first, 0.99),
 			"", "", "", "", "", "")
 	}
@@ -704,7 +704,7 @@ func (a *agentRun) window(d time.Duration) windowRow {
 	row := windowRow{csv: strings.Join(cells, ","),
 		readP95: max(pct(sorted(a.lat[kPoint]), 0.95),
 			pct(sorted(a.lat[kRange]), 0.95)),
-		arriveP95: pct(arrive, 0.95)}
+		onboardP95: pct(onboard, 0.95)}
 	if n := a.ok + a.errs; n > 0 {
 		row.errPct = 100 * float64(a.errs) / float64(n)
 	}
@@ -713,7 +713,7 @@ func (a *agentRun) window(d time.Duration) windowRow {
 		fmt.Fprintln(os.Stderr, "agents: last error:", a.lastErr)
 	}
 	a.winStart = time.Time{}
-	a.arriveLat = nil
+	a.onboardLat = nil
 	if a.trace != nil {
 		a.trace.Flush()
 	}
@@ -721,17 +721,17 @@ func (a *agentRun) window(d time.Duration) windowRow {
 }
 
 // stopRule is when a count no longer fits: the reads' p95 over a
-// bound, arrivals too slow, or statements failing. A bound of 0 is
+// bound, onboardings too slow, or statements failing. A bound of 0 is
 // off. Returns why, or "".
-type stopRule struct{ readP95, arriveP95, errPct float64 }
+type stopRule struct{ readP95, onboardP95, errPct float64 }
 
 func (r stopRule) breached(w windowRow) string {
 	switch {
 	case r.readP95 > 0 && w.readP95 > r.readP95:
 		return fmt.Sprintf("reads' p95 %.1f ms over %.1f", w.readP95, r.readP95)
-	case r.arriveP95 > 0 && w.arriveP95 > r.arriveP95:
-		return fmt.Sprintf("arrivals' p95 %.0f ms over %.0f", w.arriveP95,
-			r.arriveP95)
+	case r.onboardP95 > 0 && w.onboardP95 > r.onboardP95:
+		return fmt.Sprintf("onboardings' p95 %.0f ms over %.0f", w.onboardP95,
+			r.onboardP95)
 	case r.errPct > 0 && w.errPct > r.errPct:
 		return fmt.Sprintf("%.2f%% of statements failed, over %.1f%%",
 			w.errPct, r.errPct)
@@ -761,28 +761,28 @@ func agents(args []string) {
 	disk := fs.String("disk", "",
 		"the drive WORK is on (nvme0n1), for read_mib_s and write_mib_s")
 	floorGiB := fs.Float64("floor-gib", 16,
-		"stop arrivals when the host's MemAvailable is under this")
+		"stop onboardings when the host's MemAvailable is under this")
 	diskFloorGiB := fs.Float64("disk-floor-gib", 5,
-		"vm: stop arrivals when the disk under -run has less free")
+		"vm: stop onboardings when the disk under -run has less free")
 	stepsFlag := fs.String("steps", "1000,2000,5000,10000,20000,50000,100000",
-		"tenant counts to measure at; arrivals stop at the last")
-	arrive := fs.Float64("arrive", 30, "arrivals per second while growing")
+		"tenant counts to measure at; onboardings stop at the last")
+	onboard := fs.Float64("onboard", 30, "onboardings per second while growing")
 	window := fs.Duration("window", 2*time.Minute,
-		"measured time at each step, arrivals paused")
+		"measured time at each step, onboardings paused")
 	active := fs.Float64("active", 0.10, "share of tenants in a session at a time")
 	sessLen := fs.Duration("session", 2*time.Minute, "session length")
 	rate := fs.Float64("rate", 1, "statements per second per session")
-	rows := fs.Int("rows", 1000, "rows loaded at arrival; ids are 1..rows")
+	rows := fs.Int("rows", 1000, "rows loaded at onboarding; ids are 1..rows")
 	mixFlag := fs.String("mix", "point=60,range=15,update=15,insert=8,count=2",
 		"statement mix, percent")
 	traceFile := fs.String("trace", "",
 		"file for one line per statement: due_ms,tenant,kind,ms,woke,ok"+
-			" (arrivals too, kind arrive)")
+			" (onboardings too, kind onboard)")
 	seed := fs.Int64("seed", 1, "seed for the random choices")
 	stopRead := fs.Float64("stop-p95-ms", 50,
 		"stop growing when the reads' p95 in a window is over this; 0 = never")
-	stopArrive := fs.Float64("stop-arrive-ms", 5000,
-		"stop growing when the arrivals' p95 is over this; 0 = never")
+	stopOnboard := fs.Float64("stop-onboard-ms", 5000,
+		"stop growing when the onboardings' p95 is over this; 0 = never")
 	stopErr := fs.Float64("stop-errors-pct", 1,
 		"stop growing when more than this share of statements fail; 0 = never")
 	fs.Parse(args)
@@ -809,8 +809,8 @@ func agents(args []string) {
 		fail("need -backend shared|vm")
 	case *wakeBy != "restore" && *wakeBy != "boot":
 		fail("-wake is restore or boot")
-	case *rows < 1 || *rate <= 0 || *arrive <= 0 || *active < 0 || *active > 1:
-		fail("-rows, -rate and -arrive must be positive, -active in 0..1")
+	case *rows < 1 || *rate <= 0 || *onboard <= 0 || *active < 0 || *active > 1:
+		fail("-rows, -rate and -onboard must be positive, -active in 0..1")
 	}
 
 	a := &agentRun{addr: *addr, pid: *pid, disk: *disk, clk: newClock(),
@@ -855,11 +855,11 @@ func agents(args []string) {
 	}
 	go a.schedule()
 
-	rule := stopRule{*stopRead, *stopArrive, *stopErr}
+	rule := stopRule{*stopRead, *stopOnboard, *stopErr}
 	fmt.Println(header)
 	for _, step := range steps {
 		t0 := time.Now()
-		why := a.grow(step, *arrive, *floorGiB, *diskFloorGiB)
+		why := a.grow(step, *onboard, *floorGiB, *diskFloorGiB)
 		a.mu.Lock()
 		n := a.count
 		a.mu.Unlock()
@@ -874,11 +874,11 @@ func agents(args []string) {
 			// A breach is measured once more at the same count before it
 			// ends the run: a drive's slow phase can lift one window's
 			// p95 on its own, and a count that fails twice has not fit.
-			// Both rows are printed. The arrivals' tail is the growth's
-			// own, and a window pauses arrivals, so a second window
+			// Both rows are printed. The onboardings' tail is the growth's
+			// own, and a window pauses onboardings, so a second window
 			// cannot re-measure it: that breach stands as it is.
 			if over := rule.breached(w); over != "" && why == "" {
-				if rule.arriveP95 > 0 && w.arriveP95 > rule.arriveP95 {
+				if rule.onboardP95 > 0 && w.onboardP95 > rule.onboardP95 {
 					why = over
 					fmt.Fprintf(os.Stderr, "agents: stopping at %d tenants: "+
 						"%s\n", n, why)

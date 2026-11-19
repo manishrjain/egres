@@ -359,8 +359,8 @@ def chart_agents(runs, out):
     st = runs[("agents", sides[0][0])]["settings"]
     specs = [("point_p95_ms", "Active tenants' point read p95", "ms",
               num(st.get("STOP_P95_MS")), "the stop, {} ms"),
-             ("arrive_p95_ms", "An arrival's time to its first row, p95",
-              "ms", num(st.get("STOP_ARRIVE_MS")), "the stop, {} ms"),
+             ("onboard_p95_ms", "An onboarding's time to its first row, p95",
+              "ms", num(st.get("STOP_ONBOARD_MS")), "the stop, {} ms"),
              ("first_p95_ms", "A session's first statement from an idle "
               "tenant, p95 (a wake included)", "ms", None, None),
              ("held_mib", "Memory held", "GiB", None, None),
@@ -395,13 +395,13 @@ def chart_agents(runs, out):
             p.line(pts, colour, label)
         panels.append(p)
     active = st.get("ACTIVE", "0.10")
-    sub = (f"Tenants arrive at {st.get('ARRIVE', '?')} a second; "
+    sub = (f"Tenants onboard at {st.get('ONBOARD', '?')} a second; "
            f"{float(active) * 100:.0f}% are in a session at any moment, the"
            " rest idle. Each line ends at the last count its side was"
            " measured at.")
     open(os.path.join(out, "agents.svg"), "w").write(
         svg(W, 110 + len(panels) * (PH + 70), panels,
-            "Agents: tenants arriving and working", sub, sides))
+            "Agents: tenants onboarding and working", sub, sides))
 
 
 def main():
