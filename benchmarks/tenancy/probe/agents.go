@@ -874,16 +874,24 @@ func agents(args []string) {
 			// A breach is measured once more at the same count before it
 			// ends the run: a drive's slow phase can lift one window's
 			// p95 on its own, and a count that fails twice has not fit.
-			// Both rows are printed.
+			// Both rows are printed. The arrivals' tail is the growth's
+			// own, and a window pauses arrivals, so a second window
+			// cannot re-measure it: that breach stands as it is.
 			if over := rule.breached(w); over != "" && why == "" {
-				fmt.Fprintf(os.Stderr, "agents: %d tenants: %s; measuring "+
-					"again\n", n, over)
-				w = a.window(*window)
-				fmt.Println(w.csv)
-				if over = rule.breached(w); over != "" {
-					why = over + " in two windows"
+				if rule.arriveP95 > 0 && w.arriveP95 > rule.arriveP95 {
+					why = over
 					fmt.Fprintf(os.Stderr, "agents: stopping at %d tenants: "+
 						"%s\n", n, why)
+				} else {
+					fmt.Fprintf(os.Stderr, "agents: %d tenants: %s; measuring "+
+						"again\n", n, over)
+					w = a.window(*window)
+					fmt.Println(w.csv)
+					if over = rule.breached(w); over != "" {
+						why = over + " in two windows"
+						fmt.Fprintf(os.Stderr, "agents: stopping at %d tenants: "+
+							"%s\n", n, why)
+					}
 				}
 			}
 		}
