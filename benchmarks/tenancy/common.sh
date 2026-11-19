@@ -171,7 +171,20 @@ create_range() {
     MADE=$to
     seed_file "$rows" >/dev/null
     for ((i = from; i < to; i += CREATE_PAR)); do
-        have_room || { echo "out of room at $i" >&2; MADE=$i; return 1; }
+        # Creation writes in bursts, and the dirty pages count as held
+        # until the drive has them: one wait for writeback before the
+        # room is called gone, and the figures when it is.
+        if ! have_room; then
+            sync
+            sleep 10
+            if ! have_room; then
+                echo "out of room at $i: available $(avail_gib) GiB," \
+                    "held $(mib "$(mem_held_kb)") MiB of a" \
+                    "$(($(budget_kb) / 1024)) MiB budget" >&2
+                MADE=$i
+                return 1
+            fi
+        fi
         pids=()
         for ((j = i; j < i + CREATE_PAR && j < to; j++)); do
             tenant_create "$j" "$rows" &
