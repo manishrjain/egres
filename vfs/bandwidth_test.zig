@@ -105,8 +105,8 @@ test "limiter: a fiber whose io does not wait is charged and runs on" {
     limiter.metered = true;
 
     // A flush's worth at once, taken whole and not waited for.
-    ctx.io_waits = false;
-    defer ctx.io_waits = true;
+    ctx.waits = false;
+    defer ctx.waits = true;
     var start = utils.coarseMs();
     limiter.grant(400 * page_size, 1, .read);
     limiter.grant(400 * page_size, 1, .read);
@@ -114,7 +114,7 @@ test "limiter: a fiber whose io does not wait is charged and runs on" {
     try expectEqual(800, t.totals.io_pages.load(.monotonic));
 
     // The tenant's next paying grant owes the debt: 700 pages, 700 ms.
-    ctx.io_waits = true;
+    ctx.waits = true;
     start = utils.coarseMs();
     limiter.grant(page_size, 1, .read);
     const waited = utils.coarseMs() - start;

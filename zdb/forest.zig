@@ -875,7 +875,7 @@ pub const Forest = struct {
             em.tree.namespace,
             utils.coarseMs(),
         ) catch &fiber.meter.shared;
-        ctx.io_waits = false;
+        ctx.waits = false;
         em.flush() catch |err| {
             log.err("flush tree={d} table failed: {s}", .{
                 em.tree.tree_id, @errorName(err),

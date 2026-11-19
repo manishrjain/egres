@@ -696,6 +696,22 @@ pub const Worker = struct {
         return ticksTo(now -| self.ticks.last_pump, .ms) >= 1;
     }
 
+    /// The step that just ended held this worker for `ran_ns` without
+    /// a yield: named here with its fiber, which is still valid. The
+    /// connections dealt to this worker waited that long for their
+    /// completions to be reaped, which no other dump shows: a trace
+    /// starts after dispatch and the profiler samples shares. A
+    /// statement's context is cleared at its end, so a step that
+    /// ended a statement shows an empty name.
+    fn logLongStep(self: *Worker, f: *Fiber, ran_ns: u64) void {
+        const name = f.ctx.name;
+        log.warn("W{d:0>2} long step: {d} ms, {s} {s} fiber, {s}: {s}", .{
+            self.id,               ran_ns / std.time.ns_per_ms,
+            @tagName(f.priority),  @tagName(f.lane),
+            @tagName(f.ctx.class), name[0..@min(name.len, 80)],
+        });
+    }
+
     pub fn runMain(self: *Worker) void {
         // The one legitimate site that writes the thread-local. Reads go
         // through `currentWorkerOrNull()`; here we own it directly.
@@ -804,6 +820,8 @@ pub const Worker = struct {
                 const cycNs = ticksTo(exit -| enter, .ns);
                 f.cpu_total_ns +%= cycNs;
                 self.cpu_total_ns +%= cycNs;
+                // Before the finish below may free `f`.
+                if (rt.stallDue(cycNs)) self.logLongStep(f, cycNs);
 
                 // Body returned: CPU is now charged, so a joiner reading
                 // `cpu_total_ns` sees this final slice. `on_finished` is our
@@ -1091,6 +1109,9 @@ pub const Runtime = struct {
     steal_lone: std.atomic.Value(bool),
     prepark_poll_us: std.atomic.Value(u64),
     slice_us: std.atomic.Value(u64),
+    /// `Cfg.stall_ms`, for `stallDue`; 0 until the host's first
+    /// `apply`.
+    stall_ms: std.atomic.Value(u64),
 
     /// The simulation driving worker 0 (`InitOptions.sim`), else null.
     sim: ?_sim.Sim = null,
@@ -1117,6 +1138,7 @@ pub const Runtime = struct {
         steal_lone: bool = false,
         poll_us: u64 = 20,
         slice_us: u64 = 50,
+        stall_ms: u64 = 20,
         cpu_milli: i64 = 0,
 
         pub const docs = .{
@@ -1137,6 +1159,10 @@ pub const Runtime = struct {
                 " worker: a ready fiber, or I/O the worker has to send" ++
                 " or collect. 0 = it runs until it parks, and a" ++
                 " connection sharing its worker waits a whole statement.",
+            .stall_ms = "Milliseconds a step may hold its worker before" ++
+                " it is logged as a long step, with the fiber it ran:" ++
+                " the connections on that worker waited as long." ++
+                " 0 = never.",
             .cpu_milli = "Millicores the statements of every database" ++
                 " may consume between them, 1000 per core, paid in ticks" ++
                 " at their yields; the worker threads stay one per core." ++
@@ -1151,11 +1177,19 @@ pub const Runtime = struct {
         return slice_us > 0 and ran_ns >= slice_us * std.time.ns_per_us;
     }
 
+    /// Whether a step that ran `ran_ns` is a long step to log. Never
+    /// with the threshold off.
+    pub fn stallDue(self: *const Runtime, ran_ns: u64) bool {
+        const stall_ms = self.stall_ms.load(.monotonic);
+        return stall_ms > 0 and ran_ns >= stall_ms * std.time.ns_per_ms;
+    }
+
     /// Sets the tunables and the meter's cpu capacity from `cfg`.
     pub fn apply(self: *Runtime, cfg: Cfg) void {
         self.steal_lone.store(cfg.steal_lone, .monotonic);
         self.prepark_poll_us.store(cfg.poll_us, .monotonic);
         self.slice_us.store(cfg.slice_us, .monotonic);
+        self.stall_ms.store(cfg.stall_ms, .monotonic);
         const workers: i64 = @intCast(self.laneWorkers(.default));
         const milli = if (cfg.cpu_milli > 0) cfg.cpu_milli else workers * 1000;
         if (milli != _meter.capacity.cpu_milli) {
@@ -1203,6 +1237,10 @@ pub const Runtime = struct {
         self.steal_lone = .init(cfg.steal_lone);
         self.prepark_poll_us = .init(cfg.poll_us);
         self.slice_us = .init(cfg.slice_us);
+        // Off until `apply`: a Debug test body is one step of 20 ms and
+        // more as a rule, and a runtime without the flags has no one
+        // reading the lines.
+        self.stall_ms = .init(0);
         self.idle = .{ .{}, .{} };
         self.num_thieves = @splat(.{});
 
@@ -1571,7 +1609,7 @@ fn spawn_(
         f.ctx.class = parent.ctx.class;
         f.ctx.cache = parent.ctx.cache;
         f.ctx.tenant = parent.ctx.tenant;
-        f.ctx.io_waits = parent.ctx.io_waits;
+        f.ctx.waits = parent.ctx.waits;
         if (!detached) {
             f.ctx.parent = parent.ctx.parent orelse
                 if (parent.ctx.arena != null) &parent.ctx else null;
@@ -1861,7 +1899,10 @@ pub fn dumpWorkerCpu(writer: *std.Io.Writer) !void {
             "  polled   times the pre-park poll found work, so it did not block\n" ++
             "  sliced   long steps that gave way to other work there\n",
     );
-    const col = "{s:>8}";
+    // A column is as wide as a day's count on a busy worker: skipped
+    // passed eight digits inside half an hour and ran into its
+    // neighbour, which lost the dump's reader the boundary.
+    const col = "{s:>12}";
     try writer.print("        " ++ col ** 6 ++ "\n", .{
         "woke", "skipped", "stole", "parked", "polled", "sliced",
     });
@@ -1873,12 +1914,12 @@ pub fn dumpWorkerCpu(writer: *std.Io.Writer) !void {
             s.stolen,      s.parks,
             s.poll_hits,   s.sliced,
         };
-        try writer.print("  W{d:0>2}   " ++ "{d:>8}" ** 6 ++ "\n", .{
+        try writer.print("  W{d:0>2}   " ++ "{d:>12}" ** 6 ++ "\n", .{
             w.id, row[0], row[1], row[2], row[3], row[4], row[5],
         });
         for (&total, row) |*t, v| t.* += v;
     }
-    try writer.print("  total " ++ "{d:>8}" ** 6 ++ "\n", .{
+    try writer.print("  total " ++ "{d:>12}" ** 6 ++ "\n", .{
         total[0], total[1], total[2], total[3], total[4], total[5],
     });
 }

@@ -174,6 +174,10 @@ pub const Table = struct {
 
         var n: usize = 0;
         for (self.index.blocks, 0..) |bi, idx| {
+            // A yield point per block: a flushed table of a hot tree
+            // is thousands of blocks decoded and copied here, on a
+            // worker sessions are dealt to.
+            try fiber.ctx().meter();
             if (bi.len < 4) return error.CorruptTable;
             const raw = try self.obj.readAligned(
                 self.allocator,

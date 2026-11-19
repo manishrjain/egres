@@ -16,9 +16,15 @@ const testing = std.testing;
 pub const Error = error{
     KeysLikelyNotUnique,
     OutOfMemory,
-};
+} || fiber.Ctx.YieldError;
+
+/// Keys between the yield points of a build: a key's step is a few
+/// ns, so a meter unit per key was a measurable share of it, and
+/// 4,096 keys are well under a time slice.
+const yield_stride = 4096;
 
 const builtin = @import("builtin");
+const fiber = @import("zfiber");
 const is_debug = builtin.mode == .Debug;
 
 /// BinaryFuse8 provides a binary fuse filter with 8-bit fingerprints.
@@ -150,6 +156,10 @@ pub fn BinaryFuse(comptime T: type) type {
             if (keys.len() == 0) {
                 return;
             }
+            // A yield point every `yield_stride` keys in every pass: a
+            // filter over a hot tree's 100K keys is tens of ms, built on
+            // a worker sessions are dealt to.
+            const ctx = fiber.ctx();
             var rng_counter: u64 = 0x726b2b9d438b9d4d;
             self.seed = rngSplitMix64(&rng_counter);
 
@@ -204,7 +214,10 @@ pub fn BinaryFuse(comptime T: type) type {
 
                 const mask_block: u64 = block - 1;
                 var got_num_keys: usize = 0;
+                var seen: usize = 0;
                 while (keys.next()) |key| {
+                    seen += 1;
+                    if (seen % yield_stride == 0) try ctx.maybeYield();
                     if (is_debug) got_num_keys += 1;
                     const sum: u64 = key +% self.seed;
                     const hash: u64 = murmur64(sum);
@@ -229,6 +242,7 @@ pub fn BinaryFuse(comptime T: type) type {
                 var duplicates: u32 = 0;
                 i = 0;
                 while (i < size) : (i += 1) {
+                    if (i % yield_stride == 0) try ctx.maybeYield();
                     const hash = reverse_order[i];
                     const h0 = self.fuseHash(0, hash);
                     const h1 = self.fuseHash(1, hash);
@@ -280,11 +294,15 @@ pub fn BinaryFuse(comptime T: type) type {
                 // Add sets with one key to the queue.
                 i = 0;
                 while (i < capacity) : (i += 1) {
+                    if (i % yield_stride == 0) try ctx.maybeYield();
                     alone[Qsize] = i;
                     Qsize += if ((t2count[i] >> 2) == 1) @as(u32, 1) else @as(u32, 0);
                 }
                 var stacksize: u32 = 0;
+                var popped: usize = 0;
                 while (Qsize > 0) {
+                    popped += 1;
+                    if (popped % yield_stride == 0) try ctx.maybeYield();
                     Qsize -= 1;
                     const index: u32 = alone[Qsize];
                     if ((t2count[index] >> 2) == 1) {
@@ -329,6 +347,7 @@ pub fn BinaryFuse(comptime T: type) type {
 
             var i: u32 = @as(u32, @truncate(size - 1));
             while (i < size) : (i -%= 1) {
+                if (i % yield_stride == 0) try ctx.maybeYield();
                 // the hash of the key we insert next
                 const hash: u64 = reverse_order[i];
                 const xor2: T = @as(T, @truncate(fingerprint(hash)));

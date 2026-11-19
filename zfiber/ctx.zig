@@ -108,11 +108,11 @@ pub const Ctx = struct {
     /// spawn copies it, and until then it is the system's, which is
     /// never short.
     tenant: *Tenant = &_meter.shared,
-    /// Whether an io grant waits for the tenant's bucket. A flush is
-    /// charged and runs on (`Forest.flushTable`): stalled, it would
-    /// stall every tree's writes, so the tenant's statements wait for
-    /// what it spent instead.
-    io_waits: bool = true,
+    /// Whether a grant, io or cpu, waits for the tenant's bucket. A
+    /// flush is charged and runs on (`Forest.flushTable`): stalled, it
+    /// would stall every tree's writes, so the tenant's statements wait
+    /// for what it spent instead.
+    waits: bool = true,
     /// Live bytes in the statement's arenas, on the root: a helper's
     /// allocations count here too. Checked against the cap at a yield.
     mem_held: std.atomic.Value(i64) = .init(0),
@@ -263,9 +263,12 @@ pub const Ctx = struct {
     /// whether the process is stopping (`Shutdown.startShutdown`) and
     /// whether the statement holds more than `query_mem_bytes` or,
     /// with the pool full, than its tenant's share, then
-    /// charges the cpu since the last settle to the tenant and pays
-    /// its debt: a bucket below zero parks the fiber until the rate
-    /// has covered it. Last, a step that has run its time slice gives
+    /// charges the cpu since the last settle to the tenant and, when
+    /// the context `waits`, pays its debt: a bucket below zero parks
+    /// the fiber until the rate has covered it. A flush does not wait,
+    /// and still gives way below: a table's filter and its admit into
+    /// the cache are tens of ms of a worker that serves sessions.
+    /// Last, a step that has run its time slice gives
     /// way to other work on its worker (`Worker.sliceDue`): a tenant
     /// inside its share is never parked, and without the slice it
     /// would hold the worker for the whole statement.
@@ -286,7 +289,7 @@ pub const Ctx = struct {
         if (_rt.currentWorkerOrNull()) |w| {
             if (w.current_fiber) |f| _ = w.chargeCpu(f);
         }
-        self.tenant.pay(.cpu, self.class);
+        if (self.waits) self.tenant.pay(.cpu, self.class);
         // After the pay: a statement it parked resumes on a new step.
         _rt.yieldIfSliceDue();
     }

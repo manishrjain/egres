@@ -242,6 +242,10 @@ pub const Shutdown = struct {
     /// signal and `startShutdown()` on the second, from fiber context;
     /// also exits once shutdown started by any other path (checked
     /// first, so a pre-fired signal or start is seen without sleeping).
+    /// The wait between polls ends at a start from elsewhere: `deinit`
+    /// joins this fiber before it uninstalls, and a poll slept whole
+    /// kept the stopping instance installed for the 300 ms, failing
+    /// every `maybeYield` in the process, other tests' included.
     fn watchSignal(self: *Shutdown) void {
         while (!self.isStopping()) {
             const signals = g_signal.load(.acquire);
@@ -250,7 +254,7 @@ pub const Shutdown = struct {
                 return;
             }
             if (signals == 1) self.startDrain();
-            sleepMs(poll_ms);
+            if (self.waitForStart(.shutdown, poll_ms)) return;
         }
     }
 };

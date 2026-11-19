@@ -100,7 +100,7 @@ pub const Limiter = struct {
     /// Pays for the whole request, `ops` operations moving `bytes` in
     /// all, before the I/O starts, at the calling fiber's class and
     /// tenant, waiting as the meter says unless the fiber's io does not
-    /// wait (`Ctx.io_waits`), when the cost is taken and the I/O goes
+    /// wait (`Ctx.waits`), when the cost is taken and the I/O goes
     /// ahead. The cost is the pages or the operations' `pages_per_op`,
     /// whichever is more; a write costs `write_cost` of either per page.
     pub fn grant(
@@ -118,7 +118,7 @@ pub const Limiter = struct {
         const cost = @max(pages, nops * self.pages_per_op);
         if (self.metered) {
             const ctx = fiber.ctx();
-            if (ctx.io_waits)
+            if (ctx.waits)
                 ctx.tenant.acquire(.io, ctx.class, cost * wm)
             else
                 ctx.tenant.charge(.io, ctx.class, cost * wm, utils.coarseMs());

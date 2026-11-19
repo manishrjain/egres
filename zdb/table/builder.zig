@@ -14,6 +14,7 @@ const _compress = utils.compression;
 const _binaryfuse = @import("../binaryfusefilter.zig");
 const zroar = @import("zroar");
 const vfs = @import("vfs");
+const fiber = @import("zfiber");
 const zbuf = @import("zbuf").zbuf;
 
 const log = std.log.scoped(.table_builder);
@@ -583,6 +584,8 @@ pub const Builder = struct {
         defer self.allocator.free(block_offsets);
 
         for (self.block_infos.items, 0..) |info, i| {
+            // A yield point per block, as the filter below has per key.
+            try fiber.ctx().meter();
             // BlockIndex records each block's base key and byte range in table bytes.
             var block_writer = try _buffers.BlockIndexWriter.initWithBuf(
                 self.allocator,
