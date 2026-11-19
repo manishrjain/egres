@@ -498,6 +498,12 @@ pub const Builder = struct {
             packed_len;
         if (self.shouldFinishBlock(entry_sz)) {
             try self.finishBlock();
+            // A yield point per block: compressing one is a slice's
+            // worth (tens of µs under lz4, more under zstd), and the
+            // loops that feed the builder meter per item, 256 items
+            // between checks. After finishBlock, whose errdefer would
+            // free the base key the block list now owns.
+            try fiber.ctx().maybeYield();
         }
 
         // finishBlock clears the base key, so a block that just rolled over

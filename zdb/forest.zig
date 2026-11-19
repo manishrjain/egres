@@ -727,6 +727,11 @@ pub const Forest = struct {
     pub fn put(self: *Forest, items: []const Item) !void {
         for (items) |*item| {
             try self.memtables.putItem(item);
+            // The apply loop puts a 16 MiB batch of entries as one step
+            // on its raft-lane worker, and the WAL writer's or a peer's
+            // completion on that worker waits for it to end. Between
+            // items no lock is held.
+            try fiber.ctx().meter();
         }
     }
 
