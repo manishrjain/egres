@@ -60,13 +60,15 @@ platform_down
 trap platform_down EXIT
 platform_up
 # Out of room on the way: the heavy counts that fit in what was made
-# are run, and the row with the largest is where this side's line
-# ends; a count with no tenants to run it is not a result.
+# are run, then every heavy tenant there is, so this side's line ends
+# at the largest count it could staff; a count with no tenants to run
+# it is not a result.
 if ! create_range 0 "$total" "$ROWS"; then
     [ "$MADE" -gt "$QUIET" ] || exit 1
     fit=
-    for h in $HEAVY; do ((h <= MADE - QUIET)) && fit+="$h "; done
-    echo "heavy counts cut to $fit($MADE tenants made of $total)" >&2
+    for h in $HEAVY; do ((h < MADE - QUIET)) && fit+="$h "; done
+    fit+="$((MADE - QUIET))"
+    echo "heavy counts cut to $fit ($MADE tenants made of $total)" >&2
     HEAVY=$fit
     total=$MADE
 fi
