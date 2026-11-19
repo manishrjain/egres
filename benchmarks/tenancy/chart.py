@@ -250,7 +250,7 @@ def sides_in(runs, test):
 
 
 def chart_noisy(runs, out):
-    """Quiet tenants' p99 against the heavy count, writers and scanners,
+    """Quiet tenants' p95 against the heavy count, writers and scanners,
     and the writers' own throughput."""
     sides = sides_in(runs, "noisy")
     if not sides:
@@ -260,9 +260,9 @@ def chart_noisy(runs, out):
     xpos = {h: i for i, h in enumerate(heavies)}
     W, PW, PH = 1060, 760, 220
     panels = []
-    specs = [("write", "p99_ms", "Quiet tenants' p99 beside heavy writers",
+    specs = [("write", "p95_ms", "Quiet tenants' p95 beside heavy writers",
               "ms", True),
-             ("cpu", "p99_ms", "Quiet tenants' p99 beside heavy scanners",
+             ("cpu", "p95_ms", "Quiet tenants' p95 beside heavy scanners",
               "ms", True),
              ("write", "heavy_done", "The heavy writers' own statements in "
               "the minute", "statements", True),
@@ -293,7 +293,7 @@ def chart_noisy(runs, out):
 
 
 def chart_footprint(runs, out):
-    """Memory held and point-read p99 against the tenant count."""
+    """Memory held and point-read p95 against the tenant count."""
     sides = sides_in(runs, "footprint")
     if not sides:
         return
@@ -328,16 +328,16 @@ def chart_footprint(runs, out):
                  f'{label}, {r["tenants"]} tenants: {mem(key, r):.2f} GiB')
                 for r in rows[key]], colour, label)
     panels.append(p)
-    ys = [num(r["p99_ms"]) for v in rows.values() for r in v
-          if num(r["p99_ms"])]
+    ys = [num(r.get("p95_ms")) for v in rows.values() for r in v
+          if num(r.get("p95_ms"))]
     p = Panel(90, 110 + PH + 70, PW, PH, xs, ys, True, True,
-              "Point read p99 at each count, a fresh connection each", "ms",
+              "Point read p95 at each count, a fresh connection each", "ms",
               "tenants")
     p.frame(sorted(set(xs)), fmt)
     for key, label, colour in sides:
-        p.line([(int(r["tenants"]), num(r["p99_ms"]),
-                 f'{label}, {r["tenants"]} tenants: p99 {r["p99_ms"]} ms')
-                for r in rows[key] if num(r["p99_ms"])], colour, label)
+        p.line([(int(r["tenants"]), num(r.get("p95_ms")),
+                 f'{label}, {r["tenants"]} tenants: p95 {r.get("p95_ms")} ms')
+                for r in rows[key] if num(r.get("p95_ms"))], colour, label)
     panels.append(p)
     sub = ("Tenants created through SQL, 1,000 rows each, then point reads at"
            " random tenants. The line ends at the largest count the side ran.")
@@ -357,12 +357,12 @@ def chart_agents(runs, out):
                    if int(r["tenants"]) > 0] for s in sides}
     xs = [int(r["tenants"]) for v in rows.values() for r in v]
     st = runs[("agents", sides[0][0])]["settings"]
-    specs = [("point_p99_ms", "Active tenants' point read p99", "ms",
-              num(st.get("STOP_P99_MS")), "the stop, {} ms"),
-             ("arrive_p99_ms", "An arrival's time to its first row, p99",
+    specs = [("point_p95_ms", "Active tenants' point read p95", "ms",
+              num(st.get("STOP_P95_MS")), "the stop, {} ms"),
+             ("arrive_p95_ms", "An arrival's time to its first row, p95",
               "ms", num(st.get("STOP_ARRIVE_MS")), "the stop, {} ms"),
-             ("first_p99_ms", "A session's first statement from an idle "
-              "tenant, p99 (a wake included)", "ms", None, None),
+             ("first_p95_ms", "A session's first statement from an idle "
+              "tenant, p95 (a wake included)", "ms", None, None),
              ("held_mib", "Memory held", "GiB", None, None),
              ("write_mib_s", "Disk written during the window", "MiB/s",
               None, None)]

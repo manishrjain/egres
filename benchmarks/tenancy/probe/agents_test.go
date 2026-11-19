@@ -291,17 +291,17 @@ func TestRowShape(t *testing.T) {
 
 // The stop rule reads a window's figures, and a bound of 0 is off.
 func TestStopRule(t *testing.T) {
-	r := stopRule{readP99: 50, arriveP99: 5000, errPct: 1}
-	ok := windowRow{readP99: 49, arriveP99: 4999, errPct: 0.9}
+	r := stopRule{readP95: 50, arriveP95: 5000, errPct: 1}
+	ok := windowRow{readP95: 49, arriveP95: 4999, errPct: 0.9}
 	if why := r.breached(ok); why != "" {
 		t.Errorf("fit: %s", why)
 	}
-	for _, w := range []windowRow{{readP99: 51}, {arriveP99: 5001}, {errPct: 1.1}} {
+	for _, w := range []windowRow{{readP95: 51}, {arriveP95: 5001}, {errPct: 1.1}} {
 		if r.breached(w) == "" {
 			t.Errorf("%+v passed", w)
 		}
 	}
-	if why := (stopRule{}).breached(windowRow{readP99: 1e9, errPct: 100}); why != "" {
+	if why := (stopRule{}).breached(windowRow{readP95: 1e9, errPct: 100}); why != "" {
 		t.Errorf("rule off: %s", why)
 	}
 }

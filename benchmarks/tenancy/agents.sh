@@ -26,17 +26,17 @@
 # or woken: what stays in memory is the server's own choice.
 #
 # The run stops growing at the memory or disk floor, or when a count
-# no longer fits: the reads' p99 over STOP_P99_MS, arrivals' p99 over
+# no longer fits: the reads' p95 over STOP_P95_MS, arrivals' p95 over
 # STOP_ARRIVE_MS, or more than STOP_ERRORS_PCT of statements failing.
 # A breach is measured once more before it counts, since a drive's slow
-# phase can lift one window's p99 on its own. The last count that
+# phase can lift one window's p95 on its own. The last count that
 # passed is how many tenants fit at this activity.
 #   BACKEND=egres ./agents.sh
 #   STEPS=1000,2000,5000,10000,20000,50000,100000 ARRIVE=30 WINDOW=2m
 #   ACTIVE=0.10 SESSION=2m RATE=1 ROWS=1000
 #   MIX=point=60,range=15,update=15,insert=8,count=2
 #   MEM_GIB=64 BUDGET_PCT=90 WAKE=restore
-#   STOP_P99_MS=50 STOP_ARRIVE_MS=5000 STOP_ERRORS_PCT=1   (0 turns one off)
+#   STOP_P95_MS=50 STOP_ARRIVE_MS=5000 STOP_ERRORS_PCT=1   (0 turns one off)
 source "$(dirname "$0")/common.sh"
 in_cgroup "$@"
 platform_init "$@"
@@ -49,7 +49,7 @@ RATE=${RATE:-1}
 ROWS=${ROWS:-1000}
 MIX=${MIX:-point=60,range=15,update=15,insert=8,count=2}
 WAKE=${WAKE:-restore}
-STOP_P99_MS=${STOP_P99_MS:-50}
+STOP_P95_MS=${STOP_P95_MS:-50}
 STOP_ARRIVE_MS=${STOP_ARRIVE_MS:-5000}
 STOP_ERRORS_PCT=${STOP_ERRORS_PCT:-1}
 BUDGET_MIB=$(($(budget_kb) / 1024))
@@ -83,7 +83,7 @@ esac
     -disk "$(work_disk)" \
     -steps "$STEPS" -arrive "$ARRIVE" -window "$WINDOW" -active "$ACTIVE" \
     -session "$SESSION" -rate "$RATE" -rows "$ROWS" -mix "$MIX" \
-    -stop-p99-ms "$STOP_P99_MS" -stop-arrive-ms "$STOP_ARRIVE_MS" \
+    -stop-p95-ms "$STOP_P95_MS" -stop-arrive-ms "$STOP_ARRIVE_MS" \
     -stop-errors-pct "$STOP_ERRORS_PCT" \
     -trace "$RES/agents.trace" | tee "$out"
 [ "$(type -t platform_dump)" = function ] && platform_dump agents_end

@@ -58,12 +58,14 @@ const (
 var kindNames = [numKinds]string{"point", "range", "update", "insert", "count"}
 
 const header = "tenants,awake,held_mib,disk_mib,read_mib_s,write_mib_s," +
-	"arrive_p50_ms,arrive_p99_ms," +
-	"first_p50_ms,first_p99_ms," +
-	"wake_p50_ms,wake_p99_ms,woke_pct,sleeps_per_s,wakes_per_s," +
-	"point_p50_ms,point_p99_ms,range_p50_ms,range_p99_ms," +
-	"update_p50_ms,update_p99_ms,insert_p50_ms,insert_p99_ms," +
-	"count_p50_ms,count_p99_ms,ok,errors"
+	"arrive_p50_ms,arrive_p95_ms,arrive_p99_ms," +
+	"first_p50_ms,first_p95_ms,first_p99_ms," +
+	"wake_p50_ms,wake_p95_ms,wake_p99_ms,woke_pct,sleeps_per_s,wakes_per_s," +
+	"point_p50_ms,point_p95_ms,point_p99_ms," +
+	"range_p50_ms,range_p95_ms,range_p99_ms," +
+	"update_p50_ms,update_p95_ms,update_p99_ms," +
+	"insert_p50_ms,insert_p95_ms,insert_p99_ms," +
+	"count_p50_ms,count_p95_ms,count_p99_ms,ok,errors"
 
 // Arrivals under way at once. Past this an arrival waits its turn, and
 // the wait is in its latency.
@@ -591,10 +593,12 @@ func (a *agentRun) grow(to int, perSec, floorGiB, diskFloorGiB float64) (
 // A window's row, with the figures the stop rule reads.
 type windowRow struct {
 	csv string
-	// p99 of the reads (point and range), the arrivals' p99, and the
+	// p95 of the reads (point and range), the arrivals' p95, and the
 	// share of statements that failed, all in the window; 0 where there
-	// were no samples.
-	readP99, arriveP99, errPct float64
+	// were no samples. p95 is the figure reported and stopped on; p99
+	// is in the row for a sanity check, since at a few thousand samples
+	// it is the worst few dozen queries.
+	readP95, arriveP95, errPct float64
 }
 
 // window measures for d with arrivals paused and returns the CSV row.
@@ -676,9 +680,10 @@ func (a *agentRun) window(d time.Duration) windowRow {
 		cells = append(cells, f0(awakeAvg), f0(heldMiB),
 			f0(diskUsedMiB(a.p.run)),
 			ioRate(read0, read1), ioRate(written0, written1),
-			pctCell(arrive, 0.5), pctCell(arrive, 0.99),
-			pctCell(first, 0.5), pctCell(first, 0.99),
-			pctCell(wake, 0.5), pctCell(wake, 0.99), f2(woke),
+			pctCell(arrive, 0.5), pctCell(arrive, 0.95), pctCell(arrive, 0.99),
+			pctCell(first, 0.5), pctCell(first, 0.95), pctCell(first, 0.99),
+			pctCell(wake, 0.5), pctCell(wake, 0.95), pctCell(wake, 0.99),
+			f2(woke),
 			f2(float64(sleeps)/secs), f2(float64(wakes)/secs))
 	} else {
 		held := ""
@@ -687,18 +692,19 @@ func (a *agentRun) window(d time.Duration) windowRow {
 		}
 		cells = append(cells, "", held, "",
 			ioRate(read0, read1), ioRate(written0, written1),
-			pctCell(arrive, 0.5), pctCell(arrive, 0.99),
-			pctCell(first, 0.5), pctCell(first, 0.99), "", "", "", "", "")
+			pctCell(arrive, 0.5), pctCell(arrive, 0.95), pctCell(arrive, 0.99),
+			pctCell(first, 0.5), pctCell(first, 0.95), pctCell(first, 0.99),
+			"", "", "", "", "", "")
 	}
 	for k := range numKinds {
 		l := sorted(a.lat[k])
-		cells = append(cells, pctCell(l, 0.5), pctCell(l, 0.99))
+		cells = append(cells, pctCell(l, 0.5), pctCell(l, 0.95), pctCell(l, 0.99))
 	}
 	cells = append(cells, strconv.Itoa(a.ok), strconv.Itoa(a.errs))
 	row := windowRow{csv: strings.Join(cells, ","),
-		readP99: max(pct(sorted(a.lat[kPoint]), 0.99),
-			pct(sorted(a.lat[kRange]), 0.99)),
-		arriveP99: pct(arrive, 0.99)}
+		readP95: max(pct(sorted(a.lat[kPoint]), 0.95),
+			pct(sorted(a.lat[kRange]), 0.95)),
+		arriveP95: pct(arrive, 0.95)}
 	if n := a.ok + a.errs; n > 0 {
 		row.errPct = 100 * float64(a.errs) / float64(n)
 	}
@@ -714,18 +720,18 @@ func (a *agentRun) window(d time.Duration) windowRow {
 	return row
 }
 
-// stopRule is when a count no longer fits: the reads' p99 over a
+// stopRule is when a count no longer fits: the reads' p95 over a
 // bound, arrivals too slow, or statements failing. A bound of 0 is
 // off. Returns why, or "".
-type stopRule struct{ readP99, arriveP99, errPct float64 }
+type stopRule struct{ readP95, arriveP95, errPct float64 }
 
 func (r stopRule) breached(w windowRow) string {
 	switch {
-	case r.readP99 > 0 && w.readP99 > r.readP99:
-		return fmt.Sprintf("reads' p99 %.1f ms over %.1f", w.readP99, r.readP99)
-	case r.arriveP99 > 0 && w.arriveP99 > r.arriveP99:
-		return fmt.Sprintf("arrivals' p99 %.0f ms over %.0f", w.arriveP99,
-			r.arriveP99)
+	case r.readP95 > 0 && w.readP95 > r.readP95:
+		return fmt.Sprintf("reads' p95 %.1f ms over %.1f", w.readP95, r.readP95)
+	case r.arriveP95 > 0 && w.arriveP95 > r.arriveP95:
+		return fmt.Sprintf("arrivals' p95 %.0f ms over %.0f", w.arriveP95,
+			r.arriveP95)
 	case r.errPct > 0 && w.errPct > r.errPct:
 		return fmt.Sprintf("%.2f%% of statements failed, over %.1f%%",
 			w.errPct, r.errPct)
@@ -773,10 +779,10 @@ func agents(args []string) {
 		"file for one line per statement: due_ms,tenant,kind,ms,woke,ok"+
 			" (arrivals too, kind arrive)")
 	seed := fs.Int64("seed", 1, "seed for the random choices")
-	stopRead := fs.Float64("stop-p99-ms", 50,
-		"stop growing when the reads' p99 in a window is over this; 0 = never")
+	stopRead := fs.Float64("stop-p95-ms", 50,
+		"stop growing when the reads' p95 in a window is over this; 0 = never")
 	stopArrive := fs.Float64("stop-arrive-ms", 5000,
-		"stop growing when the arrivals' p99 is over this; 0 = never")
+		"stop growing when the arrivals' p95 is over this; 0 = never")
 	stopErr := fs.Float64("stop-errors-pct", 1,
 		"stop growing when more than this share of statements fail; 0 = never")
 	fs.Parse(args)
@@ -867,7 +873,7 @@ func agents(args []string) {
 			fmt.Println(w.csv)
 			// A breach is measured once more at the same count before it
 			// ends the run: a drive's slow phase can lift one window's
-			// p99 on its own, and a count that fails twice has not fit.
+			// p95 on its own, and a count that fails twice has not fit.
 			// Both rows are printed.
 			if over := rule.breached(w); over != "" && why == "" {
 				fmt.Fprintf(os.Stderr, "agents: %d tenants: %s; measuring "+
