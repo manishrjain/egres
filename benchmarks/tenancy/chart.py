@@ -312,7 +312,9 @@ def chart_footprint(runs, out):
     # cgroup holds, file cache they pin included.
     def mem(key, r):
         col = "pss_mib" if key == "pgshared" else "held_mib"
-        return num(r[col]) / 1024
+        held = num(r[col]) / 1024
+        # A server's block cache is its own choice, not the tenants'.
+        return held - (num(r.get("cache_mib")) or 0) / 1024
 
     panels = []
     ys = [mem(k, r) for k, v in rows.items() for r in v]
@@ -365,7 +367,8 @@ def chart_agents(runs, out):
               "ms", num(st.get("STOP_ONBOARD_MS")), "the stop, {} ms"),
              ("first_p95_ms", "A session's first statement from an idle "
               "tenant, p95 (a wake included)", "ms", None, None),
-             ("held_mib", "Memory held", "GiB", None, None),
+             ("held_mib", "Memory held, less the server's block cache", "GiB",
+              None, None),
              ("write_mib_s", "Disk written during the window", "MiB/s",
               None, None)]
     budget = None
@@ -377,8 +380,13 @@ def chart_agents(runs, out):
                     if any(c in r for v in rows.values() for r in v)),
                    cols.split("|")[0])
         div = 1024 if ylabel == "GiB" else 1
-        ys = [num(r.get(col)) / div for v in rows.values() for r in v
-              if num(r.get(col))]
+        def val(r):
+            v = num(r.get(col))
+            if v is not None and col == "held_mib":
+                v -= num(r.get("cache_mib")) or 0
+            return v
+        ys = [val(r) / div for v in rows.values() for r in v
+              if val(r) is not None]
         if not ys:
             continue
         if stop:
@@ -393,10 +401,10 @@ def chart_agents(runs, out):
         if col == "held_mib" and budget:
             p.rule(budget, f"the {fmt(budget)} GiB budget")
         for key, label, colour in sides:
-            pts = [(int(r["tenants"]), num(r[col]) / div,
+            pts = [(int(r["tenants"]), val(r) / div,
                     f'{label}, {r["tenants"]} tenants: '
-                    f'{fmt(num(r[col]) / div)} {ylabel}')
-                   for r in rows[key] if num(r.get(col))]
+                    f'{fmt(val(r) / div)} {ylabel}')
+                   for r in rows[key] if val(r) is not None]
             p.line(pts, colour, label)
         panels.append(p)
     active = st.get("ACTIVE", "0.10")

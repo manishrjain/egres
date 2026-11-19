@@ -57,7 +57,7 @@ const (
 
 var kindNames = [numKinds]string{"point", "range", "update", "insert", "count"}
 
-const header = "tenants,awake,held_mib,disk_mib,read_mib_s,write_mib_s," +
+const header = "tenants,awake,held_mib,cache_mib,disk_mib,read_mib_s,write_mib_s," +
 	"onboard_p50_ms,onboard_p95_ms,onboard_p99_ms," +
 	"first_p50_ms,first_p95_ms,first_p99_ms," +
 	"wake_p50_ms,wake_p95_ms,wake_p99_ms,woke_pct,sleeps_per_s,wakes_per_s," +
@@ -325,6 +325,7 @@ type agentRun struct {
 	p       *platform // vm; nil for shared
 	pid     int       // shared: the server's, for its PSS
 	disk    string    // the drive WORK is on, for its traffic; "" = none
+	admin   string    // shared: the server's admin port, for its block cache
 	clk     *clock
 	rows    int
 	mix     mix
@@ -677,7 +678,7 @@ func (a *agentRun) window(d time.Duration) windowRow {
 		if n := a.ok + a.errs; n > 0 {
 			woke = 100 * float64(a.woke) / float64(n)
 		}
-		cells = append(cells, f0(awakeAvg), f0(heldMiB),
+		cells = append(cells, f0(awakeAvg), f0(heldMiB), "",
 			f0(diskUsedMiB(a.p.run)),
 			ioRate(read0, read1), ioRate(written0, written1),
 			pctCell(onboard, 0.5), pctCell(onboard, 0.95), pctCell(onboard, 0.99),
@@ -690,7 +691,7 @@ func (a *agentRun) window(d time.Duration) windowRow {
 		if heldN > 0 {
 			held = f0(float64(heldSum) / float64(heldN) / 1024)
 		}
-		cells = append(cells, "", held, "",
+		cells = append(cells, "", held, cacheMiB(a.admin), "",
 			ioRate(read0, read1), ioRate(written0, written1),
 			pctCell(onboard, 0.5), pctCell(onboard, 0.95), pctCell(onboard, 0.99),
 			pctCell(first, 0.5), pctCell(first, 0.95), pctCell(first, 0.99),
@@ -760,6 +761,8 @@ func agents(args []string) {
 			"cache (the awake VMs' PSS without a cgroup limit); 0 = no budget")
 	disk := fs.String("disk", "",
 		"the drive WORK is on (nvme0n1), for read_mib_s and write_mib_s")
+	admin := fs.String("admin", "",
+		"shared: the server's admin ip:port, for cache_mib from its memory report")
 	floorGiB := fs.Float64("floor-gib", 16,
 		"stop onboardings when the host's MemAvailable is under this")
 	diskFloorGiB := fs.Float64("disk-floor-gib", 5,
@@ -813,9 +816,9 @@ func agents(args []string) {
 		fail("-rows, -rate and -onboard must be positive, -active in 0..1")
 	}
 
-	a := &agentRun{addr: *addr, pid: *pid, disk: *disk, clk: newClock(),
-		rows: *rows,
-		mix:  m, rate: *rate, sessLen: *sessLen, active: *active,
+	a := &agentRun{addr: *addr, pid: *pid, disk: *disk, admin: *admin,
+		clk: newClock(), rows: *rows,
+		mix: m, rate: *rate, sessLen: *sessLen, active: *active,
 		begin: time.Now(), rng: rand.New(rand.NewSource(*seed)),
 		running: map[*sessionRun]bool{}}
 	if *backend == "vm" {

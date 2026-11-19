@@ -15,6 +15,7 @@ EDATA=${EDATA:-$WORK/egres-data}
 OFFSET=${OFFSET:-50}
 SQL_PORT=$((3210 + OFFSET))
 ADDR=127.0.0.1:$SQL_PORT
+ADMIN=127.0.0.1:$((5210 + OFFSET))
 # Every start's log, numbered in start order: egres-1.log, egres-2.log,
 # ... run.sh points this at the run's own directory.
 LOG_DIR=${LOG_DIR:-$RUN/logs}
@@ -123,6 +124,19 @@ tenants_pss_kb() {
 # The store alone: the WAL's files are made at a fixed size up front
 # and would hide what a tenant adds.
 tenants_disk_kb() { du -sk "$EDATA/store" | cut -f1; }
+# The block cache, KiB, from the server's memory report: the server's
+# own choice of what to keep, not the tenants' cost, so the per-tenant
+# figure is what is held less this.
+tenants_cache_kb() {
+    egres_admin mem 5 2>/dev/null | awk '$1 == "block_cache:" {
+        v = $2; u = v; gsub(/[0-9.]/, "", u); sub(/[A-Za-z]+$/, "", v)
+        k = v
+        if (u == "GiB") k = v * 1048576
+        else if (u == "MiB") k = v * 1024
+        else if (u == "B") k = v / 1024
+        printf "%d\n", k
+    }'
+}
 # Files the server holds open; the host's hard limit caps it.
 tenants_fds() {
     { find "/proc/$(platform_pid)/fd" -mindepth 1 -maxdepth 1 2>/dev/null ||

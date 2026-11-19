@@ -10,7 +10,9 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"math/rand"
+	"net"
 	"os"
 	"sort"
 	"strconv"
@@ -271,6 +273,52 @@ func tagCheck(want string) checker {
 		}
 		return nil
 	}
+}
+
+// cacheMiB is the server's block cache from its admin memory report
+// ("block_cache: 10.17GiB (block bytes)"), as a cell; "" without an
+// admin address or when the report cannot be had. The cache is the
+// server's own choice of what to keep, not the tenants' cost.
+func cacheMiB(admin string) string {
+	if admin == "" {
+		return ""
+	}
+	c, err := net.DialTimeout("tcp", admin, 2*time.Second)
+	if err != nil {
+		return ""
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := c.Write([]byte("mem\n")); err != nil {
+		return ""
+	}
+	raw, _ := io.ReadAll(c)
+	for _, line := range strings.Split(string(raw), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 || f[0] != "block_cache:" {
+			continue
+		}
+		return fmt.Sprintf("%.0f", parseBytes(f[1])/1048576)
+	}
+	return ""
+}
+
+// parseBytes reads "10.17GiB", "537.72MiB", "47KiB" or "12B" as bytes.
+func parseBytes(s string) float64 {
+	units := []struct {
+		suffix string
+		mult   float64
+	}{{"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10}, {"B", 1}}
+	for _, u := range units {
+		if strings.HasSuffix(s, u.suffix) {
+			v, err := strconv.ParseFloat(strings.TrimSuffix(s, u.suffix), 64)
+			if err != nil {
+				return 0
+			}
+			return v * u.mult
+		}
+	}
+	return 0
 }
 
 // diskIO is the KiB read and written on the drive since boot, from

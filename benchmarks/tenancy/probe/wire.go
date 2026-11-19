@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -139,6 +140,24 @@ func untilReady(r *bufio.Reader) (*result, error) {
 	}
 }
 
+// dialTCP connects with a timeout. A loopback target is dialled from
+// the loopback addresses in turn, 127.0.0.1 to 127.0.0.4: one source
+// address has about 28,000 ephemeral ports, and a fleet of 100,000
+// tenants with a tenth in a session holds more connections than that
+// to the one server port. Every 127.0.0.0/8 address is the host's,
+// with nothing to configure.
+var loopbackSource atomic.Uint32
+
+func dialTCP(addr string, timeout time.Duration) (net.Conn, error) {
+	d := net.Dialer{Timeout: timeout}
+	if host, _, err := net.SplitHostPort(addr); err == nil &&
+		host == "127.0.0.1" {
+		n := loopbackSource.Add(1) % 4
+		d.LocalAddr = &net.TCPAddr{IP: net.IPv4(127, 0, 0, byte(1+n))}
+	}
+	return d.Dial("tcp", addr)
+}
+
 // splitTarget parses ip:port or ip:port/database.
 func splitTarget(target string) (addr, db string) {
 	addr, db, found := strings.Cut(target, "/")
@@ -164,7 +183,7 @@ func runTimed(target, sql string, dial time.Duration, check checker) (
 	var ph phases
 	addr, db := splitTarget(target)
 	t0 := time.Now()
-	c, err := net.DialTimeout("tcp", addr, dial)
+	c, err := dialTCP(addr, dial)
 	if err != nil {
 		return ph, err
 	}
@@ -226,7 +245,7 @@ type session struct {
 
 func open(target string, dial time.Duration) (*session, error) {
 	addr, db := splitTarget(target)
-	c, err := net.DialTimeout("tcp", addr, dial)
+	c, err := dialTCP(addr, dial)
 	if err != nil {
 		return nil, err
 	}

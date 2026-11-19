@@ -75,7 +75,7 @@ vm)
         -disk-floor-gib "$DISK_FLOOR_GIB" -cpus "$PLATFORM_CPUS")
     ;;
 egres)
-    side=(-backend shared -addr "$ADDR" -pid "$(platform_pid)")
+    side=(-backend shared -addr "$ADDR" -pid "$(platform_pid)" -admin "$ADMIN")
     ;;
 *) echo "agents runs on vm or egres, not $BACKEND" >&2; exit 2 ;;
 esac

@@ -33,20 +33,26 @@ SAMPLE=${SAMPLE:-60}
 out=$RES/footprint.csv
 
 fds() { [ "$(type -t tenants_fds)" = function ] && tenants_fds || true; }
+cache() {
+    [ "$(type -t tenants_cache_kb)" = function ] && mib "$(tenants_cache_kb)" ||
+        true
+}
 # One row: the state, then memory, disk and whatever the caller adds.
 row() {
     local n=$1 state=$2
     shift 2
     echo "$n,$state,$(mib "$(tenants_pss_kb)"),$(mib "$(mem_held_kb)")," \
-        "$(mib "$(cgroup_kb)"),$(mib "$(tenants_disk_kb)")," \
+        "$(mib "$(cgroup_kb)"),$(cache),$(mib "$(tenants_disk_kb)")," \
         "$(fds),$*" | tr -d ' ' | tee -a "$out"
 }
 
 platform_down
 trap platform_down EXIT
 platform_up
-echo "tenants,state,pss_mib,held_mib,cgroup_mib,disk_mib,open_files," \
-    "p50_ms,p95_ms,p99_ms,ok,errors" | tr -d ' ' | tee "$out"
+# cache_mib: a server's block cache (Egres's memory report), the
+# server's choice rather than the tenants' cost; the fit takes it off.
+echo "tenants,state,pss_mib,held_mib,cgroup_mib,cache_mib,disk_mib," \
+    "open_files,p50_ms,p95_ms,p99_ms,ok,errors" | tr -d ' ' | tee "$out"
 sleep 5
 # The platform with no tenants: its fixed cost.
 row 0 loaded ",,,,"
@@ -73,13 +79,16 @@ for ((t = SAMPLE; t <= SETTLE; t += SAMPLE)); do
     row "$have" "settled_${t}s" ",,,,"
 done
 
-# The estimate, on held_mib. The cost per tenant is the slope between
-# the last two counts: the first tenants also pay for the platform's
-# pools and arenas, which the fixed cost (the intercept) absorbs. The
-# settled figure scales that slope by what the last count gave back.
+# The estimate, on held_mib less cache_mib. The cost per tenant is the
+# slope between the last two counts: the first tenants also pay for
+# the platform's pools and arenas, which the fixed cost (the
+# intercept) absorbs. The settled figure scales that slope by what the
+# last count gave back.
 awk -F, -v mem_gib="$MEM_GIB" -v budget_mib="$(($(budget_kb) / 1024))" '
-    $2 == "loaded" && $1 > 0 {pn = n; ploaded = loaded; n = $1; loaded = $4}
-    $2 ~ /^settled/ {settled = $4}
+    $2 == "loaded" && $1 > 0 {
+        pn = n; ploaded = loaded; n = $1; loaded = $4 - $6
+    }
+    $2 ~ /^settled/ {settled = $4 - $6}
     END {
         if (n == 0 || n == pn) exit
         slope = (loaded - ploaded) * 1024 / (n - pn)
