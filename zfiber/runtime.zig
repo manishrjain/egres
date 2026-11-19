@@ -977,12 +977,12 @@ pub const InitOptions = struct {
     /// ids; the remaining higher ids form the `.default` lane).
     ///
     /// `null` (default) means "auto" — `raftWorkerCount` reserves 0 below 8
-    /// workers, else ≈ 1/4 of `num_workers` (capped at 4). An explicit value is
-    /// honored verbatim, INCLUDING `0`: pass `.raft_workers = 0` to put every
-    /// worker in the `.default` lane (no raft reservation). Optional so that a
-    /// requested 0 is distinguishable from "unset" — otherwise 0 and auto would
-    /// collide. Raft may claim at most half of `num_workers`, so `.default`
-    /// (which owns lead worker 0) is never starved; an empty raft lane makes
+    /// workers, else 2. An explicit value is honored verbatim, INCLUDING
+    /// `0`: pass `.raft_workers = 0` to put every worker in the `.default`
+    /// lane (no raft reservation). Optional so that a requested 0 is
+    /// distinguishable from "unset" — otherwise 0 and auto would collide.
+    /// Raft may claim at most half of `num_workers`, so `.default` (which
+    /// owns lead worker 0) is never starved; an empty raft lane makes
     /// `.raft` spawns fall back to `.default`.
     raft_workers: ?usize = null,
 
@@ -1010,23 +1010,26 @@ pub const InitOptions = struct {
     sim: ?_sim.Options = null,
 };
 
-/// Resolve how many workers serve the `.raft` lane, as a fraction of the
-/// runtime's TOTAL worker count (`num_workers`).
+/// Resolve how many workers serve the `.raft` lane out of the runtime's
+/// TOTAL worker count (`num_workers`).
 ///
 /// `requested == null` (the default) means "auto": below 8 workers reserve
 /// NONE — a dedicated raft lane isn't worth it on a small runtime, so raft
 /// fibers just share the `.default` lane's auto-scheduling. At ≥ 8 workers
-/// target a 1/4 ratio capped at 4 (8 → 2, 16 → 4, 32 → 4). An explicit
-/// `requested` (including 0) is used as-is. Either way raft may claim at most
-/// half of `num_workers`, leaving the majority (and at least one worker) to
-/// `.default`.
+/// reserve 2, one each for the main loop and the apply loop, the only raft
+/// fibers that stay busy: the tick and the rest wrap onto those two. A
+/// quarter of the workers used to be reserved, up to 4, and on a 32-core
+/// box the third and fourth sat idle for an hour while the lane cannot be
+/// stolen from. An explicit `requested` (including 0) is used as-is.
+/// Either way raft may claim at most half of `num_workers`, leaving the
+/// majority (and at least one worker) to `.default`.
 fn raftWorkerCount(num_workers: usize, requested: ?usize) usize {
-    const raft = if (requested) |r|
+    const raft: usize = if (requested) |r|
         r
     else if (num_workers < 8)
         0
     else
-        @min(num_workers / 4, 4);
+        2;
 
     // Enforced in every build (not a debug-only assert): a raft lane bigger
     // than half the workers would starve `.default`. A misconfigured count is a

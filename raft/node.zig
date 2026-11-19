@@ -1978,11 +1978,12 @@ pub const Node = struct {
         // Every loop self-exits when `isShuttingDown()` flips, so we don't
         // need `cancel()` — `wait()` suffices.
         //
-        // Pin the three hot Raft loops to distinct raft-lane workers via
-        // high-priority `worker_id` placement — mainLoop (consensus) on worker
-        // 0, applyLoop (state-machine apply) on worker 1, tickLoop (election/
-        // heartbeat ticks) on worker 2.`worker_id` is
-        // lane-relative and wraps if the raft lane has < 3 workers.
+        // Pin the Raft loops to raft-lane workers via high-priority
+        // `worker_id` placement — mainLoop (consensus) on worker 0,
+        // applyLoop (state-machine apply) on worker 1, tickLoop (election/
+        // heartbeat ticks) on worker 2. `worker_id` is lane-relative and
+        // wraps, so with the auto lane of 2 the tick shares worker 0 with
+        // the main loop; it is light enough not to matter.
         var g = fiber.Group(void).init(self.allocator);
         defer g.deinit();
         try g.ensureTotalCapacity(6);
