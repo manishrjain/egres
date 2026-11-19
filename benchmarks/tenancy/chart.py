@@ -95,7 +95,7 @@ class Panel:
                  xlabel):
         self.x0, self.y0, self.w, self.h = x0, y0, w, h
         self.xlog, self.ylog = xlog, ylog
-        self.xmin, self.xmax = min(xs), max(xs)
+        self.xmin, self.xmax = (0 if not xlog else min(xs)), max(xs)
         self.ymin, self.ymax = min(ys), max(ys)
         if ylog:
             self.ymin = 10 ** math.floor(math.log10(max(self.ymin, 1e-9)))
@@ -135,6 +135,11 @@ class Panel:
         step = nice(self.ymax / 5)
         return [i * step for i in range(int(self.ymax / step) + 1)]
 
+    def xticks(self):
+        """Ticks for a linear x: about five, at round numbers."""
+        step = nice(self.xmax / 5)
+        return [i * step for i in range(int(self.xmax / step) + 1)]
+
     def frame(self, xticks, xfmt):
         o = self.out
         o.append(f'<text x="{self.x0}" y="{self.y0 - 14}" fill="{INK}" '
@@ -168,9 +173,12 @@ class Panel:
             f'<line x1="{self.x0}" x2="{self.x0 + self.w}" y1="{py:.1f}" '
             f'y2="{py:.1f}" stroke="{INK2}" stroke-width="1" '
             f'stroke-dasharray="4 4"/>')
+        # At the right end, clear of lines that end near the left on a
+        # linear axis that runs far past them.
         self.out.append(
-            f'<text x="{self.x0 + 4}" y="{py - 5:.1f}" fill="{INK2}" '
-            f'font-size="11" {FONT}>{label}</text>')
+            f'<text x="{self.x0 + self.w - 4}" y="{py - 5:.1f}" '
+            f'fill="{INK2}" font-size="11" text-anchor="end" {FONT}>{label}'
+            f'</text>')
 
     def line(self, pts, colour, label, end_note=None):
         """One side: a 2px line, 8px markers, its name and last value
@@ -261,13 +269,13 @@ def chart_noisy(runs, out):
     W, PW, PH = 1060, 760, 220
     panels = []
     specs = [("write", "p95_ms", "Quiet tenants' p95 beside heavy writers",
-              "ms", True),
+              "ms", False),
              ("cpu", "p95_ms", "Quiet tenants' p95 beside heavy scanners",
-              "ms", True),
+              "ms", False),
              ("write", "heavy_done", "The heavy writers' own statements in "
-              "the minute", "statements", True),
+              "the minute", "statements", False),
              ("write", "write_mib", "Disk written over the writers' step",
-              "MiB", True)]
+              "MiB", False)]
     for i, (kind, col, title, ylabel, ylog) in enumerate(specs):
         ys = [num(r.get(col)) for s in sides
               for r in runs[("noisy", s[0])]["rows"]
@@ -320,9 +328,9 @@ def chart_footprint(runs, out):
     ys = [mem(k, r) for k, v in rows.items() for r in v]
     if budget:
         ys.append(budget)
-    p = Panel(90, 110, PW, PH, xs, ys, True, True,
+    p = Panel(90, 110, PW, PH, xs, ys, False, False,
               "Memory held, all tenants loaded", "GiB", "tenants")
-    p.frame(sorted(set(xs)), fmt)
+    p.frame(p.xticks(), fmt)
     if budget:
         p.rule(budget, f"the {fmt(budget)} GiB budget")
     for key, label, colour in sides:
@@ -332,10 +340,10 @@ def chart_footprint(runs, out):
     panels.append(p)
     ys = [num(r.get("p95_ms")) for v in rows.values() for r in v
           if num(r.get("p95_ms"))]
-    p = Panel(90, 110 + PH + 70, PW, PH, xs, ys, True, True,
+    p = Panel(90, 110 + PH + 70, PW, PH, xs, ys, False, False,
               "Point read p95 at each count, a fresh connection each", "ms",
               "tenants")
-    p.frame(sorted(set(xs)), fmt)
+    p.frame(p.xticks(), fmt)
     for key, label, colour in sides:
         p.line([(int(r["tenants"]), num(r.get("p95_ms")),
                  f'{label}, {r["tenants"]} tenants: p95 {r.get("p95_ms")} ms')
@@ -393,9 +401,9 @@ def chart_agents(runs, out):
             ys.append(stop)
         if col == "held_mib" and budget:
             ys.append(budget)
-        p = Panel(90, 110 + i * (PH + 70), PW, PH, xs, ys, True, True, title,
+        p = Panel(90, 110 + i * (PH + 70), PW, PH, xs, ys, False, False, title,
                   ylabel, "tenants")
-        p.frame(sorted(set(xs)), fmt)
+        p.frame(p.xticks(), fmt)
         if stop:
             p.rule(stop, stop_label.format(fmt(stop)))
         if col == "held_mib" and budget:
