@@ -46,7 +46,7 @@ platform_down
 trap platform_down EXIT
 platform_up
 echo "tenants,state,pss_mib,held_mib,cgroup_mib,disk_mib,open_files," \
-    "p50_ms,p90_ms,p99_ms,ok,errors" | tr -d ' ' | tee "$out"
+    "p50_ms,p95_ms,p99_ms,ok,errors" | tr -d ' ' | tee "$out"
 sleep 5
 # The platform with no tenants: its fixed cost.
 row 0 loaded ",,,,"

@@ -129,10 +129,10 @@ func load(args []string) {
 	}
 
 	lat = sorted(lat)
-	// p50_ms,p90_ms,p99_ms,ok,errors. No p99.9 or max: a run is a few
+	// p50_ms,p95_ms,p99_ms,ok,errors. No p99.9 or max: a run is a few
 	// thousand queries, and its top few are noise.
 	fmt.Printf("%.2f,%.2f,%.2f,%d,%d\n",
-		pct(lat, 0.5), pct(lat, 0.9), pct(lat, 0.99), len(lat), errs)
+		pct(lat, 0.5), pct(lat, 0.95), pct(lat, 0.99), len(lat), errs)
 }
 
 func main() {

@@ -204,7 +204,7 @@ targets_file() {
 }
 
 # Open-loop point reads at random tenants: the density traffic.
-# Prints p50_ms,p90_ms,p99_ms,ok,errors.
+# Prints p50_ms,p95_ms,p99_ms,ok,errors.
 point_reads() { "$ROOT/probe/probe" load -addrs "$1" -rate "$2" -dur "$3"; }
 
 BACKEND=${BACKEND:?vm, egres or pgshared}

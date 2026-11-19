@@ -246,8 +246,8 @@ func noisy(args []string) {
 			if len(a) == 0 {
 				continue
 			}
-			fmt.Fprintf(os.Stderr, "%-8s p50 %.2f  p90 %.2f  p99 %.2f ms\n",
-				x.name, pct(a, 0.5), pct(a, 0.9), pct(a, 0.99))
+			fmt.Fprintf(os.Stderr, "%-8s p50 %.2f  p95 %.2f  p99 %.2f ms\n",
+				x.name, pct(a, 0.5), pct(a, 0.95), pct(a, 0.99))
 		}
 	}
 
@@ -256,11 +256,11 @@ func noisy(args []string) {
 	if heavyDone > 0 {
 		heavyMs = float64(heavyUs) / float64(heavyDone) / 1000
 	}
-	// p50_ms,p90_ms,p99_ms,ok,errors,heavy_done,heavy_failed,heavy_mean_ms.
+	// p50_ms,p95_ms,p99_ms,ok,errors,heavy_done,heavy_failed,heavy_mean_ms.
 	// No p99.9 or max: a run is a few thousand queries, and its top few
 	// are noise.
 	fmt.Printf("%.2f,%.2f,%.2f,%d,%d,%d,%d,%.1f\n",
-		pct(lat, 0.5), pct(lat, 0.9), pct(lat, 0.99), len(lat), errs,
+		pct(lat, 0.5), pct(lat, 0.95), pct(lat, 0.99), len(lat), errs,
 		heavyDone, heavyFailed, heavyMs)
 	// The heavy loops are left to die with the process: waiting for a
 	// statement that takes a minute would only delay the next step.

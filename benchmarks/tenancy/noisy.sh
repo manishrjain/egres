@@ -68,17 +68,21 @@ for ((i = QUIET; i < total; i++)); do tenant_addr "$i"; done >"$RUN/heavy.txt"
 # heavy tenants' warm-up included. pss_mib and held_mib: the memory
 # the side has at the end of the step, as footprint measures it (the
 # tenants' processes; all the cgroup holds but clean unmapped cache).
-echo "kind,heavy,conns,p50_ms,p90_ms,p99_ms,ok,errors," \
+echo "kind,heavy,conns,p50_ms,p95_ms,p99_ms,ok,errors," \
     "heavy_done,heavy_failed,heavy_mean_ms,read_mib,write_mib," \
     "pss_mib,held_mib" | tr -d ' ' | tee "$out"
 for kind in $KINDS; do
     sql=$(heavy_sql "$kind")
     for h in $HEAVY; do
         read -r r0 w0 <<<"$(disk_io_kb)"
+        # TRACE=1: one line per quiet query (due_ms, ms, late, connect,
+        # startup, query), for finding where a slow one spent its time.
+        trace=()
+        [ "${TRACE:-0}" = 1 ] && trace=(-trace "$RES/noisy_${kind}_$h.trace")
         lat=$("$ROOT/probe/probe" noisy -quiet "$RUN/quiet.txt" \
             -heavy "$RUN/heavy.txt" -heavy-n "$h" -conns "$CONNS" $hold \
             -sql "$sql" -quiet-hold "$QHOLD" -rate "$RATE" -dur "$DUR" \
-            -rows "$ROWS")
+            -rows "$ROWS" "${trace[@]}")
         read -r r1 w1 <<<"$(disk_io_kb)"
         rd=$(((r1 - r0) / 1024)) wr=$(((w1 - w0) / 1024))
         echo "$kind,$h,$CONNS,$lat,$rd,$wr,$(mib "$(tenants_pss_kb)")," \
