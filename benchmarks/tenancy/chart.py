@@ -408,7 +408,8 @@ def chart_agents(runs, out):
             p.line(pts, colour, label)
         panels.append(p)
     active = st.get("ACTIVE", "0.10")
-    sub = (f"Tenants onboard at {st.get('ONBOARD', '?')} a second; "
+    rate = st.get("ONBOARD") or st.get("ARRIVE") or "?"
+    sub = (f"Tenants onboard at {rate} a second; "
            f"{float(active) * 100:.0f}% are in a session at any moment, the"
            " rest idle. Each line ends at the last count its side was"
            " measured at.")
