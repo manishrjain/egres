@@ -1278,6 +1278,15 @@ fn setupPlacedTree(
     }, kind, tables);
 }
 
+/// `setupPlacedTree`'s options with every placed table a finished
+/// one, for the tests of L0's move: a table that small leaves L0 by
+/// the merge otherwise.
+const finished_cfg = config.Config{
+    .max_levels = 3,
+    .lmax_target_bytes = push_lmax,
+    .table_bytes = 1,
+};
+
 fn setupPlacedTreeCfg(
     alloc: std.mem.Allocator,
     fx: *TombstoneFixture,
@@ -1349,12 +1358,12 @@ test "compaction: a push that overlaps nothing below moves its oldest table" {
     defer tmp.deinit();
     const dir_path = tmp.path;
 
-    // Disjoint L0 tables of rows over an empty L1 that is not the
-    // bottom: the same files end up in L1, none written, none retired.
-    // One per compaction, oldest first, so L1 never holds a version
-    // younger than one still in L0.
+    // Disjoint finished L0 tables of rows over an empty L1 that is not
+    // the bottom: the same files end up in L1, none written, none
+    // retired. One per compaction, oldest first, so L1 never holds a
+    // version younger than one still in L0.
     var fx: TombstoneFixture = undefined;
-    try setupPlacedTree(alloc, &fx, dir_path, 3, .rows, &.{
+    try setupPlacedTreeCfg(alloc, &fx, dir_path, finished_cfg, .rows, &.{
         .{ .id = 2, .level = 0, .egids = &.{1} },
         .{ .id = 3, .level = 0, .egids = &.{ 2, 3 } },
         .{ .id = 4, .level = 0, .egids = &.{4} },
@@ -1391,9 +1400,9 @@ test "compaction: a unique index tree moves like a rows tree" {
     const dir_path = tmp.path;
 
     // One row key per entry, no roaring chains: nothing a rewrite above
-    // the bottom would do, so the file moves as it is.
+    // the bottom would do, so the finished file moves as it is.
     var fx: TombstoneFixture = undefined;
-    try setupPlacedTree(alloc, &fx, dir_path, 3, .unique_index, &.{
+    try setupPlacedTreeCfg(alloc, &fx, dir_path, finished_cfg, .unique_index, &.{
         .{ .id = 2, .level = 0, .egids = &.{1} },
     });
     defer fx.deinit();
@@ -1408,6 +1417,70 @@ test "compaction: a unique index tree moves like a rows tree" {
         fx.ground.manifest.to_delete.count(),
     );
     try expectEgids(alloc, fx.tree, &.{1});
+}
+
+test "compaction: a small L0 table is rewritten into L1, not moved" {
+    const alloc = std.testing.allocator;
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
+
+    // The table meets nothing in L1, and still does not move: it is
+    // far under `table_bytes`. With the L0 merge off, the push
+    // rewrites it, so L1 holds a new file and the old one is retired.
+    const cfg = config.Config{
+        .max_levels = 3,
+        .lmax_target_bytes = push_lmax,
+        .l0_backpressure_start_count = 1,
+        .l0_merge_min_tables = 0,
+    };
+    var fx: TombstoneFixture = undefined;
+    try setupPlacedTreeCfg(alloc, &fx, dir_path, cfg, .rows, &.{
+        .{ .id = 2, .level = 0, .egids = &.{1} },
+    });
+    defer fx.deinit();
+
+    try compact(fx.tree, 10, 0);
+
+    try std.testing.expectEqual(@as(usize, 0), fx.tree.numTablesAt(0));
+    const ids = try levelIds(alloc, fx.tree, 1);
+    defer alloc.free(ids);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    try std.testing.expect(ids[0] != 2);
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        fx.ground.manifest.to_delete.count(),
+    );
+    try expectEgids(alloc, fx.tree, &.{1});
+}
+
+test "compaction: small L0 tables merge within L0 before any moves" {
+    const alloc = std.testing.allocator;
+    var tmp = try vfs.TmpDir.init(alloc);
+    defer tmp.deinit();
+    const dir_path = tmp.path;
+
+    // Three small disjoint tables over an empty L1, a run with one to
+    // spare: the oldest could move, and the verdict is the L0 merge.
+    const cfg = config.Config{
+        .max_levels = 3,
+        .lmax_target_bytes = push_lmax,
+        .l0_backpressure_start_count = 1,
+        .l0_merge_min_tables = 2,
+    };
+    var fx: TombstoneFixture = undefined;
+    try setupPlacedTreeCfg(alloc, &fx, dir_path, cfg, .rows, &.{
+        .{ .id = 2, .level = 0, .egids = &.{1} },
+        .{ .id = 3, .level = 0, .egids = &.{2} },
+        .{ .id = 4, .level = 0, .egids = &.{3} },
+    });
+    defer fx.deinit();
+
+    try fx.tree.updateCompactCandidate();
+    const cand = fx.tree.compact_candidate orelse
+        return error.TestExpectedCandidate;
+    try std.testing.expectEqual(@as(u8, 0), cand.level);
+    try std.testing.expect(cand.job == .merge_l0);
 }
 
 test "compaction: overlapping L0 tables are merged, not moved" {
@@ -1425,6 +1498,7 @@ test "compaction: overlapping L0 tables are merged, not moved" {
         .lmax_target_bytes = 5 * 4096, // L1 target: one 4 KiB table
         .l0_backpressure_start_count = 1,
         .l0_merge_min_tables = 0,
+        .table_bytes = 1,
     };
     var fx: TombstoneFixture = undefined;
     try setupPlacedTreeCfg(alloc, &fx, dir_path, cfg, .rows, &.{
@@ -1508,6 +1582,7 @@ const score_cfg = config.Config{
     .lmax_target_bytes = 1000, // L1 target 200 B
     .l0_backpressure_start_count = 2,
     .l0_merge_min_tables = 0,
+    .table_bytes = 1,
 };
 
 fn egidRun(comptime first: u64, comptime n: usize) [n]u64 {

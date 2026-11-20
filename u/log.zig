@@ -27,6 +27,8 @@ const String = @import("utils.zig").String;
 /// A line past this is cut; the newline stays.
 const line_max = 1024;
 const ring_bytes = 8 << 20;
+/// Most a writer takes from the ring per write.
+const chunk_bytes = 64 << 10;
 
 pub fn logFn(
     comptime level: std.log.Level,
@@ -115,29 +117,33 @@ pub const Ring = struct {
         return true;
     }
 
-    /// The oldest bytes that lie contiguous in `buf`; empty when there
-    /// are none. `advance` releases them once written.
-    pub fn peek(self: *const Ring) String {
-        const n = @min(self.len, self.buf.len - self.head);
-        return self.buf[self.head..][0..n];
-    }
-
-    pub fn advance(self: *Ring, n: usize) void {
-        std.debug.assert(n <= self.len);
+    /// Moves the oldest bytes into `out`, as many as fit, and returns
+    /// how many. Once copied they are the caller's: nothing in the ring
+    /// refers to them, so a second reader cannot write them again.
+    pub fn pop(self: *Ring, out: []u8) usize {
+        const n = @min(self.len, out.len);
+        const first = @min(n, self.buf.len - self.head);
+        @memcpy(out[0..first], self.buf[self.head..][0..first]);
+        @memcpy(out[first..n], self.buf[0 .. n - first]);
         self.head = (self.head + n) % self.buf.len;
         self.len -= n;
+        return n;
     }
 };
 
 /// The ring and the thread that drains it. Callers push under the
-/// mutex and signal; the drainer writes outside the mutex, so a slow
-/// write holds nobody but itself.
+/// mutex and signal; the drainer copies a chunk out under the mutex
+/// and writes it outside, so a slow write holds nobody but itself, and
+/// a `flush` racing it finds only the bytes it has not taken.
 const Sink = struct {
     allocator: std.mem.Allocator,
     threaded: std.Io.Threaded = .init_single_threaded,
     mu: std.Io.Mutex = .init,
     cond: std.Io.Condition = .init,
     ring: Ring,
+    /// For `flush`, which runs under the mutex on a panicking thread
+    /// whose stack may be a fiber's. The drainer has its own.
+    flush_chunk: [chunk_bytes]u8 = undefined,
     stopping: bool = false,
     thread: std.Thread = undefined,
 
@@ -152,32 +158,25 @@ const Sink = struct {
     }
 
     fn drain(self: *Sink) void {
+        var chunk: [chunk_bytes]u8 = undefined;
         var dropped_buf: [128]u8 = undefined;
         while (true) {
             self.mu.lockUncancelable(self.io());
             while (self.ring.len == 0 and !self.stopping)
                 self.cond.waitUncancelable(self.io(), &self.mu);
 
-            const chunk = self.ring.peek();
-            const dropped = self.ring.dropped;
-            if (chunk.len == 0 and dropped == 0 and self.stopping) {
-                self.mu.unlock(self.io());
-                return;
-            }
-            self.mu.unlock(self.io());
-
-            writeStderr(chunk);
-
-            self.mu.lockUncancelable(self.io());
-            self.ring.advance(chunk.len);
-
+            const n = self.ring.pop(&chunk);
             // Reported once the ring has drained: the lines around the
             // drop were the ones that did not fit, and the count stays
             // exact while callers keep dropping.
             const report = self.ring.len == 0 and self.ring.dropped > 0;
             const count = self.ring.dropped;
             if (report) self.ring.dropped = 0;
+            const done = n == 0 and !report and self.stopping;
             self.mu.unlock(self.io());
+            if (done) return;
+
+            writeStderr(chunk[0..n]);
 
             if (report) {
                 const dio = std.Options.debug_io;
@@ -197,9 +196,8 @@ const Sink = struct {
         defer self.mu.unlock(self.io());
 
         while (self.ring.len > 0) {
-            const chunk = self.ring.peek();
-            writeStderr(chunk);
-            self.ring.advance(chunk.len);
+            const n = self.ring.pop(&self.flush_chunk);
+            writeStderr(self.flush_chunk[0..n]);
         }
     }
 };

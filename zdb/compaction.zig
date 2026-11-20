@@ -567,11 +567,12 @@ fn pickL0Merge(self: *Tree, held: Lock.Shared) ?CompactCandidate {
 /// smallest-key table starves higher key ranges and biases write
 /// amplification to the keyspace's left edge.
 ///
-/// L0 differs in two ways. Only its oldest table may move. Its score
-/// is the larger of the bytes ratio (L0's target is L1's: a push of
-/// that size costs about two bytes written per byte drained) and its
-/// table count against HALF the backpressure start count: full-size
-/// tables at the target are still too few to score by count.
+/// L0 differs in two ways. Only its oldest table may move, and only
+/// when it is a finished table. Its score is the larger of the bytes
+/// ratio (L0's target is L1's: a push of that size costs about two
+/// bytes written per byte drained) and its table count against HALF
+/// the backpressure start count: full-size tables at the target are
+/// still too few to score by count.
 fn pickJob(self: *Tree, held: Lock.Shared, src: usize) ?CompactCandidate {
     const entries = self.levels[src].entries(held);
     if (entries.len == 0) return null;
@@ -589,10 +590,19 @@ fn pickJob(self: *Tree, held: Lock.Shared, src: usize) ?CompactCandidate {
     }
     if (score <= 1.0) return null;
 
-    // For move, L0 can only consider the oldest table. Otherwise, we'd
-    // have issues with newer values in lower levels.
-    const pool: []const TableEntry =
-        if (src == 0) entries[0..1] else entries;
+    // L0 moves its oldest table only, or a newer value would sit
+    // below an older one, and only once that table is finished: a
+    // small one leaves L0 by the merge, as one table with its
+    // neighbours. Moved small, it sat in L1 for good, where no job
+    // counts tables: 139K moves on a 493K-tenant store left 20M
+    // tables open to the digit.
+    const finished = entries[0].size >= opts.table_bytes;
+    const pool: []const TableEntry = if (src != 0)
+        entries
+    else if (finished)
+        entries[0..1]
+    else
+        &.{};
     var movables: std.ArrayList(TableEntry) = .empty;
     defer movables.deinit(self.ground.allocator);
     for (pool) |e| {

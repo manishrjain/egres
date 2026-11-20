@@ -37,32 +37,36 @@ test "log: the default scope prints as egres" {
     );
 }
 
+fn pop(ring: *log.Ring, out: []u8) []u8 {
+    return out[0..ring.pop(out)];
+}
+
 test "log: the ring hands lines out in order, wrapping" {
     var storage: [10]u8 = undefined;
     var ring: log.Ring = .{ .buf = &storage };
+    var out: [16]u8 = undefined;
     try std.testing.expect(ring.push("abcd\n"));
     try std.testing.expect(ring.push("ef\n"));
-    try std.testing.expectEqualStrings("abcd\nef\n", ring.peek());
-    ring.advance(5);
-    try std.testing.expectEqualStrings("ef\n", ring.peek());
-    // 7 bytes free, 2 of them before the end: the line wraps and
-    // comes out in two pieces.
+    try std.testing.expectEqualStrings("abcd\n", pop(&ring, out[0..5]));
+    // 7 bytes free, 2 of them before the end: the line wraps in the
+    // buffer and comes out whole.
     try std.testing.expect(ring.push("ghij\n"));
-    try std.testing.expectEqualStrings("ef\ngh", ring.peek());
-    ring.advance(5);
-    try std.testing.expectEqualStrings("ij\n", ring.peek());
-    ring.advance(3);
-    try std.testing.expectEqual(@as(usize, 0), ring.peek().len);
+    try std.testing.expectEqualStrings("ef\nghij\n", pop(&ring, &out));
+    try std.testing.expectEqual(@as(usize, 0), ring.pop(&out));
+    // A pop smaller than the ring takes a prefix; the rest waits.
+    try std.testing.expect(ring.push("klmno\n"));
+    try std.testing.expectEqualStrings("klm", pop(&ring, out[0..3]));
+    try std.testing.expectEqualStrings("no\n", pop(&ring, &out));
 }
 
 test "log: a line that does not fit is dropped and counted" {
     var storage: [8]u8 = undefined;
     var ring: log.Ring = .{ .buf = &storage };
+    var out: [8]u8 = undefined;
     try std.testing.expect(ring.push("abcdef\n"));
     try std.testing.expect(!ring.push("gh\n"));
     try std.testing.expect(!ring.push("i\n"));
     try std.testing.expectEqual(@as(u64, 2), ring.dropped);
-    try std.testing.expectEqualStrings("abcdef\n", ring.peek());
-    ring.advance(7);
+    try std.testing.expectEqualStrings("abcdef\n", pop(&ring, &out));
     try std.testing.expect(ring.push("gh\n"));
 }
