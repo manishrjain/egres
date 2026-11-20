@@ -287,56 +287,101 @@ pub fn levelTarget(opts: _config.Config, level: usize) i64 {
 // Compaction selection
 // -----------------------------------------------------------------------
 
-/// The trees with a job to offer and their scores, which
-/// `Forest.bestTreeToCompact` picks from. A tree posts its verdict here
-/// whenever it changes, under its own lock. Walking every tree for the
-/// pick took about 25 ms with 26,000 tenants, on a worker it held,
-/// and each compaction loop walked twice a second even with no work.
+/// The trees with a job to offer, by score, which
+/// `Forest.bestTreeToCompact` picks from. A tree posts its verdict
+/// here whenever it changes, under its own lock, far more often than
+/// it is picked. Walking every tree for the pick took about 25 ms with
+/// 26,000 tenants, on a worker it held, and a scan of the posts is the
+/// same walk one level down: so the trees sit in a bucket per integer
+/// score, and every operation is a swap in a list. A split scores 100,
+/// a move 50, an L0 merge 49 and a rewrite between 1 and 49: a unit
+/// tells apart all the pick needs to.
 pub const CompactQueue = struct {
     mu: fiber.Mutex(.untracked) = .{},
-    /// Each tree's score.
-    entries: std.AutoHashMapUnmanaged(TreeKey, f64) = .empty,
+    /// Where each queued tree sits.
+    slots: std.AutoHashMapUnmanaged(TreeKey, Slot) = .empty,
+    /// The trees at each integer score. A bucket's order means nothing.
+    buckets: [n_buckets]std.ArrayList(TreeKey) = @splat(.empty),
     allocator: std.mem.Allocator,
+
+    const n_buckets = @as(usize, @intFromFloat(split_priority_score)) + 1;
+
+    const Slot = struct { bucket: u8, idx: u32 };
 
     pub fn init(allocator: std.mem.Allocator) CompactQueue {
         return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *CompactQueue) void {
-        self.entries.deinit(self.allocator);
+        self.slots.deinit(self.allocator);
+        for (&self.buckets) |*list| list.deinit(self.allocator);
     }
 
-    fn post(self: *CompactQueue, tree: *const Tree, score: f64) !void {
+    /// Lists the tree at `score`, or moves it there. Room is made
+    /// before anything changes, so a failure leaves the tree where
+    /// it was.
+    pub fn post(self: *CompactQueue, key: TreeKey, score: f64) !void {
+        const bucket = bucketOf(score);
         self.mu.lock(@src());
         defer self.mu.unlock();
-        try self.entries.put(self.allocator, keyOf(tree), score);
+
+        const list = &self.buckets[bucket];
+        try list.ensureUnusedCapacity(self.allocator, 1);
+        const slot = try self.slots.getOrPut(self.allocator, key);
+        if (slot.found_existing) {
+            if (slot.value_ptr.bucket == bucket) return;
+            self.unlist(key, slot.value_ptr.*);
+        }
+        slot.value_ptr.* = .{
+            .bucket = bucket,
+            .idx = @intCast(list.items.len),
+        };
+        list.appendAssumeCapacity(key);
     }
 
-    fn withdraw(self: *CompactQueue, tree: *const Tree) void {
+    pub fn withdraw(self: *CompactQueue, key: TreeKey) void {
         self.mu.lock(@src());
         defer self.mu.unlock();
-        _ = self.entries.remove(keyOf(tree));
+        const kv = self.slots.fetchRemove(key) orelse return;
+        self.unlist(key, kv.value);
     }
 
+    /// Takes a tree out of its bucket. The bucket's last tree fills
+    /// the hole, and its slot is told so.
+    fn unlist(self: *CompactQueue, key: TreeKey, slot: Slot) void {
+        const list = &self.buckets[slot.bucket];
+        // The slot is right only if every fill before it was recorded.
+        std.debug.assert(std.meta.eql(list.items[slot.idx], key));
+        const last = list.pop().?;
+        if (slot.idx == list.items.len) return;
+        list.items[slot.idx] = last;
+        self.slots.getPtr(last).?.idx = slot.idx;
+    }
+
+    /// A tree from the highest bucket that has one, at random: fair
+    /// among equals, and the same tree again under a sim's replay.
     pub fn best(self: *CompactQueue) ?TreeKey {
         self.mu.lock(@src());
         defer self.mu.unlock();
-        var best_key: ?TreeKey = null;
-        var best_score: f64 = 0;
-        var it = self.entries.iterator();
-        while (it.next()) |kv| {
-            if (best_key == null or kv.value_ptr.* > best_score) {
-                best_key = kv.key_ptr.*;
-                best_score = kv.value_ptr.*;
-            }
+        var bucket = n_buckets;
+        while (bucket > 0) {
+            bucket -= 1;
+            const items = self.buckets[bucket].items;
+            if (items.len == 0) continue;
+            return items[randomIndex(items.len)];
         }
-        return best_key;
+        return null;
     }
 
-    fn keyOf(tree: *const Tree) TreeKey {
-        return .{ .namespace = tree.namespace, .tree_id = tree.tree_id };
+    fn bucketOf(score: f64) u8 {
+        const top: f64 = @floatFromInt(n_buckets - 1);
+        return @intFromFloat(@min(@max(score, 0), top));
     }
 };
+
+fn keyOf(tree: *const Tree) TreeKey {
+    return .{ .namespace = tree.namespace, .tree_id = tree.tree_id };
+}
 
 /// updateCompactCandidate recomputes which level most needs compaction and
 /// stores the result in self.compact_candidate. Called after open and after
@@ -445,7 +490,8 @@ fn setCandidate(self: *Tree, c: CompactCandidate) !void {
     // The post replaces this tree's entry, so the old one is not
     // withdrawn first: the tree never leaves the queue, and a failed
     // post leaves the old candidate standing.
-    if (self.queued) try self.ground.compact_queue.post(self, owned.score);
+    if (self.queued)
+        try self.ground.compact_queue.post(keyOf(self), owned.score);
     if (self.compact_candidate) |old| old.job.deinit(self.ground.allocator);
     self.compact_candidate = owned;
 }
@@ -456,13 +502,13 @@ fn setCandidate(self: *Tree, c: CompactCandidate) !void {
 pub fn leaveQueue(self: *Tree) void {
     const held = self.mu.hold(.exclusive, @src());
     defer held.release();
-    if (self.queued) self.ground.compact_queue.withdraw(self);
+    if (self.queued) self.ground.compact_queue.withdraw(keyOf(self));
     self.queued = false;
 }
 
 pub fn clearCandidate(self: *Tree) void {
     const c = self.compact_candidate orelse return;
-    if (self.queued) self.ground.compact_queue.withdraw(self);
+    if (self.queued) self.ground.compact_queue.withdraw(keyOf(self));
     c.job.deinit(self.ground.allocator);
     self.compact_candidate = null;
 }

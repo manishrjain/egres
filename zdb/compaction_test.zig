@@ -143,3 +143,53 @@ test "levelTarget: fixed targets cascade up from the Lmax target" {
     try std.testing.expectEqual(l1, compaction.levelTarget(opts, 0));
     try std.testing.expectEqual(@as(i64, 0), compaction.levelTarget(opts, 4));
 }
+
+const CompactQueue = compaction.CompactQueue;
+const TreeKey = zdb.kv.TreeKey;
+
+fn tree(id: u64) TreeKey {
+    return .{ .namespace = 1, .tree_id = id };
+}
+
+test "CompactQueue: the pick is from the highest bucket" {
+    var q = CompactQueue.init(std.testing.allocator);
+    defer q.deinit();
+    try std.testing.expect(q.best() == null);
+
+    try q.post(tree(1), 3.2);
+    try q.post(tree(2), compaction.merge_priority_score);
+    try q.post(tree(3), 0.5);
+    try std.testing.expectEqual(tree(2), q.best().?);
+
+    // A re-post moves the tree; one within its bucket changes nothing.
+    try q.post(tree(2), 3.7);
+    try q.post(tree(1), 3.9);
+    const pick = q.best().?;
+    try std.testing.expect(pick.tree_id == 1 or pick.tree_id == 2);
+    try q.post(tree(1), compaction.split_priority_score);
+    try std.testing.expectEqual(tree(1), q.best().?);
+
+    q.withdraw(tree(1));
+    q.withdraw(tree(1));
+    q.withdraw(tree(2));
+    try std.testing.expectEqual(tree(3), q.best().?);
+    q.withdraw(tree(3));
+    try std.testing.expect(q.best() == null);
+}
+
+test "CompactQueue: a withdrawal keeps the bucket's other trees found" {
+    var q = CompactQueue.init(std.testing.allocator);
+    defer q.deinit();
+    // Three in one bucket; taking the first out moves the last into
+    // its place, and that one must still be found by its slot.
+    try q.post(tree(1), 5.0);
+    try q.post(tree(2), 5.0);
+    try q.post(tree(3), 5.0);
+    q.withdraw(tree(1));
+    try q.post(tree(3), 7.0);
+    try std.testing.expectEqual(tree(3), q.best().?);
+    q.withdraw(tree(3));
+    try std.testing.expectEqual(tree(2), q.best().?);
+    q.withdraw(tree(2));
+    try std.testing.expect(q.best() == null);
+}
