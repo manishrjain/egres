@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -247,6 +248,61 @@ func (a *agentRun) adopt() {
 		fmt.Fprintf(os.Stderr, "agents: adopted %d tenants onboarded after the "+
 			"checkpoint; %d tenants in all\n", n, a.count)
 	}
+}
+
+// warm reads one row from every tenant before a resumed run starts
+// its sessions: a server just restarted has every tenant's tables to
+// open and its levels to settle (at 295K it ran 500 compactions a
+// second for four minutes), and sessions let loose on it then saw
+// only timeouts. How long this takes is the restart as a tenant sees
+// it, printed with the latencies; none of it is in a window.
+func (a *agentRun) warm() {
+	const par = 64
+	a.mu.Lock()
+	ids := append([]int(nil), a.idle...)
+	a.mu.Unlock()
+	start := time.Now()
+	var (
+		mu     sync.Mutex
+		lat    []float64
+		failed int
+		wg     sync.WaitGroup
+		sem    = make(chan struct{}, par)
+	)
+	for _, id := range ids {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			t0 := time.Now()
+			err := func() error {
+				s, err := openRetry(a.target(id), time.Now().Add(onboardWait))
+				if err != nil {
+					return err
+				}
+				defer s.close()
+				_, err = s.query("SELECT v FROM t WHERE id = 1")
+				return err
+			}()
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				failed++
+				if failed <= 3 {
+					fmt.Fprintf(os.Stderr, "agents: warming tenant %d: %v\n", id, err)
+				}
+				return
+			}
+			lat = append(lat, ms(time.Since(t0)))
+		}()
+	}
+	wg.Wait()
+	sort.Float64s(lat)
+	fmt.Fprintf(os.Stderr, "agents: warmed %d tenants in %s: a point read each, "+
+		"p50 %.2f p95 %.2f max %.2f ms; %d failed\n", len(lat),
+		time.Since(start).Round(time.Second), pct(lat, 0.5), pct(lat, 0.95),
+		pct(lat, 1), failed)
 }
 
 // lookup asks the server what tenant id holds: its row count and its

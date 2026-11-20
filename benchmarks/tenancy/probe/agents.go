@@ -423,13 +423,21 @@ func (a *agentRun) record(id, kind int, due time.Time, lms float64, err error,
 
 // schedule keeps about active × tenants in a session: whenever there
 // are fewer, it starts one for a tenant picked at random from the
-// idle ones.
+// idle ones. Starts are capped at twice the rate sessions turn over
+// at: in a run that grows, the count a window wants is reached long
+// before, but a resumed run wants every session at once, and 29,500
+// opened in the same instant on a server just restarted got nothing
+// but timeouts.
 func (a *agentRun) schedule() {
+	const tick = 10 * time.Millisecond
 	for {
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(tick)
 		a.mu.Lock()
 		want := int(math.Round(a.active * float64(a.count)))
-		for len(a.running) < want && len(a.idle) > 0 {
+		starts := max(1, int(math.Ceil(2*float64(want)*
+			float64(tick)/float64(a.sessLen))))
+		for len(a.running) < want && len(a.idle) > 0 && starts > 0 {
+			starts--
 			k := a.rng.Intn(len(a.idle))
 			id := a.idle[k]
 			a.idle[k] = a.idle[len(a.idle)-1]
@@ -575,7 +583,7 @@ func (a *agentRun) onboard(i int, due time.Time) error {
 		}
 	}
 	err := func() error {
-		s, err := openRetry(a.target(i), time.Now().Add(convTimeout))
+		s, err := openRetry(a.target(i), time.Now().Add(onboardWait))
 		if err != nil {
 			return err
 		}
@@ -951,6 +959,7 @@ func agents(args []string) {
 			fail("resume: " + err.Error())
 		}
 		a.adopt()
+		a.warm()
 	}
 	save := func() {
 		if *ckPath == "" {
