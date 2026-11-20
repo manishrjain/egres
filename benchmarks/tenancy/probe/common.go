@@ -304,6 +304,70 @@ func cacheMiB(admin string) string {
 	return ""
 }
 
+// l0Backlog is the server's count of trees wanting an L0 compaction
+// and of tables open, from its admin zdb report ("compactions wanted:"
+// then "L0: trees=N ..."; "tables: open=N ..."); -1 without an answer.
+func l0Backlog(admin string) (trees, tables int) {
+	trees, tables = -1, -1
+	c, err := net.DialTimeout("tcp", admin, 2*time.Second)
+	if err != nil {
+		return
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(20 * time.Second))
+	if _, err := c.Write([]byte("zdb\n")); err != nil {
+		return
+	}
+	raw, _ := io.ReadAll(c)
+	wanted := false
+	for _, line := range strings.Split(string(raw), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 {
+			continue
+		}
+		switch {
+		case f[0] == "compactions" && len(f) > 1 && f[1] == "wanted:":
+			wanted = true
+		case wanted && f[0] == "L0:" && len(f) > 1:
+			trees, _ = strconv.Atoi(strings.TrimPrefix(f[1], "trees="))
+			wanted = false
+		case f[0] == "tables:" && len(f) > 1 &&
+			strings.HasPrefix(f[1], "open="):
+			tables, _ = strconv.Atoi(strings.TrimPrefix(f[1], "open="))
+		}
+	}
+	return
+}
+
+// settle waits for the server's L0 compactions to catch up with the
+// tenants just added: until no tree wants one, or the count has not
+// made a new low for two minutes (some trees never settle: at 492K
+// four compactions had been stuck for an hour), or limit is up. The
+// wait is the platform's own time to absorb a batch of tenants, not
+// any tenant's latency, and it is printed.
+func settle(admin string, limit time.Duration) {
+	const poll = 10 * time.Second
+	start := time.Now()
+	trees0, tables0 := l0Backlog(admin)
+	low, lowAt := trees0, start
+	trees, tables := trees0, tables0
+	for trees != 0 && time.Since(start) < limit {
+		time.Sleep(poll)
+		trees, tables = l0Backlog(admin)
+		if trees < 0 {
+			continue
+		}
+		if low < 0 || trees < low {
+			low, lowAt = trees, time.Now()
+		} else if time.Since(lowAt) > 2*time.Minute {
+			break
+		}
+	}
+	fmt.Fprintf(os.Stderr, "agents: settled in %s: trees wanting an L0 "+
+		"compaction %d -> %d, tables open %d -> %d\n",
+		time.Since(start).Round(time.Second), trees0, trees, tables0, tables)
+}
+
 // parseBytes reads "10.17GiB", "537.72MiB", "47KiB" or "12B" as bytes.
 func parseBytes(s string) float64 {
 	units := []struct {

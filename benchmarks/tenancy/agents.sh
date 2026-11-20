@@ -47,6 +47,12 @@
 # count reached. A row is then held to its checkpointed version or
 # newer until it is read once.
 #   RESUME=/data/tenancy/results/agents-egres-<stamp> STEPS=...,1000000
+# SETTLE=<duration> paces the growth to the server: before each window
+# the probe waits, up to that long, for the trees wanting an L0
+# compaction to reach zero or stop falling, and prints how long it
+# took. Without it a window measures a server still absorbing the
+# batch just added (at 50 a second, 200,000 tenants in 67 minutes).
+#   SETTLE=30m STEPS=...,300000,350000,400000,...
 source "$(dirname "$0")/common.sh"
 in_cgroup "$@"
 platform_init "$@"
@@ -65,6 +71,7 @@ STOP_ERRORS_PCT=${STOP_ERRORS_PCT:-1}
 BUDGET_MIB=$(($(budget_kb) / 1024))
 CHECKPOINT_EVERY=${CHECKPOINT_EVERY:-5m}
 RESUME=${RESUME:-}
+SETTLE=${SETTLE:-0}
 out=$RES/agents.csv
 
 if [ -n "$RESUME" ]; then
@@ -99,7 +106,8 @@ vm)
     ;;
 egres)
     side=(-backend shared -addr "$ADDR" -pid "$(platform_pid)" -admin "$ADMIN"
-        -checkpoint "$RES/checkpoint.bin" -checkpoint-every "$CHECKPOINT_EVERY")
+        -checkpoint "$RES/checkpoint.bin" -checkpoint-every "$CHECKPOINT_EVERY"
+        -settle "$SETTLE")
     [ -z "$RESUME" ] || side+=(-resume "$RESUME/checkpoint.bin")
     ;;
 *) echo "agents runs on vm or egres, not $BACKEND" >&2; exit 2 ;;

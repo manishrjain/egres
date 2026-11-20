@@ -872,6 +872,9 @@ func agents(args []string) {
 		"the drive WORK is on (nvme0n1), for read_mib_s and write_mib_s")
 	admin := fs.String("admin", "",
 		"shared: the server's admin ip:port, for cache_mib from its memory report")
+	settleFor := fs.Duration("settle", 0,
+		"shared: before each window, wait up to this for the server's L0 "+
+			"compactions to catch up with the tenants added (0: do not)")
 	floorGiB := fs.Float64("floor-gib", 16,
 		"stop onboardings when the host's MemAvailable is under this")
 	diskFloorGiB := fs.Float64("disk-floor-gib", 5,
@@ -1013,6 +1016,13 @@ func agents(args []string) {
 		}
 		if n > 0 {
 			save()
+			// Growth paced to the platform: the window measures a server
+			// that has absorbed the batch, as a platform that onboards
+			// in waves is measured between them. A run without it
+			// measures the server while it is still catching up.
+			if *settleFor > 0 && a.p == nil && a.admin != "" {
+				settle(a.admin, *settleFor)
+			}
 			w := a.window(*window)
 			fmt.Println(w.csv)
 			save()
