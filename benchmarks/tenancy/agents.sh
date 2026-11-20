@@ -48,10 +48,11 @@
 # newer until it is read once.
 #   RESUME=/data/tenancy/results/agents-egres-<stamp> STEPS=...,1000000
 # SETTLE=<duration> paces the growth to the server: before each window
-# the probe waits, up to that long, for the trees wanting an L0
-# compaction to reach zero or stop falling, and prints how long it
-# took. Without it a window measures a server still absorbing the
-# batch just added (at 50 a second, 200,000 tenants in 67 minutes).
+# the probe goes quiet (no sessions) and waits, up to that long, for
+# the trees wanting an L0 compaction to reach zero or stop falling,
+# and prints how long it took. Without it a window measures a server
+# still absorbing the batch just added (at 50 a second, 200,000
+# tenants in 67 minutes), with the sessions restocking its backlog.
 #   SETTLE=30m STEPS=...,300000,350000,400000,...
 source "$(dirname "$0")/common.sh"
 in_cgroup "$@"

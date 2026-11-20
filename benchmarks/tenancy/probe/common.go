@@ -339,35 +339,6 @@ func l0Backlog(admin string) (trees, tables int) {
 	return
 }
 
-// settle waits for the server's L0 compactions to catch up with the
-// tenants just added: until no tree wants one, or the count has not
-// made a new low for two minutes (some trees never settle: at 492K
-// four compactions had been stuck for an hour), or limit is up. The
-// wait is the platform's own time to absorb a batch of tenants, not
-// any tenant's latency, and it is printed.
-func settle(admin string, limit time.Duration) {
-	const poll = 10 * time.Second
-	start := time.Now()
-	trees0, tables0 := l0Backlog(admin)
-	low, lowAt := trees0, start
-	trees, tables := trees0, tables0
-	for trees != 0 && time.Since(start) < limit {
-		time.Sleep(poll)
-		trees, tables = l0Backlog(admin)
-		if trees < 0 {
-			continue
-		}
-		if low < 0 || trees < low {
-			low, lowAt = trees, time.Now()
-		} else if time.Since(lowAt) > 2*time.Minute {
-			break
-		}
-	}
-	fmt.Fprintf(os.Stderr, "agents: settled in %s: trees wanting an L0 "+
-		"compaction %d -> %d, tables open %d -> %d\n",
-		time.Since(start).Round(time.Second), trees0, trees, tables0, tables)
-}
-
 // parseBytes reads "10.17GiB", "537.72MiB", "47KiB" or "12B" as bytes.
 func parseBytes(s string) float64 {
 	units := []struct {

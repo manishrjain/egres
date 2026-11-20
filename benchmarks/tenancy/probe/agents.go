@@ -351,6 +351,7 @@ type agentRun struct {
 	pid     int       // shared: the server's, for its PSS
 	disk    string    // the drive WORK is on, for its traffic; "" = none
 	admin   string    // shared: the server's admin port, for its block cache
+	quiet   bool      // no sessions start: the server is left to settle
 	clk     *clock
 	rows    int
 	mix     mix
@@ -421,6 +422,56 @@ func (a *agentRun) record(id, kind int, due time.Time, lms float64, err error,
 	}
 }
 
+// settle leaves the server alone to catch up with the tenants just
+// added: no session starts, the running ones end, and then it waits
+// until no tree wants an L0 compaction, or that count has not made a
+// new low for two minutes (some trees never settle: at 492K four
+// compactions had been stuck for an hour), or limit is up. Sessions
+// would restock the backlog: each flush leaves a table in every tree
+// it touches, and at 493K the compactor spent all its time moving
+// those down a level, never merging. The wait is the platform's own
+// time to absorb a batch of tenants, not any tenant's latency; it is
+// printed with the backlog before and after.
+func (a *agentRun) settle(limit time.Duration) {
+	const poll = 10 * time.Second
+	start := time.Now()
+	a.mu.Lock()
+	a.quiet = true
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		a.quiet = false
+		a.mu.Unlock()
+	}()
+	for time.Since(start) < a.sessLen+30*time.Second {
+		a.mu.Lock()
+		running := len(a.running)
+		a.mu.Unlock()
+		if running == 0 {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	trees0, tables0 := l0Backlog(a.admin)
+	low, lowAt := trees0, time.Now()
+	trees, tables := trees0, tables0
+	for trees != 0 && time.Since(start) < limit {
+		time.Sleep(poll)
+		trees, tables = l0Backlog(a.admin)
+		if trees < 0 {
+			continue
+		}
+		if low < 0 || trees < low {
+			low, lowAt = trees, time.Now()
+		} else if time.Since(lowAt) > 2*time.Minute {
+			break
+		}
+	}
+	fmt.Fprintf(os.Stderr, "agents: settled in %s with no sessions: trees "+
+		"wanting an L0 compaction %d -> %d, tables open %d -> %d\n",
+		time.Since(start).Round(time.Second), trees0, trees, tables0, tables)
+}
+
 // schedule keeps about active × tenants in a session: whenever there
 // are fewer, it starts one for a tenant picked at random from the
 // idle ones. Starts are capped at twice the rate sessions turn over
@@ -434,6 +485,9 @@ func (a *agentRun) schedule() {
 		time.Sleep(tick)
 		a.mu.Lock()
 		want := int(math.Round(a.active * float64(a.count)))
+		if a.quiet {
+			want = 0
+		}
 		starts := max(1, int(math.Ceil(2*float64(want)*
 			float64(tick)/float64(a.sessLen))))
 		for len(a.running) < want && len(a.idle) > 0 && starts > 0 {
@@ -1021,7 +1075,7 @@ func agents(args []string) {
 			// in waves is measured between them. A run without it
 			// measures the server while it is still catching up.
 			if *settleFor > 0 && a.p == nil && a.admin != "" {
-				settle(a.admin, *settleFor)
+				a.settle(*settleFor)
 			}
 			w := a.window(*window)
 			fmt.Println(w.csv)
