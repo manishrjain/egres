@@ -71,6 +71,11 @@ const header = "tenants,awake,held_mib,cache_mib,disk_mib,read_mib_s,write_mib_s
 // the wait is in its latency.
 const maxOnboarding = 32
 
+// How long an onboarding may wait for the platform to take it before
+// the growth stops: a micro-VM's boot allowance, and on a shared server
+// the connections the create keeps trying for.
+const onboardWait = 60 * time.Second
+
 // mix is each kind's share of the statements, in percent.
 type mix [numKinds]int
 
@@ -537,18 +542,33 @@ func (a *agentRun) onboard(i int, due time.Time) error {
 	} else {
 		// A server may refuse the create for a moment (a full proposal
 		// queue behind a big flush); a client retries once, and a
-		// database that exists by then was made by the first try.
+		// database that exists by then was made by the first try. A
+		// connection the server does not take (its accept queue full,
+		// seen at 295K tenants) is tried again until the allowance a
+		// micro-VM gets to boot, the wait in the onboarding's latency.
 		create := fmt.Sprintf("CREATE DATABASE tenant_%d", i)
-		err := run(a.addr+"/egres", create, 2*time.Second, nil)
-		var pe *pgError
-		if err != nil && errors.As(err, &pe) {
-			fmt.Fprintf(os.Stderr, "agents: tenant_%d refused once (%v); "+
-				"retrying\n", i, err)
-			time.Sleep(time.Second)
+		deadline := time.Now().Add(onboardWait)
+		var err error
+		for tried, refused := false, false; ; tried = true {
 			err = run(a.addr+"/egres", create, 2*time.Second, nil)
-			if err != nil && errors.As(err, &pe) && pe.code == "42P04" {
-				err = nil
+			var pe *pgError
+			if err == nil {
+				break
+			} else if errors.As(err, &pe) {
+				if tried && pe.code == "42P04" {
+					err = nil // made by an earlier try whose reply was lost
+					break
+				}
+				if refused {
+					break
+				}
+				refused = true
+				fmt.Fprintf(os.Stderr, "agents: tenant_%d refused once (%v); "+
+					"retrying\n", i, err)
+			} else if time.Now().After(deadline) {
+				break
 			}
+			time.Sleep(time.Second)
 		}
 		if err != nil {
 			return fmt.Errorf("tenant_%d: %w", i, err)
