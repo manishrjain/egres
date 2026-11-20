@@ -34,10 +34,14 @@ pub const format_version: u32 = 1;
 /// trailer from here; nothing may hardcode 12.
 pub const trailer_len: usize = 4 + 8;
 
-/// A table's size and where its index starts, as the manifest records
-/// them: [index_offset, size) is the index plus the trailer, so an open
-/// is one read with no stat and no trailer round trip.
+/// Where a table sits in its file, as the manifest records it: the
+/// table's first byte, its size, and where within it its index
+/// starts, so an open is one read of [index_offset, size) with no stat
+/// and no trailer round trip. A flush packs many trees' tables into
+/// one file, each whole, at its own offset; a compaction's table is
+/// alone in its file at offset 0.
 pub const Extent = struct {
+    offset: u64 = 0,
     size: u64,
     index_offset: u64,
 };

@@ -3333,6 +3333,7 @@ pub const FileRefStruct = struct {
     id: u64 = 0,
     size: u64 = 0,
     index_offset: u64 = 0,
+    offset: u64 = 0,
     pub fn deinit(self: *FileRefStruct, alloc: std.mem.Allocator) void {
         _ = self;
         _ = alloc;
@@ -3348,6 +3349,7 @@ pub const FileRefStruct = struct {
             .id = self.id,
             .size = self.size,
             .index_offset = self.index_offset,
+            .offset = self.offset,
         };
         errdefer s.deinit(alloc);
         return s;
@@ -3365,6 +3367,7 @@ pub const FileRefStruct = struct {
         try writer.setId(self.id);
         try writer.setSize(self.size);
         try writer.setIndexOffset(self.index_offset);
+        try writer.setOffset(self.offset);
         const result = try writer.finish();
         return result.offset;
     }
@@ -3375,7 +3378,7 @@ pub const FileRefReader = struct {
     t: zbuf.Table,
 
     pub const TABLE_ID: u16 = 42258;
-    pub const SIZE_BYTES: u16 = 26;
+    pub const SIZE_BYTES: u16 = 34;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
@@ -3397,11 +3400,16 @@ pub const FileRefReader = struct {
         return self.t.scalar(u64, 18);
     }
 
+    pub fn offset(self: Self) u64 {
+        return self.t.scalar(u64, 26);
+    }
+
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try FileRefWriter.initWithBuf(alloc, out);
         try writer.setId(self.id());
         try writer.setSize(self.size());
         try writer.setIndexOffset(self.indexOffset());
+        try writer.setOffset(self.offset());
         const result = try writer.finish();
         return result.offset;
     }
@@ -3414,6 +3422,7 @@ pub const FileRefReader = struct {
             .id = self.id(),
             .size = self.size(),
             .index_offset = self.indexOffset(),
+            .offset = self.offset(),
         };
         errdefer s.deinit(alloc);
         return s;
@@ -3433,7 +3442,7 @@ pub const FileRefWriter = struct {
     w: zbuf.TableWriter,
 
     pub const TABLE_ID: u16 = 42258;
-    pub const SIZE_BYTES: u16 = 26;
+    pub const SIZE_BYTES: u16 = 34;
     /// Slots of nested tables, null until set.
     const child_slots = [_]u16{};
 
@@ -3457,6 +3466,10 @@ pub const FileRefWriter = struct {
         return self.w.setScalar(u64, 18, v);
     }
 
+    pub fn setOffset(self: *Self, v: u64) Error!void {
+        return self.w.setScalar(u64, 26, v);
+    }
+
     pub fn set(self: *Self, values: anytype) Error!void {
         const Values = @TypeOf(values);
         if (@typeInfo(Values) != .@"struct") {
@@ -3465,6 +3478,7 @@ pub const FileRefWriter = struct {
         if (@hasField(Values, "id")) try self.setId(@field(values, "id"));
         if (@hasField(Values, "size")) try self.setSize(@field(values, "size"));
         if (@hasField(Values, "index_offset")) try self.setIndexOffset(@field(values, "index_offset"));
+        if (@hasField(Values, "offset")) try self.setOffset(@field(values, "offset"));
     }
 
     pub fn finish(self: *Self) Error!FileRefBuffer {

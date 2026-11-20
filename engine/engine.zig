@@ -412,7 +412,11 @@ pub const StorageImpl = struct {
         for (needed, files) |*n, f| n.* = .{
             .id = f.id,
             .level = 0,
-            .extent = .{ .size = f.size, .index_offset = f.index_offset },
+            .extent = .{
+                .offset = f.offset,
+                .size = f.size,
+                .index_offset = f.index_offset,
+            },
         };
 
         var attempt: u64 = 1;
@@ -1744,11 +1748,16 @@ pub const Engine = struct {
                 .id = c.sst_id,
                 .size = c.size,
                 .index_offset = c.index_offset,
+                .offset = c.offset,
             });
             try needed.append(self.allocator, .{
                 .id = c.sst_id,
                 .level = c.level,
-                .extent = .{ .size = c.size, .index_offset = c.index_offset },
+                .extent = .{
+                    .offset = c.offset,
+                    .size = c.size,
+                    .index_offset = c.index_offset,
+                },
             });
         }
         if (files.items.len == 0) return;

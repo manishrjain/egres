@@ -17,6 +17,7 @@ const _compaction = @import("compaction.zig");
 const flags = @import("flags");
 
 const Table = _table.Table;
+
 const TableIterator = _table.TableIterator;
 const Item = _table.table.Item;
 const Level = _level_handler.Level;
@@ -51,15 +52,26 @@ pub const TableNeed = struct {
     table: ?*Table = null,
 };
 
-/// TableCache is a Forest-owned registry of open *Table objects keyed by
-/// table_id. Tree.open() calls loadTables() instead of opening SST files
-/// itself, so a table opened for one tree is reused when the same file is
-/// needed by another tree (e.g. shared tables after a split).
+/// TableCache is a Forest-owned registry of the open files the trees
+/// read, one counted `vfs.Object` per file id however many tables a
+/// flush packed into it, and of the open *Table objects in each, by
+/// offset. Tree.open() calls loadTables() instead of opening SST files
+/// itself, so a table opened for one tree is reused when the same file
+/// is needed by another tree (e.g. shared tables after a split).
 pub const TableCache = struct {
     allocator: std.mem.Allocator,
     store: *vfs.Store,
-    tables: std.AutoHashMap(u64, *Table),
+    /// Every open file the cache holds: the cache's ref on its handle
+    /// and its tables, so a file is one descriptor and `evict` is one
+    /// removal.
+    files: std.AutoHashMap(u64, *OpenFile),
     mu: fiber.RWMutex(.tracked),
+
+    const OpenFile = struct {
+        obj: *vfs.Object,
+        /// By the table's offset in the file.
+        tables: std.AutoArrayHashMapUnmanaged(u64, *Table) = .empty,
+    };
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -68,7 +80,7 @@ pub const TableCache = struct {
         return .{
             .allocator = allocator,
             .store = store,
-            .tables = std.AutoHashMap(u64, *Table).init(allocator),
+            .files = std.AutoHashMap(u64, *OpenFile).init(allocator),
             .mu = .{},
         };
     }
@@ -77,38 +89,81 @@ pub const TableCache = struct {
         // Release the cache's ref on each table; the last ref frees it.
         // The tables' blocks stay in the block cache, which its owner
         // frees after the forest: no use dropping them one by one.
-        var it = self.tables.iterator();
-        while (it.next()) |kv| {
-            const tbl = kv.value_ptr.*;
-            tbl.block_cache = null;
-            tbl.decrRef();
+        var fit = self.files.iterator();
+        while (fit.next()) |kv| {
+            const of = kv.value_ptr.*;
+            for (of.tables.values()) |tbl| {
+                tbl.block_cache = null;
+                tbl.decrRef();
+            }
+            self.dropFile(of);
         }
-        self.tables.deinit();
+        self.files.deinit();
         self.mu.deinit();
     }
 
-    /// contains reports whether a table with this id is currently cached.
+    /// The file's entry gone, with the cache's ref on its handle.
+    fn dropFile(self: *TableCache, of: *OpenFile) void {
+        of.obj.decrRef();
+        of.tables.deinit(self.allocator);
+        self.allocator.destroy(of);
+    }
+
+    /// The cached table at `offset` of file `id`, under the lock.
+    fn get(self: *TableCache, id: u64, offset: u64) ?*Table {
+        const of = self.files.get(id) orelse return null;
+        return of.tables.get(offset);
+    }
+
+    /// `t` as the table at its offset of file `id`, under the lock: the
+    /// file's entry is made from `t`'s handle when the cache has none.
+    /// False when that table is already cached, and nothing changes.
+    fn put(self: *TableCache, id: u64, t: *Table) !bool {
+        const gop = try self.files.getOrPut(id);
+        if (!gop.found_existing) {
+            const of = self.allocator.create(OpenFile) catch |err| {
+                _ = self.files.remove(id);
+                return err;
+            };
+            t.obj.incrRef();
+            of.* = .{ .obj = t.obj };
+            gop.value_ptr.* = of;
+        }
+        const of = gop.value_ptr.*;
+        const slot = of.tables.getOrPut(
+            self.allocator,
+            t.extent.offset,
+        ) catch |err| {
+            if (of.tables.count() == 0) {
+                _ = self.files.remove(id);
+                self.dropFile(of);
+            }
+            return err;
+        };
+        if (slot.found_existing) return false;
+        slot.value_ptr.* = t;
+        return true;
+    }
+
+    /// contains reports whether file `id` is currently open in the cache.
     pub fn contains(self: *TableCache, id: u64) bool {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
-        return self.tables.contains(id);
+        return self.files.contains(id);
     }
 
-    /// own hands a *Table to the cache, which takes its own ref; the caller
-    /// keeps its ref and drops it when done with `t`. Returns false when
-    /// the id is already cached — the apply loop's `loadTables` can open
-    /// the same file between a caller's `contains` check and this call,
-    /// and Forest.writeFile does exactly that across seconds of I/O — in
-    /// which case the cached one stays, nothing is taken, and the struct's
-    /// disposal is the caller's too (a cache entry is what would otherwise
-    /// own it).
+    /// own hands a *Table to the cache, which takes its own ref, and its
+    /// file; the caller keeps its ref and drops it when done with `t`.
+    /// Returns false when the table is already cached — the apply
+    /// loop's `loadTables` can open the same file between a caller's
+    /// `contains` check and this call — in which case the cached one
+    /// stays, nothing is taken, and the struct's disposal is the
+    /// caller's too (a cache entry is what would otherwise own it).
     pub fn own(self: *TableCache, id: u64, t: *Table) !bool {
         self.mu.lock(@src());
         defer self.mu.unlock();
-        const gop = try self.tables.getOrPut(id);
-        if (gop.found_existing) return false;
+        if (!try self.put(id, t)) return false;
         t.incrRef();
-        gop.value_ptr.* = t;
         return true;
     }
 
@@ -119,22 +174,24 @@ pub const TableCache = struct {
         t.decrRef();
     }
 
-    /// Drop the cache's entry and its own ref on `id`, if it has one. The
-    /// `Table`, its file descriptor and its cached blocks go away when the
-    /// last ref goes: a reader or compaction that pinned the table keeps
-    /// it usable for the rest of its work and frees it when it releases.
+    /// Drop the cache's entry and its own refs on file `id`: every
+    /// table in it, and the file. A `Table`, and with the last of them
+    /// the file descriptor, and its cached blocks go away when the last
+    /// ref goes: a reader or compaction that pinned the table keeps it
+    /// usable for the rest of its work and frees it when it releases.
     /// For a file the manifest has just unlisted: no level points at it
     /// any more, so nothing will ask the cache for it again.
     pub fn evict(self: *TableCache, id: u64) void {
-        const t = blk: {
+        const of = blk: {
             self.mu.lock(@src());
             defer self.mu.unlock();
-            const entry = self.tables.fetchRemove(id) orelse return;
+            const entry = self.files.fetchRemove(id) orelse return;
             break :blk entry.value;
         };
         // Outside the lock: the last ref purges the table's blocks, which
         // takes block cache shard locks.
-        t.decrRef();
+        for (of.tables.values()) |t| t.decrRef();
+        self.dropFile(of);
     }
 
     /// loadTables serves each TableNeed from cache (read lock) or opens it
@@ -162,7 +219,7 @@ pub const TableCache = struct {
             self.mu.lockShared(@src());
             defer self.mu.unlockShared();
             for (needed) |*n| {
-                if (self.tables.get(n.id)) |t| {
+                if (self.get(n.id, n.extent.offset)) |t| {
                     t.incrRef(); // the caller's, under the lock
                     n.table = t;
                 } else {
@@ -258,7 +315,7 @@ pub const TableCache = struct {
     fn openOne(self: *TableCache, need: *TableNeed) !void {
         // Phase A: check under write lock (brief — no I/O).
         self.mu.lock(@src());
-        if (self.tables.get(need.id)) |t| {
+        if (self.get(need.id, need.extent.offset)) |t| {
             t.incrRef(); // the caller's, under the lock
             self.mu.unlock();
             need.table = t;
@@ -266,21 +323,21 @@ pub const TableCache = struct {
         }
         self.mu.unlock();
 
-        // Phase B: open the SST WITHOUT holding the lock. Table.open
-        // yields the fiber (I/O); holding the lock here would deadlock
-        // cooperative fibers on the same OS thread (EDEADLK).
-        const t = try Table.open(
-            self.allocator,
-            self.store,
-            need.id,
-            need.extent,
-        );
+        // Phase B: open the file, if the cache has it not yet, and the
+        // table in it, WITHOUT holding the lock: both yield the fiber
+        // (I/O), and holding the lock here would deadlock cooperative
+        // fibers on the same OS thread (EDEADLK). The table takes its
+        // own ref on the file.
+        const file = try self.openObject(need.id);
+        const t = try Table.openTable(self.allocator, file, need.extent);
+        t.file_id = need.id;
+        t.block_cache = self.store.blockCache();
 
         // Phase C: re-acquire write lock to insert; handle race with another
         // fiber. The open-time ref becomes the cache's on success; on the
         // two other paths nothing owns `t`, so it is dropped whole.
         self.mu.lock(@src());
-        if (self.tables.get(need.id)) |existing| {
+        if (self.get(need.id, need.extent.offset)) |existing| {
             // Another fiber opened the same table while we were in phase B.
             existing.incrRef(); // the caller's, under the lock
             self.mu.unlock();
@@ -288,14 +345,31 @@ pub const TableCache = struct {
             dropUnowned(t);
             return;
         }
-        self.tables.put(need.id, t) catch |err| {
+        const placed = self.put(need.id, t) catch |err| {
             self.mu.unlock();
             dropUnowned(t);
             return err;
         };
+        std.debug.assert(placed);
         t.incrRef(); // the caller's, under the lock
         self.mu.unlock();
         need.table = t;
+    }
+
+    /// File `id` open, with a ref for the caller: the cache's handle
+    /// when it has one, else opened here. The cache lists a file only
+    /// with a table of it (`put`), so two fibers opening the same
+    /// file at once each read the index through their own handle, and
+    /// the one whose table is published keeps its handle listed.
+    fn openObject(self: *TableCache, id: u64) !*vfs.Object {
+        self.mu.lockShared(@src());
+        if (self.files.get(id)) |of| {
+            of.obj.incrRef();
+            self.mu.unlockShared();
+            return of.obj;
+        }
+        self.mu.unlockShared();
+        return Table.openObject(self.allocator, self.store, id);
     }
 };
 
@@ -497,12 +571,12 @@ pub const Tree = struct {
                 kind = tree.kind;
                 for (tree.levels.items, 0..) |lm, level_idx| {
                     if (level_idx >= opts.max_levels) continue;
-                    var tit = lm.tables.keyIterator();
-                    while (tit.next()) |tid| {
+                    var tit = lm.tables.iterator();
+                    while (tit.next()) |listed| {
                         try needed.append(allocator, .{
-                            .id = tid.*,
+                            .id = listed.key_ptr.*,
                             .level = level_idx,
-                            .extent = manifest.extent(held, tid.*).?,
+                            .extent = listed.value_ptr.*,
                         });
                     }
                 }
@@ -880,6 +954,7 @@ pub const Tree = struct {
                     .id = c.sst_id,
                     .level = c.level,
                     .extent = .{
+                        .offset = c.offset,
                         .size = c.size,
                         .index_offset = c.index_offset,
                     },

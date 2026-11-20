@@ -22,55 +22,113 @@ fn idFromName(basename: String) u64 {
     if (stem.len != 16) return 0;
     return std.fmt.parseInt(u64, stem, 16) catch 0;
 }
-
-/// The extent the manifest would hold for `name`, read from the file:
-/// its size and, from the trailer ([u32 index_len][u64 hash]), where
-/// the index starts. This tool has no manifest to ask.
+/// The extent of the table whose last byte is at `end` of the file.
+/// A table ends in its trailer ([u32 index_len][u64 hash]), its index
+/// has every block's offset and length, and its size is its blocks,
+/// index and trailer padded to a page (`Builder.finish`), so its start
+/// is `end` less that. A flush packs many trees' tables into one file,
+/// each whole, so a walk from the file's end down to 0 visits them
+/// all. This tool has no manifest to ask.
 fn probeExtent(
     allocator: std.mem.Allocator,
-    store: *vfs.Store,
-    name: String,
+    obj: *vfs.Object,
+    end: u64,
 ) !Table.Extent {
     const trailer_len = zdb.table.index.trailer_len;
-    const size = (try store.stat(name)).size;
-    if (size < trailer_len) return error.CorruptTable;
-
-    var obj = try store.open(name, size, .{});
-    defer obj.close();
-
-    const trailer_at = size - trailer_len;
+    if (end < trailer_len) return error.CorruptTable;
+    const trailer_at = end - trailer_len;
     const res = try obj.readAligned(allocator, trailer_at, trailer_len);
     defer res.free();
-
     if (res.data.len < trailer_len) return error.CorruptTable;
     const index_len = std.mem.readInt(u32, res.data[0..4], .little);
     if (index_len > trailer_at) return error.CorruptTable;
 
-    return .{ .size = size, .index_offset = trailer_at - index_len };
+    const index_at = trailer_at - index_len;
+    const idx = try obj.readAligned(allocator, index_at, index_len);
+    defer idx.free();
+    if (idx.data.len < index_len) return error.CorruptTable;
+    const reader = try zdb.buffers.TableIndexReader.init(
+        idx.data[0..index_len],
+        0,
+    );
+    var index = try reader.toStruct(allocator);
+    defer index.destroy(allocator);
+    var blocks_end: u64 = 0;
+    for (index.blocks) |b| {
+        blocks_end = @max(blocks_end, @as(u64, b.offset) + b.len);
+    }
+    const page = vfs.page_size;
+    const unpadded = blocks_end + index_len + trailer_len;
+    const size = (unpadded + page - 1) / page * page;
+    if (size > end) return error.CorruptTable;
+    return .{
+        .offset = end - size,
+        .size = size,
+        .index_offset = size - index_len - trailer_len,
+    };
 }
 
+/// Every table of one file, from its end down: true when all verify.
 fn verifyOne(
     allocator: std.mem.Allocator,
     store: *vfs.Store,
     base: String,
 ) bool {
-    const extent = probeExtent(allocator, store, base) catch |err| {
-        std.debug.print("FAIL {s} probe={s}\n", .{ base, @errorName(err) });
+    const fid = idFromName(base);
+    const file_size = (store.stat(base) catch |err| {
+        std.debug.print("FAIL {s} stat={s}\n", .{ base, @errorName(err) });
         return false;
-    };
-    const t = Table.open(
-        allocator,
-        store,
-        idFromName(base),
-        extent,
-    ) catch |err| {
+    }).size;
+    const file = Table.openObject(allocator, store, fid) catch |err| {
         std.debug.print("FAIL {s} open={s}\n", .{ base, @errorName(err) });
         return false;
     };
-    defer t.decrRef();
+    defer file.decrRef();
 
-    const file_size = t.fileSize();
-    const fid = t.file_id;
+    var tables: u64 = 0;
+    var keys: u64 = 0;
+    var end = file_size;
+    while (end > 0) : (tables += 1) {
+        const extent = probeExtent(allocator, file, end) catch |err| {
+            std.debug.print("FAIL {s} end={d} probe={s}\n", .{
+                base, end, @errorName(err),
+            });
+            return false;
+        };
+        file.incrRef();
+        const t = Table.openTable(allocator, file, extent) catch |err| {
+            std.debug.print("FAIL {s} offset={d} open={s}\n", .{
+                base, extent.offset, @errorName(err),
+            });
+            return false;
+        };
+        defer t.decrRef();
+        t.file_id = fid;
+        if (!verifyTable(allocator, base, file_size, fid, t, &keys)) {
+            return false;
+        }
+        end = extent.offset;
+    }
+    std.debug.print("OK   {s} size={d} fid={d} tables={d} keys={d}\n", .{
+        base, file_size, fid, tables, keys,
+    });
+    return true;
+}
+
+/// One table: keys ascend strictly, one entry each, versions descend.
+/// Adds its keys to `total`.
+fn verifyTable(
+    allocator: std.mem.Allocator,
+    base: String,
+    file_size: u64,
+    fid: u64,
+    t: *Table,
+    total: *u64,
+) bool {
+    var prev_buf: std.ArrayList(u8) = .empty;
+    defer prev_buf.deinit(allocator);
+    var keys: u64 = 0;
+    var have_prev = false;
 
     // The file carries no namespace or table_id; a standalone check
     // stamps 0 and 0, and only the primaries are looked at.
@@ -85,11 +143,6 @@ fn verifyOne(
         std.debug.print("FAIL {s} size={d} fid={d} seek={s}\n", .{ base, file_size, fid, @errorName(err) });
         return false;
     };
-
-    var prev_buf: std.ArrayList(u8) = .empty;
-    defer prev_buf.deinit(allocator);
-    var keys: u64 = 0;
-    var have_prev = false;
 
     while (it.itemRef()) |item| {
         // Entries ascend strictly by key, one entry per key.
@@ -124,9 +177,7 @@ fn verifyOne(
             return false;
         };
     }
-    std.debug.print("OK   {s} size={d} fid={d} keys={d} smallest_pri={x} biggest_pri={x}\n", .{
-        base, file_size, fid, keys, t.smallest.primary, t.biggest.primary,
-    });
+    total.* += keys;
     return true;
 }
 

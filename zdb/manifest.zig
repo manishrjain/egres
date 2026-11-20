@@ -34,7 +34,10 @@ pub const ManifestError = error{
 // -------------------------------------------------------------------------
 
 pub const LevelState = struct {
-    tables: std.AutoHashMap(u64, void), // set of sst_ids at this level
+    /// The files listed at this level, each with the extent of the
+    /// table the tree reads in it: a flush packs many trees' tables
+    /// into one file, so the extent is the listing's, not the file's.
+    tables: std.AutoHashMap(u64, Extent),
 };
 
 /// What the manifest knows about one SST file, independent of which trees
@@ -43,13 +46,10 @@ pub const SstInfo = struct {
     /// Log index of the entry that first listed this id. L0 recency comes
     /// from this, not from the id: ids are random, log indexes are not.
     raft_index: u64,
-    /// Size and index start, from the CREATE that first listed the file;
-    /// every later open (apply, recovery, re-list, snapshot) reads just
-    /// that extent.
-    extent: Extent,
     /// How many (tree, level) listings name this id. A split hands the
-    /// same file to a second tree, so one file can be listed more than
-    /// once; the record dies when the last listing goes.
+    /// same file to a second tree, and a flush lists one file from
+    /// every tree it packed, so one file is listed many times; the
+    /// record dies when the last listing goes.
     refs: u32,
 };
 
@@ -520,12 +520,6 @@ pub const Manifest = struct {
     }
 
     /// The extent a listed file was created with. Caller holds the lock.
-    pub fn extent(self: *Manifest, held: Lock.Shared, sst_id: u64) ?Extent {
-        self.mu.assertHeld(held);
-        const info = self.ssts.get(sst_id) orelse return null;
-        return info.extent;
-    }
-
     /// A tree's manifest record, borrowed for as long as `held` is: the
     /// record's key bytes are freed by a delete or range update, so this
     /// exists only under a caller's hold. Null if the tree is not listed.
@@ -589,24 +583,24 @@ pub const Manifest = struct {
                 return ManifestError.TreeNotFound;
             while (tree.levels.items.len <= @as(usize, tc.level)) {
                 const lm = LevelState{
-                    .tables = std.AutoHashMap(u64, void).init(self.allocator),
+                    .tables = std.AutoHashMap(u64, Extent).init(self.allocator),
                 };
                 try tree.levels.append(self.allocator, lm);
             }
             // Already listed at this level: a re-apply during WAL replay
             // over snapshot-restored state must not bump refs a second time.
             if (tree.levels.items[tc.level].tables.contains(tc.sst_id)) return;
-            try tree.levels.items[tc.level].tables.put(tc.sst_id, {});
+            try tree.levels.items[tc.level].tables.put(tc.sst_id, .{
+                .offset = tc.offset,
+                .size = tc.size,
+                .index_offset = tc.index_offset,
+            });
             // A split re-lists a file another tree already holds: that
             // finds the existing record and keeps its original
             // raft_index, so the file's L0 recency never moves.
             const slot = try self.ssts.getOrPut(tc.sst_id);
             if (!slot.found_existing) slot.value_ptr.* = .{
                 .raft_index = if (tc.raft_index != 0) tc.raft_index else index,
-                .extent = .{
-                    .size = tc.size,
-                    .index_offset = tc.index_offset,
-                },
                 .refs = 0,
             };
             slot.value_ptr.refs += 1;
@@ -989,11 +983,13 @@ pub const Manifest = struct {
             tree.kind = s.kind;
             for (s.levels.items) |lm| {
                 var copy = LevelState{
-                    .tables = std.AutoHashMap(u64, void).init(self.allocator),
+                    .tables = std.AutoHashMap(u64, Extent).init(self.allocator),
                 };
                 errdefer copy.tables.deinit();
-                var tit = lm.tables.keyIterator();
-                while (tit.next()) |id| try copy.tables.put(id.*, {});
+                var tit = lm.tables.iterator();
+                while (tit.next()) |listed| {
+                    try copy.tables.put(listed.key_ptr.*, listed.value_ptr.*);
+                }
                 try tree.levels.append(self.allocator, copy);
             }
         }
@@ -1104,10 +1100,12 @@ pub const Manifest = struct {
             const tk = kv.key_ptr.*;
             const tree = kv.value_ptr;
             for (tree.levels.items, 0..) |lm, level| {
-                var tit = lm.tables.keyIterator();
-                while (tit.next()) |id| {
+                var tit = lm.tables.iterator();
+                while (tit.next()) |listed| {
                     try fiber.ctx().meter();
-                    const info = self.ssts.get(id.*).?;
+                    const id = listed.key_ptr.*;
+                    const extent = listed.value_ptr.*;
+                    const info = self.ssts.get(id).?;
                     var sst = try _zen.SSTableChangeWriter.initWithBuf(
                         allocator,
                         &out,
@@ -1115,11 +1113,12 @@ pub const Manifest = struct {
                     try sst.set(.{
                         .op = .create,
                         .level = @as(u32, @intCast(level)),
-                        .sst_id = id.*,
+                        .sst_id = id,
                         .tree_id = tk.tree_id,
                         .namespace_id = tk.namespace,
-                        .size = info.extent.size,
-                        .index_offset = info.extent.index_offset,
+                        .offset = extent.offset,
+                        .size = extent.size,
+                        .index_offset = extent.index_offset,
                         .raft_index = info.raft_index,
                     });
                     try sst_offsets.append(a, (try sst.finish()).offset);
@@ -1243,6 +1242,7 @@ pub const Manifest = struct {
                     .namespace_id = tc.namespaceId(),
                     .tree_id = tc.treeId(),
                     .level = tc.level(),
+                    .offset = tc.offset(),
                     .size = tc.size(),
                     .index_offset = tc.indexOffset(),
                     .raft_index = tc.raftIndex(),
@@ -1319,6 +1319,7 @@ pub fn createSSTableChange(
         .namespace_id = namespace_id,
         .tree_id = tree_id,
         .level = level,
+        .offset = extent.offset,
         .size = extent.size,
         .index_offset = extent.index_offset,
     };

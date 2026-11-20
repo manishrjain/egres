@@ -972,7 +972,7 @@ pub fn mergeAndWrite(
         &part_buf,
     );
 
-    var group = try fiber.Group(?Emitter.Result).initCapacity(
+    var group = try fiber.Group(?_emitter.Result).initCapacity(
         self.ground.allocator,
         parts.len,
     );
@@ -1105,7 +1105,7 @@ fn runPartition(
     job: MergeJob,
     part: Partition,
     snapshot_ts: u64,
-) ?Emitter.Result {
+) ?_emitter.Result {
     return runPartition_(self, job, part, snapshot_ts) catch |err| {
         // The engine's loop takes a failed job again after a wait.
         utils.logEvery(.err, 30, "compact tree={d} L{d}->L{d} partition " ++
@@ -1121,7 +1121,7 @@ fn runPartition_(
     job: MergeJob,
     part: Partition,
     snapshot_ts: u64,
-) !Emitter.Result {
+) !_emitter.Result {
     const dest = job.dest_level;
 
     // The job's I/O class, and the caches bypassed: each input is read
@@ -1163,7 +1163,10 @@ fn runPartition_(
     try merge.seekRange(part.range.left, part.range.right);
 
     // --- merge loop ---
-    var emitter = try Emitter.init(self, dest, snapshot_ts);
+    // A file per table: the pack cuts after each.
+    var pack = try _emitter.PackObject.init(self.ground, dest, 0);
+    defer pack.deinit();
+    var emitter = try Emitter.init(self, dest, snapshot_ts, &pack);
     defer emitter.deinit();
     // Between its reads a partition merges for tens of ms, on a worker
     // sessions are dealt to, as the job's tenant: its cpu is charged
@@ -1173,5 +1176,6 @@ fn runPartition_(
         try merge.next();
         try fiber.ctx().meter();
     }
-    return emitter.finish();
+    try emitter.flush();
+    return .{ .changes = try pack.finish(), .stats = emitter.stats };
 }

@@ -75,7 +75,8 @@ pub fn openBuffer(
         // Memory-backed: reads never charge the limiter.
         .bw = vfs.g().bw,
     };
-    return Table.openObject(alloc, .{ .file = handle }, tb.extent());
+    const obj = try vfs.Object.init(alloc, .{ .file = handle });
+    return Table.openTable(alloc, obj, tb.extent());
 }
 
 /// The extent of SST `name` read from the file itself — a stat and the
@@ -89,7 +90,7 @@ pub fn probeExtent(
     const size = (try store.stat(name)).size;
     if (size < _idx.trailer_len) return error.CorruptTable;
     var obj = try store.open(name, size, .{});
-    defer obj.close();
+    defer obj.decrRef();
     const trailer_offset = size - _idx.trailer_len;
     const res = try obj.readAligned(
         alloc,

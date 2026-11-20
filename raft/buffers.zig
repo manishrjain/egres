@@ -216,10 +216,13 @@ pub const JoinResponse = schema.Table(&.{
 
 // One announced SST: its id and what the manifest will say about it, so
 // the peer's open is the same single read the apply's would be.
+// One table a peer may open ahead of the entry that lists it: the
+// file and the table's extent in it (zdb's `Extent`).
 pub const FileRef = schema.Table(&.{
     .{ .id = 1, .name = "id", .ty = schema.U64 },
     .{ .id = 2, .name = "size", .ty = schema.U64 },
     .{ .id = 3, .name = "index_offset", .ty = schema.U64 },
+    .{ .id = 4, .name = "offset", .ty = schema.U64 },
 });
 
 pub const AnnounceFiles = schema.Table(&.{

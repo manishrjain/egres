@@ -152,7 +152,7 @@ pub fn read(
     defer alloc.free(name);
 
     var object = try store.open(name, snap.size, .{});
-    defer object.close();
+    defer object.decrRef();
     const got = try object.readAligned(alloc, 0, @intCast(snap.size));
     defer got.free();
 

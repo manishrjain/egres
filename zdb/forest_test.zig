@@ -645,11 +645,13 @@ test "forest: a flush built before a drop keeps the tables of what is left" {
     try std.testing.expect(!f.hasNamespace(gone));
     try std.testing.expect((try f.buildFlush()) == null);
 
-    // No entry names the dropped tree's table, so its file goes.
+    // Both trees' tables went into one file, at their own offsets. The
+    // dropped tree's table is unlisted, but the kept tree's entry names
+    // the file, so it stays.
     const unlisted = flush.changes.items[listed_len..];
-    try std.testing.expect(try sstExists(alloc, &store, unlisted[0].sst_id));
+    try std.testing.expectEqual(listed[0].sst_id, unlisted[0].sst_id);
+    try std.testing.expect(listed[0].offset != unlisted[0].offset);
     try f.removeUnlisted(unlisted);
-    try std.testing.expect(!try sstExists(alloc, &store, unlisted[0].sst_id));
     try std.testing.expect(try sstExists(alloc, &store, listed[0].sst_id));
 }
 
@@ -3756,7 +3758,7 @@ fn copySst(
     defer alloc.free(to_name);
     const st = try f.store.stat(from_name);
     var obj = try f.store.open(from_name, st.size, .{});
-    defer obj.close();
+    defer obj.decrRef();
     // readAligned: put needs a page-aligned buffer.
     const r = try obj.readAligned(alloc, 0, @intCast(obj.size()));
     defer r.free();

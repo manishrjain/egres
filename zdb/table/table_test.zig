@@ -770,7 +770,7 @@ test "table checksum mismatch is detected" {
     const first_meta = r.index.blocks[0];
     const block_start: usize = first_meta.offset;
     const block_end = block_start + first_meta.len;
-    r.obj.file.owned_buf.?[block_end - 5] ^= 0x01;
+    r.obj.impl.file.owned_buf.?[block_end - 5] ^= 0x01;
 
     try std.testing.expectError(error.ChecksumMismatch, r.readBlock(0));
 }
@@ -790,7 +790,7 @@ test "table iterator survives a failed read of its next block" {
 
     // Damage block 1 while the iterator stands in block 0.
     const second = t.index.blocks[1];
-    t.obj.file.owned_buf.?[second.offset + second.len - 5] ^= 0x01;
+    t.obj.impl.file.owned_buf.?[second.offset + second.len - 5] ^= 0x01;
     var failed = false;
     while (it.itemRef() != null) it.next() catch {
         failed = true;
@@ -1924,4 +1924,67 @@ test "builder: shrink frees the table buffer, and the next table builds" {
     var second = try b.finish();
     defer second.deinit();
     try std.testing.expect(second.bytes.len > 0);
+}
+
+test "table: two tables packed in one file open at their offsets" {
+    const alloc = std.testing.allocator;
+    var first = try buildTestTable(alloc, "a", 300, 512);
+    defer first.deinit();
+    var second = try buildTestTable(alloc, "b", 200, 512);
+    defer second.deinit();
+
+    // The file a flush writes: the tables back to back, each a page
+    // multiple, so the second starts where the first ends.
+    const file = try alloc.alloc(u8, first.bytes.len + second.bytes.len);
+    @memcpy(file[0..first.bytes.len], first.bytes);
+    @memcpy(file[first.bytes.len..], second.bytes);
+    const handle = vfs.FileHandle{
+        .file_size = file.len,
+        .owned_buf = file,
+        .buf_allocator = alloc,
+        .vfs = vfs.g(),
+        .bw = vfs.g().bw,
+    };
+    const extents = [_]Table.Extent{
+        .{ .offset = 0, .size = first.bytes.len, .index_offset = first.index_offset },
+        .{
+            .offset = first.bytes.len,
+            .size = second.bytes.len,
+            .index_offset = second.index_offset,
+        },
+    };
+
+    // One shared handle, a table over each extent, as the cache opens
+    // them; the handle closes with the last table.
+    const shared = try vfs.Object.init(alloc, .{ .file = handle });
+    shared.incrRef();
+    const t1 = try Table.openTable(alloc, shared, extents[0]);
+    defer destroyTable(t1);
+    const t2 = try Table.openTable(alloc, shared, extents[1]);
+    defer destroyTable(t2);
+    try std.testing.expectEqual(first.bytes.len, t1.fileSize());
+    try std.testing.expectEqual(second.bytes.len, t2.fileSize());
+
+    for ([_]struct { t: *Table, prefix: u8, n: usize }{
+        .{ .t = t1, .prefix = 'a', .n = 300 },
+        .{ .t = t2, .prefix = 'b', .n = 200 },
+    }) |want| {
+        var it = TableIterator.init(alloc, want.t, zero_table_key, .forward);
+        defer it.deinit();
+        try it.seekRange(Key.inf, Key.inf);
+        var n: usize = 0;
+        while (it.itemRef()) |item| : (try it.next()) {
+            try std.testing.expectEqual(want.prefix, item.key.primary[0]);
+            n += 1;
+        }
+        try std.testing.expectEqual(want.n, n);
+    }
+
+    // An extent past the file's end is refused.
+    shared.incrRef();
+    try std.testing.expectError(error.CorruptTable, Table.openTable(alloc, shared, .{
+        .offset = first.bytes.len + 4096,
+        .size = second.bytes.len,
+        .index_offset = second.index_offset,
+    }));
 }

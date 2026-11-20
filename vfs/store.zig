@@ -149,14 +149,18 @@ pub const Store = union(enum) {
         name: String,
         size: u64,
         flags: _vfs.Flags,
-    ) !Object {
+    ) !*Object {
         switch (self.*) {
             .file => |*f| return f.open(name, flags),
-            .s3 => |*s| return .{ .s3 = .{
-                .store = s,
-                .name = try s.a.dupe(u8, name),
-                .sz = size,
-            } },
+            .s3 => |*s| {
+                const owned = try s.a.dupe(u8, name);
+                errdefer s.a.free(owned);
+                return Object.init(s.a, .{ .s3 = .{
+                    .store = s,
+                    .name = owned,
+                    .sz = size,
+                } });
+            },
         }
     }
 
@@ -216,12 +220,46 @@ pub const Store = union(enum) {
 /// handle (tests, benches) — so direct I/O, mmap and the bandwidth
 /// limiter apply as they do to any local file. `.s3` reads are ranged
 /// GETs.
-pub const Object = union(enum) {
-    file: _vfs.FileHandle,
-    s3: S3Object,
+/// Counted: `open` hands out one ref, and the tables packed in one SST
+/// file read through one object, each with a ref, so a file is one
+/// descriptor however many trees list it and the last reader closes it.
+pub const Object = struct {
+    allocator: std.mem.Allocator,
+    impl: Impl,
+    ref: std.atomic.Value(i32),
+
+    pub const Impl = union(enum) {
+        file: _vfs.FileHandle,
+        s3: S3Object,
+    };
+
+    /// Takes over `impl`, with one ref for the caller.
+    pub fn init(allocator: std.mem.Allocator, impl: Impl) !*Object {
+        const o = try allocator.create(Object);
+        o.* = .{ .allocator = allocator, .impl = impl, .ref = .init(1) };
+        return o;
+    }
+
+    pub fn incrRef(self: *Object) void {
+        const prev = self.ref.fetchAdd(1, .monotonic);
+        if (prev <= 0) @panic("Object.incrRef on a closed object");
+    }
+
+    /// The last ref closes the handle and frees the object.
+    pub fn decrRef(self: *Object) void {
+        const prev = self.ref.fetchSub(1, .acq_rel);
+        if (prev <= 0) @panic("Object.decrRef below zero");
+        if (prev == 1) {
+            switch (self.impl) {
+                .file => |*f| f.close(),
+                .s3 => |*o| o.store.a.free(o.name),
+            }
+            self.allocator.destroy(self);
+        }
+    }
 
     pub fn size(self: *const Object) u64 {
-        switch (self.*) {
+        switch (self.impl) {
             .file => |*f| return f.file_size,
             .s3 => |*o| return o.sz,
         }
@@ -230,7 +268,7 @@ pub const Object = union(enum) {
     /// True when reads are memory copies, not I/O: a memory-backed
     /// file. Nothing to gain from batching those.
     pub fn isResident(self: *const Object) bool {
-        switch (self.*) {
+        switch (self.impl) {
             .file => |*f| return f.owned_buf != null,
             .s3 => return false,
         }
@@ -244,7 +282,7 @@ pub const Object = union(enum) {
         offset: u64,
         len: usize,
     ) !_vfs.ReadResult {
-        switch (self.*) {
+        switch (self.impl) {
             .file => |*f| return f.readAligned(a, offset, len),
             .s3 => |*o| {
                 // The same aligned-buffer contract as the file path, so a
@@ -270,7 +308,7 @@ pub const Object = union(enum) {
         arena: *std.heap.ArenaAllocator,
         requests: []_vfs.FileHandle.ReadRequest,
     ) !void {
-        switch (self.*) {
+        switch (self.impl) {
             .file => |*f| return f.batchRead(arena, requests),
             .s3 => |*o| return o.store.batchRead(
                 o.name,
@@ -278,13 +316,6 @@ pub const Object = union(enum) {
                 arena,
                 requests,
             ),
-        }
-    }
-
-    pub fn close(self: *Object) void {
-        switch (self.*) {
-            .file => |*f| f.close(),
-            .s3 => |*o| o.store.a.free(o.name),
         }
     }
 };
@@ -375,13 +406,15 @@ pub const FileStore = struct {
         try _vfs.deleteFile(path);
     }
 
-    fn open(self: *FileStore, name: String, flags: _vfs.Flags) !Object {
+    fn open(self: *FileStore, name: String, flags: _vfs.Flags) !*Object {
         const path = try self.objectPath(name);
         defer self.a.free(path);
-        return .{ .file = try self.vfs.openFile(self.a, path, .{
+        var handle = try self.vfs.openFile(self.a, path, .{
             .mode = self.read_mode,
             .flags = flags,
-        }) };
+        });
+        errdefer handle.close();
+        return Object.init(self.a, .{ .file = handle });
     }
 
     /// Object size in bytes; errors if absent.

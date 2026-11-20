@@ -24,6 +24,8 @@ const Item = _table.table.Item;
 const ItemRef = _table.table.ItemRef;
 const Version = @import("kv.zig").Version;
 const Builder = _table.builder.Builder;
+const TreeKey = @import("kv.zig").TreeKey;
+const Extent = _table.Table.Extent;
 
 const log = std.log.scoped(.zdb_tree);
 
@@ -335,40 +337,24 @@ pub const Metrics = struct {
 
 /// The compaction output stage — emission mechanics only. Every
 /// consumed item goes through `push` in merge order; `finish`
-/// closes the stream and hands back what it wrote. Run awareness
-/// (retention boundaries AND the roaring rollup) lives in the
-/// VersionTracker, which calls back into `emitOne`: tracker update →
-/// discard → file-split check → addItem → stale/stats accounting.
-/// Consumption accounting (keys_in/bytes_in) happens in `push`. The
-/// emitter owns the builder its tables come out of, the group their
-/// syncs run in, and the stats of what it consumed and wrote.
+/// closes the stream and hands back the stats of what it consumed and
+/// wrote. Run awareness (retention boundaries AND the roaring rollup)
+/// lives in the VersionTracker, which calls back into `emitOne`:
+/// tracker update → discard → table-split check → addItem →
+/// stale/stats accounting. Consumption accounting (keys_in/bytes_in)
+/// happens in `push`. The emitter owns the builder its tables come
+/// out of; the tables go to its `PackObject`, which files them.
 pub const Emitter = struct {
-    /// What `finish` hands back: a manifest CREATE per output table,
-    /// at the emitter's level and in key order, and the stats of what
-    /// it consumed and wrote. The changes are allocated from the
-    /// tree's allocator.
-    pub const Result = struct {
-        changes: std.ArrayList(_manifest.SSTableChange),
-        stats: Metrics,
-    };
-
     tree: *Tree,
     /// The runtime's allocator counted on the tenant the job runs as:
     /// the tree's for a compaction, the shared one for a flush. Every
-    /// buffer of the merge is on it; the result's changes are the
-    /// tree's, since the caller frees them.
+    /// buffer of the merge is on it.
     allocator: std.mem.Allocator,
     /// The tunables when the job started: one snapshot for the whole
     /// merge, read per key by the rollup policy.
     opts: _config.Config,
     bld: Builder,
-    /// One put fiber per table written; joined by `finish`.
-    group: fiber.Group(?FlushResult),
-    /// One seat per put in flight, `max_inflight` of them. A finished
-    /// table sits in memory until its put returns, so `flush` takes a
-    /// seat before spawning and parks when none is free instead of
-    /// running ahead of a slow store; `putFile` gives it back.
-    inflight: fiber.Channel(void),
+    pack: *PackObject,
     stats: Metrics = .{},
     /// An output table is cut once it reaches this. An L0 table has
     /// no limit: an L0→L0 merge writes one output, whatever it weighs,
@@ -377,10 +363,13 @@ pub const Emitter = struct {
     dest: usize,
     tracker: VersionTracker,
 
+    /// Writes `tree`'s tables at level `dest` into `pack`, which the
+    /// caller keeps alive past `deinit`.
     pub fn init(
         tree: *Tree,
         dest: usize,
         snapshot_ts: u64,
+        pack: *PackObject,
     ) !Emitter {
         const opts = tree.ground.live.cur();
         const cfg = _table.builder.Config{
@@ -393,11 +382,7 @@ pub const Emitter = struct {
             .tree = tree,
             .allocator = allocator,
             .bld = Builder.init(allocator, cfg),
-            .group = fiber.Group(?FlushResult).init(allocator),
-            .inflight = try fiber.Channel(void).initAlloc(
-                allocator,
-                max_inflight,
-            ),
+            .pack = pack,
             .file_sz = if (dest == 0)
                 std.math.maxInt(usize)
             else
@@ -415,18 +400,10 @@ pub const Emitter = struct {
         };
     }
 
-    /// Safe after `finish` and after an error: every put still
-    /// running is joined before the builder goes.
     pub fn deinit(e: *Emitter) void {
         e.tracker.deinit();
-        _ = e.group.wait();
-        e.group.deinit();
-        e.inflight.deinit();
         e.bld.deinit();
     }
-
-    /// Finished tables an emitter holds while their puts run.
-    const max_inflight = 3;
 
     /// Feed one item — one primary with its versions — in merge
     /// (consumption) order. Nothing is held across calls: the merge
@@ -481,90 +458,245 @@ pub const Emitter = struct {
         }
     }
 
-    /// The open table out: finished, its upload to the store spawned
-    /// into the group; the builder is reset for the next. Nothing
-    /// happens for an empty builder.
+    /// The open table out: finished and handed to the pack; the
+    /// builder is reset for the next. Nothing happens for an empty
+    /// builder. The last call closes the stream; the pack's `finish`
+    /// has the CREATEs once its puts are done, and `stats` says what
+    /// was consumed and written.
     pub fn flush(e: *Emitter) !void {
-        var tb = try e.bld.finish();
-        errdefer tb.deinit();
-        // An L0 emitter writes exactly one table and lives on until every
-        // tree's is written: its 8 MiB chunk would be held that long for every
-        // tree in the flush, thousands of them at once.
-        defer {
-            e.bld.reset();
-            if (e.dest == 0) e.bld.shrink();
-        }
+        const tb = try e.bld.finish();
+        e.bld.reset();
+        try e.pack.add(.{
+            .namespace = e.tree.namespace,
+            .tree_id = e.tree.tree_id,
+        }, tb);
+    }
+};
+
+/// What a job hands back: the CREATEs of its pack and the stats of its
+/// emitters.
+pub const Result = struct {
+    changes: std.ArrayList(_manifest.SSTableChange),
+    stats: Metrics,
+};
+
+/// Where emitters' finished tables go: files in the store. Tables are
+/// appended to the open file, each whole and page-aligned at its own
+/// offset, until it holds `cut_bytes`; then it goes out on a fiber of
+/// its own while the next fills, and `finish` waits for every put and
+/// lists each table at its offset for its tree. The flush gives every
+/// tree's emitter one pack, so a flush over thousands of trees is a few
+/// files of the table size; a compaction's pack puts after every
+/// table, so its files are its tables, as before.
+pub const PackObject = struct {
+    ground: *_tree.Ground,
+    /// The job's allocator, as the emitters'.
+    allocator: std.mem.Allocator,
+    dest: usize,
+    cut_bytes: usize,
+    /// The open file: its tables as built, and whose each is.
+    parts: std.ArrayList(_table.builder.TableBuffer) = .empty,
+    entries: std.ArrayList(Entry) = .empty,
+    len: u64 = 0,
+    /// One put fiber per file written; joined by `finish`.
+    group: fiber.Group(?Put),
+    /// One seat per put in flight, `max_inflight` of them. A finished
+    /// file sits in memory until its put returns, so `cutAndPut` takes a seat
+    /// before spawning and parks when none is free instead of running
+    /// ahead of a slow store; `putFile` gives it back.
+    inflight: fiber.Channel(void),
+    /// Set by `finish`, which takes every put's entries.
+    finished: bool = false,
+
+    /// One table of a file: the tree that lists it and where it sits.
+    const Entry = struct { tree: TreeKey, extent: Extent };
+    /// One file written, its tables in order.
+    const Put = struct { file_id: u64, entries: []Entry };
+
+    /// Finished files a pack holds while their puts run.
+    const max_inflight = 3;
+
+    /// A pack for level `dest` whose files are put once they hold
+    /// `cut_bytes`; 0 puts each table as its own file.
+    pub fn init(
+        ground: *_tree.Ground,
+        dest: usize,
+        cut_bytes: usize,
+    ) !PackObject {
+        const allocator = fiber.allocator(.tenant);
+        return .{
+            .ground = ground,
+            .allocator = allocator,
+            .dest = dest,
+            .cut_bytes = cut_bytes,
+            .group = fiber.Group(?Put).init(allocator),
+            .inflight = try fiber.Channel(void).initAlloc(
+                allocator,
+                max_inflight,
+            ),
+        };
+    }
+
+    /// Safe after `finish` and after an error: every put still
+    /// running is joined before the pack goes, and the entries of puts
+    /// `finish` did not take are freed here.
+    pub fn deinit(p: *PackObject) void {
+        const results = p.group.wait();
+        if (!p.finished) for (results) |r_opt| {
+            if (r_opt) |r| p.allocator.free(r.entries);
+        };
+        p.group.deinit();
+        p.inflight.deinit();
+        for (p.parts.items) |*tb| tb.deinit();
+        p.parts.deinit(p.allocator);
+        p.entries.deinit(p.allocator);
+    }
+
+    /// Takes `tb`, a table built for `tree`, into the open file; an
+    /// empty one is dropped. The file goes out once it holds enough.
+    pub fn add(
+        p: *PackObject,
+        tree: TreeKey,
+        tb_in: _table.builder.TableBuffer,
+    ) !void {
+        var tb = tb_in;
         if (tb.bytes.len == 0) {
             tb.deinit();
             return;
         }
-
-        const tree = e.tree;
-        const id = tree.ground.manifest.newFileId();
-        e.inflight.send({}) catch return error.FlushFailed;
-        errdefer _ = e.inflight.tryReceive() catch {};
-        // The fiber owns `tb` from here: the builder's next table is
-        // built while this one uploads.
-        try e.group.spawn(.{}, putFile, .{ e, tb, id });
+        const extent: Extent = .{
+            .offset = p.len,
+            .size = tb.bytes.len,
+            .index_offset = tb.index_offset,
+        };
+        p.parts.append(p.allocator, tb) catch |err| {
+            tb.deinit();
+            return err;
+        };
+        try p.entries.append(p.allocator, .{ .tree = tree, .extent = extent });
+        p.len += tb.bytes.len;
+        if (p.len >= p.cut_bytes) try p.cutAndPut();
     }
 
-    /// Close the stream: the last table out, every sync joined, and
-    /// what was written handed back as CREATEs in key order. A failed
-    /// sync fails the whole job.
-    pub fn finish(e: *Emitter) !Result {
-        try e.flush();
-        const tree = e.tree;
-        var changes: std.ArrayList(_manifest.SSTableChange) = .empty;
-        errdefer changes.deinit(tree.ground.allocator);
-        for (e.group.wait()) |r_opt| {
-            const r = r_opt orelse return error.FlushFailed;
-            try changes.append(
-                tree.ground.allocator,
-                _manifest.createSSTableChange(
-                    r.file_id,
-                    tree.namespace,
-                    tree.tree_id,
-                    @intCast(e.dest),
-                    r.extent,
-                ),
-            );
+    /// The open file ends here and goes to the store: its tables
+    /// gathered into one buffer, a table alone taken as it is, and the
+    /// put spawned into the group. Nothing happens for an empty file.
+    pub fn cutAndPut(p: *PackObject) !void {
+        if (p.parts.items.len == 0) return;
+        defer {
+            for (p.parts.items) |*tb| tb.deinit();
+            p.parts.clearRetainingCapacity();
+            p.len = 0;
         }
-        return .{ .changes = changes, .stats = e.stats };
+
+        var file = if (p.parts.items.len == 1)
+            p.parts.pop().?
+        else
+            try p.gather();
+        errdefer file.deinit();
+
+        const entries = try p.entries.toOwnedSlice(p.allocator);
+        errdefer p.allocator.free(entries);
+
+        const id = p.ground.manifest.newFileId();
+        p.inflight.send({}) catch return error.FlushFailed;
+        errdefer _ = p.inflight.tryReceive() catch {};
+
+        // The fiber owns `file` and `entries` from here: the next file
+        // fills while this one uploads.
+        try p.group.spawn(.{}, putFile, .{ p, file, id, entries });
+    }
+
+    /// The open file's tables copied back to back into one
+    /// page-aligned buffer, the address alignment O_DIRECT asks for.
+    /// Each table is a page multiple, so each lands at its extent.
+    fn gather(p: *PackObject) !_table.builder.TableBuffer {
+        const bytes = try p.allocator.alignedAlloc(
+            u8,
+            vfs.page_alignment,
+            @intCast(p.len),
+        );
+        var at: usize = 0;
+        for (p.parts.items) |tb| {
+            @memcpy(bytes[at..][0..tb.bytes.len], tb.bytes);
+            at += tb.bytes.len;
+        }
+        return .{ .allocator = p.allocator, .bytes = bytes, .index_offset = 0 };
+    }
+
+    /// Close the pack: the open file out, every put joined, and what
+    /// was written handed back as CREATEs, a table's for its tree at
+    /// its extent, in write order. A failed put fails the whole job.
+    pub fn finish(p: *PackObject) !std.ArrayList(_manifest.SSTableChange) {
+        try p.cutAndPut();
+        const arloc = p.ground.allocator;
+
+        var changes: std.ArrayList(_manifest.SSTableChange) = .empty;
+        errdefer changes.deinit(arloc);
+
+        var failed = false;
+        const results = p.group.wait();
+        p.finished = true;
+        for (results) |r_opt| {
+            const r = r_opt orelse {
+                failed = true;
+                continue;
+            };
+            defer p.allocator.free(r.entries);
+            for (r.entries) |en| {
+                try changes.append(arloc, _manifest.createSSTableChange(
+                    r.file_id,
+                    en.tree.namespace,
+                    en.tree.tree_id,
+                    @intCast(p.dest),
+                    en.extent,
+                ));
+            }
+        }
+        if (failed) return error.FlushFailed;
+        return changes;
     }
 };
 
-const FlushResult = struct { file_id: u64, extent: _table.Table.Extent };
-
-/// Upload one finished table. put syncs the bytes; the caller's
-/// `store.sync()` after the group covers the names.
+/// Upload one finished file. put syncs the bytes; the caller's
+/// `store.sync()` after the group covers the names. `entries` go back
+/// in the result, or are freed on failure.
 fn putFile(
-    e: *Emitter,
+    p: *PackObject,
     tb_in: _table.builder.TableBuffer,
     file_id: u64,
-) ?FlushResult {
+    entries: []PackObject.Entry,
+) ?PackObject.Put {
     var tb = tb_in;
     defer tb.deinit();
-    defer _ = e.inflight.tryReceive() catch {};
-    const name = _table.table.sstName(tb.allocator, file_id) catch return null;
-    defer tb.allocator.free(name);
-    const store = e.tree.ground.cache.store;
-    store.put(name, tb.bytes) catch |err| {
-        log.err("put {s}: {s}", .{ name, @errorName(err) });
+    defer _ = p.inflight.tryReceive() catch {};
+    const name = _table.table.sstName(tb.allocator, file_id) catch {
+        p.allocator.free(entries);
         return null;
     };
-    if (store.blockCache()) |cache| admit(e, &tb, file_id, cache);
-    return .{ .file_id = file_id, .extent = tb.extent() };
+    defer tb.allocator.free(name);
+    const store = p.ground.cache.store;
+    store.put(name, tb.bytes) catch |err| {
+        log.err("put {s}: {s}", .{ name, @errorName(err) });
+        p.allocator.free(entries);
+        return null;
+    };
+    if (store.blockCache()) |cache| {
+        for (entries) |en| admit(p, &tb, file_id, en.extent, cache);
+    }
+    return .{ .file_id = file_id, .entries = entries };
 }
 
-/// The written table's blocks into the block cache (`Table.admit`),
-/// through a memory-backed Table over the bytes just put: the index
-/// and the decode are the reader's own, so what goes in is what a
-/// read would have produced. Best effort: the file is durable either
+/// One written table's blocks into the block cache (`Table.admit`),
+/// through a memory-backed Table over the file bytes just put: the
+/// index and the decode are the reader's own, so what goes in is what
+/// a read would have produced. Best effort: the file is durable either
 /// way, and a table that does not fit is left to the reads.
 fn admit(
-    e: *Emitter,
+    p: *PackObject,
     tb: *const _table.builder.TableBuffer,
     file_id: u64,
+    extent: Extent,
     cache: *vfs.BlockCache,
 ) void {
     // No `buf_allocator`: the handle borrows `tb.bytes`, so its close
@@ -575,10 +707,12 @@ fn admit(
         .vfs = vfs.g(),
         .bw = vfs.g().bw,
     };
-    const t = _table.table.Table.openObject(
-        e.tree.ground.allocator,
-        .{ .file = handle },
-        tb.extent(),
+    const obj = vfs.Object.init(p.ground.allocator, .{ .file = handle }) catch
+        return;
+    const t = _table.table.Table.openTable(
+        p.ground.allocator,
+        obj,
+        extent,
     ) catch |err| {
         log.debug("admit {d}: open: {s}", .{ file_id, @errorName(err) });
         return;

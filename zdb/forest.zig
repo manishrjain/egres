@@ -38,7 +38,8 @@ const Table = _table.Table;
 const Item = _table.table.Item;
 const ItemRef = _table.table.ItemRef;
 const SkipList = _skl.SkipList;
-const Emitter = _tree.Tree.Emitter;
+const _emitter = @import("emitter.zig");
+const Emitter = _emitter.Emitter;
 const _mitr = _table.merge_iterator;
 
 pub const sstName = _table.table.sstName;
@@ -788,73 +789,62 @@ pub const Forest = struct {
         defer iter.deinit();
         try iter.seekRange(Key.inf, Key.inf);
 
-        // One Emitter per tree, in the order the trees are met. The
-        // merge is globally sorted and a tree covers a contiguous key
-        // range of one table, so a tree's keys arrive as one run: the
-        // current emitter serves until a key falls outside its tree,
-        // and a tree is never met twice. Once a run ends its table
-        // goes out on a fiber of its own, overlapping the walk of the
-        // trees after it. Each emitter holds its tree's ref for as
-        // long as it lives. An item is one key with every version of
-        // it, newest first, which is the order the emitter wants. At
-        // L0 an emitter writes one table, whatever it weighs, and
-        // folds only the roaring delta chains the flushed memtables
-        // hold whole.
-        var emitters: std.ArrayList(*Emitter) = .empty;
-        defer {
-            for (emitters.items) |em| {
-                em.deinit();
-                em.tree.release();
-                self.allocator.destroy(em);
-            }
-            emitters.deinit(self.allocator);
-        }
+        // One pack for the whole flush, cutting files at the table
+        // size, and one Emitter per tree in the order the trees are
+        // met. The merge is globally sorted and a tree covers a
+        // contiguous key range of one table, so a tree's keys arrive
+        // as one run: the emitter serves until a key falls outside its
+        // tree, then its table goes into the pack and the emitter
+        // goes, and a tree is never met twice. An item is one key with
+        // every version of it, newest first, which is the order the
+        // emitter wants. At L0 an emitter writes one table, whatever it
+        // weighs, and folds only the roaring delta chains the flushed
+        // memtables hold whole. A finished file goes out on a fiber of
+        // its own, overlapping the walk after it.
         const snapshot_ts = self.snapshotTs();
-        var flush_err: utils.SafeError = .{};
-        var flushes = fiber.Group(void).init(self.allocator);
-        defer {
-            _ = flushes.wait();
-            flushes.deinit();
-        }
+        var pack = try _emitter.PackObject.init(
+            &self.ground,
+            0,
+            opts.table_bytes,
+        );
+        defer pack.deinit();
 
-        var cur: ?*Emitter = null;
+        var cur: ?Emitter = null;
+        defer if (cur) |*em| {
+            em.deinit();
+            em.tree.release();
+        };
+
         while (iter.itemRef()) |item| {
             if (cur == null or !cur.?.tree.covers(item.key)) {
-                // We're on a new tree. Flush the previous one; a table
-                // that failed fails the flush, so no point walking on.
-                if (cur) |em| {
-                    try flushes.spawn(.{}, flushTable, .{ em, &flush_err });
+                // On a new tree: the one before is done.
+                if (cur) |*em| {
+                    try em.flush();
+                    em.deinit();
+                    em.tree.release();
+                    cur = null;
                 }
-                if (flush_err.get()) |err| return err;
-
-                cur = try self.openFlushEmitter(
-                    &emitters,
-                    item.key,
-                    snapshot_ts,
-                );
+                if (self.treeOf(item.key)) |tree| {
+                    errdefer tree.release();
+                    cur = try Emitter.init(tree, 0, snapshot_ts, &pack);
+                }
             }
             // No tree for the key (its namespace is gone): dropped.
-            if (cur) |em| try em.push(item);
+            if (cur) |*em| try em.push(item);
             try iter.next();
             // The walk is every frozen memtable, 200 ms and more under
             // four writers, on a worker sessions are dealt to.
             try fiber.ctx().meter();
         }
-        if (cur) |em| try flushes.spawn(.{}, flushTable, .{ em, &flush_err });
-
-        // Every table written, then each emitter's syncs joined for
-        // its CREATEs.
-        _ = flushes.wait();
-        if (flush_err.get()) |err| return err;
-
-        var changes: std.ArrayList(_manifest.SSTableChange) = .empty;
-        errdefer changes.deinit(self.allocator);
-
-        for (emitters.items) |em| {
-            var r = try em.finish();
-            defer r.changes.deinit(self.allocator);
-            try changes.appendSlice(self.allocator, r.changes.items);
+        if (cur) |*em| {
+            try em.flush();
+            em.deinit();
+            em.tree.release();
+            cur = null;
         }
+
+        var changes = try pack.finish();
+        errdefer changes.deinit(self.allocator);
 
         // The names' durability barrier: every put above is synced.
         try self.store.sync();
@@ -866,49 +856,10 @@ pub const Forest = struct {
         return .{ .changes = changes, .newest_memtable_id = newest_id };
     }
 
-    /// A flush emitter's table out, on its own fiber: the emitter is
-    /// done being pushed to, and nothing touches it until the fiber
-    /// is joined. A failure is logged here and set in `err_out`.
-    fn flushTable(em: *Emitter, err_out: *utils.SafeError) void {
-        // The tables are the tree's database's work, charged to its
-        // tenant, by the put fibers the flush spawns too, but never
-        // waited for: the forest's flush is every tree's, so the
-        // tenant's statements wait instead. The fiber ends with the
-        // flush, so nothing to restore.
-        const ctx = fiber.ctx();
-        ctx.tenant = fiber.meter.tenants.get(
-            em.tree.namespace,
-            utils.coarseMs(),
-        ) catch &fiber.meter.shared;
-        ctx.waits = false;
-        em.flush() catch |err| {
-            log.err("flush tree={d} table failed: {s}", .{
-                em.tree.tree_id, @errorName(err),
-            });
-            err_out.set(err);
-        };
-    }
-
-    /// An L0 emitter for the tree owning `key`, added to `emitters`,
-    /// or null when no tree does. The emitter takes over the tree ref.
-    fn openFlushEmitter(
-        self: *Forest,
-        emitters: *std.ArrayList(*Emitter),
-        key: Key,
-        snapshot_ts: u64,
-    ) !?*Emitter {
+    /// The tree owning `key`, with a ref, or null when no tree does.
+    fn treeOf(self: *Forest, key: Key) ?*Tree {
         const trees = self.getTable(key.tableKey()) orelse return null;
-        const tree = trees.getTreeByKey(key) orelse return null;
-        errdefer tree.release();
-
-        const em = try self.allocator.create(Emitter);
-        errdefer self.allocator.destroy(em);
-
-        em.* = try Emitter.init(tree, 0, snapshot_ts);
-        errdefer em.deinit();
-
-        try emitters.append(self.allocator, em);
-        return em;
+        return trees.getTreeByKey(key);
     }
 
     /// Build BOTTOM-level SSTs for (`ns`, `table_id`) from
@@ -946,19 +897,23 @@ pub const Forest = struct {
         if (items.len == 0) return changes;
 
         // One emitter at the bottom level: tables cut at `table_bytes`,
-        // and every item kept, a single state above the horizon.
+        // a file each, and every item kept, a single state above the
+        // horizon.
         const bottom: usize = self.live.cur().max_levels - 1;
         const tree = try self.singleTree(table_key);
         defer tree.release();
 
-        var em = try Emitter.init(tree, bottom, self.snapshotTs());
+        var pack = try _emitter.PackObject.init(&self.ground, bottom, 0);
+        defer pack.deinit();
+        var em = try Emitter.init(tree, bottom, self.snapshotTs(), &pack);
         defer em.deinit();
 
         for (items) |*item| try em.push(item);
 
-        var r = try em.finish();
-        defer r.changes.deinit(self.allocator);
-        try changes.appendSlice(allocator, r.changes.items);
+        try em.flush();
+        var created = try pack.finish();
+        defer created.deinit(self.allocator);
+        try changes.appendSlice(allocator, created.items);
 
         try self.store.sync();
         return changes;
@@ -1103,7 +1058,11 @@ pub const Forest = struct {
             try needed.append(self.allocator, .{
                 .id = c.sst_id,
                 .level = c.level,
-                .extent = .{ .size = c.size, .index_offset = c.index_offset },
+                .extent = .{
+                    .offset = c.offset,
+                    .size = c.size,
+                    .index_offset = c.index_offset,
+                },
             });
         }
         try self.ground.cache.loadTables(needed.items);

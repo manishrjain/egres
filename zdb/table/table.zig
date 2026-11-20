@@ -89,8 +89,9 @@ const min_key_len: usize = 1;
 
 pub const Table = struct {
     allocator: std.mem.Allocator,
-    /// The SST's bytes, wherever the store keeps them.
-    obj: vfs.Object,
+    /// The file's bytes, wherever the store keeps them; this table is
+    /// `extent` of them, and holds a ref on the object.
+    obj: *vfs.Object,
     index: *_buffers.TableIndexStruct,
     /// The table's filter, one of the two (see `builder.Config.kind`),
     /// or neither for a table written without one.
@@ -124,27 +125,39 @@ pub const Table = struct {
     /// This table's share of `resident`, taken back when it is freed.
     resident: Resident,
 
+    /// The table's bytes: its extent's, not its file's.
     pub fn fileSize(self: *const Table) u64 {
-        return self.obj.size();
+        return self.extent.size;
     }
 
     pub const Extent = _idx.Extent;
 
-    /// Open SST `file_id` from the store, with the store's block
-    /// cache. A file store reads it in its own mode, readahead off.
-    /// `extent` is what the manifest recorded at create: the open is
-    /// then one read of the index and trailer, no stat and no trailer
-    /// round trip.
+    /// Open the file of SST `file_id` from the store, random access,
+    /// readahead off: the shared handle every table of the file reads
+    /// through (`openTable`). One stat for the file's size, which an s3
+    /// range read needs and a listing no longer carries, since a file
+    /// holds many tables.
+    pub fn openObject(
+        allocator: std.mem.Allocator,
+        store: *vfs.Store,
+        file_id: u64,
+    ) !*vfs.Object {
+        const name = try sstName(allocator, file_id);
+        defer allocator.free(name);
+        const size = (try store.stat(name)).size;
+        return store.open(name, size, .{ .random = true });
+    }
+
+    /// Open the table at `extent` of `file_id`: `openObject` then
+    /// `openTable`, for a tool with no cache to share the file through.
     pub fn open(
         allocator: std.mem.Allocator,
         store: *vfs.Store,
         file_id: u64,
         extent: Extent,
     ) !*Table {
-        const name = try sstName(allocator, file_id);
-        defer allocator.free(name);
-        const obj = try store.open(name, extent.size, .{ .random = true });
-        const t = try openObject(allocator, obj, extent);
+        const obj = try openObject(allocator, store, file_id);
+        const t = try openTable(allocator, obj, extent);
         t.file_id = file_id;
         t.block_cache = store.blockCache();
         return t;
@@ -181,7 +194,7 @@ pub const Table = struct {
             if (bi.len < 4) return error.CorruptTable;
             const raw = try self.obj.readAligned(
                 self.allocator,
-                @intCast(bi.offset),
+                self.extent.offset + bi.offset,
                 bi.len,
             );
             defer raw.free();
@@ -196,20 +209,22 @@ pub const Table = struct {
         return n;
     }
 
-    /// A Table over an already-open object (a memory-backed handle in
-    /// tests and benches): one read of [index_offset, size) — the index
-    /// and its trailer. Takes ownership of `obj_in`, closing it on error
-    /// or when the table is freed. file_id stays 0.
-    pub fn openObject(
+    /// The table at `extent` of `obj`, the file: one read of
+    /// [index_offset, size) within it, the index and its trailer. Takes
+    /// over the caller's ref on `obj`, released on error or when the
+    /// table is freed.
+    /// file_id stays 0.
+    pub fn openTable(
         allocator: std.mem.Allocator,
-        obj_in: vfs.Object,
+        obj: *vfs.Object,
         extent: Extent,
     ) !*Table {
-        var obj = obj_in;
-        errdefer obj.close();
+        errdefer obj.decrRef();
 
         const size = extent.size;
-        if (size == 0 or size != obj.size()) return error.CorruptTable;
+        if (size == 0 or extent.offset + size > obj.size()) {
+            return error.CorruptTable;
+        }
         if (extent.index_offset + _idx.trailer_len > size) {
             return error.CorruptTable;
         }
@@ -221,7 +236,7 @@ pub const Table = struct {
 
         const tail = try obj.readAligned(
             allocator,
-            extent.index_offset,
+            extent.offset + extent.index_offset,
             tail_len,
         );
         defer tail.free();
@@ -349,7 +364,7 @@ pub const Table = struct {
         self.index.destroy(self.allocator);
         if (self.binary_fuse) |*bf| bf.deinit(self.allocator);
         if (self.egid_bm) |*bm| bm.deinit();
-        self.obj.close();
+        self.obj.decrRef();
     }
 
     /// Increment the reference count. Call this when sharing a Table pointer.
@@ -464,12 +479,14 @@ pub const Table = struct {
 
     pub const Sizes = struct { left: u64 = 0, right: u64 = 0 };
 
-    /// The block cache key: file_id in the high 64 bits, block_idx in
-    /// the low 64 — no hashing, no collision. 0 = "skip cache" (file_id
-    /// 0 is the in-memory / non-SST marker).
+    /// The block cache key: file_id in the high 64 bits, the block's
+    /// byte offset in the file in the low 64 — no hashing, no
+    /// collision, and the tables packed in one file never share a key.
+    /// 0 = "skip cache" (file_id 0 is the in-memory / non-SST marker).
     fn cacheKey(self: *const Table, block_idx: usize) u128 {
         if (self.file_id == 0) return 0;
-        return (@as(u128, self.file_id) << 64) | @as(u128, block_idx);
+        const at = self.extent.offset + self.index.blocks[block_idx].offset;
+        return (@as(u128, self.file_id) << 64) | @as(u128, at);
     }
 
     /// Record that block `idx` is in the block cache. A hit on a block
@@ -562,7 +579,7 @@ pub const Table = struct {
         // Read raw bytes (temporary)
         const result = try self.obj.readAligned(
             self.allocator,
-            @intCast(bi.offset),
+            self.extent.offset + bi.offset,
             bi.len,
         );
         defer result.free();
@@ -626,7 +643,7 @@ pub const Table = struct {
             const bi = blocks[idx];
             if (bi.len < 4) return error.CorruptTable;
             try reqs.append(arloc, .{
-                .offset = @intCast(bi.offset),
+                .offset = self.extent.offset + bi.offset,
                 .len = bi.len,
             });
             try wanted.append(arloc, idx);
@@ -1265,9 +1282,12 @@ pub const TableIterator = struct {
         if (bpos >= blocks.len) return error.CorruptTable;
 
         const block = blocks[bpos];
+        // Offsets in the file: the table's base plus the block's.
+        const base = self.table.extent.offset;
+        const at_file = base + block.offset;
         const held = if (self.window) |w|
-            block.offset >= w.offset and
-                block.offset + block.len <= w.offset + w.data.len
+            at_file >= w.offset and
+                at_file + block.len <= w.offset + w.data.len
         else
             false;
 
@@ -1282,11 +1302,11 @@ pub const TableIterator = struct {
             }
             self.window = try self.table.obj.readAligned(
                 self.allocator,
-                block.offset,
+                at_file,
                 len,
             );
         }
-        const at: usize = @intCast(block.offset - self.window.?.offset);
+        const at: usize = @intCast(at_file - self.window.?.offset);
         return self.table.decodeBlock(self.window.?.data[at..][0..block.len]);
     }
 };

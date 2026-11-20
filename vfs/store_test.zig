@@ -36,7 +36,7 @@ test "store: file backend put/get/exists/delete round-trip" {
 
     // Whole-object and ranged reads through the handle.
     var obj = try store.open("0001_000000000001.sst", vfs.page_size, .{});
-    defer obj.close();
+    defer obj.decrRef();
     try testing.expectEqual(@as(u64, vfs.page_size), obj.size());
     const got = try obj.readAligned(alloc, 0, vfs.page_size);
     defer got.free();
