@@ -745,7 +745,7 @@ pub const Node = struct {
                     else => return,
                 };
                 fiber.spawnDetached(
-                    .{ .lane = .raft },
+                    .{ .lane = .raft, .name = "file-announce" },
                     handleFileAnnounce,
                     .{ self, ann },
                 ) catch |err| {
@@ -1988,11 +1988,27 @@ pub const Node = struct {
         defer g.deinit();
         try g.ensureTotalCapacity(6);
 
-        try g.spawn(.{ .lane = .raft, .priority = .high, .worker_id = 0 }, mainLoop, .{ self, self.config.tick_interval_ms });
-        try g.spawn(.{ .lane = .raft, .priority = .high, .worker_id = 1 }, applyLoop, .{self});
-        try g.spawn(.{ .lane = .raft, .priority = .high, .worker_id = 2 }, tickLoop, .{ self, self.config.tick_interval_ms });
-        try g.spawn(.{ .lane = .raft }, clockTickLoop, .{self});
-        try g.spawn(.{ .lane = .raft }, commitPersistLoop, .{self});
+        try g.spawn(
+            .{ .lane = .raft, .priority = .high, .worker_id = 0, .name = "raft-main" },
+            mainLoop,
+            .{ self, self.config.tick_interval_ms },
+        );
+        try g.spawn(
+            .{ .lane = .raft, .priority = .high, .worker_id = 1, .name = "raft-apply" },
+            applyLoop,
+            .{self},
+        );
+        try g.spawn(
+            .{ .lane = .raft, .priority = .high, .worker_id = 2, .name = "raft-tick" },
+            tickLoop,
+            .{ self, self.config.tick_interval_ms },
+        );
+        try g.spawn(.{ .lane = .raft, .name = "raft-clock" }, clockTickLoop, .{self});
+        try g.spawn(
+            .{ .lane = .raft, .name = "raft-commit-persist" },
+            commitPersistLoop,
+            .{self},
+        );
         // Reacts to the shutdown signal (from wherever it fires) by closing
         // everything the loops above can park on, then exits with them.
         try g.spawn(.{ .lane = .raft }, shutdownWatchLoop, .{self});

@@ -161,7 +161,7 @@ pub const MetaStore = struct {
             slot_size,
         );
         defer self.allocator.free(page);
-        @memset(page, 0);
+        utils.fill(page, 0);
 
         // Marshal HardState directly into the slot's payload region (the
         // bytes after the frame prefix). Wrap the writer with the message

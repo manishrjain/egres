@@ -13,6 +13,7 @@ pub const log = @import("log.zig");
 /// the fiber runtime reaches them without a cycle.
 pub const context = @import("context.zig");
 pub const mem = @import("mem.zig");
+pub const fill = @import("fill.zig").fill;
 pub const coarse_clock = @import("coarse_clock.zig");
 pub const coarseMs = coarse_clock.ms;
 pub const timestampNow = coarse_clock.timestampNow;
@@ -120,7 +121,7 @@ pub const ChunkBuffer = struct {
         while (rest > 0) {
             const dst = try self.tail();
             const n = @min(dst.len, rest);
-            @memset(dst[0..n], byte);
+            fill(dst[0..n], byte);
             rest -= n;
             self.len += n;
         }

@@ -33,6 +33,7 @@ const _deadlines = @import("deadlines.zig");
 const _spinlock = @import("spinlock.zig");
 const _queue = @import("queue.zig");
 const _fsops = @import("fsops.zig");
+const _stacks = @import("stacks.zig");
 const _context = @import("utils").context;
 const _sim = @import("sim.zig");
 const _simdisk = @import("simdisk.zig");
@@ -98,6 +99,13 @@ var g_rt: ?*Runtime = null;
 /// through this.
 pub fn runtime() *Runtime {
     return g_rt orelse @panic("fiber runtime not initialized");
+}
+
+/// The runtime's stack pool, null before `init` publishes it (a
+/// manual-mode fiber maps its own stack).
+pub fn stackPool() ?*_stacks.StackPool {
+    const rt = g_rt orelse return null;
+    return &rt.stacks;
 }
 
 /// Contiguous worker-id range owned by a lane. `len == 0` means the
@@ -702,9 +710,9 @@ pub const Worker = struct {
     /// completions to be reaped, which no other dump shows: a trace
     /// starts after dispatch and the profiler samples shares. A
     /// statement's context is cleared at its end, so a step that
-    /// ended a statement shows an empty name.
+    /// ended a statement shows the fiber's spawn name.
     fn logLongStep(self: *Worker, f: *Fiber, ran_ns: u64) void {
-        const name = f.ctx.name;
+        const name = if (f.ctx.name.len > 0) f.ctx.name else f.name;
         log.warn("W{d:0>2} long step: {d} ms, {s} {s} fiber, {s}: {s}", .{
             self.id,               ran_ns / std.time.ns_per_ms,
             @tagName(f.priority),  @tagName(f.lane),
@@ -1083,6 +1091,8 @@ pub const Runtime = struct {
     /// the spinlock too.
     fibers: std.ArrayList(*Fiber) = .empty,
     fibers_sl: Spinlock = .{},
+    /// Finished fibers' stacks, for the next spawns (stacks.zig).
+    stacks: _stacks.StackPool,
 
     /// Set by `stop()`; once true every worker's run loop exits after
     /// its current pass. The runtime otherwise runs forever (workers
@@ -1227,6 +1237,8 @@ pub const Runtime = struct {
         self.allocator = allocator;
         self.fibers = .empty;
         self.fibers_sl = .{};
+        self.stacks = try _stacks.StackPool.init(allocator);
+        errdefer self.stacks.deinit();
         self.stopping = .init(false);
         self.steal_enabled = opts.steal;
         self.pin_workers = opts.pin_workers and !sim_mode;
@@ -1330,6 +1342,7 @@ pub const Runtime = struct {
         for (self.workers) |*w| w.deinit();
         self.allocator.free(self.workers);
         g_rt = null;
+        self.stacks.deinit();
     }
 
     fn appendFiber(self: *Runtime, f: *Fiber) !void {
@@ -1968,8 +1981,9 @@ pub fn dumpFibers(rt: *Runtime, writer: *std.Io.Writer) !void {
         try writer.print("({d} more waiting — out of memory to list)\n", .{n_waiting - parked.items.len});
     }
     for (parked.items, 0..) |e, idx| {
-        try writer.print("W {d:>5} fiber=0x{x} parked_for={d}ms cpu_total={d}ms\n", .{
-            idx, @intFromPtr(e.f), e.for_ms, @divTrunc(e.f.cpu_total_ns, std.time.ns_per_ms),
+        try writer.print("W {d:>5} fiber=0x{x} {s} parked_for={d}ms cpu_total={d}ms\n", .{
+            idx,      @intFromPtr(e.f),                                e.f.name,
+            e.for_ms, @divTrunc(e.f.cpu_total_ns, std.time.ns_per_ms),
         });
         try writeStackTrace(writer, e.f); // re-checks `.waiting`; bails if it resumed
     }

@@ -597,16 +597,28 @@ pub const Engine = struct {
         try self.recoverFromSnapshot();
         self.node.applyCommits();
 
-        try self.bg.spawn(.{}, runRaft, .{&self.raft_rt});
-        try self.bg.spawn(.{}, runManifestQueue, .{self});
-        try self.bg.spawn(.{}, closeMQueueOnStop, .{self});
-        try self.bg.spawn(.{}, runCompactionLoop, .{self});
-        try self.bg.spawn(.{}, runSnapshotLoop, .{self});
+        try self.bg.spawn(.{ .name = "raft" }, runRaft, .{&self.raft_rt});
+        try self.bg.spawn(
+            .{ .name = "manifest-queue" },
+            runManifestQueue,
+            .{self},
+        );
+        try self.bg.spawn(
+            .{ .name = "manifest-queue-stop" },
+            closeMQueueOnStop,
+            .{self},
+        );
+        try self.bg.spawn(
+            .{ .name = "compaction-loop" },
+            runCompactionLoop,
+            .{self},
+        );
+        try self.bg.spawn(.{ .name = "snapshot-loop" }, runSnapshotLoop, .{self});
         // High priority, so a shrink for a burst does not wait behind
         // a busy worker's queue; high fibers are pinned, to worker 0.
         if (_governor.g() != null)
             try self.bg.spawn(
-                .{ .priority = .high, .worker_id = 0 },
+                .{ .priority = .high, .worker_id = 0, .name = "governor" },
                 runGovernor,
                 .{self},
             );
@@ -841,10 +853,32 @@ pub const Engine = struct {
         var req: _manifest_queue.Request = .{ .class = class, .kind = kind };
         return self.mqueue.submit(&req);
     }
-    /// Register a front-end listener loop (admin, sql) into the engine's
-    /// background group so it is cancelled and joined with the engine.
-    pub fn spawnListener(self: *Engine, comptime f: anytype, args: anytype) !void {
-        try self.bg.spawn(.{}, f, args);
+    /// A front-end accept loop (admin, sql) in the engine's background
+    /// group, so it is cancelled and joined with the engine. High
+    /// priority, pinned to lane worker 1 (the governor holds 0): an
+    /// accepted connection is dealt out ahead of the statements on
+    /// that worker, so a busy worker never grows the kernel's queue.
+    pub fn spawnListener(
+        self: *Engine,
+        name: String,
+        comptime f: anytype,
+        args: anytype,
+    ) !void {
+        try self.bg.spawn(
+            .{ .priority = .high, .worker_id = 1, .name = name },
+            f,
+            args,
+        );
+    }
+
+    /// A front end's helper loop in the same group.
+    pub fn spawnLoop(
+        self: *Engine,
+        name: String,
+        comptime f: anytype,
+        args: anytype,
+    ) !void {
+        try self.bg.spawn(.{ .name = name }, f, args);
     }
 
     /// Watcher fiber — one per front-end listener, spawned detached by each
@@ -938,11 +972,11 @@ pub const Engine = struct {
             return;
         };
 
-        g.spawn(.{}, runMemtableLoop, .{self}) catch |err| {
+        g.spawn(.{ .name = "memtable-loop" }, runMemtableLoop, .{self}) catch |err| {
             log.err("runCompactionLoop: spawn runMemtableLoop failed: {s}", .{@errorName(err)});
             return;
         };
-        g.spawn(.{}, runFlushLoop, .{self}) catch |err| {
+        g.spawn(.{ .name = "flush-loop" }, runFlushLoop, .{self}) catch |err| {
             log.err("runCompactionLoop: spawn runFlushLoop failed: {s}", .{@errorName(err)});
             return;
         };
@@ -951,12 +985,12 @@ pub const Engine = struct {
         // once. A tree runs several only on disjoint levels, so an L0
         // merge proceeds while a long rewrite below holds the tree.
         for (0..n_compactors) |_| {
-            g.spawn(.{}, runLevelsLoop, .{self}) catch |err| {
+            g.spawn(.{ .name = "levels-loop" }, runLevelsLoop, .{self}) catch |err| {
                 log.err("runCompactionLoop: spawn runLevelsLoop failed: {s}", .{@errorName(err)});
                 return;
             };
         }
-        g.spawn(.{}, runInFlightWatchdog, .{self}) catch |err| {
+        g.spawn(.{ .name = "inflight-watchdog" }, runInFlightWatchdog, .{self}) catch |err| {
             log.err("runCompactionLoop: spawn runInFlightWatchdog failed: {s}", .{@errorName(err)});
             return;
         };
@@ -1704,9 +1738,11 @@ pub const Engine = struct {
             else => return err,
         };
         const t3 = utils.coarseMs();
-        // The one line per compaction a release log keeps: every phase's
-        // time is in it.
-        log.info(
+        // TODO: a tally on the Engine, reported every 10 s from the
+        // compaction loop: jobs by level transition, bytes in and out,
+        // build time summed and the slowest, jobs pending. Then a job
+        // over a second keeps an INFO line of its own.
+        log.debug(
             "compact cid={d} done tree={d} L{d} changes={d} build_ms={d} " ++
                 "distribute_ms={d} propose_ms={d} total_ms={d}",
             .{

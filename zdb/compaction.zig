@@ -843,7 +843,7 @@ fn moveDown(
     create.raft_index = e.raft_index;
     changes.appendAssumeCapacity(create);
 
-    log.info("move tree={d} L{d}->L{d} sst={d} bytes={d}", .{
+    log.debug("move tree={d} L{d}->L{d} sst={d} bytes={d}", .{
         self.tree_id, src, dest, e.id, e.table.fileSize(),
     });
     return changes;
@@ -983,7 +983,11 @@ pub fn mergeAndWrite(
     errdefer for (parts[spawned..]) |*part| part.bot.deinit();
 
     for (parts) |part| {
-        try group.spawn(.{}, runPartition, .{ self, job, part, snapshot_ts });
+        try group.spawn(
+            .{ .name = "compaction" },
+            runPartition,
+            .{ self, job, part, snapshot_ts },
+        );
         spawned += 1;
     }
     const results = group.wait();
@@ -1069,7 +1073,9 @@ fn reportJob(
         stats.src_bytes_disk + stats.bot_bytes_disk;
     const lost_in_iter = expected_in -| stats.keys_in;
     const discarded = stats.keys_in -| stats.keys_out;
-    log.info(
+    // The engine prints the one line per compaction a release log
+    // keeps; this is the build's accounting.
+    log.debug(
         "compact tree={d} L{d}->L{d} fibers={d} src_tables={d} src_keys={d} " ++
             "src_bytes_disk={d} bot_tables={d} bot_keys={d} " ++
             "bot_bytes_disk={d} expected_in={d} expected_bytes_disk={d} " ++

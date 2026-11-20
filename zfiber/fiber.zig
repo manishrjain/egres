@@ -37,6 +37,7 @@ const Coroutine = coro.Coroutine;
 const Context = coro.Context;
 const Spinlock = _spinlock.Spinlock;
 const Ctx = @import("ctx.zig").Ctx;
+const String = utils.String;
 
 /// One pending deadline in a per-worker `Deadlines` min-heap. Each `Fiber`
 /// OWNS one of these (`Fiber.timeout`) rather than putting it on the caller's
@@ -249,6 +250,9 @@ pub const SpawnOptions = struct {
     worker_id: ?u8 = null,
     lane: Lane = .default,
     priority: Priority = .normal,
+    /// What the fiber does, a static string: what a long step or a
+    /// fiber dump shows for a fiber that runs no statement.
+    name: String = "",
     /// Bytes of stack reserved AND fully committed for this fiber. Fixed —
     /// no on-demand growth, so a body that recurses past this hits the
     /// guard page and crashes (raise it for deep-recursion bodies). Lazily
@@ -350,6 +354,8 @@ pub const Fiber = struct {
     running: std.atomic.Value(u32),
 
     priority: Priority,
+    /// `SpawnOptions.name`.
+    name: String,
     /// Placement lane (`.default` / `.raft`). Set at spawn; used by
     /// normal-priority routing to pick a worker ring in the right lane.
     lane: Lane,
@@ -505,6 +511,7 @@ pub const Fiber = struct {
             .intent = .reschedule,
             .running = std.atomic.Value(u32).init(0),
             .priority = opts.priority,
+            .name = opts.name,
             .lane = opts.lane,
             .home_worker_id = undefined, // high priority only; see spawnInner
             .cpu_total_ns = 0,
@@ -523,12 +530,15 @@ pub const Fiber = struct {
             .context = undefined,
         };
 
-        try coro.stackAlloc(
-            &self.coro.context.stack_info,
-            opts.stack_size, // maximum_size
-            opts.stack_size, // committed_size == maximum: fully committed, never grows
-        );
-        errdefer coro.stackFree(self.coro.context.stack_info);
+        // Fully committed, never grows; from the runtime's pool when
+        // one is up (manual-mode tests have none).
+        const info = &self.coro.context.stack_info;
+        if (_rt.stackPool()) |pool| {
+            try pool.get(info, opts.stack_size);
+        } else {
+            try coro.stackAlloc(info, opts.stack_size, opts.stack_size);
+        }
+        errdefer freeStack(info.*);
 
         self.coro.setup(&fiberEntry, self);
         // Context fully initialized → lock its page read-only. From here it is
@@ -573,9 +583,15 @@ pub const Fiber = struct {
 
     pub fn deinit(self: *Fiber, allocator: std.mem.Allocator) void {
         self.body_destroy(self.body, allocator);
-        coro.stackFree(self.coro.context.stack_info);
+        freeStack(self.coro.context.stack_info);
         if (comptime guard_level >= 2) freeCoro(self.coro);
         allocator.destroy(self);
+    }
+
+    /// Back to the pool when there is one, else unmapped.
+    fn freeStack(info: coro.Stack) void {
+        if (_rt.stackPool()) |pool| return pool.put(info);
+        coro.stackFree(info);
     }
 
     /// Manual mode: caller -> fiber. Saves caller CPU state into

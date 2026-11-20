@@ -25,6 +25,7 @@ const yield_stride = 4096;
 
 const builtin = @import("builtin");
 const fiber = @import("zfiber");
+const utils = @import("utils");
 const is_debug = builtin.mode == .Debug;
 
 /// BinaryFuse8 provides a binary fuse filter with 8-bit fingerprints.
@@ -166,7 +167,7 @@ pub fn BinaryFuse(comptime T: type) type {
             var size = keys.len();
             const reverse_order = try allocator.alloc(u64, size + 1);
             defer allocator.free(reverse_order);
-            @memset(reverse_order, 0);
+            utils.fill(reverse_order, 0);
 
             const capacity = self.fingerprints.len;
             const alone = try allocator.alloc(u32, capacity);
@@ -174,14 +175,14 @@ pub fn BinaryFuse(comptime T: type) type {
 
             const t2count = try allocator.alloc(T, capacity);
             defer allocator.free(t2count);
-            @memset(t2count, 0);
+            utils.fill(t2count, 0);
 
             const reverse_h = try allocator.alloc(T, size);
             defer allocator.free(reverse_h);
 
             const t2hash = try allocator.alloc(u64, capacity);
             defer allocator.free(t2hash);
-            @memset(t2hash, 0);
+            utils.fill(t2hash, 0);
 
             var block_bits: u5 = 1;
             while ((@as(u32, 1) << block_bits) < self.segment_count) {
@@ -338,9 +339,9 @@ pub fn BinaryFuse(comptime T: type) type {
                     size = stacksize;
                     break;
                 }
-                @memset(reverse_order[0..size], 0);
-                @memset(t2count[0..capacity], 0);
-                @memset(t2hash[0..capacity], 0);
+                utils.fill(reverse_order[0..size], 0);
+                utils.fill(t2count[0..capacity], 0);
+                utils.fill(t2hash[0..capacity], 0);
                 self.seed = rngSplitMix64(&rng_counter);
             }
             if (size == 0) return;

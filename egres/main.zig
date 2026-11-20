@@ -25,6 +25,21 @@ pub const std_options = std.Options{
     .logFn = utils.log.logFn,
 };
 
+/// The log's ring is written out before the panic message, so the
+/// lines that led to it are in the file.
+pub const panic = std.debug.FullPanic(panicFlushed);
+
+fn panicFlushed(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    utils.log.flush();
+    std.debug.defaultPanic(msg, first_trace_addr);
+}
+
+/// A usage error's exit, after the log's ring is written out.
+fn exit(code: u8) noreturn {
+    utils.log.stop();
+    std.process.exit(code);
+}
+
 /// `--listen` — where the server binds. Actual addresses are
 /// `<host>:<port+offset>` for both raft and client. `offset` makes it
 /// trivial to bring up N servers on one host without spelling out
@@ -35,11 +50,17 @@ const ListenCfg = struct {
     client_port: u16 = 5210,
     sql_port: u16 = 3210,
     offset: u16 = 0,
+    sql_backlog: u31 = 4096,
 
     pub const docs = .{
         .self = "Where the server listens. raft, admin (client), and SQL" ++
             " ports each get +offset.",
         .host = "Hostname/IP to bind the raft, admin, and SQL listeners on.",
+        .sql_backlog = "Connections the kernel keeps for the SQL listener" ++
+            " between the client's handshake and the server's accept." ++
+            " When the queue is full the kernel drops the SYN, and that" ++
+            " client waits 1 s to retry. The kernel caps the value at" ++
+            " net.core.somaxconn.",
         .raft_port = "Base port for raft peer connections. Actual port =" ++
             " raft_port + offset.",
         .client_port = "Base port for the admin protocol. Actual port =" ++
@@ -197,10 +218,16 @@ const Args = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    defer log.info("shutdown complete", .{});
     // The process allocator, counted (`mem`, the cache governor).
     utils.context.initGlobalWithAllocator(init, galloc.allocator());
     const allocator = utils.context.g().gpa;
+
+    // The log's writer thread, up before any worker logs and down
+    // after the last line below.
+    try utils.log.start(allocator);
+    defer utils.log.stop();
+    defer log.info("shutdown complete", .{});
+
     // Fail fast if the gpa above ever stops routing to the build-selected
     // allocator: the embedded allocator policy, memory accounting, and
     // reclamation model all assume it.
@@ -229,10 +256,10 @@ pub fn main(init: std.process.Init) !void {
     // This fiber is that somebody; it isn't even compiled in where the
     // allocator reclaims on its own.
     if (comptime !galloc.has_background_reclaim) {
-        try fiber.spawnDetached(.{}, allocMaintenance, .{});
+        try fiber.spawnDetached(.{ .name = "alloc-maintenance" }, allocMaintenance, .{});
     }
 
-    try fiber.spawnDetached(.{}, bootstrapAndStop, .{ allocator, argv });
+    try fiber.spawnDetached(.{ .name = "bootstrap" }, bootstrapAndStop, .{ allocator, argv });
     fiber_rt.run();
     if (failed.load(.acquire)) return error.Failed;
 }
@@ -381,7 +408,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     flags.g().parseArgv(settings.items, &leftover) catch |err| {
         log.err("flag parse failed: {s}", .{@errorName(err)});
         usage(allocator);
-        std.process.exit(1);
+        exit(1);
     };
     if (leftover.items.len != 0) {
         log.err(
@@ -390,7 +417,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
             .{leftover.items[0]},
         );
         usage(allocator);
-        std.process.exit(1);
+        exit(1);
     }
 
     const listen = live_listen.cur();
@@ -409,26 +436,26 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     if (raft_cfg.id == 0 or wal_cfg.dir.len == 0) {
         log.err("--raft requires id (>0); --wal requires dir", .{});
         usage(allocator);
-        std.process.exit(1);
+        exit(1);
     }
     if (!(memory_cfg.query_ratio > 0 and memory_cfg.query_ratio <= 1)) {
         log.err("--memory query_ratio must be in (0, 1]", .{});
         usage(allocator);
-        std.process.exit(1);
+        exit(1);
     }
     // An endpoint selects S3; dir_path has a default, so it cannot.
     const store_dir = store_cfg.s3_endpoint.len == 0;
     if (store_dir and store_cfg.dir_path.len == 0) {
         log.err("--store needs dir_path or s3_endpoint", .{});
-        std.process.exit(1);
+        exit(1);
     }
     if (!store_dir and store_cfg.s3_bucket.len == 0) {
         log.err("--store s3_endpoint requires s3_bucket", .{});
-        std.process.exit(1);
+        exit(1);
     }
     if (store_dir and std.mem.eql(u8, store_cfg.dir_path, wal_cfg.dir)) {
         log.err("--store dir_path and --wal dir must differ", .{});
-        std.process.exit(1);
+        exit(1);
     }
 
     // Resolve listen addresses from host + base port + offset.
@@ -583,7 +610,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
 
     zdb_cfg.validate() catch |err| {
         log.err("--zdb: invalid storage options: {s}", .{@errorName(err)});
-        std.process.exit(1);
+        exit(1);
     };
 
     // The replicated storage engine, one node of it: opens the raft WAL
@@ -623,13 +650,13 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     // changes (see sql/server.zig).
     // Before the engine starts: it gives the engine the hook that feeds
     // the commit stream to its per-table state.
-    const sql_srv = try sql.Server.create(eng, sql_addr);
+    const sql_srv = try sql.Server.create(eng, sql_addr, listen.sql_backlog);
     defer deinitWithLog("sql_srv", sql_srv);
 
     log.info("all components initialized", .{});
 
     var handle = try fiber.spawn(
-        .{},
+        .{ .name = "app-main" },
         appMain,
         .{ eng, &admin_srv, sql_srv, &args },
     );
@@ -672,7 +699,11 @@ fn appMain(
         log.err("engine.start failed: {s}", .{@errorName(err)});
         return;
     };
-    eng.spawnListener(engine.AdminServer.runListener, .{admin_srv}) catch |err| {
+    eng.spawnListener(
+        "admin-listener",
+        engine.AdminServer.runListener,
+        .{admin_srv},
+    ) catch |err| {
         log.err("appMain: spawn admin server failed: {s}", .{@errorName(err)});
         return;
     };

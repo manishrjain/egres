@@ -151,6 +151,7 @@ pub const File = fs.File;
 // From fsops.zig — blocking-op offload pool (fsync + fs metadata) that parks
 // the calling fiber and wakes it when a pool thread finishes the syscall.
 pub const fsops = @import("fsops.zig");
+pub const StackPool = @import("stacks.zig").StackPool;
 
 // From net.zig — TCP networking with zio.net-compatible Stream/Server/
 // IpAddress and the std.Io.Reader/Writer socket adapters.

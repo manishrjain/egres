@@ -50,6 +50,7 @@ const _fs = @import("fs.zig");
 const _rt = @import("runtime.zig");
 
 const String = @import("utils").String;
+const fill = @import("utils").fill;
 const Allocator = std.mem.Allocator;
 const Op = _fs.Op;
 const File = _fs.File;
@@ -580,7 +581,7 @@ pub const SimDisk = struct {
             if (node.lost_pages.contains(idx)) continue;
             const img = self.alloc.create([page_size]u8) catch
                 @panic("simdisk: out of memory on a failed sync");
-            @memset(img, 0);
+            fill(img[0..], 0);
             node.lost_pages.putNoClobber(self.alloc, idx, img) catch
                 @panic("simdisk: out of memory on a failed sync");
         }
@@ -634,7 +635,7 @@ pub const SimDisk = struct {
             if (node.old_pages.contains(idx)) continue;
             const img = try self.alloc.create([page_size]u8);
             errdefer self.alloc.destroy(img);
-            @memset(img, 0);
+            fill(img[0..], 0);
             const start = idx * page_size;
             const have = @min(start + page_size, node.data.items.len);
             if (have > start)
@@ -821,7 +822,7 @@ pub const SimDisk = struct {
         const old_len = data.items.len;
         data.resize(self.alloc, len) catch
             @panic("simdisk: out of memory resizing a file");
-        if (len > old_len) @memset(data.items[old_len..len], 0);
+        if (len > old_len) fill(data.items[old_len..len], 0);
     }
 
     fn assertDirect(ptr: [*]const u8, len: usize, offset: u64) void {

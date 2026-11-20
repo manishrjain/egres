@@ -604,7 +604,11 @@ pub const PackObject = struct {
 
         // The fiber owns `file` and `entries` from here: the next file
         // fills while this one uploads.
-        try p.group.spawn(.{}, putFile, .{ p, file, id, entries });
+        try p.group.spawn(
+            .{ .name = "put-file" },
+            putFile,
+            .{ p, file, id, entries },
+        );
     }
 
     /// The open file's tables copied back to back into one

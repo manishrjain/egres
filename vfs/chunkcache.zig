@@ -547,7 +547,7 @@ const Open = struct {
     /// records of every slot on it, from the slots' in-memory state;
     /// a slot without a chunk is a zero record.
     fn composeSlotRecordPage(self: *const Open, page: u64, out: []u8) void {
-        @memset(out, 0);
+        utils.fill(out, 0);
         const first = (page - 1) * SlotRecord.per_page;
         const last = @min(first + SlotRecord.per_page, self.slots.len);
         for (first..last) |id| {
@@ -702,7 +702,7 @@ const Open = struct {
         const read_words: u32 = @intCast((chunk_bytes / page_size + 63) / 64);
         const read_bits = try a.alloc(u64, n * read_words);
         errdefer a.free(read_bits);
-        @memset(read_bits, 0);
+        utils.fill(read_bits, 0);
 
         // Indexed by page number; page 0, the file header, stays clear.
         var dirty = try std.DynamicBitSetUnmanaged.initEmpty(

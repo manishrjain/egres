@@ -49,6 +49,8 @@ pub const Database = _database.Database;
 pub const Server = struct {
     engine: *engine.Engine,
     listen_addr: fiber.net.IpAddress,
+    /// The kernel's accept queue (`--listen sql_backlog`).
+    backlog: u31,
     /// Connections accepted so far; deals each new connection's fiber to
     /// the next lane worker (see runListener). Only the accept loop
     /// touches it.
@@ -77,7 +79,7 @@ pub const Server = struct {
     /// Before `eng.start`: this hands the engine the commit-stream
     /// hook, and no applied entry may be missed. The hook holds the
     /// server's address, so the server is on the heap.
-    pub fn create(eng: *engine.Engine, addr: String) !*Server {
+    pub fn create(eng: *engine.Engine, addr: String, backlog: u31) !*Server {
         const alloc = eng.allocator;
         const self = try alloc.create(Server);
         errdefer alloc.destroy(self);
@@ -89,6 +91,7 @@ pub const Server = struct {
         self.* = .{
             .engine = eng,
             .listen_addr = listen_addr,
+            .backlog = backlog,
             .catalogs = catalogs,
             .databases = std.AutoHashMap(u64, *Database).init(alloc),
             .oracle = oracle,
@@ -101,9 +104,9 @@ pub const Server = struct {
     /// engine's loop group, so they end with its loops. After
     /// `eng.start`.
     pub fn start(self: *Server) !void {
-        try self.engine.spawnListener(runListener, .{self});
-        try self.engine.spawnListener(runOracleRotation, .{self});
-        try self.engine.spawnListener(runLockSweep, .{self});
+        try self.engine.spawnListener("sql-listener", runListener, .{self});
+        try self.engine.spawnLoop("oracle-rotation", runOracleRotation, .{self});
+        try self.engine.spawnLoop("lock-sweep", runLockSweep, .{self});
     }
 
     /// After `eng.stop`: the apply loop calls the hook until then.
@@ -302,7 +305,10 @@ pub const Server = struct {
         // a refused connection is what clients already retry on.
         self.engine.waitForBootCatchUp();
         if (self.engine.node.isShuttingDown()) return;
-        const listener = self.listen_addr.listen(.{ .reuse_address = true }) catch |err| {
+        const listener = self.listen_addr.listen(.{
+            .reuse_address = true,
+            .backlog = self.backlog,
+        }) catch |err| {
             log.err("listen failed: {s}", .{@errorName(err)});
             return;
         };
@@ -311,7 +317,7 @@ pub const Server = struct {
         // watcher fiber self-connects to our address when the drain
         // starts. No connection is taken from then on.
         fiber.spawnDetached(
-            .{},
+            .{ .name = "sql-listener-stop" },
             engine.Engine.stopListenerOnStart,
             .{ self.engine, self.listen_addr, .drain },
         ) catch {};
@@ -336,7 +342,7 @@ pub const Server = struct {
             // out one fiber at a time.
             self.conn_seq +%= 1;
             fiber.spawnDetached(
-                .{ .worker_id = @truncate(self.conn_seq) },
+                .{ .worker_id = @truncate(self.conn_seq), .name = "sql-conn" },
                 handleConn,
                 .{ self, stream },
             ) catch {

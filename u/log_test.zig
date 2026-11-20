@@ -36,3 +36,33 @@ test "log: the default scope prints as egres" {
         w.buffered(),
     );
 }
+
+test "log: the ring hands lines out in order, wrapping" {
+    var storage: [10]u8 = undefined;
+    var ring: log.Ring = .{ .buf = &storage };
+    try std.testing.expect(ring.push("abcd\n"));
+    try std.testing.expect(ring.push("ef\n"));
+    try std.testing.expectEqualStrings("abcd\nef\n", ring.peek());
+    ring.advance(5);
+    try std.testing.expectEqualStrings("ef\n", ring.peek());
+    // 7 bytes free, 2 of them before the end: the line wraps and
+    // comes out in two pieces.
+    try std.testing.expect(ring.push("ghij\n"));
+    try std.testing.expectEqualStrings("ef\ngh", ring.peek());
+    ring.advance(5);
+    try std.testing.expectEqualStrings("ij\n", ring.peek());
+    ring.advance(3);
+    try std.testing.expectEqual(@as(usize, 0), ring.peek().len);
+}
+
+test "log: a line that does not fit is dropped and counted" {
+    var storage: [8]u8 = undefined;
+    var ring: log.Ring = .{ .buf = &storage };
+    try std.testing.expect(ring.push("abcdef\n"));
+    try std.testing.expect(!ring.push("gh\n"));
+    try std.testing.expect(!ring.push("i\n"));
+    try std.testing.expectEqual(@as(u64, 2), ring.dropped);
+    try std.testing.expectEqualStrings("abcdef\n", ring.peek());
+    ring.advance(7);
+    try std.testing.expect(ring.push("gh\n"));
+}

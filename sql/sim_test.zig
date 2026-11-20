@@ -519,7 +519,7 @@ const Instance = struct {
             .runtime_cfg = self.runtime_live,
         });
         errdefer self.eng.deinit();
-        self.sqlsrv = try sql.Server.create(self.eng, sql_addr);
+        self.sqlsrv = try sql.Server.create(self.eng, sql_addr, 128);
         errdefer self.sqlsrv.deinit();
 
         try self.eng.start();

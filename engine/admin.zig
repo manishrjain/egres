@@ -772,7 +772,7 @@ pub const AdminServer = struct {
         // self-connects to our address when the engine's shutdown channel
         // closes, so the `accept()` below returns and this loop exits.
         fiber.spawnDetached(
-            .{},
+            .{ .name = "admin-listener-stop" },
             Engine.stopListenerOnStart,
             .{ self.engine, self.listen_addr, .shutdown },
         ) catch {};
@@ -799,7 +799,11 @@ pub const AdminServer = struct {
             }
             conn_id += 1;
             log.debug("accepted client connection #{d}", .{conn_id});
-            fiber.spawnDetached(.{}, handleClient, .{ self, stream }) catch {
+            fiber.spawnDetached(
+                .{ .name = "admin-conn" },
+                handleClient,
+                .{ self, stream },
+            ) catch {
                 log.err("failed to spawn handler for connection #{d}", .{conn_id});
                 stream.close();
                 continue;
