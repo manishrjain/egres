@@ -144,11 +144,22 @@ func onboardingDue(begin time.Time, k int, perSec float64) time.Time {
 
 // tenant is what the probe knows of a tenant's table, so that a read
 // can be held to it: which rows exist and the version each updated
-// row is at. Only the tenant's one session at a time touches it.
+// row is at. The tenant's one session at a time touches it, under mu
+// since a checkpoint copies it meanwhile.
 type tenant struct {
 	id int
+	mu sync.Mutex
 	// Rows 1..rows were loaded; the id the next insert uses.
 	rows, nextID int
+	// Ids below nextID with no row that the probe cannot name: a
+	// resumed tenant's count is measured, not remembered.
+	holes int
+	// After a resume: writes made after the checkpoint are above what
+	// it says, so a row is accepted at its saved version or newer
+	// until read once (open); the row count is measured at the next
+	// session (refresh); nothing but the count is certain when the
+	// load was caught half way (unknown).
+	open, refresh, unknown bool
 	// ver[id] is the version of row id's last attempted update (0:
 	// never updated, the row holds md5(id)); nil until the first.
 	ver []uint16
@@ -190,6 +201,12 @@ func (t *tenant) accept(id int, v string) error {
 	if !doubted {
 		lo = hi
 	}
+	if t.open && k > hi {
+		// A version written after the checkpoint: now known.
+		t.setVersion(id, k)
+		delete(t.doubt, id)
+		return nil
+	}
 	if k < lo || k > hi {
 		want := value(id, hi)
 		if doubted {
@@ -205,6 +222,9 @@ func (t *tenant) accept(id int, v string) error {
 
 // exists says whether row id is certainly there.
 func (t *tenant) exists(id int) bool {
+	if t.unknown {
+		return false
+	}
 	return id <= t.rows || (id < t.nextID && !t.absent[id] && !t.unsure[id])
 }
 
@@ -253,7 +273,7 @@ func (t *tenant) rangeCheck(from, to int) checker {
 
 // countCheck: the rows that certainly exist, up to those that may.
 func (t *tenant) countCheck() checker {
-	hi := t.nextID - 1 - len(t.absent)
+	hi := t.nextID - 1 - len(t.absent) - t.holes
 	return countCheck(hi-len(t.unsure), hi)
 }
 
@@ -335,6 +355,7 @@ type agentRun struct {
 	begin   time.Time
 	next    int // the next tenant to onboard; the main goroutine's
 
+	ckMu    sync.Mutex // one checkpoint written at a time
 	mu      sync.Mutex // guards what follows
 	rng     *rand.Rand
 	tenants []*tenant // by id; nil until it has onboarded
@@ -454,11 +475,25 @@ func (a *agentRun) session(s *sessionRun, start time.Time, seed int64) {
 		due := start.Add(time.Duration(k) * gap)
 		a.clk.wait(due)
 		kind := a.mix.pick(rng.Intn(100))
-		sql, check, done := t.statement(kind, 1+rng.Intn(a.rows))
 		err := held
 		if err == nil && conn == nil {
 			conn, err = openRetry(a.target(t.id), time.Now().Add(convTimeout))
 		}
+		if err == nil && t.refresh {
+			// The first session after a resume measures the table
+			// first, outside the statement's latency.
+			t0 := time.Now()
+			if count, top, e := measureRows(conn); e == nil {
+				t.adoptRows(count, top, a.rows)
+				t.mu.Lock()
+				t.refresh = false
+				t.mu.Unlock()
+			}
+			due = due.Add(time.Since(t0))
+		}
+		t.mu.Lock()
+		sql, check, done := t.statement(kind, 1+rng.Intn(a.rows))
+		t.mu.Unlock()
 		if err == nil {
 			var res *result
 			res, err = conn.query(sql)
@@ -468,6 +503,7 @@ func (a *agentRun) session(s *sessionRun, start time.Time, seed int64) {
 				conn.close()
 				conn = nil
 			}
+			t.mu.Lock()
 			if err == nil {
 				if err = check(res); err != nil {
 					err = fmt.Errorf("%s: %w", kindNames[kind], err)
@@ -476,8 +512,11 @@ func (a *agentRun) session(s *sessionRun, start time.Time, seed int64) {
 			if done != nil {
 				done(err, lost)
 			}
+			t.mu.Unlock()
 		} else if done != nil {
+			t.mu.Lock()
 			done(err, false)
+			t.mu.Unlock()
 		}
 		a.record(t.id, kind, due, msSince(due), err, k == 0, woke && k == 0,
 			took)
@@ -809,6 +848,14 @@ func agents(args []string) {
 		"stop growing when the onboardings' p95 is over this; 0 = never")
 	stopErr := fs.Float64("stop-errors-pct", 1,
 		"stop growing when more than this share of statements fail; 0 = never")
+	ckPath := fs.String("checkpoint", "",
+		"shared: file for the tenants' state, written at every window and "+
+			"every -checkpoint-every, for a later -resume")
+	ckEvery := fs.Duration("checkpoint-every", 5*time.Minute,
+		"how often the checkpoint is written while growing")
+	resumePath := fs.String("resume", "",
+		"shared: go on from this checkpoint, on a server that kept its data;"+
+			" tenants onboarded after it was taken are found and adopted")
 	fs.Parse(args)
 
 	fail := func(msg string) {
@@ -835,6 +882,8 @@ func agents(args []string) {
 		fail("-wake is restore or boot")
 	case *rows < 1 || *rate <= 0 || *onboard <= 0 || *active < 0 || *active > 1:
 		fail("-rows, -rate and -onboard must be positive, -active in 0..1")
+	case *backend == "vm" && (*ckPath != "" || *resumePath != ""):
+		fail("-checkpoint and -resume are for the shared backend")
 	}
 
 	a := &agentRun{addr: *addr, pid: *pid, disk: *disk, admin: *admin,
@@ -877,11 +926,31 @@ func agents(args []string) {
 		}
 		os.Exit(code)
 	}
+	if *resumePath != "" {
+		if err := a.resume(*resumePath); err != nil {
+			fail("resume: " + err.Error())
+		}
+		a.adopt()
+	}
+	save := func() {
+		if *ckPath == "" {
+			return
+		}
+		if err := a.checkpoint(*ckPath); err != nil {
+			fmt.Fprintln(os.Stderr, "agents: checkpoint:", err)
+		}
+	}
+	if *ckPath != "" {
+		go a.checkpoints(*ckPath, *ckEvery)
+	}
 	go a.schedule()
 
 	rule := stopRule{*stopRead, *stopOnboard, *stopErr}
 	fmt.Println(header)
 	for _, step := range steps {
+		if step <= a.next {
+			continue // a count a resumed run has passed
+		}
 		t0 := time.Now()
 		why := a.grow(step, *onboard, *floorGiB, *diskFloorGiB)
 		a.mu.Lock()
@@ -893,8 +962,10 @@ func agents(args []string) {
 			fmt.Fprintf(os.Stderr, "agents: stopping at %d tenants: %s\n", n, why)
 		}
 		if n > 0 {
+			save()
 			w := a.window(*window)
 			fmt.Println(w.csv)
+			save()
 			// A breach is measured once more at the same count before it
 			// ends the run: a drive's slow phase can lift one window's
 			// p95 on its own, and a count that fails twice has not fit.
@@ -931,5 +1002,6 @@ func agents(args []string) {
 			break
 		}
 	}
+	save()
 	exit(0)
 }

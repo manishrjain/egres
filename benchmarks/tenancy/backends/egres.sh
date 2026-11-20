@@ -75,8 +75,10 @@ egres_launch() {
 # Blocks until the server takes writes, or fails after 60 s. A read is
 # answered before the election is won, so the log is what tells.
 egres_wait() {
+    # EGRES_WAIT_S: a server opening a store of hundreds of thousands
+    # of tenants (a resumed run) takes longer than a fresh one.
     local i
-    for ((i = 0; i < 600; i++)); do
+    for ((i = 0; i < ${EGRES_WAIT_S:-60} * 10; i++)); do
         grep -q "become-leader" "$ELOG" 2>/dev/null &&
             sql1 "$ADDR/egres" "SELECT 1" >/dev/null 2>&1 && return 0
         sleep 0.1

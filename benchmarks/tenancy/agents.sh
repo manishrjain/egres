@@ -37,6 +37,16 @@
 #   MIX=point=60,range=15,update=15,insert=8,count=2
 #   MEM_GIB=64 BUDGET_PCT=90 WAKE=restore
 #   STOP_P95_MS=50 STOP_ONBOARD_MS=5000 STOP_ERRORS_PCT=1   (0 turns one off)
+#
+# On Egres the probe writes checkpoint.bin, its tenants' state, at
+# every window and every CHECKPOINT_EVERY of growth. RESUME=<an earlier
+# run's directory> goes on from that run's checkpoint: the server is
+# started on the data it left (KEEP=1), the time it takes to answer
+# again is restart.txt, tenants onboarded after the checkpoint are
+# found on the server and adopted, and the steps continue from the
+# count reached. A row is then held to its checkpointed version or
+# newer until it is read once.
+#   RESUME=/data/tenancy/results/agents-egres-<stamp> STEPS=...,1000000
 source "$(dirname "$0")/common.sh"
 in_cgroup "$@"
 platform_init "$@"
@@ -53,11 +63,24 @@ STOP_P95_MS=${STOP_P95_MS:-50}
 STOP_ONBOARD_MS=${STOP_ONBOARD_MS:-5000}
 STOP_ERRORS_PCT=${STOP_ERRORS_PCT:-1}
 BUDGET_MIB=$(($(budget_kb) / 1024))
+CHECKPOINT_EVERY=${CHECKPOINT_EVERY:-5m}
+RESUME=${RESUME:-}
 out=$RES/agents.csv
 
+if [ -n "$RESUME" ]; then
+    [ "$BACKEND" = egres ] || { echo "RESUME is for egres" >&2; exit 2; }
+    [ -f "$RESUME/checkpoint.bin" ] ||
+        { echo "no checkpoint in $RESUME" >&2; exit 2; }
+    export KEEP=1 EGRES_WAIT_S=${EGRES_WAIT_S:-3600}
+fi
 platform_down
 trap platform_down EXIT
+t0=$(date +%s.%N)
 platform_up
+if [ -n "$RESUME" ]; then
+    awk -v a="$t0" -v b="$(date +%s.%N)" \
+        'BEGIN {printf "restart_s %.1f\n", b - a}' | tee "$RES/restart.txt" >&2
+fi
 side=()
 case $BACKEND in
 vm)
@@ -75,7 +98,9 @@ vm)
         -disk-floor-gib "$DISK_FLOOR_GIB" -cpus "$PLATFORM_CPUS")
     ;;
 egres)
-    side=(-backend shared -addr "$ADDR" -pid "$(platform_pid)" -admin "$ADMIN")
+    side=(-backend shared -addr "$ADDR" -pid "$(platform_pid)" -admin "$ADMIN"
+        -checkpoint "$RES/checkpoint.bin" -checkpoint-every "$CHECKPOINT_EVERY")
+    [ -z "$RESUME" ] || side+=(-resume "$RESUME/checkpoint.bin")
     ;;
 *) echo "agents runs on vm or egres, not $BACKEND" >&2; exit 2 ;;
 esac
