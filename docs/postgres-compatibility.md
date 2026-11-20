@@ -53,7 +53,8 @@ The default SQL port is `3210`. The database `egres` exists from the first boot,
 | `DROP TABLE [IF EXISTS] name` | Yes | One table per statement. |
 | `CREATE [UNIQUE] INDEX [IF NOT EXISTS]` | Partial | See [Indexes](#indexes). |
 | `DROP INDEX [IF EXISTS] name` | Yes | One index per statement. `CONCURRENTLY` is not needed: every index change is online. |
-| `ALTER TABLE`, `ALTER INDEX`, `ALTER DATABASE` | Not&nbsp;yet | |
+| `ALTER TABLE [IF EXISTS] … RENAME [COLUMN] … TO …` | Yes | |
+| Other `ALTER TABLE`, `ALTER INDEX`, `ALTER DATABASE` | Not&nbsp;yet | |
 | `TRUNCATE` | Not&nbsp;yet | |
 | `INSERT ... VALUES` | Yes | Multi-row `VALUES` and an explicit column list. |
 | `INSERT ... ON CONFLICT (column) DO NOTHING \| DO UPDATE SET ... [WHERE ...]` | Yes | The column must carry a `PRIMARY KEY` or `UNIQUE` constraint. `DO NOTHING` without a target takes any unique constraint. The `SET` values may name the existing row's columns (through the table name or its `AS` alias) and `EXCLUDED.column`, the proposed row's; the `WHERE` reads the existing row and skips it when false. The tag counts updated rows with inserted ones. Not yet: `ON CONSTRAINT`, a partial-index `WHERE` on the target, `EXCLUDED` in the `WHERE`. |
