@@ -557,14 +557,17 @@ func (a *agentRun) onboard(i int, due time.Time) error {
 		create := fmt.Sprintf("CREATE DATABASE tenant_%d", i)
 		deadline := time.Now().Add(onboardWait)
 		var err error
+		leftover := false
 		for tried, refused := false, false; ; tried = true {
 			err = run(a.addr+"/egres", create, 2*time.Second, nil)
 			var pe *pgError
 			if err == nil {
 				break
 			} else if errors.As(err, &pe) {
-				if tried && pe.code == "42P04" {
-					err = nil // made by an earlier try whose reply was lost
+				if pe.code == "42P04" {
+					// Made by an earlier try whose reply was lost, or
+					// (first try) by a run before this one.
+					err, leftover = nil, !tried
 					break
 				}
 				if refused {
@@ -580,6 +583,24 @@ func (a *agentRun) onboard(i int, due time.Time) error {
 		}
 		if err != nil {
 			return fmt.Errorf("tenant_%d: %w", i, err)
+		}
+		// A database a run before this one made and did not finish (a
+		// crashed onboarding, or one lost to a server that would not
+		// answer): with its table it is taken as it is, its rows
+		// measured, and not timed as an onboarding; without, the load
+		// goes ahead as for a new one.
+		if leftover {
+			if t, there, err := a.lookup(i); err == nil && there {
+				a.mu.Lock()
+				defer a.mu.Unlock()
+				for len(a.tenants) <= i {
+					a.tenants = append(a.tenants, nil)
+				}
+				a.tenants[i] = t
+				a.count++
+				a.idle = append(a.idle, i)
+				return nil
+			}
 		}
 	}
 	err := func() error {

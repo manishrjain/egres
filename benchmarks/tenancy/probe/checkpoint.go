@@ -225,25 +225,29 @@ func (a *agentRun) adopt() {
 		}()
 	}
 	wg.Wait()
-	// Tenants are onboarded in order, so the first one missing ends
-	// the run's tenants; a later one found is a stray and not adopted.
+	// Tenants are onboarded in order, up to 32 at a time, so one
+	// missing within that many of the last found was an onboarding
+	// that did not finish (left nil, as a failed one is); the search
+	// ends at the first missing with none found beyond it.
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	last := start - 1
+	for id := range found {
+		last = max(last, id)
+	}
 	n := 0
-	for id := start; id < stopAt; id++ {
-		t, ok := found[id]
-		if !ok {
-			break
-		}
+	for id := start; id <= last; id++ {
 		for len(a.tenants) <= id {
 			a.tenants = append(a.tenants, nil)
 		}
-		a.tenants[id] = t
-		a.idle = append(a.idle, id)
-		a.count++
-		a.next = id + 1
-		n++
+		if t, ok := found[id]; ok {
+			a.tenants[id] = t
+			a.idle = append(a.idle, id)
+			a.count++
+			n++
+		}
 	}
+	a.next = max(a.next, last+1)
 	if n > 0 {
 		fmt.Fprintf(os.Stderr, "agents: adopted %d tenants onboarded after the "+
 			"checkpoint; %d tenants in all\n", n, a.count)
